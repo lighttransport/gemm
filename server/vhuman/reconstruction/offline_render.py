@@ -18,13 +18,15 @@ DEFAULT_BLENDER = Path('/mnt/disk01/data/vhuman/tools/blender-4.5.14-linux-x64/b
 def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            detail_preset='mature', blender=DEFAULT_BLENDER, gpu_index=0,
            hard_limit_mib=14336, cancel=None, motion=None, frame=1, appearance=None,
-           lighting='studio', yaw=0.):
+           lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08):
     if device not in ('hip', 'cpu') or preset not in ('draft', 'final'):
         raise ValueError('invalid render device or preset')
     if not 1024 <= hard_limit_mib <= 14336:
         raise ValueError('hard GPU limit must be 1024..14336 MiB')
     if lighting not in ('studio','left','right','rim') or not -60<=yaw<=60:
         raise ValueError('invalid lighting or yaw')
+    if not -3<=exposure<=3 or not 0<=sss_weight<=1:
+        raise ValueError('exposure must be -3..3 EV and SSS weight 0..1')
     candidate, out = Path(candidate).resolve(), Path(out).resolve()
     blender = Path(blender).resolve()
     if not blender.is_file():
@@ -43,7 +45,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
             raise ValueError('appearance belongs to a different reconstruction')
         for name in ('expression_appearance.npz','expression_appearance.json'):
             shutil.copyfile(appearance/name,out/name)
-    request = dict(out=str(out), device=device, preset=preset, gpu_index=gpu_index,lighting=lighting,yaw=yaw)
+    request = dict(out=str(out), device=device, preset=preset, gpu_index=gpu_index,lighting=lighting,yaw=yaw,exposure=exposure,sss_weight=sss_weight)
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())
@@ -123,6 +125,8 @@ def main():
     parser.add_argument('--appearance',type=Path,help='gated expression appearance directory')
     parser.add_argument('--lighting',choices=('studio','left','right','rim'),default='studio')
     parser.add_argument('--yaw',type=float,default=0)
+    parser.add_argument('--exposure',type=float,default=-1.5,help='display exposure in EV')
+    parser.add_argument('--sss-weight',type=float,default=.08,help='authored subsurface weight')
     args = parser.parse_args()
     print(json.dumps(render(**vars(args)), indent=2))
 

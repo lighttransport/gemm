@@ -172,6 +172,8 @@ def run(request):
     resolution=512 if request['preset']=='draft' else 1024
     scene.render.resolution_x=resolution;scene.render.resolution_y=resolution;scene.render.resolution_percentage=100
     scene.render.film_transparent=True
+    scene.view_settings.exposure=request.get('exposure',-1.5)
+    scene['skin_lighting_prior']=json.dumps(dict(sss_weight=request.get('sss_weight',.08),exposure=request.get('exposure',-1.5),status='authored studio preset'))
     config=json.loads((out/'scene.json').read_text());candidate=Path(config['candidate'])
     data=np.load(out/'scene_assets.npz',allow_pickle=False)
     materials={}
@@ -199,7 +201,7 @@ def run(request):
     confidence.label='Observed source confidence; hidden texels remain inferred'
     orm=image_node(nodes,candidate/'skin_orm.png',linear=True);channels=nodes.new('ShaderNodeSeparateColor')
     links.new(orm.outputs['Color'],channels.inputs['Color']);links.new(channels.outputs['Green'],node.inputs['Roughness'])
-    node.inputs['Subsurface Weight'].default_value=.2
+    node.inputs['Subsurface Weight'].default_value=request.get('sss_weight',.08)
     node.inputs['Subsurface Scale'].default_value=1
     node.inputs['Subsurface Radius'].default_value=config['material']['sss']['radii_m']
     detail=np.load(out/'skin_detail.npz',allow_pickle=False)
@@ -300,7 +302,7 @@ def run(request):
     bpy.data.images['Render Result'].save_render(str(out/'beauty.png'),scene=scene)
     result=dict(device=device_name,backend=request['device'],resolution=resolution,samples=scene.cycles.samples,
                 seconds=time.perf_counter()-started,blend='head.blend',exr='beauty.exr',preview='beauty.png',
-                lighting=request.get('lighting','studio'),yaw=request.get('yaw',0),frame=scene.frame_current)
+                lighting=request.get('lighting','studio'),yaw=request.get('yaw',0),frame=scene.frame_current,exposure=scene.view_settings.exposure,sss_weight=request.get('sss_weight',.08))
     (out/'render_result.json').write_text(json.dumps(result,indent=2))
 
 

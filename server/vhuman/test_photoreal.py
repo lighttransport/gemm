@@ -8,6 +8,26 @@ from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_
 
 
 class PhotorealTests(unittest.TestCase):
+    def test_render_rejects_invalid_skin_controls_before_gpu_access(self):
+        from .reconstruction.offline_render import render
+        for options in ({'exposure':4},{'sss_weight':-1},{'exposure':float('nan')}):
+            with self.assertRaises(ValueError):render('unused','unused',**options)
+
+    def test_seam_feather_protects_detail_and_opposing_sheets(self):
+        from .reconstruction.texture_completion import feather
+        points=np.array([[0.,0,0],[.001,0,0],[.001,0,.0001]])
+        normals=np.array([[0.,0,1],[0,0,1],[0,0,-1]])
+        colors=np.array([[.8,.5,.3],[.2,.2,.2],[0.,0.,0.]])
+        confidence=np.array([1.,.1,0.])
+        actual,report=feather(points,normals,colors,confidence)
+        np.testing.assert_equal(actual[0],colors[0])
+        np.testing.assert_equal(actual[2],colors[2])
+        self.assertGreater(actual[1,0],colors[1,0])
+        self.assertGreater(report['boundary_edges'],0)
+        self.assertLess(report['boundary_rms_after'],report['boundary_rms_before'])
+        constant,_=feather(points,normals,np.ones_like(colors)*.3,confidence)
+        np.testing.assert_allclose(constant,.3)
+
     def test_glasses_temple_attaches_and_clears_scalp_symmetrically(self):
         boundary=np.array([[.04,.02,.026],[.06,.02,.026],[.05,.03,.026]])
         scalp=np.array([[.075,.02,z] for z in np.linspace(-.1,.026,100)])

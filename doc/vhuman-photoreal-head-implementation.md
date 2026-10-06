@@ -207,3 +207,78 @@ clearance, rearward ordering and left/right reflection equivariance.
 Packed-scene reload validation passed; elapsed time was 24.89 seconds and
 whole-device peak VRAM was 2463.30 MiB (previous `happy15`: 24.51 seconds,
 2463.31 MiB).
+
+### Skin lighting and transfer seams: two-subject validation
+
+Skin transfer now feathers uncertain samples in metric surface space over
+4 mm neighbourhoods (normal dot > 0.7). Confidence >= 0.6 remains unchanged;
+low-confidence samples blend toward their local mean. This crosses UV islands
+through their geometric correspondence and prevents opposite skin sheets
+from sharing colors. It reduces transfer edges without claiming hidden detail
+or measured reflectance. Existing harmonic completion remains the first pass.
+The material manifest records the filter, changed-sample RMS, and a local
+boundary diagnostic. Coverage and confidence still describe source evidence.
+
+The offline studio default now uses SSS weight 0.08 and display exposure
+-1.5 EV, versus 0.2 and 0 EV previously. Both are artist-selected rendering
+controls, not fitted physical parameters. `rig-render` and the standalone
+renderer expose `--sss-weight` and `--exposure`; the request and result record
+the selected values. Exposure changes the display PNG, not scene-linear EXR
+radiance. The texture bake's original lighting/albedo ambiguity remains.
+
+Rebake into a new candidate while preserving identity and motion compatibility:
+
+```sh
+$PY -m server.vhuman.reconstruction.refine_material \
+  tmp/vhuman-hopper-photoreal/reconstruction/hopperidentity02 \
+  --out tmp/vhuman-hopper-photoreal/reconstruction/hoppermaterial03
+```
+
+The official Obama portrait provides a second subject without glasses or a
+hat, with different skin tone and short hair. Source:
+[Library of Congress, official White House photo by Pete Souza, 2012](https://www.loc.gov/item/2017645540/).
+The [Obama Presidential Library](https://www.obamalibrary.gov/photos-videos)
+identifies its official photo materials as public domain. Downloaded asset:
+`https://cdn.loc.gov/service/pnp/ppbd/00600/00603v.jpg`, SHA256
+`1a46b4b0d7bd00f7b02feabadf84fded2e920285c854e948a2fdfb7c2f44ac2f`. Crop [225, 0, 570, 410] in original pixels.
+Source/crop provenance is stored in `tmp/vhuman-public-portraits/obama/source.json`.
+
+```sh
+$PY -m server.vhuman.reconstruction.pipeline \
+  tmp/vhuman-public-portraits/obama/head \
+  --portrait tmp/vhuman-public-portraits/obama/portrait.png \
+  --run-id baseline01 --occlusion-mode auto --texture-res 1024 --iterations 80
+$PY -m server.vhuman.reconstruction.refine_material \
+  tmp/vhuman-public-portraits/obama/head/reconstruction/baseline01 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/material02
+$PY -m server.vhuman.reconstruction.offline_render \
+  tmp/vhuman-public-portraits/obama/head/reconstruction/material02 \
+  --out tmp/vhuman-public-portraits/obama/offline/after03 \
+  --preset final --lighting right --yaw 20
+```
+
+Independent before/after diagnostics on the actual quantized PNG atlases:
+
+| Subject | Surface boundary RGB RMS before | After | Reduction | Boundary edges |
+|---|---:|---:|---:|---:|
+| Hopper | 0.028577 | 0.020130 | 29.6% | 78,889 |
+| Obama | 0.036161 | 0.022358 | 38.2% | 57,026 |
+
+These compare neighboring measured/unobserved samples within 4 mm, normal
+dot > 0.7, in linear RGB. They measure seam continuity, not independent
+photometric accuracy. Both pairs have byte-identical geometry. The diagnostic
+script and JSON are under `tmp/vhuman-skin-review/`; `comparison.png` shows
+matching before/after cameras, lights and poses for each subject.
+
+At 1024 px / 256 samples on RX 9070 XT, Hopper `offline/happy19/` took
+23.10 seconds including saved-scene reload validation, versus 24.89 seconds
+for `happy17/`, using 2463.30 MiB whole-device VRAM. Obama `offline/after03/`
+took 25.16 seconds versus 28.04 seconds for `before01/`, using 2261.22 MiB.
+These are single-run observations, not a controlled speed benchmark.
+All revised packed scenes reload and validate signed detail maps.
+
+The Obama variant also exposes remaining source-fit limitations: teeth are
+still projected onto some skin around the smiling mouth, short scalp hair is
+not reconstructed, and the unobserved neck/scalp has low-detail prior colors.
+The skin seam and lighting changes do not resolve those geometry/coverage
+issues. No additional I2V clips were generated for this static material test.

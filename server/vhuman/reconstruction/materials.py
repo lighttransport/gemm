@@ -174,6 +174,8 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
     from .texture_completion import harmonic
     completed,completion_confidence,completion_report=harmonic(neutral_points,neutral_normals,
                                   accum/np.maximum(weight[:,None],1e-9),measured)
+    from .texture_completion import feather
+    completed,seam_report=feather(neutral_points,neutral_normals,completed,np.clip(weight,0,1))
     color[yy,xx] = completed
     observed = np.zeros((res,res), bool)
     observed[yy[measured],xx[measured]] = True
@@ -206,7 +208,7 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
                     f0=dict(value=f0,status=reflectance['status']), sss=dict(enabled=False,radii_m=[.0012,.0006,.0003],
                     status='authored profile, not measured anatomy'),
                     observed_texels=int(observed.sum()),covered_texels=int(covered.sum()),
-                    completion=completion_report,
+                    completion=completion_report,seam_cleanup=seam_report,
                     limitations=['single-view lighting/albedo ambiguity','bounded low-detail completion; no hidden detail recovery',
                                  'pores/wrinkles are separate authored detail; no material predictor'])
     (out/'skin_material.json').write_text(json.dumps(manifest,indent=2))

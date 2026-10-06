@@ -41,3 +41,44 @@ def harmonic(points,normals,colors,measured,max_distance=.02):
         bounded_distance_m=max_distance,max_edge_m=.004,normal_dot_min=.7,harmonically_completed_samples=len(missing),
         measured_samples=int(measured.sum()),completion_is_observation=False,
         limitations=['nearby surface graph approximates geodesics; no recovered hidden detail','far skin retains bounded median prior'])
+
+
+def feather(points,normals,colors,confidence,radius=.004):
+    """Blend uncertain transfer edges in metric space, across UV islands.
+
+    High-confidence samples retain source detail. Opposing surface sheets and
+    distant regions cannot exchange color. This is seam cleanup, not recovery.
+    """
+    from scipy.spatial import cKDTree
+    points,normals,colors,confidence=map(np.asarray,(points,normals,colors,confidence))
+    if points.shape!=normals.shape or colors.shape!=points.shape or confidence.shape!=(len(points),) or not len(points):
+        raise ValueError('invalid seam arrays')
+    if not np.isfinite(radius) or radius<=0 or not all(np.isfinite(a).all() for a in (points,normals,colors,confidence)) or ((confidence<0)|(confidence>1)).any():
+        raise ValueError('invalid seam samples or radius')
+    tree=cKDTree(points);out=colors.copy()
+    uncertain=np.flatnonzero(confidence<.6)
+    for start in range(0,len(uncertain),8192):
+        ids=uncertain[start:start+8192]
+        distance,near=tree.query(points[ids],k=min(32,len(points)))
+        distance,near=distance.reshape(len(ids),-1),near.reshape(len(ids),-1)
+        agreement=(normals[ids,None]*normals[near]).sum(-1)
+        weights=(distance<radius)*(agreement>.7)*np.exp(-.5*(distance/(radius/2))**2)
+        smooth=(colors[near]*weights[...,None]).sum(1)/np.maximum(weights.sum(1)[:,None],1e-12)
+        t=np.clip(confidence[ids]/.6,0,1)
+        strength=.85*(1-t*t*(3-2*t))
+        out[ids]=colors[ids]*(1-strength[:,None])+smooth*strength[:,None]
+    before=after=0.;edge_count=0
+    for start in range(0,len(uncertain),8192):
+        ids=uncertain[start:start+8192]
+        distance,near=tree.query(points[ids],k=min(8,len(points)))
+        distance,near=distance.reshape(len(ids),-1),near.reshape(len(ids),-1)
+        agreement=(normals[ids,None]*normals[near]).sum(-1)
+        boundary=((confidence[ids,None]>.1)!=(confidence[near]>.1))&(distance<radius)&(agreement>.7)
+        before+=float(((colors[ids,None]-colors[near])**2)[boundary].sum())
+        after+=float(((out[ids,None]-out[near])**2)[boundary].sum())
+        edge_count+=int(boundary.sum())
+    return out,dict(method='confidence-feathered metric surface color',radius_m=radius,
+                    boundary_edges=edge_count,boundary_rms_before=float(np.sqrt(before/max(3*edge_count,1))),
+                    boundary_rms_after=float(np.sqrt(after/max(3*edge_count,1))),
+                    normal_dot_min=.7,protected_confidence=.6,filtered_samples=len(uncertain),
+                    rms_linear_change=float(np.sqrt(np.mean((out-colors)**2))))

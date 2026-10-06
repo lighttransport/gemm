@@ -276,7 +276,7 @@ def cmd_rig_render(args):
     return render(args.candidate, args.out, device=args.render_device, preset=args.preset,
                   accessories=args.accessories, detail_preset=args.detail_preset,
                   gpu_index=args.device, motion=args.motion, frame=args.frame, appearance=args.appearance,
-                  lighting=args.lighting,yaw=args.yaw)
+                  lighting=args.lighting,yaw=args.yaw,exposure=args.exposure,sss_weight=args.sss_weight)
 
 
 def cmd_portrait_create(args):
@@ -550,6 +550,8 @@ def main(argv=None) -> int:
     sp.add_argument('--appearance',help='gated I2V appearance directory')
     sp.add_argument('--lighting',choices=('studio','left','right','rim'),default='studio')
     sp.add_argument('--yaw',type=float,default=0)
+    sp.add_argument('--exposure',type=float,default=-1.5,help='display exposure in EV')
+    sp.add_argument('--sss-weight',type=float,default=.08,help='authored subsurface weight')
     sp.set_defaults(fn=cmd_rig_render)
     sp = sub.add_parser("body", help="Qwen full-body image -> SAM 3D Body -> Pixal3D -> combined avatar")
     sp.add_argument("--head", required=True, help="existing head with a facial rig")
