@@ -286,7 +286,9 @@ def cmd_gnm_refine_fit(args):
     if not args.rig_python:raise ValueError('a configured ROCm Python interpreter is required')
     command=[args.rig_python,'-m','server.vhuman.reconstruction.refine_fit',args.candidate,
              '--out',args.out,'--iterations',str(args.iterations),'--modes',str(args.modes),
+             '--identity-modes',str(args.identity_modes),'--surface-mm',str(args.surface_mm),
              '--device','cpu' if gpu.backend()=='cpu' else f'cuda:{args.device}']
+    if args.target_px is not None:command.extend(['--target-px',str(args.target_px)])
     result=subprocess.run(python_command(command),check=True)
     report=json.loads((Path(args.out)/'fit_refinement.json').read_text())
     return dict(report,out=args.out,returncode=result.returncode)
@@ -556,6 +558,9 @@ def main(argv=None) -> int:
     sp.add_argument('--out',required=True)
     sp.add_argument('--iterations',type=int,default=400)
     sp.add_argument('--modes',type=int,default=64)
+    sp.add_argument('--identity-modes',type=int,default=0,help='optional observable native identity modes, up to 128')
+    sp.add_argument('--surface-mm',type=float,default=0.,help='optional smooth portrait correction bound, up to 5 mm')
+    sp.add_argument('--target-px',type=float,help='require held-out mean error below this pixel threshold')
     sp.set_defaults(fn=cmd_gnm_refine_fit)
     sp = sub.add_parser('rig-render', help='render complete GNM anatomy with Cycles HIP')
     sp.add_argument('--candidate', required=True, help='completed reconstruction run directory')

@@ -439,3 +439,81 @@ These errors measure consistency with held-out tracker landmarks, not true
 3D accuracy. Dense correspondences beyond the official 68 landmarks are
 inferred. Identity depth, tooth size, unseen anatomy and skin reflectance
 remain prior estimates; the new solve specifically improves capture pose.
+
+### Obama fitting below 1.5 portrait pixels
+
+The refinement CLI now optionally fits native identity (`--identity-modes`)
+and a bounded smooth surface residual (`--surface-mm`). Native identity and
+expression subspaces, and surface control centres, use training attachments
+only. The camera and anatomical correspondences remain fixed. Surface controls
+blend through a metric Gaussian field (192 centres, 8 mm width), with a convex
+displacement bound and zero displacement along the camera depth axis. The
+surface field fades away from observed facial regions. This is explicitly
+saved as `portrait_surface_delta`, separate from native GNM coefficients.
+The saved field is cumulative when refining an existing corrected candidate;
+the requested displacement bound and reported maximum apply to the new step.
+
+The objective balances all parsed lip landmarks, including the official mouth
+anchors, and uses a 2 px robust-loss scale. Both neutral-to-source and
+capture-to-neutral oriented skin areas are guarded. Native identity updates
+also update the complete anatomy and identity-dependent joint bind positions.
+`--target-px` adds a strict held-out mean-error threshold to the existing
+mouth, non-mouth and topology gates. Failing that threshold exports diagnostics
+without a candidate manifest.
+
+Validated command (fresh output directory required):
+
+```sh
+LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib PYTHONDONTWRITEBYTECODE=1 \
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 \
+tmp/vhuman-rocm-venv/bin/python -m server.vhuman.reconstruction.refine_fit \
+  tmp/vhuman-public-portraits/obama/head/reconstruction/nativefit04 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/nativefit11 \
+  --iterations 2000 --modes 128 --identity-modes 96 \
+  --surface-mm 5 --target-px 1.5 --device cuda:0
+```
+
+The same flags are available through `gnm-refine-fit`. Identity and surface
+updates remain opt-in; their defaults are zero.
+
+| Error in the 345 x 410 source portrait | Before | After |
+| --- | ---: | ---: |
+| Held-out mean (confidence weighted) | 2.609 | **1.376** |
+| Held-out mouth mean | 2.478 | **1.332** |
+| All-landmark mean | 2.261 | 0.731 |
+| Mouth mean | 1.867 | 0.986 |
+
+The unweighted held-out mean is also 1.376 px. The target concerns the mean:
+held-out p95 is 3.117 px and the maximum is 4.050 px. The same 420 training /
+47 held-out valid landmarks, confidence weights and portrait resolution are
+used before and after. This split was used for development and acceptance
+across several solver trials; it is not an untouched test set or independent
+measurement of true 3D shape.
+
+The accepted solve took 42.80 seconds on RX 9070 XT with PyTorch ROCm, peaking
+at 264.31 MiB of PyTorch allocated memory (optimization only, excluding
+parsing, subspace construction and rebaking). Maximum residual displacement
+is 4.625 mm within the 5 mm bound. Minimum oriented area ratio is 0.173;
+no expression halving was needed. Exported projection agrees with the solver
+to 1e-4 px. Complete native anatomy and joint-bind updates agree with the
+GNM evaluator to 1e-7 m, with the explicit residual added separately.
+
+All 78 reconstruction/quality tests pass with the test command above.
+Additional checks cover strict target rejection, metric translation
+invariance, displacement bounds under a rotated camera, preserved camera
+depth, far-field decay, differentiability and invalid metric inputs.
+
+Residual caveats: identity coefficients now change, so this is a revised
+static identity fit and requires rebuilding rig/motion assets. Single-view
+depth remains prior-dependent. The residual is retained as a fixed neutral
+correction in the current temporal path; it is not dynamically skinned with
+large head/jaw rotations. Such motion needs separate validation before using
+this candidate for animation.
+
+Frontal studio HIP render `tmp/vhuman-public-portraits/obama/offline/fit12`
+uses the same camera, lighting, 1024 px resolution and 256 samples as the
+previous `offline/fit11`. It took 29.29 seconds including saved-scene reload,
+with a 2285.24 MiB whole-device VRAM peak. Packed anatomy, hair and material
+assets pass reload validation. Review:
+`tmp/vhuman-skin-review/gnm-fit-target15-comparison.png` and
+`tmp/vhuman-skin-review/gnm-landmarks-target15-comparison.png`.
