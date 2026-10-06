@@ -39,6 +39,24 @@ def mouth_mask(labels,confidence):
     return binary_dilation(interior,iterations=1)&~np.isin(labels,[12,13])
 
 
+def skin_bake_mask(labels, confidence):
+    """Reject non-skin source pixels; retain brows, lips, ears and neck.
+
+    The one-pixel guard around background/clothing/accessories prevents their
+    antialiased boundary colors entering the skin atlas. Facial features are
+    protected from that guard. These labels are predictions, not ground truth.
+    """
+    from scipy.ndimage import binary_dilation
+    labels,confidence=np.asarray(labels),np.asarray(confidence)
+    if labels.ndim!=2 or labels.shape!=confidence.shape or not np.isfinite(confidence).all():
+        raise ValueError('matching finite parsing arrays required')
+    foreign=np.isin(labels,[0,6,9,15,16,17,18])&(confidence>=.5)
+    protected=np.isin(labels,[2,3,7,8,10,12,13])&(confidence>=.5)
+    excluded=(binary_dilation(foreign,iterations=1)&~protected)|(confidence<.4)
+    excluded|=np.isin(labels,[4,5])&(confidence>=.5)
+    return excluded|mouth_mask(labels,confidence)
+
+
 def estimate(image,anchors,skin_mask):
     from scipy.ndimage import binary_opening,binary_dilation
     rgb=np.asarray(image,float)/255.;h,w=rgb.shape[:2]

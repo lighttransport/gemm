@@ -9,7 +9,7 @@ from .reference import Camera
 from .materials import bake_portrait
 
 
-def refine(candidate,out, *, exclude_mouth=False):
+def refine(candidate,out, *, exclude_mouth=False, exclude_non_skin=False):
     candidate,out=Path(candidate).resolve(),Path(out).resolve()
     manifest=validate_candidate(candidate)
     if out.exists() and any(out.iterdir()):raise ValueError('output must be empty')
@@ -20,24 +20,32 @@ def refine(candidate,out, *, exclude_mouth=False):
     for view in observations:
         view['image_path']=str(out/view['image'])
         if view.get('exclusion_mask'):view['exclusion_mask_path']=str(out/view['exclusion_mask'])
-    if exclude_mouth:
+    if exclude_mouth or exclude_non_skin:
         from PIL import Image
         from ..face_parsing import FaceParser
-        from .occlusion import mouth_mask
+        from .occlusion import mouth_mask, skin_bake_mask
+        from ..face_assets import PARSING_SHA256
         from .observations import sha256
         parser=FaceParser();reports=[]
         for i,view in enumerate(observations):
             image=np.asarray(Image.open(view['image_path']).convert('RGB'))
             labels,confidence=parser.predict(image)
-            excluded=mouth_mask(labels,confidence)
+            excluded=skin_bake_mask(labels,confidence) if exclude_non_skin else mouth_mask(labels,confidence)
+            automatic=int(excluded.sum())
             if view.get('exclusion_mask_path'):
                 excluded|=np.asarray(Image.open(view['exclusion_mask_path']).convert('L'))>0
-            path=out/f'mouth_exclusion_{i}.png'
+            prefix='skin' if exclude_non_skin else 'mouth'
+            path=out/f'{prefix}_exclusion_{i}.png'
             Image.fromarray(excluded.astype(np.uint8)*255).save(path)
             view['exclusion_mask_path']=str(path);view['exclusion_mask']=path.name
             view['exclusion_mask_sha256']=sha256(path)
-            reports.append(dict(mouth_pixels=int(mouth_mask(labels,confidence).sum()),source='confident face parsing; lips protected'))
-        manifest['mouth_texture_exclusions']=reports
+            label_path=out/f'{prefix}_labels_{i}.png';Image.fromarray(labels).save(label_path)
+            reports.append(dict(automatic_pixels=automatic,total_excluded_pixels=int(excluded.sum()),
+                mouth_pixels=int(mouth_mask(labels,confidence).sum()),
+                source='face parsing; manual masks unioned; lips protected',
+                parser_sha256=PARSING_SHA256,labels=label_path.name,labels_sha256=sha256(label_path),
+                independent_ground_truth=False))
+        manifest['skin_texture_exclusions' if exclude_non_skin else 'mouth_texture_exclusions']=reports
         document=json.loads((out/'observations.json').read_text())
         document['views']=[{k:v for k,v in view.items() if not k.endswith('_path')} for view in observations]
         (out/'observations.json').write_text(json.dumps(document,indent=2))
@@ -61,7 +69,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('candidate');p.add_argument('--out',required=True)
     p.add_argument('--exclude-mouth',action='store_true',help='exclude parsed cavity pixels, retaining lips and manual masks')
-    a=p.parse_args();print(json.dumps(refine(a.candidate,a.out,exclude_mouth=a.exclude_mouth),indent=2))
+    p.add_argument('--exclude-non-skin',action='store_true',help='exclude parsed background, clothes, accessories, hair, eyeballs and mouth from the skin bake')
+    a=p.parse_args();print(json.dumps(refine(a.candidate,a.out,exclude_mouth=a.exclude_mouth,exclude_non_skin=a.exclude_non_skin),indent=2))
 
 
 if __name__=='__main__':main()

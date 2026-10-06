@@ -11,6 +11,36 @@ from ..rig.common import vertex_normals, normalize
 from .reference import srgb_to_linear, linear_to_srgb, rasterize
 
 
+def sample_portrait(image, pixels, exclusion=None):
+    """Bilinear linear-light sampling, normalized over allowed source pixels.
+
+    Return RGB in the estimator's 0..255 sRGB convention and fractional source
+    support. Excluded colors never enter the interpolation footprint.
+    """
+    image=np.asarray(image);pixels=np.asarray(pixels,float)
+    h,w=image.shape[:2]
+    if image.shape!=(h,w,4) or pixels.ndim!=2 or pixels.shape[1]!=2 or not np.isfinite(pixels).all():
+        raise ValueError('RGBA image and finite Nx2 pixel coordinates required')
+    support=image[...,3].astype(float)/255
+    if exclusion is not None:
+        exclusion=np.asarray(exclusion,float)
+        if exclusion.shape!=(h,w):raise ValueError('exclusion mask dimensions mismatch')
+        support*=1-np.clip(exclusion/255,0,1)
+    linear=srgb_to_linear(image[...,:3]/255)
+    p=np.clip(pixels-.5,[0,0],[w-1,h-1]);low=np.floor(p).astype(int)
+    high=np.minimum(low+1,[w-1,h-1]);fraction=p-low
+    color=np.zeros((len(p),3));coverage=np.zeros(len(p))
+    for x,y,weight in ((low[:,0],low[:,1],(1-fraction[:,0])*(1-fraction[:,1])),
+                       (high[:,0],low[:,1],fraction[:,0]*(1-fraction[:,1])),
+                       (low[:,0],high[:,1],(1-fraction[:,0])*fraction[:,1]),
+                       (high[:,0],high[:,1],fraction[:,0]*fraction[:,1])):
+        weight=weight*support[y,x]
+        color+=linear[y,x]*weight[:,None];coverage+=weight
+    color/=np.maximum(coverage[:,None],1e-12)
+    inside=(pixels[:,0]>=0)&(pixels[:,0]<w)&(pixels[:,1]>=0)&(pixels[:,1]<h)
+    return linear_to_srgb(color)*255,coverage*inside
+
+
 def estimate(rgb, normals, confidence):
     rgb = srgb_to_linear(np.asarray(rgb)/255.)
     n = np.asarray(normals, float)
@@ -125,20 +155,20 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
         pixels, z = cam.project(p)
         ix, iy = np.floor(pixels[:,0]).astype(int), np.floor(pixels[:,1]).astype(int)
         valid = (ix>=0)&(ix<w)&(iy>=0)&(iy<h)&(z>0)
-        ix, iy = np.clip(ix,0,w-1), np.clip(iy,0,h-1)
         dx = np.clip((pixels[:,0]*s).astype(int),0,size[0]-1)
         dy = np.clip((pixels[:,1]*s).astype(int),0,size[1]-1)
         viewdir = normalize(cam.origin-p)
         agree = np.maximum((n*viewdir).sum(1), 0)
-        conf = valid*(abs(depth[dy,dx]-z)<.002)*agree*(image[iy,ix,3]/255.)
+        mask=None
         if view.get('exclusion_mask_path'):
             mask = np.asarray(Image.open(view['exclusion_mask_path']).convert('L'))
             if mask.shape != (h,w):
                 raise ValueError('exclusion mask dimensions mismatch')
-            conf *= 1-mask[iy,ix]/255.
-        rgb, light = estimate(image[iy,ix,:3], n, conf)
+        sampled,support=sample_portrait(image,pixels,mask)
+        conf = valid*(abs(depth[dy,dx]-z)<.002)*agree*support
+        rgb, light = estimate(sampled, n, conf)
         calibration=view.get("lighting")
-        observations.append(srgb_to_linear(image[iy,ix,:3]/255.) / (calibration.get("exposure",1) if calibration else 1))
+        observations.append(srgb_to_linear(sampled/255.) / (calibration.get("exposure",1) if calibration else 1))
         normals.append(n);directions.append(viewdir);confidences.append(conf)
         albedos.append(rgb)
         accum += rgb*conf[:,None]

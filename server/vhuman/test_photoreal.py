@@ -8,6 +8,30 @@ from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_
 
 
 class PhotorealTests(unittest.TestCase):
+    def test_skin_bake_mask_rejects_foreign_colors_preserves_features(self):
+        from .reconstruction.occlusion import skin_bake_mask
+        labels=np.ones((9,57),int);labels[4,1::3]=np.arange(19)
+        confidence=np.ones_like(labels,float)
+        mask=skin_bake_mask(labels,confidence)
+        for label in [0,4,5,6,9,11,15,16,17,18]:self.assertTrue(mask[4,1+3*label])
+        for label in [2,3,7,8,10,12,13]:self.assertFalse(mask[4,1+3*label])
+        self.assertFalse(mask[0,14])
+        confidence[0,14]=.2;self.assertTrue(skin_bake_mask(labels,confidence)[0,14])
+
+    def test_source_interpolation_is_linear_and_exclusion_aware(self):
+        from .reconstruction.materials import sample_portrait
+        from .reconstruction.reference import srgb_to_linear
+        image=np.array([[[255,0,0,255],[0,255,0,255]]],np.uint8)
+        rgb,coverage=sample_portrait(image,[[1.,.5]])
+        np.testing.assert_allclose(srgb_to_linear(rgb/255),[[.5,.5,0]],atol=1e-12)
+        rgb,coverage=sample_portrait(image,[[1.,.5]],[[0,255]])
+        np.testing.assert_allclose(rgb,[[255,0,0]],atol=1e-10)
+        np.testing.assert_allclose(coverage,[.5])
+        _,coverage=sample_portrait(image,[[-1,.5],[3,.5]],[[0,0]])
+        np.testing.assert_array_equal(coverage,0)
+        rgb,coverage=sample_portrait(image,[[1.,.5]],[[255,255]])
+        np.testing.assert_array_equal(rgb,0);np.testing.assert_array_equal(coverage,0)
+
     def test_crown_feather_is_metric_smooth_and_moves_with_identity(self):
         points=np.zeros((5,3));points[:,1]=[-.003,-.002,0,.002,.003]
         actual=crown_coverage(points,0)

@@ -1173,6 +1173,37 @@ The updated Obama package is `tmp/vhuman-mobile/obama08`, its browser build is
 `tmp/vhuman-browser/bake-check04`. Reproduce with the export, preprocess, browser
 and browser_verify commands above, using these output paths or fresh directories.
 
+For source-color cleanup before export, rebake the existing candidate with:
+
+```sh
+python -m server.vhuman.reconstruction.refine_material \
+  tmp/vhuman-public-portraits/obama/head/reconstruction/nativefit11 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/material12 \
+  --exclude-non-skin
+```
+
+This opt-in parsing mask excludes background, clothing, accessories, hair,
+eyeballs and mouth cavity from the skin material; lips, brows, ears and neck
+remain eligible. Existing manual exclusions are unioned with the prediction.
+The candidate records the parser checksum, predicted labels and mask counts.
+Labels are model predictions, so inspect the saved masks when using a new subject.
+All portrait bakes now interpolate in linear light over non-excluded source
+pixels only, carrying the remaining interpolation support into bake confidence.
+This avoids both nearest-pixel stepping and color leakage across mask edges.
+
+Obama `material12` preserves the exact fitted geometry hash. Compared with
+`nativefit11`, observed texels change from 186,196 to 175,326: 11,790 old
+observations are removed and 920 gain sufficient support through interpolation.
+Visual inspection confirms removal of the shoulder color contamination.
+Excluded areas use the existing bounded completion prior, not recovered detail.
+The refreshed package is `tmp/vhuman-mobile/obama09`; browser output and AMD
+verification are `tmp/vhuman-browser/player-bake05` and
+`tmp/vhuman-browser/bake-check05`. The latter passed native/WASM and attachment
+parity, relighting/detail checks and audio timing at 29.9 animated FPS.
+Run `python -m unittest server.vhuman.test_photoreal server.vhuman.test_quality
+server.vhuman.test_reconstruction server.vhuman.test_mobile_preprocess
+server.vhuman.test_mobile` for the 74-test preprocessing/material/runtime suite.
+
 Upstream API references: [Filament build and platform guidance](https://google.github.io/filament/dup/building.html),
 [Apple audio-player timeline](https://developer.apple.com/documentation/avfaudio/avaudioplayernode),
 and [output presentation latency](https://developer.apple.com/documentation/avfaudio/avaudionode/outputpresentationlatency).
