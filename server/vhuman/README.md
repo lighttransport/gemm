@@ -1138,7 +1138,13 @@ PCM fixture tests timing mechanics, not TTS intelligibility or measured lip sync
 
 Obama preprocessing: 768 training poses and 192 held-out poses; mean activation
 error improved from 0.011743 to 0.001765 (6.65×), p95 from 0.047317 to 0.005835.
-Twelve 256px two-channel float slope maps total 6 MiB. Chromium/AMD validation
+Twelve 256px two-channel slope maps use 1.5 MiB of biased signed RG8 data
+(previously 6 MiB of float data). Zero is represented exactly; maximum slope
+quantization error is 0.001378. RG8 supports linear filtering in core WebGL2,
+without a float-linear extension. The viewer also accepts earlier float bakes.
+Height reduction normalizes atlas coverage, and derivatives use only valid
+neighbors within a UV chart, avoiding height-to-background edges.
+Chromium/AMD validation
 measured exact native/WASM vertices on three poses, about 6 ms WASM evaluation
 and 5–10 ms attachment/normal updates. The final animated check sustained 29.9
 rendered FPS and 29.9 pose updates/sec with dynamic detail enabled. Attachment
@@ -1148,6 +1154,24 @@ fixture played 48,000 source samples through 48 kHz output with zero underruns.
 These desktop results do not establish iPhone/Safari performance, a thermal soak,
 or photometric wrinkle accuracy. Unseen side-face and neck texture quality still
 requires additional observations and review.
+
+Mobile texture baking now matches geometric edges across UV seams and applies
+bounded, confidence-weighted corrections in a narrow band in linear RGB.
+For Obama `nativefit11` with prepared scene `fit12`, the pre-scalp basecolor
+edge RMS decreased from 0.08406 to 0.04990 (40.6%, 1,648 sample pairs);
+1,359 texels changed, with a maximum linear correction of 0.08. This measures
+edge continuity, not recovered albedo accuracy. Each package includes
+`bake_quality.json` with the seam and scalp diagnostics.
+
+Scalp baking uses bilinear parsing-mask sampling instead of nearest-neighbor
+sampling. Tangent normals are renormalized after blending; four-texel atlas
+gutters remain in place. Projected hair coverage and the inferred crown remain
+single-view priors; scalp occlusion and unseen hair coverage still need
+additional observations.
+The updated Obama package is `tmp/vhuman-mobile/obama08`, its browser build is
+`tmp/vhuman-browser/player-bake04`, and hardware verification is saved in
+`tmp/vhuman-browser/bake-check04`. Reproduce with the export, preprocess, browser
+and browser_verify commands above, using these output paths or fresh directories.
 
 Upstream API references: [Filament build and platform guidance](https://google.github.io/filament/dup/building.html),
 [Apple audio-player timeline](https://developer.apple.com/documentation/avfaudio/avaudioplayernode),

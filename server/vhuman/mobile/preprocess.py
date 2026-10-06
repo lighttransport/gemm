@@ -16,6 +16,7 @@ from ..reconstruction.observations import sha256
 from ..reconstruction.skin_detail import REGIONS
 from ..rig.gnm_model import GNMModel
 from ..rig.bake import rasterize_uv
+from .baking import chart_labels, chart_gradient
 
 
 def regional_strain(reference, basis, triangles, regions, coefficients):
@@ -66,19 +67,30 @@ def tangent_slopes(geometry, fields, resolution):
     valid=(ids>=0); selected=ids[valid]
     valid[valid]=(abs(determinant[selected])>1e-12)&(tu[selected]>1e-6)&(tv[selected]>1e-6)
     selected=ids[valid]
+    face_labels=chart_labels(triangles,uv)
+    labels=np.where(valid,face_labels[np.maximum(ids,0)],-1)
+    source_resolution=fields.shape[-1]
+    source_ids,_=rasterize_uv(uv.reshape(-1,2),np.arange(uv.size//2).reshape(-1,3),source_resolution)
+    source_coverage=(source_ids>=0).astype(np.float32)
+    filtered_coverage=np.asarray(Image.fromarray(source_coverage).resize((resolution,resolution),Image.Resampling.BILINEAR))
+    _, near=distance_transform_edt(~valid,return_indices=True)
     output=np.zeros((len(fields),resolution,resolution,2),np.float32)
     for index, field in enumerate(fields):
-        # Extend each UV island before differentiating to avoid height-to-zero
-        # discontinuities along chart boundaries.
-        height=np.asarray(Image.fromarray(field.astype(np.float32)).resize((resolution,resolution),Image.Resampling.BILINEAR))
-        _, near=distance_transform_edt(~valid,return_indices=True)
-        height=height.copy();height[~valid]=height[near[0][~valid],near[1][~valid]]
-        dv,du=np.gradient(height,1/resolution)
+        # Normalize coverage before differentiating to avoid height-to-zero
+        # discontinuities along atlas boundaries.
+        height=np.asarray(Image.fromarray((field*source_coverage).astype(np.float32)).resize((resolution,resolution),Image.Resampling.BILINEAR))
+        height=height/np.maximum(filtered_coverage,1e-8)
+        dv,du=chart_gradient(height,labels,1/resolution)
         sx=du[valid]/tu[selected]
         sy=(dv[valid]-shear[selected]*sx)/tv[selected]
         output[index,valid,0]=sx;output[index,valid,1]=sy
         output[index,~valid]=output[index,near[0][~valid],near[1][~valid]]
     return np.clip(output,-.35,.35)
+
+
+def encode_slopes(slopes, limit=.35):
+    """Filterable RG8, exact zero at 128, bounded signed slope range."""
+    return np.uint8(np.clip(np.round(np.clip(slopes,-limit,limit)/limit*127)+128,1,255))
 
 
 def preprocess(candidate, package, out, samples=768, resolution=256):
@@ -107,24 +119,29 @@ def preprocess(candidate, package, out, samples=768, resolution=256):
     weights,scores=fit_driver(train,target,test,expected,prior)
     slopes=tangent_slopes(geometry,detail['dynamic_height_m'],resolution)
     out.mkdir(parents=True,exist_ok=True)
-    # Float32 two-channel array texture avoids colour-space transforms and
-    # preserves exact zero slopes. A 256px twelve-region atlas is 6 MiB.
-    slopes.astype('<f4').tofile(out/'wrinkle_slopes.f32')
+    # Core WebGL2 filterable RG8; biased signed quantization preserves exact
+    # zero. Unlike RG32F this needs no optional float-linear texture extension.
+    encoded=encode_slopes(slopes)
+    encoded.tofile(out/'wrinkle_slopes.u8')
     model=dict(schema='vhuman.strain_driver.v1',source_geometry_sha256=source['geometry_sha256'],
         package_sha256=sha256(package/'avatar.json'),source_detail_sha256=sha256(package/'skin_detail.npz'),
         reference=reference.tolist(),prior=prior.tolist(),weights=weights.T.tolist(),regions=list(REGIONS),
         feature_recipe='concat(delta383, square(prior12 @ delta383))',resolution=resolution,
         slope_limit=.35,activation_limit=1.,max_combined_slope=.5,trained_samples=samples,heldout_samples=len(test),
+        slope_encoding='rg8_snorm_bias128',slope_file='wrinkle_slopes.u8',
+        slope_quantization_max_error=float(abs((encoded.astype(float)-128)*(.35/127)-slopes).max()),
+        gradient_method='coverage-normalized reduction; within-chart central/one-sided metric derivatives',
         train_seed=317,test_seed=911,coefficient_sigma=.15,metrics=scores,
         selected_driver='trained' if scores['accepted'] else 'analytic',
         supervision='synthetic native GNM regional surface-area strain; no photometric depth labels',
         detail_source='authored bounded groove/height prior; not learned wrinkle depth',
         limitations=['validation covers the sampled coefficient distribution, not all expressions',
             'no new identity, anatomical depth, or image-observed wrinkle accuracy is established'])
-    model['files']={'wrinkle_slopes.f32':dict(sha256=sha256(out/'wrinkle_slopes.f32'),bytes=(out/'wrinkle_slopes.f32').stat().st_size)}
+    model['files']={'wrinkle_slopes.u8':dict(sha256=sha256(out/'wrinkle_slopes.u8'),bytes=(out/'wrinkle_slopes.u8').stat().st_size)}
     (out/'detail.json').write_text(json.dumps(model,separators=(',',':')))
     np.savez_compressed(out/'heldout.npz',delta=test,target=expected,predicted=np.clip(features(test,prior)@weights,-1,1))
-    return dict(out=str(out),selected_driver=model['selected_driver'],metrics=scores,texture_bytes=slopes.nbytes)
+    return dict(out=str(out),selected_driver=model['selected_driver'],metrics=scores,texture_bytes=encoded.nbytes,
+        slope_quantization_max_error=model['slope_quantization_max_error'])
 
 
 def main():

@@ -79,8 +79,10 @@ function normals(parts,shared){
     }
 }
 function wrinkleShader(material,detail,slopes){
+    const quantized=detail.slope_encoding==='rg8_snorm_bias128';
     const texture=new THREE.DataArrayTexture(slopes,detail.resolution,detail.resolution,12);
-    texture.format=THREE.RGFormat;texture.type=THREE.FloatType;texture.minFilter=texture.magFilter=THREE.NearestFilter;
+    texture.format=THREE.RGFormat;texture.type=quantized?THREE.UnsignedByteType:THREE.FloatType;
+    texture.minFilter=texture.magFilter=quantized?THREE.LinearFilter:THREE.NearestFilter;
     texture.generateMipmaps=false;texture.needsUpdate=true;
     const activation=new Float32Array(12);
     material.onBeforeCompile=shader=>{
@@ -88,12 +90,16 @@ function wrinkleShader(material,detail,slopes){
         shader.fragmentShader='uniform highp sampler2DArray wrinkleSlopes;\nuniform float wrinkleActivation[12];\n'+shader.fragmentShader;
         shader.fragmentShader=shader.fragmentShader.replace('#include <normal_fragment_maps>',`#include <normal_fragment_maps>
             vec2 wrinkleSlope=vec2(0.0);
-            for(int region=0;region<12;region++)wrinkleSlope+=texture(wrinkleSlopes,vec3(vNormalMapUv,float(region))).rg*wrinkleActivation[region];
+            for(int region=0;region<12;region++){
+                vec2 slope=texture(wrinkleSlopes,vec3(vNormalMapUv,float(region))).rg;
+                ${quantized?`slope=(slope*255.0-128.0)*${Number(detail.slope_limit/127).toFixed(12)};`:''}
+                wrinkleSlope+=slope*wrinkleActivation[region];
+            }
             wrinkleSlope=clamp(wrinkleSlope,vec2(-0.5),vec2(0.5));
             normal=normalize(normal - tbn[0]*wrinkleSlope.x - tbn[1]*wrinkleSlope.y);
         `);
     };
-    material.customProgramCacheKey=()=> 'vhuman-strain-v1';material.needsUpdate=true;
+    material.customProgramCacheKey=()=> 'vhuman-strain-v2-'+quantized;material.needsUpdate=true;
     return expression=>{
         const delta=expression.map((v,i)=>v-detail.reference[i]);
         const prior=detail.prior.map(row=>row.reduce((sum,v,i)=>sum+v*delta[i],0));
@@ -144,8 +150,10 @@ async function main(){
     if(config.detail){
         const detail=json(await bytes(config.detail+'detail.json',config.detail_sha256));
         if(detail.package_sha256!==config.package_sha256||detail.regions.length!==12)throw Error('Skin detail identity mismatch');
-        const file=detail.files['wrinkle_slopes.f32'];
-        const slopes=new Float32Array(await bytes(config.detail+'wrinkle_slopes.f32',file.sha256,file.bytes));
+        if(detail.slope_encoding&&detail.slope_encoding!=='rg8_snorm_bias128')throw Error('Unsupported wrinkle encoding');
+        const filename=detail.slope_file||'wrinkle_slopes.f32',file=detail.files[filename];
+        const payload=await bytes(config.detail+filename,file.sha256,file.bytes);
+        const slopes=detail.slope_encoding==='rg8_snorm_bias128'?new Uint8Array(payload):new Float32Array(payload);
         if(slopes.length!==12*detail.resolution**2*2||slopes.some(v=>!Number.isFinite(v)))throw Error('Invalid wrinkle texture');
         updateDetail=wrinkleShader(parts.find(p=>p.name==='skin').mesh.material,detail,slopes);
         state.detailMetrics=detail.metrics;
