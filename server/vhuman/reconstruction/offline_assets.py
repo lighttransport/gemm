@@ -92,6 +92,12 @@ def glasses_temple(boundary, scalp, clearance=.003):
     return path
 
 
+def short_scalp_prior(labels,confidence,eye_y):
+    """Require substantial unoccluded scalp evidence before a short-hair prior."""
+    y,_=np.nonzero((np.asarray(labels)==17)&(np.asarray(confidence)>.4))
+    return bool(len(y)>=256 and (np.asarray(labels)==18).sum()<100 and np.mean(y<eye_y)>.5)
+
+
 def attachment_frames(points):
     x=points[...,1,:]-points[...,0,:]
     x/=np.maximum(np.linalg.norm(x,axis=-1,keepdims=True),1e-12)
@@ -252,28 +258,70 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
                 accessory_records.append(dict(name='hat',source='parsed outline and ray-projected front; curved hidden cloth dome is an artist prior',
                     inferred_geometry=True,outline_simplification_px=tolerance,front_bulge_m=.018,rear_depth_m=.20))
     if accessories not in ('keep','omit'):raise ValueError('invalid accessories policy')
-    # Visible side hair: stable scalp roots, no hat pixels used as hair evidence.
-    hair=(labels==17)&(yy>min(p[1] for p in eye_pixels)-ipd*.25)&(confidence>.4)
+    # Visible scalp and side hair; hat pixels never seed hair.
+    hair=(labels==17)&(confidence>.4)
+    if (labels==18).sum()>=100:hair&=yy>min(v[1] for v in eye_pixels)-ipd*.25
     skin=model.group('skin_exterior');p=full[skin];skin_tri=model.data['triangles']
     remap=np.full(len(full),-1,int);remap[np.flatnonzero(skin)]=np.arange(skin.sum())
     allowed=skin[skin_tri].all(1);normals=vertex_normals(p,remap[skin_tri[allowed]])
     projected,_=camera.project(p)
-    from scipy.spatial import cKDTree
     hy,hx=np.nonzero(hair);rng=np.random.default_rng(19)
-    hair_paths=[];hair_roots=[]
-    if len(hx):
-        count=min(5000,len(hx)*20);chosen=rng.choice(len(hx),count,replace=True)
-        _,nearest=cKDTree(projected).query(np.column_stack((hx[chosen],hy[chosen])))
-        for idx in nearest:
-            tangent=rng.normal(size=3);tangent-=normals[idx]*np.dot(tangent,normals[idx])
-            tangent/=max(np.linalg.norm(tangent),1e-8)
-            root=p[idx]+normals[idx]*.0005+tangent*rng.uniform(0,.0003)
-            length=rng.uniform(.012,.032)
-            direction=normals[idx]*.2+np.array([np.sign(root[0])*.2,-1,0])
-            direction/=np.linalg.norm(direction)
-            t=np.linspace(0,1,8)
-            hair_paths.append(root+t[:,None]*length*direction+(t*t)[:,None]*np.array([0,0,-.006]))
-            hair_roots.append(np.flatnonzero(skin)[idx])
+    short_hair=short_scalp_prior(labels,confidence,min(v[1] for v in eye_pixels))
+    from .reference import srgb_to_linear
+    # Dark quartile resists skin pixels mixed into a cropped short hairline.
+    samples=image[hy,hx,:3] if len(hy) else np.array([[160,158,151]])
+    if short_hair:
+        samples=samples[samples.mean(1)<=np.percentile(samples.mean(1),25)]
+    source_hair_color=srgb_to_linear(np.median(samples,axis=0)/255.)
+    hair_color=source_hair_color*(.25 if short_hair else 1.)
+    facing=(normals*((camera.origin-p)/np.maximum(np.linalg.norm(camera.origin-p,axis=1)[:,None],1e-9))).sum(1)>.1
+    crown_cutoff=None
+    if short_hair:
+        Image.fromarray(hair.astype(np.uint8)*255).save(out/'hair_coverage.png')
+        scalp_tri=remap[skin_tri[allowed]]
+        selected=facing[scalp_tri].all(1)
+        if selected.any():
+            scalp=p+normals*.0005
+            texture=projected/[w,h]
+            part('short_hair_undercoat',scalp,scalp_tri[selected],texture[scalp_tri[selected]],'hair_undercoat')
+        # Complete scalp gaps with a labelled close-cropped crown prior.
+        # Its height follows the central observed hairline; no hidden strands
+        # or posterior haircut detail are claimed to have been recovered.
+        pixel=np.floor(projected).astype(int)
+        valid=(pixel[:,0]>=0)&(pixel[:,0]<w)&(pixel[:,1]>=0)&(pixel[:,1]<h)&facing&(abs(p[:,0])<.025)
+        ids=np.flatnonzero(valid);ids=ids[hair[pixel[ids,1],pixel[ids,0]]]
+        crown_cutoff=float(np.percentile(p[ids,1],5)*.95) if len(ids) else .08
+        rear=p[:,1]>crown_cutoff
+        rear_tri=rear[scalp_tri].sum(1)>=2
+        if rear_tri.any():
+            part('inferred_rear_hair',p+normals*.0003,scalp_tri[rear_tri],np.zeros((rear_tri.sum(),3,2)),'hair_inferred')
+    hair_paths=[];hair_roots=[];hair_triangles=[];hair_weights=[]
+    if len(hx) and facing.any():
+        from .reference import rasterize
+        scalp_tri=remap[skin_tri[allowed]]
+        raster_ids,raster_bary,_=rasterize(p,scalp_tri,camera,(w,h))
+        visible=raster_ids[hy,hx]>=0
+        hx,hy=hx[visible],hy[visible]
+        if len(hx):
+            count=min(12000 if short_hair else 5000,len(hx)*20)
+            chosen=rng.choice(len(hx),count,replace=True)
+            root_tri=scalp_tri[raster_ids[hy[chosen],hx[chosen]]]
+            weights=raster_bary[hy[chosen],hx[chosen]]
+            # Rasterized barycentric roots avoid repeated vertex-centred tufts.
+            roots=(p[root_tri]*weights[...,None]).sum(1)
+            root_normals=(normals[root_tri]*weights[...,None]).sum(1)
+            root_normals/=np.maximum(np.linalg.norm(root_normals,axis=1)[:,None],1e-9)
+            for root,normal,triangle,bary in zip(roots,root_normals,root_tri,weights):
+                tangent=rng.normal(size=3);tangent-=normal*np.dot(tangent,normal)
+                tangent/=max(np.linalg.norm(tangent),1e-8)
+                root=root+normal*.0008+tangent*rng.uniform(0,.0003)
+                length=rng.uniform(.0015,.0035) if short_hair else rng.uniform(.012,.032)
+                direction=normal*(.3 if short_hair else .2)+np.array([np.sign(root[0])*.2,-.7 if short_hair else -1,0])
+                direction/=np.linalg.norm(direction)
+                t=np.linspace(0,1,8)
+                hair_paths.append(root+t[:,None]*length*direction+(t*t)[:,None]*np.array([0,0,-.0005 if short_hair else -.006]))
+                hair_roots.append(np.flatnonzero(skin)[triangle[np.argmax(bary)]])
+                hair_triangles.append(np.flatnonzero(skin)[triangle]);hair_weights.append(bary)
     # Lower-lid wet line and sparse lashes use fixed anatomical attachments.
     from .dense_landmarks import attachments
     lid_ids,lid_weights,_=attachments();skin_ids=np.flatnonzero(skin)
@@ -300,13 +348,17 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
         part('eyelashes',v,t,np.zeros((len(t),3,2)),'lash',surface=binding)
     arrays['hair_curves']=np.asarray(hair_paths,np.float32).reshape(-1,8,3)
     arrays['hair_root_ids']=np.asarray(hair_roots,np.int32)
+    arrays['hair_root_triangle_ids']=np.asarray(hair_triangles,np.int32).reshape(-1,3)
+    arrays['hair_root_weights']=np.asarray(hair_weights,np.float32).reshape(-1,3)
     arrays['rest_joints']=joints
     for name,path in curves.items():arrays[name]=path.astype(np.float32)
     np.savez_compressed(out/'scene_assets.npz',**arrays)
     detail=build(candidate,out,preset=detail_preset)
     scene=dict(schema='vhuman.offline_scene.v1',candidate=str(candidate.resolve()),parts=parts,
         camera=camera.as_dict(),source_size=[w,h],curves=list(curves),accessories=accessory_records,
-        hair=dict(strands=len(hair_paths),lashes=len(lash_paths),source='visible parsing + scalp attachment; density, strand shape and depth inferred'),
+        hair=dict(strands=len(hair_paths),lashes=len(lash_paths),short_hair=short_hair,color_linear=hair_color.tolist(),source_color_linear=source_hair_color.tolist(),color_gain_prior=.25 if short_hair else 1.,
+            crown_gap_completion_prior=short_hair,crown_cutoff_y_m=crown_cutoff,root_attachment='source-camera visible triangle barycentrics',
+            source='visible parsing + front-facing scalp attachment; short undercoat, density, strand shape and depth inferred'),
         optical_eyes=dict(source='analytic GNM-profile shell, iris annulus and recessed pupil cavity',
             pupil_ratio=params_module.pupil_ratio(eye_params),pupil_status=pupil_status,
             ior=eye_params['optics']['ior_cornea'] if 'ior_cornea' in eye_params['optics'] else 1.376),

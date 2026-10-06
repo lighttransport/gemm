@@ -16,7 +16,7 @@ def parsing_masks(view, out, parser):
     image = np.asarray(Image.open(view['image_path']).convert('RGB'))
     labels, confidence = parser.predict(image)
     occluders = np.isin(labels, [6, 9, 15, 16, 17, 18])
-    exclusion = binary_dilation(occluders, iterations=2) | (confidence < .4)
+    exclusion = binary_dilation(occluders, iterations=2) | (confidence < .4) | mouth_mask(labels,confidence)
     skin = np.isin(labels, [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14])
     out = Path(out)
     manual_exclusion = bool(view.get('exclusion_mask_path'))
@@ -29,6 +29,14 @@ def parsing_masks(view, out, parser):
     return dict(method='pre-fit image-only face parsing', excluded_pixels=int(exclusion.sum()),
                 confidence_threshold=.4, independent_ground_truth=False,
                 manual_exclusion_retained=manual_exclusion)
+
+
+def mouth_mask(labels,confidence):
+    """Exclude confident cavity pixels while retaining separately parsed lips."""
+    from scipy.ndimage import binary_dilation
+    labels,confidence=np.asarray(labels),np.asarray(confidence)
+    interior=(labels==11)&(confidence>.5)
+    return binary_dilation(interior,iterations=1)&~np.isin(labels,[12,13])
 
 
 def estimate(image,anchors,skin_mask):

@@ -282,3 +282,58 @@ still projected onto some skin around the smiling mouth, short scalp hair is
 not reconstructed, and the unobserved neck/scalp has low-detail prior colors.
 The skin seam and lighting changes do not resolve those geometry/coverage
 issues. No additional I2V clips were generated for this static material test.
+
+### Mouth transfer and visible scalp hair
+
+Automatic parsing exclusions now include confident mouth-cavity pixels with a
+one-pixel margin while explicitly protecting the upper/lower lip labels.
+Existing manual masks retain precedence in the pipeline. For a stored
+candidate, opt into an additive cavity mask when rebaking:
+
+```sh
+$PY -m server.vhuman.reconstruction.refine_material \
+  tmp/vhuman-public-portraits/obama/head/reconstruction/material02 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/mouth03 \
+  --exclude-mouth
+```
+
+The Obama rebake adds 1,197 cavity exclusion pixels and removes the tooth row
+that had been projected onto the skin above the native teeth. Lips and prior
+exclusions remain intact. Identity geometry stays byte-identical; the native
+mouth pose/teeth fit itself has not been improved by this texture correction.
+
+Hair now attaches through source-camera-visible triangle barycentrics rather
+than repeating nearest-vertex roots. Visible scalp hair above eye level is
+included. A short-scalp prior requires at least 256 confident hair pixels,
+more than half above the eyes, and fewer than 100 hat pixels. Hats keep the
+side-hair path, preventing a tiny parsing fragment from creating a full crown.
+
+The short-hair path uses a subdivided scalp undercoat with a packed source
+coverage mask plus 1.5–3.5 mm strands. The source's dark color quartile reduces
+skin contamination; a recorded 0.25 color-gain prior, low undercoat IOR 1.2,
+and strand roughness 0.6 provide the studio shading preset. Source color and
+the gain remain separate in provenance. Unobserved crown gaps use an explicit
+close-cropped coverage prior whose height follows the central source hairline;
+no posterior haircut details or strands are claimed as recovered evidence.
+Hair roots/undercoat still follow rigid head pose rather than local scalp strain.
+
+Final review: `tmp/vhuman-public-portraits/obama/offline/after08/`, compared to
+`after03/` (same geometry, camera, lighting and exposure). All 12,000 strand
+anchors project onto source hair; barycentric weights are nonnegative and sum
+to one within 1.2e-7. Root offsets are 0.800–0.854 mm. The independent report is
+`hair_attachment_validation.json`. Fresh Blender reload now verifies all
+96,000 hair-point coordinates and the packed coverage mask in addition to
+signed detail maps. The 1024 px / 256-sample HIP render takes 35.99 seconds
+including reload, 2293.24 MiB whole-device VRAM. This costs more than the
+previous bald render (25.16 seconds), principally from the masked undercoat.
+
+Hopper regression: `tmp/vhuman-hopper-photoreal/offline/happy22/`, 1,440
+side-hair strands with no crown prior, 23.46 seconds / 2463.27 MiB; native
+motion, 11,520 saved hair points and physical maps pass reload validation.
+All 72 reconstruction/quality tests pass. The comparison figure is
+`tmp/vhuman-skin-review/hair-mouth-comparison.png`.
+
+Remaining limits include the approximate/jagged inferred haircut boundary,
+unmeasured hair reflectance, source mouth pose and tooth-size alignment, and
+unobserved neck/scalp textures. This is an improved reconstruction baseline,
+not a completed photorealistic likeness.

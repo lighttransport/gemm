@@ -4,10 +4,28 @@ import numpy as np
 from .reconstruction.reference import Camera
 from .reconstruction.temporal import crop_camera
 from .reconstruction.skin_detail import driver_matrix,evaluate
-from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_cap,glasses_temple
+from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_cap,glasses_temple,short_scalp_prior
 
 
 class PhotorealTests(unittest.TestCase):
+    def test_short_scalp_requires_evidence_and_rejects_hat(self):
+        labels=np.ones((60,60),int);labels[:20]=17;confidence=np.ones_like(labels,float)
+        self.assertTrue(short_scalp_prior(labels,confidence,30))
+        labels[20:25]=18
+        self.assertFalse(short_scalp_prior(labels,confidence,30))
+        labels[:]=1;labels[:2]=17
+        self.assertFalse(short_scalp_prior(labels,confidence,30))
+
+    def test_mouth_exclusion_retains_lips_and_requires_confidence(self):
+        from .reconstruction.occlusion import mouth_mask
+        labels=np.ones((5,7),int);labels[2,3]=11;labels[1,3]=12;labels[3,3]=13
+        confidence=np.ones_like(labels,float)
+        mask=mouth_mask(labels,confidence)
+        self.assertTrue(mask[2,3]);self.assertFalse(mask[1,3]);self.assertFalse(mask[3,3])
+        self.assertFalse(mask[0,0])
+        confidence[2,3]=.2
+        self.assertFalse(mouth_mask(labels,confidence).any())
+
     def test_render_rejects_invalid_skin_controls_before_gpu_access(self):
         from .reconstruction.offline_render import render
         for options in ({'exposure':4},{'sss_weight':-1},{'exposure':float('nan')}):

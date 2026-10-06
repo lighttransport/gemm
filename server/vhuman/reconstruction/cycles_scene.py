@@ -241,6 +241,16 @@ def run(request):
     hattex=image_node(materials['hat'].node_tree.nodes,out/'accessory_source.png')
     materials['hat'].node_tree.links.new(hattex.outputs['Color'],principled.inputs['Base Color'])
     materials['hat_cloth'],_=material('inferred_navy_cap_cloth',(.015,.018,.025),.7)
+    materials['hair_undercoat'],_=material('short_hair_undercoat',config['hair']['color_linear'],.85,ior=1.2)
+    materials['hair_inferred'],_=material('inferred_rear_hair',config['hair']['color_linear'],.85,ior=1.2)
+    if (out/'hair_coverage.png').is_file():
+        mat=materials['hair_undercoat'];nodes=mat.node_tree.nodes;links=mat.node_tree.links
+        coverage=image_node(nodes,out/'hair_coverage.png',linear=True)
+        transparent=nodes.new('ShaderNodeBsdfTransparent');mix=nodes.new('ShaderNodeMixShader')
+        links.new(coverage.outputs['Color'],mix.inputs[0])
+        links.new(transparent.outputs[0],mix.inputs[1])
+        links.new(nodes.get('Principled BSDF').outputs[0],mix.inputs[2])
+        links.new(mix.outputs[0],nodes.get('Material Output').inputs['Surface'])
     objects={}
     for part in config['parts']:
         name=part['name'];mesh=bpy.data.meshes.new(name)
@@ -250,15 +260,15 @@ def run(request):
         obj=bpy.data.objects.new(name,mesh);bpy.context.collection.objects.link(obj);mesh.materials.append(materials[part['material']])
         objects[name]=obj
         for polygon in mesh.polygons:polygon.use_smooth=part['material'] not in ('glass',)
-        if part['material']=='skin':
+        if part['material'] in ('skin','hair_undercoat','hair_inferred'):
             modifier=obj.modifiers.new('skin_subdivision','SUBSURF');modifier.levels=1;modifier.render_levels=2
         if part['material']=='glass':
             modifier=obj.modifiers.new('lens_thickness_prior','SOLIDIFY');modifier.thickness=.001
-    hair=bpy.data.materials.new('gray_hair_prior');hair.use_nodes=True
+    hair=bpy.data.materials.new('source_hair_color_prior');hair.use_nodes=True
     nodes=hair.node_tree.nodes;nodes.remove(nodes.get('Principled BSDF'))
     shader=nodes.new('ShaderNodeBsdfHairPrincipled');shader.parametrization='COLOR'
-    shader.inputs['Color'].default_value=(.35,.34,.31,1)
-    shader.inputs['Roughness'].default_value=.35
+    shader.inputs['Color'].default_value=(*config['hair']['color_linear'],1)
+    shader.inputs['Roughness'].default_value=.6 if config['hair']['short_hair'] else .35
     hair.node_tree.links.new(shader.outputs[0],nodes.get('Material Output').inputs[0])
     hair_object=curve_object('hair',data['hair_curves'],hair,.000035)
     if hair_object:objects['hair']=hair_object

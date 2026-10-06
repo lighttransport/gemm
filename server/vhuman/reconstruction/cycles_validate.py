@@ -18,6 +18,24 @@ def validate(out):
         error=float(np.max(abs(actual-expected[::-1])))
         if error>1e-8:raise ValueError(f'{name}: signed physical map changed by {error} m')
         checks.append(dict(name=name,max_error_m=error,minimum_m=float(actual.min())))
+    assets=np.load(out/'scene_assets.npz',allow_pickle=False)
+    expected_hair=assets['hair_curves'].reshape(-1,3)
+    if len(expected_hair):
+        hair=bpy.data.objects['hair'].data
+        positions=np.empty(len(expected_hair)*3,np.float32)
+        hair.attributes['position'].data.foreach_get('vector',positions)
+        if np.max(abs(positions.reshape(-1,3)-expected_hair))>1e-7:
+            raise ValueError('hair strand coordinates changed after scene reload')
+    if (out/'hair_coverage.png').is_file():
+        image=bpy.data.images['hair_coverage.png']
+        if image.packed_file is None:raise ValueError('short-hair coverage is unpacked')
+        # Reload source bytes independently and compare the packed Non-Color mask.
+        source=bpy.data.images.load(str(out/'hair_coverage.png'),check_existing=False)
+        source.colorspace_settings.name='Non-Color'
+        original=np.empty(len(source.pixels),np.float32);source.pixels.foreach_get(original)
+        actual=np.empty(len(image.pixels),np.float32);image.pixels.foreach_get(actual)
+        if np.max(abs(actual-original))>1e-7:raise ValueError('packed hair coverage changed')
+        bpy.data.images.remove(source)
     request=json.loads((out/'request.json').read_text())
     if request.get('motion'):
         motion=np.load(Path(request['motion'])/'motion.npz',allow_pickle=False)
@@ -30,7 +48,7 @@ def validate(out):
             expected=motion['vertices'][frame,assets['skin_native_ids']]
             if np.max(abs(positions.reshape(-1,3)-expected))>1e-7:
                 raise ValueError('native motion coordinates changed after scene reload')
-    result=dict(passed=True,float_maps=checks,native_motion_checked=bool(request.get('motion')),
+    result=dict(passed=True,float_maps=checks,hair_points_checked=len(expected_hair),hair_mask_checked=(out/'hair_coverage.png').is_file(),native_motion_checked=bool(request.get('motion')),
                 storage='packed scene-linear 32-bit EXR')
     (out/'asset_validation.json').write_text(json.dumps(result,indent=2))
     print('VHUMAN_PACKED_ASSET_VALID',flush=True)
