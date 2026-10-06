@@ -64,6 +64,7 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
     native_rest,_=model.evaluate(beta)
     offset=np.median(rest-scale*native_rest.detach().cpu().numpy()@rotation.T,axis=0)
     residual=rest-(scale*native_rest.detach().cpu().numpy()@rotation.T+offset)
+    bind_residual=residual@rotation/scale
     dense_ids,bary,confidence=attachments()
     exterior=np.flatnonzero(model.group('skin_exterior'))
     full_ids=exterior[dense_ids]
@@ -114,8 +115,8 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
     translation=torch.zeros((frames,3),device=device,requires_grad=True)
     optimizer=torch.optim.Adam([{'params':[latent],'lr':.04},
         {'params':[head_rotation,eye_rotation],'lr':.003},{'params':[translation],'lr':.0005}])
-    evaluator=model.frame_evaluator(beta,sampled)
-    rot=tensor(rotation);off=tensor(offset);residual=tensor(residual[sampled])
+    evaluator=model.frame_evaluator(beta,sampled,bind_residual=bind_residual)
+    rot=tensor(rotation);off=tensor(offset)
     target_t,weight_t,ipd_t=tensor(target),tensor(weights),tensor(ipd)
     attachment_ids=torch.as_tensor(remap[full_ids],device=device)
     bary_t=tensor(bary)
@@ -125,7 +126,7 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
     skin_tri=all_tri[exterior_mask[all_tri].all(1)]
     skin_remap=np.full(len(rest),-1,int);skin_remap[exterior]=np.arange(len(exterior))
     guard_tri=torch.as_tensor(skin_remap[skin_tri],device=device)
-    bind_guard=native_rest[exterior].detach()
+    bind_guard=native_rest[exterior].detach()+tensor(bind_residual[exterior])
     guard_basis=model.tensors['expression_basis'][:,exterior].reshape(383,-1)
     base_faces=bind_guard[guard_tri]
     base_normal=torch.linalg.cross(base_faces[:,1]-base_faces[:,0],base_faces[:,2]-base_faces[:,0])
@@ -144,7 +145,7 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
         eyes=torch.cat((eye_rotation,torch.zeros((frames,2,1),device=device)),-1)
         rotations=torch.cat((zero,head_rotation[:,None],eyes),1)
         vertices,joints=evaluator(coefficients,rotations,translation)
-        points=scale*(vertices@rot.T)+off+residual
+        points=scale*(vertices@rot.T)+off
         landmarks=(points[:,attachment_ids]*bary_t[None,:,:,None]).sum(2)
         pupils=torch.stack([points[:,remap[ids]].mean(1) for ids in pupil_ids],1)
         p=(torch.cat((landmarks,pupils),1)-camera_o)@camera_r.T
@@ -181,11 +182,10 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
         coefficients,rotations,pixels=forward(coefficients)
         min_jacobian=jacobian_guard(coefficients).min(1).values
         if not bool((min_jacobian>=.05).all()):raise ValueError('native expression failed skin topology guard')
-        full_evaluator=model.frame_evaluator(beta)
+        full_evaluator=model.frame_evaluator(beta,bind_residual=bind_residual)
         vertices,joints=full_evaluator(coefficients,rotations,translation)
-        # Neutral reconstruction residual is fixed; identity never refits per clip.
-        neutral_residual=tensor(rest-(scale*native_rest.detach().cpu().numpy()@rotation.T+offset))
-        vertices=scale*(vertices@rot.T)+off+neutral_residual
+        # The shared identity residual participates in native LBS in bind space.
+        vertices=scale*(vertices@rot.T)+off
         joints=scale*(joints@rot.T)+off
     numpy=lambda v:v.detach().cpu().numpy()
     normalized=np.linalg.norm(numpy(pixels)-target,axis=-1)/ipd[:,None]
@@ -197,6 +197,7 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
     result=dict(schema='vhuman.native_gnm_motion.v1',candidate=str(candidate.resolve()),
         candidate_geometry_sha256=sha256(candidate/'geometry.npz'),clip=str(clip.resolve()),clip_sha256=sha256(clip),
         synthetic=True,identity_frozen=True,identity_sha256=hashlib.sha256(beta.tobytes()).hexdigest(),
+        residual_transport='native_lbs_bind_space',
         frames=frames,fps=observations['fps'],size=[w,h],camera=camera.as_dict(),
         expression_rank=rank,expression_dim=383,iterations=iterations,
         landmark_error_before_ipd=float((before_error*weights).sum()/weights.sum()),
@@ -206,7 +207,7 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
         peak_torch_allocated_mib=torch.cuda.max_memory_allocated(device)/1024**2 if str(device).startswith('cuda') else None,
         seconds=time.monotonic()-started,limitations=['I2V landmarks do not establish true 3D identity',
         'hidden anatomy remains a prior','camera intrinsics fixed from source; generated camera drift is nuisance motion',
-        'neutral reconstruction residual is fixed rather than dynamically skinned',
+        'bind-space residual uses native skinning; additional pose-dependent detail remains a prior',
         'dense canonical attachments beyond GNM68 are inferred correspondences'])
     result['ocular_observations']='native lid/iris tracks under glasses retain low authored weights; they do not become skin-color observations'
     result['motion_sha256']=sha256(out/'motion.npz')

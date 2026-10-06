@@ -87,3 +87,23 @@ class GNMTests(unittest.TestCase):
     def test_bad_coefficients_are_rejected(self):
         with self.assertRaises(ValueError):self.model.evaluate(identity=np.zeros(170))
         with self.assertRaises(ValueError):self.model.evaluate(expression=np.full(383,np.nan))
+
+    def test_bind_residual_rotates_with_root_and_matches_sampled_runtime(self):
+        import torch
+        from scipy.spatial.transform import Rotation
+        rng=np.random.default_rng(18);m=self.model
+        residual=rng.normal(0,.001,(17821,3));beta=rng.normal(0,.1,253)
+        rotations=np.zeros((4,3));rotations[0]=[.2,-.6,.1]
+        plain,_=m.evaluate(beta,rotations=rotations)
+        corrected,_=m.evaluate(beta,rotations=rotations,bind_residual=residual)
+        np.testing.assert_allclose(corrected-plain,residual@Rotation.from_rotvec(rotations[0]).as_matrix().T,atol=1e-7)
+        # Eye/head rotations exercise different skinning influences, not only
+        # a global rigid transform.
+        rotations[1:]=rng.normal(0,.15,(3,3));expr=rng.normal(0,.1,383)
+        expected,_=m.evaluate(beta,expr,rotations,bind_residual=residual)
+        ids=np.arange(0,17821,53);t=GNMModel(device='cpu')
+        r=torch.tensor(rotations[None],dtype=torch.float32,requires_grad=True)
+        actual,_=t.frame_evaluator(beta,ids,bind_residual=residual)(torch.tensor(expr[None],dtype=torch.float32),r,torch.zeros((1,3)))
+        np.testing.assert_allclose(actual[0].detach(),expected[ids],atol=1e-6)
+        actual.square().sum().backward();self.assertTrue(bool(torch.isfinite(r.grad).all()))
+        with self.assertRaises(ValueError):t.frame_evaluator(beta,bind_residual=np.zeros((3,3)))

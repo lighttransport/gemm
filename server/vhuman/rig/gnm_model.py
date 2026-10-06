@@ -33,7 +33,7 @@ class GNMModel:
     def group(self, name):
         return self.data['vertex_groups'][self.data['vertex_group_names'].tolist().index(name)] > .5
 
-    def frame_evaluator(self, identity, vertex_ids=None):
+    def frame_evaluator(self, identity, vertex_ids=None, *, bind_residual=None):
         """Cache fixed identity and sampled anatomy for batched temporal fitting.
 
         Expressions and the four native joint rotations remain differentiable.
@@ -51,6 +51,11 @@ class GNMModel:
             raise ValueError('invalid shared GNM identity')
         d = self.tensors
         bind = (d['template_vertex_positions'][ids] + torch.einsum('i,ivc->vc',beta,d['vertex_identity_basis'][:,ids])).detach()
+        if bind_residual is not None:
+            residual = torch.as_tensor(bind_residual,dtype=torch.float32,device=self.device)
+            if residual.shape != d['template_vertex_positions'].shape or not bool(torch.isfinite(residual).all()):
+                raise ValueError('invalid GNM bind-space residual')
+            bind = bind + residual[ids].detach()
         joints = (d['template_joint_positions'] + torch.einsum('i,ijc->jc',beta,d['joint_identity_basis'])).detach()
         basis = d['expression_basis'][:,ids].reshape(self.expression_dim,-1)
         correctives = d['pose_correctives_regressor'].reshape(36,-1,3)[:,ids].reshape(36,-1)
@@ -80,7 +85,7 @@ class GNMModel:
             return (weighted_r@vertices[...,None])[...,0]+weighted_t,t
         return evaluate
 
-    def evaluate(self, identity=None, expression=None, rotations=None, translation=None):
+    def evaluate(self, identity=None, expression=None, rotations=None, translation=None, *, bind_residual=None):
         """Single frame, metres, original GNM axes. Returns vertices and joints."""
         torch_mode = self.device is not None
         if torch_mode:
@@ -117,6 +122,11 @@ class GNMModel:
         skew = stack((stack((zero,-z,y),-1),stack((z,zero,-x),-1),stack((-y,x,zero),-1)),-2)
         local_r = eye+sin(angle)[:,None,None]*skew+(1-cos(angle))[:,None,None]*(skew@skew)
         vertices = data['template_vertex_positions']+einsum('i,ivc->vc',identity,data['vertex_identity_basis'])+einsum('e,evc->vc',expression,data['expression_basis'])
+        if bind_residual is not None:
+            residual = arr(bind_residual)
+            if residual.shape != vertices.shape or not bool((torch.isfinite(residual) if torch_mode else np.isfinite(residual)).all()):
+                raise ValueError('invalid GNM bind-space residual')
+            vertices = vertices + residual
         joints = data['template_joint_positions']+einsum('i,ijc->jc',identity,data['joint_identity_basis'])
         vertices = vertices+((local_r-eye).reshape(-1)@data['pose_correctives_regressor']).reshape(vertices.shape)
         world_r, world_t = [local_r[0]], [joints[0]+translation]
