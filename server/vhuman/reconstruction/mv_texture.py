@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import shutil
 import time
+import warnings
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -97,7 +98,7 @@ def fuse(colors, weights):
     return mean,w,spread,(weights>.01).sum(0)
 
 
-def bake(work, backend, out):
+def bake(work, backend, out, *, delight=True):
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
     info=json.loads((work/backend/'generation.json').read_text())
     for name,digest in info['views'].items():
@@ -107,14 +108,29 @@ def bake(work, backend, out):
     frame,views=conditions(candidate,record['resolution'])
     valid,points,normals=skin.atlas_surface(geometry,len(base))
     images=[np.asarray(Image.open(work/backend/f"view_{v['name']}.png").convert('RGB')) for v in views]
+    delight_report=None
+    if delight:
+        from .mv_delight import delight as remove_light
+        delight_report={}
+        for i,v in enumerate(views):
+            images[i],delight_report[v['name']]=remove_light(images[i],v['normal'],v['valid'])
     colors,weights=cond.project_views(frame,views,images,points,normals)
-    gen,support,spread,count=fuse(colors,weights)
     linear=srgb_to_linear(base[valid]/255);seen=observed[valid]
+    weights*=neck_cut_weight(geometry,points)[None]
+    # Reject per-view outliers (cast shadows, collars) against the cross-view
+    # luminance median before fusing.
+    luma=colors@np.array([.2126,.7152,.0722]);has=weights>.01
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore',RuntimeWarning)  # texels no view sees
+        ref=np.nanmedian(np.where(has,luma,np.nan),0)
+    weights*=~(has&((luma<.6*ref)|(luma>1.6*ref)))
+    gen,support,spread,count=fuse(colors,weights)
+    gen,support=fill_unsupported(points,gen,support,seen)
     # Generators relight; match their per-channel level to photographed skin
     # over texels both observed and generated (robust median ratio).
     both=seen&(support>.05)
     gain=np.median(linear[both],0)/np.maximum(np.median(gen[both],0),1e-6) if both.sum()>500 else np.ones(3)
-    gen=np.clip(gen*gain,0,1)
+    gen=np.clip(gen*gain*local_gain(points,linear,gen*gain,both),0,1)
     blend=skin.unseen_weight(points,seen,distance=.01)*np.clip(support/.05,0,1)
     colour=linear*(1-blend[:,None])+gen*blend[:,None]
     result=base.copy()
@@ -132,7 +148,7 @@ def bake(work, backend, out):
     report=dict(schema='vhuman.synthetic_skin_completion.v1',method='mv_texture',backend=backend,
         source_geometry_sha256=record['geometry_sha256'],work=str(work.resolve()),
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
-        basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),
+        basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
         photographed_texels_changed=int(np.any(result[observed]!=base[observed],axis=-1).sum()),
         generated_texels=int((blend>.01).sum()),
         unseen_texels=int((~seen).sum()),unseen_covered=float((support[~seen]>.05).mean()),
@@ -149,12 +165,54 @@ def bake(work, backend, out):
     return report
 
 
-def seam_energy(points, valid_result, seen, radius=.004):
-    """Mean linear-RGB jump between observed texels and nearby generated texels."""
-    tree=cKDTree(points[~seen]);pairs=tree.query(points[seen],distance_upper_bound=radius)
-    hit=np.isfinite(pairs[0])
-    a=valid_result[seen][hit];b=valid_result[~seen][pairs[1][hit]]
-    return float(np.abs(a-b).mean()) if hit.any() else None
+def neck_cut_weight(geometry, points, width=.015):
+    """Fade generated colour near the lowest open boundary (the neck cut)."""
+    from ..rig.common import boundary_edges
+    p=geometry['captured'][0].astype(float);edges=boundary_edges(geometry['triangles'])
+    ids=np.unique(edges);low=ids[p[ids,1]<p[:,1].min()+.25*np.ptp(p[:,1])]
+    if not len(low):return np.ones(len(points))
+    d,_=cKDTree(p[low]).query(points)
+    return np.clip(d/width-1,0,1)
+
+
+def local_gain(points, photo, gen, both, k=48, falloff=.03):
+    """Per-channel ratio field matching photographed shading near the boundary.
+
+    Log-ratios measured on overlap texels are averaged over k neighbours and
+    fade to 1 with distance, so far unseen texels keep the delit albedo.
+    """
+    if both.sum()<k:return np.ones_like(gen)
+    log=np.clip(np.log(np.maximum(photo[both],1e-4))-np.log(np.maximum(gen[both],1e-4)),-1,1)
+    d,j=cKDTree(points[both]).query(points,k=k)
+    w=1/(d+.002);field=(log[j]*w[...,None]).sum(1)/w.sum(1)[:,None]
+    return np.exp(field*np.exp(-d[:,0]/falloff)[:,None])
+
+
+def fill_unsupported(points, gen, support, seen, threshold=.05):
+    """Unseen texels no view saw take the nearest supported generated colour."""
+    ok=support>threshold;need=(~ok)&(~seen)
+    if ok.any() and need.any():
+        _,j=cKDTree(points[ok]).query(points[need],k=8)
+        gen=gen.copy();gen[need]=gen[ok][j].mean(1)
+        support=support.copy();support[need]=threshold
+    return gen,support
+
+
+def seam_energy(points, valid_result, seen, radius=.004, neighbourhood=.008, samples=3000):
+    """Low-pass colour jump across the observed boundary (linear RGB).
+
+    Compares 8 mm neighbourhood means on the observed and the generated side
+    of boundary points, so real fine texture does not dominate the score.
+    """
+    tree_un=cKDTree(points[~seen]);tree_seen=cKDTree(points[seen])
+    d,_=tree_un.query(points[seen],distance_upper_bound=radius);boundary=np.flatnonzero(np.isfinite(d))
+    if not len(boundary):return None
+    boundary=boundary[np.linspace(0,len(boundary)-1,min(samples,len(boundary))).astype(int)]
+    q=points[seen][boundary];jumps=[]
+    for a,b in zip(tree_seen.query_ball_point(q,neighbourhood),tree_un.query_ball_point(q,neighbourhood)):
+        if len(a)>=4 and len(b)>=4:
+            jumps.append(np.abs(valid_result[seen][a].mean(0)-valid_result[~seen][b].mean(0)).mean())
+    return float(np.mean(jumps)) if jumps else None
 
 
 def evaluate(work, outs):
@@ -191,13 +249,13 @@ def main():
     p.add_argument('stage',choices=('prepare','generate','bake','eval'))
     p.add_argument('--candidate');p.add_argument('--work',required=True)
     p.add_argument('--backend',choices=BACKENDS,default='mvadapter');p.add_argument('--out',nargs='*')
-    p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
+    p.add_argument('--no-delight',action='store_true');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
     if a.stage=='generate':
         opts=dict(seed=a.seed);opts.update(steps=a.steps) if a.steps else None
         print(json.dumps(generate(a.work,a.backend,**opts),indent=1))
-    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0]),indent=1))
+    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
 

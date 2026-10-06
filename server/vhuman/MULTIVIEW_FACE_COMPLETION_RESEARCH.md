@@ -263,9 +263,33 @@ Notes:
   flat.
 
 Next:
-- De-light MV-Adapter views before baking (shading estimated from the GNM
+- DONE (see below): de-light MV-Adapter views before baking.
   normal map, or an intrinsic decomposition).
 - Mask the neck cut and bottom view.
 - Run MV-Adapter as the backbone of the sequential CAP4D-style mode.
 - Qwen-Image-Edit-2509 (Apache-2.0) is pending. It needs about 58 GB and
   `/mnt/disk01` has about 32 GB free.
+
+### MV-Adapter de-lighting (`mv_delight.py`, default on in `mv_texture bake`)
+
+Per view:
+- Fit robust second-order spherical-harmonic shading of log-luminance to the
+  GNM normal map and divide it out.
+- Flatten broad luminance blobs with a masked low-pass (σ = res/24).
+- Hue is never changed.
+
+Fusion:
+- Reject per-view outliers (<0.6× or >1.6× the cross-view luminance median).
+- Fade generated colour within 1.5 cm of the neck cut.
+- Fill texels no view saw from the nearest supported generated texel.
+- A local log-ratio field, measured on the overlap and fading over 3 cm,
+  matches the photographed shading at the boundary.
+
+The seam metric is now a low-pass jump: 8 mm neighbourhood means on each side
+of the observed boundary.
+
+| bake | seam jump | cross-view spread | visual |
+|---|---|---|---|
+| input (flat fill) | 0.0467 | – | flat |
+| MV-Adapter, raw | 0.0447 | 0.094 | dark crown patch, scalp sheen, black collar |
+| MV-Adapter, de-lit + local gain | 0.0472 | 0.067 | patch, sheen and collar removed; a faint pink band remains on the back of the head (generator chroma) |

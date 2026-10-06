@@ -51,4 +51,18 @@ class MultiviewTextureTests(unittest.TestCase):
         np.testing.assert_array_equal(count,[2,2])
 
 
+    def test_delight_removes_directional_shading_but_keeps_detail(self):
+        from .reconstruction.mv_delight import delight
+        from .reconstruction.reference import srgb_to_linear,linear_to_srgb
+        r=64;yy,xx=np.mgrid[:r,:r];x=(xx+.5)/r*2-1;y=1-(yy+.5)/r*2;z=np.sqrt(np.clip(1-x*x-y*y,0,1))
+        valid=x*x+y*y<.9;n=np.stack((x,y,z),-1)
+        albedo=.4+.04*((xx//4+yy//4)%2)  # checker detail
+        lit=albedo*(.35+.65*np.clip(.7*x+.7*z,0,1))[...,]
+        img=np.uint8(np.clip(linear_to_srgb(np.repeat(lit[...,None],3,2))*255+.5,0,255))
+        out,_=delight(img,n/2+.5,valid,blob_strength=0)
+        before=srgb_to_linear(img[valid][:,0]/255);after=srgb_to_linear(out[valid][:,0]/255)
+        self.assertLess(np.std(np.log(after)),.5*np.std(np.log(before)))
+        # checker contrast survives
+        a=srgb_to_linear(out[...,0]/255);self.assertGreater(abs(a[32,30]-a[32,34]),.01)
+
 if __name__=='__main__':unittest.main()
