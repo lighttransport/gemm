@@ -13,10 +13,10 @@ PROMPT = ("Photorealistic studio headshot of an original fictional adult woman, 
 
 def generate(output, cache, seed=7, expressions=False, resume=False, *,
              backend='native', native_assets=None, runner=None, device=0):
-    if backend == 'native':
+    if backend in ('native','native-rocm'):
         from .native_identity import generate as native_generate
         return native_generate(output, native_assets, seed, PROMPT, expressions=expressions,
-                               resume=resume, runner=runner, device=device)
+                               resume=resume, runner=runner, device=device, backend='rocm' if backend=='native-rocm' else 'cuda')
     if backend != 'torch-reference':
         raise ValueError('unsupported identity backend')
     return generate_reference(output, cache, seed, expressions, resume)

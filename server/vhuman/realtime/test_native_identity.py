@@ -101,6 +101,17 @@ class NativeIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'checksum/path mismatch'):
             native.load_assets(self.config)
 
+    def test_rocm_command_and_reference_conditioning_gate(self):
+        def generate(command, **kwargs):
+            self.assertIn('--size',command);self.assertIn('-d',command)
+            self.assertNotIn('--gpu-enc',command);self.assertNotIn('--weight-type',command)
+            Image.new('RGB',(512,512),(80,110,140)).save(command[command.index('--out')+1])
+        with patch.object(native.subprocess,'run',side_effect=generate):
+            native.generate(self.root/'hip',self.config,7,'neutral',runner=self.runner,backend='rocm')
+        self.assertEqual(json.loads((self.root/'hip/manifest.json').read_text())['hardware_backend'],'rocm')
+        with self.assertRaisesRegex(ValueError,'Wan I2V'):
+            native.generate(self.root/'hip-expressions',self.config,7,'neutral',runner=self.runner,backend='rocm',expressions=True)
+
 
 if __name__ == '__main__':
     unittest.main()

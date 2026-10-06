@@ -294,6 +294,12 @@ def cmd_gnm_refine_fit(args):
     return dict(report,out=args.out,returncode=result.returncode)
 
 
+def cmd_mobile_export(args):
+    from .mobile.export import export
+    result=export(args.candidate,args.out,scene=args.scene,profile=args.profile)
+    return dict(out=args.out,triangles=result['triangles'],validation=result['validation'])
+
+
 def cmd_portrait_create(args):
     import subprocess
     from .runtime import python_command
@@ -553,6 +559,12 @@ def main(argv=None) -> int:
     sp.add_argument('--render-preset',choices=('draft','final'),default='final')
     sp.add_argument('--generate-probes',action='store_true')
     sp.set_defaults(fn=cmd_portrait_create)
+    sp = sub.add_parser('mobile-export',help='export complete native GNM anatomy for the iPhone reference player')
+    sp.add_argument('--candidate',required=True)
+    sp.add_argument('--scene',required=True,help='prepared offline scene for the same candidate')
+    sp.add_argument('--out',required=True)
+    sp.add_argument('--profile',choices=['iphone12'],default='iphone12')
+    sp.set_defaults(fn=cmd_mobile_export)
     sp = sub.add_parser('gnm-refine-fit', help='refine native portrait expression with held-out and topology gates')
     sp.add_argument('--candidate',required=True)
     sp.add_argument('--out',required=True)

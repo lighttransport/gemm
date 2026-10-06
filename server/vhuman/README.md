@@ -965,6 +965,122 @@ The standalone backbone runners remain available in `cpu/rmbg` and
 `ref/rmbg`; odd/rectangular and both production encoder scales passed before
 the full decoder port.
 
+## Native mobile avatar reference
+
+`mobile/` contains a C++17 GNM evaluator, a Filament C++ player, and a Swift/UIKit
+shell for iOS 16.4+. The renderer uses Metal on Apple platforms and Vulkan for
+Linux validation. The iPhone 12 profile targets 30 FPS; no iPhone performance
+claim is implied by the desktop checks. The phone receives audio and native
+motion from the server; it does not load a diffusion model or TTS/LLM weights.
+
+Export an accepted reconstruction and its matching prepared offline scene:
+
+```sh
+python -m server.vhuman.cli mobile-export \
+  --candidate tmp/vhuman-public-portraits/obama/head/reconstruction/nativefit11 \
+  --scene tmp/vhuman-public-portraits/obama/offline/fit12 \
+  --profile iphone12 --out tmp/vhuman-mobile/avatar
+python -m server.vhuman.mobile.verify \
+  --candidate tmp/vhuman-public-portraits/obama/head/reconstruction/nativefit11 \
+  --package tmp/vhuman-mobile/avatar --work tmp/vhuman-mobile/verify
+python -m unittest server.vhuman.test_mobile server.vhuman.test_gnm_anatomy
+```
+
+The export includes a checksum manifest, static GLB reference, native deformation
+weights, mesh streams, native/surface/joint bindings, control ordering, prepared
+skin detail, optical anatomy and 1,024 deterministic hair ribbons. The Obama
+reference totals 79,716 triangles. Short-hair undercoat coverage is baked into
+the scalp material with UV gutters. Geometric normals are shared across UV seams
+during animation. Portrait residuals now deform in bind space through GNM LBS;
+they no longer remain fixed in world space when the head turns. PCA coefficients
+retain their native names and are never relabelled as semantic visemes.
+
+Validation on 2026-10-06: 90 affected tests passed, plus a cancellation rerun
+after tightening async-generator shutdown. The 20-pose Obama native check
+measured 0.000161 mm p95 vertex error (0.25 mm gate), 0.000620 mm maximum and
+6.35 ms median host CPU evaluation. Filament static/posed Vulkan renders passed
+on RX 9070 XT; CPU deformation plus vertex-upload submission measured about
+8 ms. These are host measurements, not iPhone FPS or end-to-end speech results.
+
+Build the host player against the **official Filament 1.77.2 SDK**:
+
+```sh
+cmake -S server/vhuman/mobile -B tmp/vhuman-mobile/build \
+  -DCMAKE_BUILD_TYPE=Release -DFILAMENT_ROOT=/path/to/filament \
+  -DFILAMENT_LIB_DIR=/path/to/filament/lib/x86_64
+cmake --build tmp/vhuman-mobile/build -j4
+tmp/vhuman-mobile/build/vhuman_player_probe \
+  tmp/vhuman-mobile/avatar tmp/vhuman-mobile/front.ppm
+```
+
+The Linux SDK uses libc++; use Clang with matching libc++ headers/libraries
+(`-stdlib=libc++`) when building against the precompiled archive. The optional
+third probe argument is a little-endian F32 pose file containing 383 expression
+coefficients, 12 joint axis-angle values, then 3 native translation values.
+Its timing measures CPU deformation and upload submission, not GPU frame time.
+The Linux SDK archive used for validation has SHA256
+`b01d7aeb3d6877fbd6c9736ce1fa1eb2aeb67fa3a3603017c9aa04a15f8e455a`.
+
+On a Mac, extract the corresponding iOS SDK and point `FILAMENT_LIB_DIR` at
+its **device arm64** static libraries, then generate the Xcode project:
+
+```sh
+cmake -S server/vhuman/mobile -B tmp/vhuman-mobile/ios -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=16.4 \
+  -DFILAMENT_ROOT=/path/to/filament-ios \
+  -DFILAMENT_LIB_DIR=/path/to/filament-ios/lib/arm64
+open tmp/vhuman-mobile/ios/vhuman_mobile.xcodeproj
+```
+
+Select a signing team, build `VHuman` for a physical device, and copy the exported
+folder as `Documents/avatar` using Finder file sharing. **Load avatar** verifies
+every package hash before opening it. The app pauses rendering and disconnects
+audio on backgrounding, audio interruption or route change. Xcode compilation,
+signing and physical-device validation remain unverified in the Linux workspace.
+
+The server transport uses 24kHz mono audio, utterance-relative sample positions,
+increasing epochs and an exact avatar-manifest handshake. Cancellation joins the
+producer before starting the next epoch. Audio gaps fail closed. The app samples
+motion against the AVAudioPlayerNode timeline, subtracting downstream output
+presentation latency; it never advances animation using wall time.
+
+```sh
+uv pip install --python /path/to/venv/bin/python -r server/vhuman/mobile/requirements.txt
+python -m server.vhuman.mobile.speech --package tmp/vhuman-mobile/avatar \
+  --mapping /path/to/geometry-matched-gnm-map.json --adapter /path/to/motion.native \
+  --runner speech/build/qwen3_tts_rocm --model /path/to/qwen3-tts \
+  --revision EXACT_MODEL_REVISION --backend rocm
+```
+
+Use `--host` explicitly for LAN binding, or terminate WSS at the existing server
+proxy. The bridge accepts English/Japanese text and uses the existing native
+Qwen TTS feature stream and causal motion student. Mapping metadata must include
+`source_geometry_sha256`, matching native coefficient names, semantic control
+ordering and a 383-by-controls matrix. The default rejects diagnostic students;
+`--diagnostic` is an explicit local experiment option. This bridge is implemented
+but has not yet passed the planned bilingual end-to-end quality evaluation.
+
+For deterministic transport validation, `python -m server.vhuman.mobile.stream`
+accepts `--package`, `--wav` (24kHz mono PCM16) and `--motion` (NPZ fields
+`sample_positions`, `expression`, `rotations`, `translation`,
+`source_geometry_sha256`). Replay does not synthesize the entered text.
+The identity generator also accepts `--identity-backend native-rocm` for neutral
+FLUX.2 Klein T2I; its HIP runner has no reference-image input, so expression
+generation must use the existing Wan I2V path rather than independent T2I faces.
+
+Current reference limitations: LOD1/2, ASTC/KTX packaging, mobile skin SSS and
+wrinkle shaders, refined corneal rendering, oral contact quality, and device
+thermal/memory/FPS/lip-sync gates remain open. Full 3D identity still requires
+multi-view review; a low frontal landmark error does not establish unseen facial
+shape. Asset manifests explicitly set `production_ready=false` and
+`device_measured=false`. On-device LLM/TTS and the planned six-identity / bilingual
+acceptance corpus are not implemented by this mobile reference.
+
+Upstream API references: [Filament build and platform guidance](https://google.github.io/filament/dup/building.html),
+[Apple audio-player timeline](https://developer.apple.com/documentation/avfaudio/avaudioplayernode),
+and [output presentation latency](https://developer.apple.com/documentation/avfaudio/avaudionode/outputpresentationlatency).
+
 ## Licensing and provenance
 
 The [neural avatar runtime](realtime/README.md) adds timestamped native TTS

@@ -81,26 +81,29 @@ def create_assets(output, revision, *, dit, vae, encoder, tokenizer):
 
 
 def generate(output, config, seed, prompt, *, expressions=False, resume=False,
-             runner=None, device=0):
+             runner=None, device=0, backend='cuda'):
     from PIL import Image
     import numpy as np
     from ....rig.exprdata import EXPRESSIONS, KEEP
     if config is None:
         raise ValueError('native identity generation requires --native-assets with verified FLUX.2 component paths')
+    if backend not in ('cuda','rocm'):raise ValueError('unsupported native identity backend')
+    if backend=='rocm' and expressions:
+        raise ValueError('HIP FLUX runner supports neutral T2I; use Wan I2V for identity-conditioned expressions')
     specs = [('neutral', prompt, {})]
     if expressions:
         specs += [(name, KEEP + ' ' + EXPRESSION_PROMPTS.get(name, text), controls)
                   for name, (text, controls, _) in EXPRESSIONS.items()]
     if type(seed) is not int or not 0 <= seed <= 2**63-len(specs) or type(device) is not int or device < 0:
         raise ValueError('invalid seed/device')
-    runner = Path(runner) if runner else ROOT / 'cuda/flux2/test_cuda_flux2'
+    runner = Path(runner) if runner else ROOT / ('rdna4/flux2/test_hip_flux2' if backend=='rocm' else 'cuda/flux2/test_cuda_flux2')
     if not runner.is_file():
-        raise RuntimeError('Build native identity generation with make -C cuda/flux2')
+        raise RuntimeError('Build native identity generation with make -C '+('rdna4/flux2' if backend=='rocm' else 'cuda/flux2'))
     assets, paths = load_assets(config)
     asset_hash, runner_hash = sha256(config), sha256(runner)
     output = Path(output).resolve()
     manifest_path = output / 'manifest.json'
-    recipe = 'diffusers_512_right_padding_reference_t10_cuda_f32_kv'
+    recipe = 'hip_512_t2i_quant_autodetect' if backend=='rocm' else 'diffusers_512_right_padding_reference_t10_cuda_f32_kv'
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
         if (not resume or manifest.get('backend') != 'native_flux2' or
@@ -123,8 +126,8 @@ def generate(output, config, seed, prompt, *, expressions=False, resume=False,
                         backend='native_flux2', assets_sha256=asset_hash, assets=assets, runner_sha256=runner_hash,
                         neutral_prompt=prompt, conditioning_recipe=recipe, references=[], provenance=[],
                         requires_manual_identity_and_pose_QA=True, parity='unverified',
-                        precision='F16 DiT weights converted from selected checkpoint', gemm='repo',
-                        text_backend='cuda_f32_kv')
+                        precision='checkpoint quantization auto-detected' if backend=='rocm' else 'F16 DiT weights converted from selected checkpoint', gemm='repo',
+                        text_backend='hip' if backend=='rocm' else 'cuda_f32_kv', hardware_backend=backend)
     def checkpoint():
         partial = manifest_path.with_suffix('.json.partial')
         partial.write_text(json.dumps(manifest, indent=2) + '\n')
@@ -140,6 +143,10 @@ def generate(output, config, seed, prompt, *, expressions=False, resume=False,
                    '--weight-type', 'f16', '--gemm', 'repo', '--conditioning', 'diffusers',
                    '--gpu-enc', '--no-text-cache',
                    '--device', str(device), '--no-dumps', '--out', str(ppm)]
+        if backend=='rocm':
+            command=[str(runner.resolve()),'--generate','--dit',str(paths['dit']),'--vae',str(paths['vae']),
+                     '--enc',str(paths['encoder']),'--tok',str(paths['tokenizer']),'--prompt',text,
+                     '--size','512','--steps','4','--seed',str(seed+index),'-d',str(device),'--out',str(ppm)]
         if index:
             with Image.open(output / 'neutral.png') as neutral:
                 pixels = np.asarray(neutral.convert('RGB'), np.float32) / 127.5 - 1

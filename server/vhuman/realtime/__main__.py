@@ -149,7 +149,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor")
     p = commands.add_parser("generate-identity")
-    p.add_argument('--identity-backend', choices=('native', 'torch-reference'), default='native')
+    p.add_argument('--identity-backend', choices=('native', 'native-rocm', 'torch-reference'), default='native')
     p.add_argument('--native-assets', help='Hashed native FLUX.2 component manifest')
     p.add_argument('--identity-runner', help='Repository FLUX.2 executable')
     p.add_argument('--identity-device', type=int, default=0)

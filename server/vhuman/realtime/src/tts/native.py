@@ -16,8 +16,10 @@ from .startup import StartupMeter
 
 
 class NativeTTS:
-    def __init__(self, runner, model, revision, text, work, epoch=0, speaker="Ono_Anna", max_frames=256, threads=8, text_feed="incremental"):
+    def __init__(self, runner, model, revision, text, work, epoch=0, speaker="Ono_Anna", max_frames=256, threads=8, text_feed="incremental", *, backend="cuda", language="Japanese"):
         if text_feed not in ("incremental", "full"): raise ValueError("invalid text feed")
+        if backend not in ("cpu", "cuda", "rocm"): raise ValueError("invalid native TTS backend")
+        if language not in ("Japanese", "English"): raise ValueError("unsupported mobile speech language")
         from .identity import verify_model
         verify_model(model, revision)
         self.audio, self.features = queue.Queue(4), queue.Queue(4)
@@ -30,8 +32,8 @@ class NativeTTS:
         reader, writer = os.pipe()
         self.stderr = (work / "tts.stderr.log").open("w")
         try:
-            self.process = subprocess.Popen([str(Path(runner).resolve()), "--backend", "cuda", "--model", str(model),
-                "--text", text, "--speaker", speaker, "--language", "Japanese", "--streaming" if text_feed == "incremental" else "--non-streaming", "--max-frames", str(max_frames),
+            self.process = subprocess.Popen([str(Path(runner).resolve()), "--backend", backend, "--model", str(model),
+                "--text", text, "--speaker", speaker, "--language", language, "--streaming" if text_feed == "incremental" else "--non-streaming", "--max-frames", str(max_frames),
                 "--threads", str(threads),
                 "--pcm-out", "-", "--features-out", f"/proc/self/fd/{writer}", "--out", str(work / "tts.wav")],
                 stdout=subprocess.PIPE, stderr=self.stderr, pass_fds=(writer,), bufsize=0)

@@ -1,0 +1,2 @@
+# BSD-3-Clause. Server only; the iOS client uses URLSession.
+websockets>=14,<16

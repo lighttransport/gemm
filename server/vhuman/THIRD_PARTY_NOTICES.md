@@ -1,5 +1,14 @@
 # Third-party notices
 
+The optional native mobile player links the separately installed
+[Google Filament 1.77.2 SDK](https://github.com/google/filament/releases/tag/v1.77.2),
+licensed under Apache-2.0. Preserve the SDK's LICENSE and bundled third-party
+notices when distributing a linked app. No SDK binaries are checked into this
+repository. The mobile server uses the separately installed `websockets` package
+(BSD-3-Clause). Apple system frameworks are supplied by iOS/Xcode and are not
+redistributed as open-source components. The portable deformation runtime and
+app glue are repository-authored MIT code.
+
 The PBR Neutral tone-mapping adaptations in `eye/optics.py` and
 `web/vhuman_eye_shader.js` follow Three.js `NeutralToneMapping`:
 https://github.com/mrdoob/three.js/blob/r170/src/renderers/shaders/ShaderChunk/tonemapping_pars_fragment.glsl.js
