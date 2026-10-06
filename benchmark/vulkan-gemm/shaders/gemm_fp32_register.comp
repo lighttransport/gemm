@@ -1,0 +1,190 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+// A workgroup computes a 64x64 or 128x128 output tile. Each invocation owns
+// a 4x4 or 8x8 register tile, reusing each LDS operand for multiple FMAs.
+layout(constant_id=0) const uint MICRO = 8;
+layout(constant_id=1) const uint BK = 16;
+layout(constant_id=2) const uint PAD = 0;
+layout(constant_id=3) const uint ALIGNED = 0;
+layout(constant_id=4) const uint PREFETCH = 1;
+layout(constant_id=5) const uint MICRO_N = 8;
+layout(constant_id=6) const uint LDS_PREFETCH = 0;
+layout(constant_id=7) const uint PACK_A = 0;
+const uint BLOCK = 16 * MICRO;
+const uint BLOCK_N = 16 * MICRO_N;
+const uint VECTORS = BLOCK / 4;
+const uint VECTORS_N = BLOCK_N / 4;
+const uint STRIPS = MICRO / 4;
+const uint STRIPS_N = MICRO_N / 4;
+layout(local_size_x=16, local_size_y=16) in;
+layout(set=0, binding=0, std430) readonly restrict buffer A { float a[]; };
+layout(set=0, binding=1, std430) readonly restrict buffer B { float b[]; };
+layout(set=0, binding=2, std430) writeonly restrict buffer C { float c[]; };
+// Aliases use the same descriptors. Specialization removes the unused view.
+layout(set=0, binding=0, std430) readonly restrict buffer AV { vec4 a4[]; };
+layout(set=0, binding=1, std430) readonly restrict buffer BV { vec4 b4[]; };
+layout(set=0, binding=2, std430) writeonly restrict buffer CV { vec4 c4[]; };
+layout(push_constant) uniform Params { uint m; uint n; uint k; } p;
+// A is transposed in LDS so four output rows can be fetched in one vector.
+// The default uses no padding to keep the 128x128 tile within 16 KiB LDS.
+shared vec4 ta[BK][VECTORS + PAD];
+shared vec4 tb[BK][VECTORS_N];
+
+void main() {
+    uint x = gl_LocalInvocationID.x, y = gl_LocalInvocationID.y;
+    uint tid = gl_LocalInvocationIndex;
+    uint row_base = gl_WorkGroupID.y * BLOCK;
+    uint col_base = gl_WorkGroupID.x * BLOCK_N;
+    vec4 sums[MICRO * STRIPS_N];
+    const uint LOADS = (BLOCK * BK / 4 + 255) / 256;
+    const uint LOADS_N = (BLOCK_N * BK / 4 + 255) / 256;
+    vec4 next_a[LOADS], next_b[LOADS_N];
+    [[unroll]] for (uint i = 0; i < MICRO * STRIPS_N; ++i) sums[i] = vec4(0);
+    if (ALIGNED != 0 && PREFETCH != 0) {
+        [[unroll]] for (uint l = 0; l < LOADS; ++l) {
+            uint i = tid + l*256;
+            if (BLOCK * BK / 4 < 256 && i >= BLOCK * BK / 4) continue;
+            uint r = i / (BK/4), kk = (i % (BK/4))*4;
+            if (PACK_A != 0) next_a[l] = a4[(i/VECTORS)*(p.m/4)+row_base/4+i%VECTORS];
+            else next_a[l] = a4[(row_base+r)*(p.k/4)+kk/4];
+        }
+        [[unroll]] for (uint l = 0; l < LOADS_N; ++l) {
+            uint i = tid + l*256;
+            if (BLOCK_N * BK / 4 < 256 && i >= BLOCK_N * BK / 4) continue;
+            uint kk = i / VECTORS_N;
+            next_b[l] = b4[kk*(p.n/4)+col_base/4+i%VECTORS_N];
+        }
+    }
+
+    for (uint tile = 0; tile < p.k; tile += BK) {
+        if (ALIGNED != 0) {
+            if (PACK_A != 0) {
+                [[unroll]] for (uint l = 0; l < LOADS; ++l) {
+                    uint i = tid+l*256;
+                    if (BK*VECTORS < 256 && i >= BK*VECTORS) continue;
+                    uint kk = i / VECTORS, vr = i % VECTORS;
+                    vec4 value;
+                    if (PREFETCH != 0) value = next_a[l];
+                    else value = a4[(tile+kk)*(p.m/4)+row_base/4+vr];
+                    ta[kk][vr] = value;
+                }
+            } else {
+              // Coalesced 128-bit global loads, transposed into LDS.
+              [[unroll]] for (uint l = 0; l < LOADS; ++l) {
+                uint i = tid+l*256;
+                if (BLOCK*BK/4 < 256 && i >= BLOCK*BK/4) continue;
+                uint r = i / (BK/4), kk = (i % (BK/4))*4;
+                vec4 value;
+                if (PREFETCH != 0) value = next_a[l];
+                else value = a4[(row_base+r)*(p.k/4)+tile/4+kk/4];
+                ta[kk+0][r/4][r%4] = value.x;
+                ta[kk+1][r/4][r%4] = value.y;
+                ta[kk+2][r/4][r%4] = value.z;
+                ta[kk+3][r/4][r%4] = value.w;
+              }
+            }
+        } else {
+          // General path: vector rows from A, contiguous K across lanes.
+          [[unroll]] for (uint l = 0; l < LOADS; ++l) {
+                    uint i = tid+l*256;
+                    if (BK*VECTORS < 256 && i >= BK*VECTORS) continue;
+            uint kk = i % BK, vr = i / BK;
+            uint r = row_base + vr * 4, k = tile + kk;
+            vec4 av = vec4(0);
+            if (k < p.k) {
+                if (r+0 < p.m) av.x = a[PACK_A != 0 ? k*p.m+r+0 : (r+0)*p.k+k];
+                if (r+1 < p.m) av.y = a[PACK_A != 0 ? k*p.m+r+1 : (r+1)*p.k+k];
+                if (r+2 < p.m) av.z = a[PACK_A != 0 ? k*p.m+r+2 : (r+2)*p.k+k];
+                if (r+3 < p.m) av.w = a[PACK_A != 0 ? k*p.m+r+3 : (r+3)*p.k+k];
+            }
+            ta[kk][vr] = av;
+          }
+        }
+        [[unroll]] for (uint l = 0; l < LOADS_N; ++l) {
+            uint i = tid+l*256;
+            if (BK*VECTORS_N < 256 && i >= BK*VECTORS_N) continue;
+            uint kk = i / VECTORS_N, vc = i % VECTORS_N;
+            uint col = col_base + vc * 4, k = tile + kk;
+            vec4 bv = vec4(0);
+            if (ALIGNED != 0) {
+                if (PREFETCH != 0) bv = next_b[l];
+                else bv = b4[k*(p.n/4)+col/4];
+            } else if (k < p.k) {
+                if (col+0 < p.n) bv.x = b[k*p.n+col+0];
+                if (col+1 < p.n) bv.y = b[k*p.n+col+1];
+                if (col+2 < p.n) bv.z = b[k*p.n+col+2];
+                if (col+3 < p.n) bv.w = b[k*p.n+col+3];
+            }
+            tb[kk][vc] = bv;
+        }
+        barrier();
+        if (ALIGNED != 0 && PREFETCH != 0 && tile+BK < p.k) {
+            // Start the next global reads while computing the current LDS tile.
+            [[unroll]] for (uint l = 0; l < LOADS; ++l) {
+                uint i = tid + l*256;
+                if (BLOCK * BK / 4 < 256 && i >= BLOCK * BK / 4) continue;
+                uint r = i / (BK/4), kk = (i % (BK/4))*4;
+                if (PACK_A != 0) next_a[l] = a4[(tile+BK+i/VECTORS)*(p.m/4)+row_base/4+i%VECTORS];
+                else next_a[l] = a4[(row_base+r)*(p.k/4)+(tile+BK+kk)/4];
+            }
+            [[unroll]] for (uint l = 0; l < LOADS_N; ++l) {
+                uint i = tid + l*256;
+                if (BLOCK_N * BK / 4 < 256 && i >= BLOCK_N * BK / 4) continue;
+                uint kk = i / VECTORS_N;
+                next_b[l] = b4[(tile+BK+kk)*(p.n/4)+col_base/4+i%VECTORS_N];
+            }
+        }
+        vec4 current_a[STRIPS], current_b[STRIPS_N];
+        if (LDS_PREFETCH != 0) {
+            [[unroll]] for (uint s = 0; s < STRIPS; ++s) current_a[s] = ta[0][y+s*16];
+            [[unroll]] for (uint s = 0; s < STRIPS_N; ++s) current_b[s] = tb[0][x+s*16];
+        }
+        [[unroll]] for (uint kk = 0; kk < BK; ++kk) {
+            vec4 av[STRIPS], bv[STRIPS_N];
+            vec4 future_a[STRIPS], future_b[STRIPS_N];
+            [[unroll]] for (uint s = 0; s < STRIPS; ++s) {
+                if (LDS_PREFETCH != 0) av[s] = current_a[s];
+                else av[s] = ta[kk][y + s*16];
+            }
+            [[unroll]] for (uint s = 0; s < STRIPS_N; ++s) {
+                if (LDS_PREFETCH != 0) bv[s] = current_b[s];
+                else bv[s] = tb[kk][x + s*16];
+            }
+            if (LDS_PREFETCH != 0 && kk+1 < BK) {
+                [[unroll]] for (uint s = 0; s < STRIPS; ++s) future_a[s] = ta[kk+1][y+s*16];
+                [[unroll]] for (uint s = 0; s < STRIPS_N; ++s) future_b[s] = tb[kk+1][x+s*16];
+            }
+            [[unroll]] for (uint sr = 0; sr < STRIPS; ++sr) {
+                [[unroll]] for (uint sc = 0; sc < STRIPS_N; ++sc) {
+                    uint base = sr*4*STRIPS_N + sc;
+                    sums[base + 0*STRIPS_N] = fma(vec4(av[sr].x), bv[sc], sums[base + 0*STRIPS_N]);
+                    sums[base + 1*STRIPS_N] = fma(vec4(av[sr].y), bv[sc], sums[base + 1*STRIPS_N]);
+                    sums[base + 2*STRIPS_N] = fma(vec4(av[sr].z), bv[sc], sums[base + 2*STRIPS_N]);
+                    sums[base + 3*STRIPS_N] = fma(vec4(av[sr].w), bv[sc], sums[base + 3*STRIPS_N]);
+                }
+            }
+            if (LDS_PREFETCH != 0 && kk+1 < BK) {
+                [[unroll]] for (uint s = 0; s < STRIPS; ++s) current_a[s] = future_a[s];
+                [[unroll]] for (uint s = 0; s < STRIPS_N; ++s) current_b[s] = future_b[s];
+            }
+        }
+        barrier();
+    }
+    [[unroll]] for (uint sr = 0; sr < STRIPS; ++sr) {
+        [[unroll]] for (uint r = 0; r < 4; ++r) {
+            uint row = row_base + (y + sr*16)*4 + r;
+            [[unroll]] for (uint sc = 0; sc < STRIPS_N; ++sc) {
+                uint col = col_base + (x + sc*16)*4;
+                vec4 value = sums[(sr*4+r)*STRIPS_N+sc];
+                if (ALIGNED != 0) {
+                    c4[row*(p.n/4)+col/4] = value;
+                } else if (row < p.m) {
+                    if (col+0 < p.n) c[row*p.n+col+0] = value.x;
+                    if (col+1 < p.n) c[row*p.n+col+1] = value.y;
+                    if (col+2 < p.n) c[row*p.n+col+2] = value.z;
+                    if (col+3 < p.n) c[row*p.n+col+3] = value.w;
+                }
+            }
+        }
+    }
+}
