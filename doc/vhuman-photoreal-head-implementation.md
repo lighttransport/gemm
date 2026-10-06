@@ -372,3 +372,70 @@ This draft is a regression check, not a resolution-matched speed comparison.
 Remaining close-up limits include the approximate crown/sideburn shape,
 unmeasured hair shading, and source mouth/teeth alignment. Smoother hairline
 coverage does not recover a true posterior haircut or calibrated reflectance.
+
+### Obama native expression fitting
+
+`gnm-refine-fit` refines a single portrait with identity and camera frozen.
+The previous energy-ranked 12-mode expression fit missed the smile and its
+post-fit topology guard halved the expression. The new solve uses the full
+383-dimensional native expression basis, restricted to 64 combinations
+observable on training landmark attachments. Every tenth dense landmark is
+held out; held-out points do not select the subspace or enter the loss.
+Mouth landmarks receive extra weight. An oriented triangle-area barrier
+preserves the skin surface during optimization, followed by a hard acceptance
+gate on topology, held-out face/mouth error, and non-mouth regression.
+Rejected fits retain diagnostics without exporting a candidate manifest.
+
+Reproduce on the existing Obama portrait candidate:
+
+```sh
+LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib PYTHONDONTWRITEBYTECODE=1 \
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 \
+tmp/vhuman-rocm-venv/bin/python -m server.vhuman.reconstruction.refine_fit \
+  tmp/vhuman-public-portraits/obama/head/reconstruction/mouth03 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/nativefit04 \
+  --iterations 400 --modes 64 --device cuda:0
+```
+
+Use a fresh output directory when repeating. The main CLI also exposes
+`gnm-refine-fit --candidate SOURCE --out OUTPUT --iterations 400 --modes 64`
+and uses its configured ROCm Python interpreter and backend/device settings.
+
+Obama results (420 training / 47 held-out valid landmarks):
+
+| Error in portrait pixels | Before | After |
+| --- | ---: | ---: |
+| Held-out face | 3.775 | 2.609 |
+| Mouth | 5.628 | 1.867 |
+| Held-out mouth | 7.102 | 2.478 |
+| Non-mouth | 3.663 | 2.280 |
+
+The minimum oriented skin-area ratio is 0.160 (hard floor 0.05), with no
+expression halving. The 400-step RX 9070 XT ROCm solve took 4.06 seconds and
+peaked at 213 MiB of PyTorch allocated memory; this excludes parsing, SVD,
+and texture rebaking. Native identity coefficients, neutral vertices and
+camera are unchanged. The complete native anatomy follows the expression:
+lower teeth and tongue deform while the upper dental arch stays head-fixed.
+Skin is rebaked for the new capture. Existing rig/motion fits must be rebuilt
+against the new geometry hash; source rig directories are not copied.
+
+Matched 1024 px / 256-sample HIP render: `offline/after09` versus
+`offline/fit10`, identical camera and lighting, 28.06 seconds and 2285 MiB
+for the new render including packed-scene reload. Frontal studio render
+`offline/fit11` took 27.40 seconds. Review figures:
+`tmp/vhuman-skin-review/gnm-fit-comparison.png` and
+`tmp/vhuman-skin-review/gnm-landmarks-comparison.png`.
+
+Validation: all 76 tests pass with the ROCm interpreter:
+`python -m unittest server.vhuman.test_native_fit server.vhuman.test_gnm_anatomy
+server.vhuman.test_portrait_identity server.vhuman.test_photoreal
+server.vhuman.test_reconstruction server.vhuman.test_expression_catalog
+server.vhuman.test_quality`. Tests include acceptance-gate regressions,
+held-out metric isolation and complete native expression-forward parity.
+The saved candidate also passes provenance, frozen identity/camera and
+full-anatomy parity checks.
+
+These errors measure consistency with held-out tracker landmarks, not true
+3D accuracy. Dense correspondences beyond the official 68 landmarks are
+inferred. Identity depth, tooth size, unseen anatomy and skin reflectance
+remain prior estimates; the new solve specifically improves capture pose.

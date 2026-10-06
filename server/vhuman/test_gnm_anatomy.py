@@ -34,6 +34,18 @@ class GNMTests(unittest.TestCase):
         for group in ('skin','left_eye','right_eye','upper_teeth_and_gums','lower_teeth_and_gums','tongue'):
             self.assertGreater(m.group(group).sum(),0)
 
+    def test_native_expression_refinement_matches_complete_forward(self):
+        m=self.model;rng=np.random.default_rng(31)
+        beta=rng.normal(0,.1,m.identity_dim);expression=rng.normal(0,.05,m.expression_dim)
+        rest,_=m.evaluate(beta);actual,_=m.evaluate(beta,expression)
+        linear=rest+np.einsum('e,evc->vc',expression,m.data['expression_basis'])
+        np.testing.assert_allclose(actual,linear,atol=1e-7)
+        # The upper dental arch stays fixed to the head; the lower arch and
+        # tongue have native expression deformation.
+        np.testing.assert_allclose(actual[m.group('upper_teeth_and_gums')],rest[m.group('upper_teeth_and_gums')],atol=1e-7)
+        for group in ('lower_teeth_and_gums','tongue'):
+            self.assertGreater(np.linalg.norm((actual-rest)[m.group(group)]),0)
+
     def test_numpy_torch_parity_and_gradient(self):
         import torch
         m=self.model;t=GNMModel(device='cpu');rng=np.random.default_rng(19)

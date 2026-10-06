@@ -279,6 +279,19 @@ def cmd_rig_render(args):
                   lighting=args.lighting,yaw=args.yaw,exposure=args.exposure,sss_weight=args.sss_weight)
 
 
+def cmd_gnm_refine_fit(args):
+    import subprocess
+    from . import gpu
+    from .runtime import python_command
+    if not args.rig_python:raise ValueError('a configured ROCm Python interpreter is required')
+    command=[args.rig_python,'-m','server.vhuman.reconstruction.refine_fit',args.candidate,
+             '--out',args.out,'--iterations',str(args.iterations),'--modes',str(args.modes),
+             '--device','cpu' if gpu.backend()=='cpu' else f'cuda:{args.device}']
+    result=subprocess.run(python_command(command),check=True)
+    report=json.loads((Path(args.out)/'fit_refinement.json').read_text())
+    return dict(report,out=args.out,returncode=result.returncode)
+
+
 def cmd_portrait_create(args):
     import subprocess
     from .runtime import python_command
@@ -538,6 +551,12 @@ def main(argv=None) -> int:
     sp.add_argument('--render-preset',choices=('draft','final'),default='final')
     sp.add_argument('--generate-probes',action='store_true')
     sp.set_defaults(fn=cmd_portrait_create)
+    sp = sub.add_parser('gnm-refine-fit', help='refine native portrait expression with held-out and topology gates')
+    sp.add_argument('--candidate',required=True)
+    sp.add_argument('--out',required=True)
+    sp.add_argument('--iterations',type=int,default=400)
+    sp.add_argument('--modes',type=int,default=64)
+    sp.set_defaults(fn=cmd_gnm_refine_fit)
     sp = sub.add_parser('rig-render', help='render complete GNM anatomy with Cycles HIP')
     sp.add_argument('--candidate', required=True, help='completed reconstruction run directory')
     sp.add_argument('--out', required=True, help='empty artifact directory')
