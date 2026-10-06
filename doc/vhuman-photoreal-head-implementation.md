@@ -190,3 +190,20 @@ The regression suite now has 50 passing tests, including rear-width and depth
 checks. `offline/happy15/` is the matching 1024 px / 256-sample comparison:
 24.51 seconds including packed-scene validation, 2463.31 MiB whole-device
 VRAM. `offline/frontal15/` supplies the frontal draft check.
+
+### Glasses attachment refinement
+
+The glasses now include head-pose-attached temple arms and rounded ear hooks.
+Each arm begins at its lens frame's outer edge and follows the fitted skin's
+lateral envelope in 8 mm height/depth neighbourhoods with 3 mm clearance.
+The 120 mm arm depth and 9 mm hook radius are explicit geometric priors,
+not measurements recovered from the portrait. The bridge endpoints now use
+actual inner frame vertices rather than fixed offsets from lens centres.
+Local envelope clearance is not a complete triangle-collision guarantee.
+
+All 51 reconstruction tests pass, including hinge attachment, sampled scalp
+clearance, rearward ordering and left/right reflection equivariance.
+`offline/happy17/` is the matching 1024 px / 256-sample HIP review render.
+Packed-scene reload validation passed; elapsed time was 24.89 seconds and
+whole-device peak VRAM was 2463.30 MiB (previous `happy15`: 24.51 seconds,
+2463.31 MiB).

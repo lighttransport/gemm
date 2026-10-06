@@ -72,6 +72,26 @@ def curved_cap(camera, contour, z, rings=12, rear_depth=.20):
     return vertices,faces,front_count
 
 
+def glasses_temple(boundary, scalp, clearance=.003):
+    """Head-space arm following the outer scalp envelope; depth is a prior."""
+    boundary=np.asarray(boundary,float);scalp=np.asarray(scalp,float)
+    side=1 if boundary[:,0].mean()>0 else -1
+    hinge=boundary[np.argmax(side*boundary[:,0])].copy()
+    depths=np.linspace(hinge[2],hinge[2]-.12,24)
+    path=np.tile(hinge,(len(depths),1));path[:,2]=depths
+    for i,z in enumerate(depths[1:],1):
+        nearby=(abs(scalp[:,1]-hinge[1])<.008)&(abs(scalp[:,2]-z)<.008)&(side*scalp[:,0]>0)
+        if nearby.any():
+            outer=(side*scalp[nearby,0]).max()+clearance
+            path[i,0]=side*max(side*hinge[0],outer)
+        else:path[i,0]=path[i-1,0]
+    # A short downward tip behind the ear, explicitly inferred from one image.
+    angle=np.linspace(0,np.pi/2,9)[1:]
+    hook=np.stack((np.zeros_like(angle),-.009*(1-np.cos(angle)),-.009*np.sin(angle)),-1)
+    path=np.concatenate((path,path[-1]+hook))
+    return path
+
+
 def attachment_frames(points):
     x=points[...,1,:]-points[...,0,:]
     x/=np.maximum(np.linalg.norm(x,axis=-1,keepdims=True),1e-12)
@@ -201,10 +221,13 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
             lens=np.concatenate([projected_plane(camera,c[None],.026),boundary])
             faces=np.stack((np.zeros(64,int),np.arange(64)+1,np.roll(np.arange(64),-1)+1),-1)
             part(side+'_glasses_lens',lens,faces,np.zeros((64,3,2)),'glass')
-            accessory_records.append(dict(name=side+'_glasses',source='parsing silhouette + planar lens prior',inferred_geometry=True))
-        if len(curves)==2:
-            centers=np.array([curves[s+'_glasses_frame'].mean(0) for s in ('right','left')])
-            bridge=np.stack((centers[0]+[.025,.007,0],centers.mean(0)+[0,.011,.004],centers[1]+[-.025,.007,0]))
+            curves[side+'_glasses_temple']=glasses_temple(boundary,full[model.group('skin_exterior')])
+            accessory_records.append(dict(name=side+'_glasses',source='parsing silhouette + planar lens; scalp-envelope temple and ear hook are priors',
+                inferred_geometry=True,temple_clearance_m=.003,temple_depth_m=.12))
+        if all(s+'_glasses_frame' in curves for s in ('right','left')):
+            right=curves['right_glasses_frame'];left=curves['left_glasses_frame']
+            a=right[np.argmax(right[:,0])];b=left[np.argmin(left[:,0])]
+            bridge=np.stack((a,(a+b)/2+[0,.007,.004],b))
             curves['glasses_bridge']=bridge
         hat=(labels==18)&(yy<min(p[1] for p in eye_pixels)-ipd*.25)
         contours,_=cv2.findContours(hat.astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)

@@ -4,10 +4,21 @@ import numpy as np
 from .reconstruction.reference import Camera
 from .reconstruction.temporal import crop_camera
 from .reconstruction.skin_detail import driver_matrix,evaluate
-from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_cap
+from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_cap,glasses_temple
 
 
 class PhotorealTests(unittest.TestCase):
+    def test_glasses_temple_attaches_and_clears_scalp_symmetrically(self):
+        boundary=np.array([[.04,.02,.026],[.06,.02,.026],[.05,.03,.026]])
+        scalp=np.array([[.075,.02,z] for z in np.linspace(-.1,.026,100)])
+        path=glasses_temple(boundary,scalp)
+        np.testing.assert_equal(path[0],boundary[1])
+        self.assertTrue((path[1:24,0]>=.078-1e-12).all())
+        self.assertTrue((np.diff(path[:,2])<0).all())
+        mirror=np.array([-1,1,1])
+        np.testing.assert_allclose(glasses_temple(boundary*mirror,scalp*mirror),path*mirror)
+        self.assertAlmostEqual(path[-1,1],.011)
+
     def test_curved_cap_preserves_outline_and_is_closed(self):
         camera=Camera(1400,255,299,np.array([.02,.03,1.5]),np.eye(3))
         angle=np.linspace(0,2*np.pi,40,endpoint=False)
