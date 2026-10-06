@@ -1069,13 +1069,85 @@ The identity generator also accepts `--identity-backend native-rocm` for neutral
 FLUX.2 Klein T2I; its HIP runner has no reference-image input, so expression
 generation must use the existing Wan I2V path rather than independent T2I faces.
 
-Current reference limitations: LOD1/2, ASTC/KTX packaging, mobile skin SSS and
-wrinkle shaders, refined corneal rendering, oral contact quality, and device
+Current reference limitations: LOD1/2, ASTC/KTX packaging, native Filament skin
+SSS/wrinkle shaders, refined corneal rendering, oral contact quality, and device
 thermal/memory/FPS/lip-sync gates remain open. Full 3D identity still requires
 multi-view review; a low frontal landmark error does not establish unseen facial
 shape. Asset manifests explicitly set `production_ready=false` and
 `device_measured=false`. On-device LLM/TTS and the planned six-identity / bilingual
 acceptance corpus are not implemented by this mobile reference.
+
+### Browser target and skin-detail preprocessing
+
+The alternative runtime in `web/vhuman_mobile*` uses **WebGL2 + WASM SIMD**.
+It compiles the same `mobile/native.cpp` evaluator used by the native player;
+there is no approximate JavaScript replacement for GNM. A worker performs
+deformation, and the browser applies native, joint and barycentric attachments,
+recomputes normals shared across skin UV seams, and renders the same GLB optical
+materials. The package runs locally without a CDN. Three.js 0.163.0 is installed
+separately under its MIT license, and the build copies its LICENSE into the output.
+
+Preprocessing fits a per-identity expression-to-regional-area-strain regressor
+against synthetic native GNM deformation, then bakes metric tangent-space wrinkle
+slopes. UV scale and shear are accounted for; chart padding avoids height-to-zero
+edges. The driver keeps the captured reference at zero activation. Train/test
+seeds, coefficient distribution, package/detail hashes and held-out metrics are
+recorded in `detail.json`; rejected fits retain the analytic driver. This is
+**geometric supervision**, not recovery of observed wrinkle depth. Groove depth
+and pattern still come from the bounded authored skin-detail prior.
+
+```sh
+python -m server.vhuman.mobile.preprocess \
+  --candidate tmp/vhuman-public-portraits/obama/head/reconstruction/nativefit11 \
+  --package tmp/vhuman-mobile/obama04 --out tmp/vhuman-browser/obama-detail
+
+# Emscripten (em++) must be on PATH. Extract the pinned Three.js package locally.
+mkdir -p tmp/vhuman-browser/vendor
+(cd tmp/vhuman-browser/vendor && npm pack three@0.163.0 && tar -xzf three-0.163.0.tgz)
+python -m server.vhuman.mobile.browser \
+  --package tmp/vhuman-mobile/obama04 --detail tmp/vhuman-browser/obama-detail \
+  --three tmp/vhuman-browser/vendor/package --out tmp/vhuman-browser/player
+python -m http.server 8088 --bind 127.0.0.1 --directory tmp/vhuman-browser/player
+```
+
+Open `http://127.0.0.1:8088/`. The review controls provide a head turn, pose sweep,
+lighting presets and a dynamic-detail toggle. The speech controls connect to the
+same `mobile.speech` / `mobile.stream` server used by the iOS shell. Supply the
+original exported avatar directory to that server so its manifest hash matches.
+Browser audio uses an AudioWorklet with a bounded PCM queue and device-rate
+resampling. Animation follows source-sample markers mapped to the output device
+through `AudioContext.getOutputTimestamp()`. Underruns freeze the source timeline;
+cancel, disconnect and page backgrounding stop the stream. HTTPS or localhost is
+required for WebAssembly worker asset checks and Web Audio; WSS is needed from
+HTTPS pages. No microphone permission is needed.
+
+Validation commands:
+
+```sh
+python -m unittest server.vhuman.test_mobile_preprocess server.vhuman.test_mobile
+node server/vhuman/mobile/test_browser_audio.mjs
+python -m server.vhuman.mobile.browser_verify \
+  --player tmp/vhuman-browser/player --out tmp/vhuman-browser/check --hardware
+```
+
+`--hardware` requests headless ANGLE/Vulkan and reports the actual renderer.
+Without it, the verifier requests SwiftShader. It checks WASM/native vertices,
+every attachment class, strain activations, rendered lighting/detail changes,
+WebSocket delivery, device-rate audio accounting and cancellation. Its silent
+PCM fixture tests timing mechanics, not TTS intelligibility or measured lip sync.
+
+Obama preprocessing: 768 training poses and 192 held-out poses; mean activation
+error improved from 0.011743 to 0.001765 (6.65×), p95 from 0.047317 to 0.005835.
+Twelve 256px two-channel float slope maps total 6 MiB. Chromium/AMD validation
+measured exact native/WASM vertices on three poses, about 6 ms WASM evaluation
+and 5–10 ms attachment/normal updates. The final animated check sustained 29.9
+rendered FPS and 29.9 pose updates/sec with dynamic detail enabled. Attachment
+error was 0.0000064 mm p95; browser strain activations matched Python within
+6.1e-10. The audio
+fixture played 48,000 source samples through 48 kHz output with zero underruns.
+These desktop results do not establish iPhone/Safari performance, a thermal soak,
+or photometric wrinkle accuracy. Unseen side-face and neck texture quality still
+requires additional observations and review.
 
 Upstream API references: [Filament build and platform guidance](https://google.github.io/filament/dup/building.html),
 [Apple audio-player timeline](https://developer.apple.com/documentation/avfaudio/avaudioplayernode),
