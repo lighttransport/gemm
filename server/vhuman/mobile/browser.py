@@ -1,7 +1,7 @@
 """Build a self-contained WebGL2/WebAssembly avatar review directory.
 
 Uses a locally extracted, pinned Three.js npm package; no CDN is needed at
-runtime. Serve the output on localhost or HTTPS for package SHA256 verification.
+runtime. LAN HTTP supports visual review; use localhost or HTTPS for speech audio.
 """
 import argparse
 import json

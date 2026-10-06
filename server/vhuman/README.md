@@ -1124,6 +1124,23 @@ unavailable. Speech controls require HTTPS or localhost for Web Audio and are
 disabled on LAN HTTP; WSS is needed from HTTPS pages. No microphone permission
 is needed.
 
+To serve an exported preview over HTTPS on the LAN, use a certificate with the
+server's LAN IP (or DNS name) in its Subject Alternative Name, signed by a CA
+trusted on the client PC:
+
+```sh
+python -m server.vhuman.mobile.serve \
+  --directory tmp/vhuman-browser/player-generated01 \
+  --cert tmp/vhuman-browser/tls/server.crt \
+  --key tmp/vhuman-browser/tls/server.key --bind 0.0.0.0 --port 8443
+```
+
+Keep private keys outside the served directory. Install only the public CA
+certificate in the other PC's trusted root certificate store (Firefox may use
+its own Authorities store). Then open `https://SERVER_LAN_IP:8443/`. Changing
+the server IP requires a certificate covering the new address. This is a static
+preview server; speech additionally needs a WSS endpoint.
+
 Validation commands:
 
 ```sh
