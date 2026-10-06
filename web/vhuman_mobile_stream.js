@@ -4,6 +4,7 @@ export class AvatarStream {
         this.socket=null;this.context=null;this.node=null;this.epoch=-1;this.expectedEpoch=-1;this.frames=[];this.markers=[];this.ready=false;this.waiting=true;this.position=0;this.underruns=0;
     }
     async connect(address){
+        if(globalThis.isSecureContext===false)throw Error('Speech audio requires HTTPS or localhost');
         this.close();const url=new URL(address,location.href);
         if(!['ws:','wss:'].includes(url.protocol))throw Error('Use a WebSocket server address');
         this.context=new AudioContext();await this.context.audioWorklet.addModule('./vhuman_mobile_audio.js');

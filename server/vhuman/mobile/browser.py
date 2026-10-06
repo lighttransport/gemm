@@ -41,7 +41,7 @@ def build(package,out,three,detail=None):
         text=(three/source).read_text()
         text=text.replace("from 'three'","from './three.module.js'").replace("'../utils/BufferGeometryUtils.js'","'./BufferGeometryUtils.js'")
         (out/target).write_text(text)
-    for name in ('vhuman_mobile.html','vhuman_mobile.js','vhuman_mobile_worker.js','vhuman_mobile_stream.js','vhuman_mobile_audio.js'):
+    for name in ('vhuman_mobile.html','vhuman_mobile.js','vhuman_mobile_hash.js','vhuman_mobile_worker.js','vhuman_mobile_stream.js','vhuman_mobile_audio.js'):
         shutil.copyfile(ROOT/'web'/name,out/('index.html' if name.endswith('.html') else name))
     (out/'config.json').write_text(json.dumps(dict(schema='vhuman.browser.v1',package='avatar/',
         package_sha256=sha256(package/'avatar.json'),detail='detail/' if detail else None,

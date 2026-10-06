@@ -1117,9 +1117,12 @@ original exported avatar directory to that server so its manifest hash matches.
 Browser audio uses an AudioWorklet with a bounded PCM queue and device-rate
 resampling. Animation follows source-sample markers mapped to the output device
 through `AudioContext.getOutputTimestamp()`. Underruns freeze the source timeline;
-cancel, disconnect and page backgrounding stop the stream. HTTPS or localhost is
-required for WebAssembly worker asset checks and Web Audio; WSS is needed from
-HTTPS pages. No microphone permission is needed.
+cancel, disconnect and page backgrounding stop the stream. The visual preview
+also works over LAN HTTP: serve with `--bind 0.0.0.0` and open the server's LAN
+address. Asset checks use a JavaScript SHA-256 fallback when SubtleCrypto is
+unavailable. Speech controls require HTTPS or localhost for Web Audio and are
+disabled on LAN HTTP; WSS is needed from HTTPS pages. No microphone permission
+is needed.
 
 Validation commands:
 

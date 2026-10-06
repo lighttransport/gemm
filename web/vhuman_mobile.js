@@ -1,6 +1,7 @@
 import * as THREE from './three.module.js';
 import {GLTFLoader} from './GLTFLoader.js';
 import {AvatarStream} from './vhuman_mobile_stream.js';
+import {sha256} from './vhuman_mobile_hash.js';
 
 const $=id=>document.getElementById(id), status=$('status');
 const state={ready:false,pending:false,animate:false,frames:0,poseId:0,workerMs:0,updateMs:0,detail:true,errors:[]};
@@ -11,7 +12,7 @@ async function bytes(url,digest,size){
     const data=await response.arrayBuffer();
     if(size!==undefined&&data.byteLength!==size)throw Error(`Size mismatch: ${url}`);
     if(digest){
-        const hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',data))].map(v=>v.toString(16).padStart(2,'0')).join('');
+        const hash=await sha256(data);
         if(hash!==digest)throw Error(`Checksum mismatch: ${url}`);
     }
     return data;
@@ -110,7 +111,6 @@ function wrinkleShader(material,detail,slopes){
 }
 
 async function main(){
-    if(!crypto.subtle)throw Error('Open this viewer on localhost or HTTPS');
     const context=$('viewport').getContext('webgl2',{antialias:true,alpha:false,preserveDrawingBuffer:true});
     if(!context)throw Error('WebGL2 is required');
     const renderer=new THREE.WebGLRenderer({canvas:$('viewport'),context,antialias:true});
@@ -133,6 +133,10 @@ async function main(){
     const controls=json(buffers['controls.json']), parts=readBindings(buffers['bindings.bin'],manifest.parts);
     const speech=new AvatarStream(config.package_sha256,manifest.source_geometry_sha256,controls.reference,message=>{$('speech-status').textContent=message;});
     state.speech=speech;
+    if(!globalThis.isSecureContext){
+        $('connect').disabled=true;$('speak').disabled=true;$('stop').disabled=true;
+        $('speech-status').textContent='Speech audio requires HTTPS or localhost. Visual preview works over LAN HTTP.';
+    }
     $('connect').onclick=async()=>{try{state.animate=false;await speech.connect($('server').value);}catch(error){speech.error(error.message);}};
     $('speak').onclick=()=>{try{state.animate=false;speech.command($('text').value,$('language').value);}catch(error){$('speech-status').textContent=error.message;}};
     $('stop').onclick=()=>{try{speech.command();poseDirty=true;}catch(error){$('speech-status').textContent=error.message;}};
@@ -190,7 +194,8 @@ async function main(){
             for(const part of parts)attach(data.positions,data.joints,part);normals(parts,shared);updateDetail(latestExpression);
             state.updateMs=performance.now()-start;state.workerMs=data.milliseconds;state.poseId=data.id;state.pending=false;
             state.ready=true;state.reference=controls.reference;state.vertexSample=Array.from(data.positions.slice(0,30));
-            for(const name of ['sweep','reset','connect','speak','stop'])$(name).disabled=false;
+            for(const name of ['sweep','reset'])$(name).disabled=false;
+            for(const name of ['connect','speak','stop'])$(name).disabled=!globalThis.isSecureContext;
         }
     };
     state.nativeVertices=()=>Array.from(latestPose?.positions||[]);
