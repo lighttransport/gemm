@@ -1,7 +1,9 @@
-"""Qwen-edited skin material baked in mesh coordinates without invented anatomy.
+"""Experimental Qwen wrinkle-color transfer onto a fixed GNM surface.
 
 Whole-view diffusion may copy a flat render or hallucinate another ear. Edit an
 anatomy-free material instead, and attach its detail to the captured GNM surface.
+This baseline does not recover anatomical wrinkles or their depth. Passing its
+contrast gate does not establish photorealism; see MULTIVIEW_FACE_COMPLETION_RESEARCH.md.
 """
 import argparse
 import json
@@ -16,19 +18,53 @@ from . import generated_skin as skin
 from .multiview_skin import crop_camera, detail_quality
 from .observations import sha256
 
-PROMPT=('Change this smooth skin material into mature neck skin with clearly visible thin creases and intersecting fine wrinkles. '
+PROMPT = ('Change this smooth skin material into mature neck skin with clearly visible thin creases and intersecting fine wrinkles. '
     'Macro photograph of a continuous medium-brown human skin texture. Several gently curving horizontal wrinkles and finer intersecting '
     'lines run across the entire image, with natural pores between the wrinkles. The square is completely filled by one flat skin '
     'surface texture. No body shape, no ear, no face, no hair, no objects. Even diffuse light, no cast shadows.')
-NEGATIVE='smooth plastic, flat uniform color, airbrushed skin, ear, face, eye, nose, mouth, hair, objects, text, grid, deep scars'
+NEGATIVE = 'smooth plastic, flat uniform color, airbrushed skin, ear, face, eye, nose, mouth, hair, objects, text, grid, deep scars'
+
+MATERIAL_RESOLUTION = 384
+MAX_LINEAR_DETAIL = .08
+BROAD_DETAIL_SIGMA = 24.
+LUMINANCE_WEIGHTS = np.array([.2126, .7152, .0722])
+# Crops are calibrated against the 512px orbit render, not arbitrary UV regions.
+REVIEW_VIEWS = (
+    ('ear_left', -85, 10, (90, 190, 410, 510)),
+    ('ear_right', 85, 10, (102, 190, 422, 510)),
+    ('front', 0, 0, None),
+    ('rear', 180, 20, None),
+)
 
 
 def generate(work, prior, *, steps=10, seed=412):
-    work=Path(work);work.mkdir(parents=True,exist_ok=True)
-    Image.open(prior).convert('RGB').resize((384,384),Image.Resampling.LANCZOS).save(work/'input.png')
-    Image.new('L',(384,384),255).save(work/'mask.png')
-    return skin.qwen_generate(work/'edited.png',PROMPT,reference=work/'input.png',init_image=work/'input.png',
-        mask=work/'mask.png',steps=steps,strength=1.,cfg=4.,negative_prompt=NEGATIVE,resolution=384,seed=seed)
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    size = (MATERIAL_RESOLUTION, MATERIAL_RESOLUTION)
+    with Image.open(prior) as image:
+        image.convert('RGB').resize(size, Image.Resampling.LANCZOS).save(work/'input.png')
+    Image.new('L', size, 255).save(work/'mask.png')
+    return skin.qwen_generate(
+        work/'edited.png', PROMPT, reference=work/'input.png',
+        init_image=work/'input.png', mask=work/'mask.png', steps=steps,
+        strength=1., cfg=4., negative_prompt=NEGATIVE,
+        resolution=MATERIAL_RESOLUTION, seed=seed,
+    )
+
+
+def _verified_material_receipt(work):
+    """Bind the material edit to its exact reference, init image and mask."""
+    receipt = json.loads((work/'edited.json').read_text())
+    request = receipt['request']
+    expected = (
+        ('edited.png', receipt['sha256']),
+        ('input.png', request['reference_sha256']),
+        ('input.png', request['init_image_sha256']),
+        ('mask.png', request['mask_sha256']),
+    )
+    if any(sha256(work/name) != digest for name, digest in expected):
+        raise ValueError('wrinkle material generation receipt mismatch')
+    return receipt
 
 
 def material_field(points, normals, patch, period=.1):
@@ -37,26 +73,27 @@ def material_field(points, normals, patch, period=.1):
     Mirror addressing is continuous across repeats and UV chart cuts. The
     material adds fine/mid-scale luminance only, preserving the base complexion.
     """
-    if not .02<=period<=.3:raise ValueError('material period must be 20..300 mm')
-    band=skin.band_detail(patch,limit=.08,broad_sigma=24.)@np.array([.2126,.7152,.0722])
-    weights=abs(normals)**4;weights/=np.maximum(weights.sum(1,keepdims=True),1e-12)
-    field=np.zeros(len(points))
-    for axis,pair in enumerate(((2,1),(0,2),(0,1))):
-        uv=1-abs(np.mod(points[:,pair]/period,2)-1)
-        field+=skin.sample(band,uv)*weights[:,axis]
+    if not .02 <= period <= .3:
+        raise ValueError('material period must be 20..300 mm')
+    band = skin.band_detail(
+        patch, limit=MAX_LINEAR_DETAIL, broad_sigma=BROAD_DETAIL_SIGMA,
+    ) @ LUMINANCE_WEIGHTS
+    weights = abs(normals)**4
+    weights /= np.maximum(weights.sum(1, keepdims=True), 1e-12)
+    field = np.zeros(len(points))
+    for axis, pair in enumerate(((2, 1), (0, 2), (0, 1))):
+        uv = 1 - abs(np.mod(points[:, pair]/period, 2) - 1)
+        field += skin.sample(band, uv)*weights[:, axis]
     # Neck/jaw/ear creases taper off toward the upper scalp. This is a spatial
     # material prior, not a fitted anatomical wrinkle model.
-    height=np.clip((.055-points[:,1])/.045,0,1)
+    height = np.clip((.055-points[:, 1])/.045, 0, 1)
     return field*height*height*(3-2*height)
 
 
 def bake(candidate, work, out, *, period=.1):
     candidate,work,out=map(Path,(candidate,work,out));manifest=skin.validate_candidate(candidate)
     if out.exists() and any(out.iterdir()):raise ValueError('candidate output must be empty')
-    receipt=json.loads((work/'edited.json').read_text());request=receipt['request']
-    if (sha256(work/'edited.png')!=receipt['sha256'] or request['reference_sha256']!=sha256(work/'input.png')
-            or request['init_image_sha256']!=sha256(work/'input.png') or request['mask_sha256']!=sha256(work/'mask.png')):
-        raise ValueError('wrinkle material generation receipt mismatch')
+    receipt = _verified_material_receipt(work)
     original=np.asarray(Image.open(work/'input.png').convert('RGB'))
     edited=np.asarray(Image.open(work/'edited.png').convert('RGB'))
     quality=detail_quality(original,edited,np.ones(original.shape[:2],bool))
@@ -69,9 +106,12 @@ def bake(candidate, work, out, *, period=.1):
     blend=skin.unseen_weight(points,observed[valid])
     scalar=material_field(points,normals,skin.srgb_to_linear(edited/255),period)
     linear=skin.srgb_to_linear(base[valid]/255)
-    luminance=linear@np.array([.2126,.7152,.0722])
-    delta=np.clip(scalar[:,None]*linear/np.maximum(luminance[:,None],.03),-.08,.08)*blend[:,None]
-    result=skin.apply_detail(base,valid,delta,observed,limit=.08)
+    luminance = linear @ LUMINANCE_WEIGHTS
+    delta = np.clip(
+        scalar[:, None]*linear/np.maximum(luminance[:, None], .03),
+        -MAX_LINEAR_DETAIL, MAX_LINEAR_DETAIL,
+    )*blend[:, None]
+    result = skin.apply_detail(base, valid, delta, observed, limit=MAX_LINEAR_DETAIL)
     out.mkdir(parents=True,exist_ok=True)
     for path in candidate.iterdir():
         if path.is_file():shutil.copyfile(path,out/path.name)
@@ -116,25 +156,26 @@ def review(candidate, work, completed):
     blend[valid]=skin.unseen_weight(points,observed[valid])
     p=geometry['captured'][0];head=p[p[:,1]>p[:,1].min()+.35*np.ptp(p[:,1])]
     rows=[];files=[];quality={}
-    for name,yaw,pitch,box in [('ear_left',-85,10,(90,190,410,510)),('ear_right',85,10,(102,190,422,510)),
-                               ('front',0,0,None),('rear',180,20,None)]:
+    for name, yaw, pitch, box in REVIEW_VIEWS:
         camera=skin.orbit_camera(head,yaw,pitch=pitch)
         if box:camera=crop_camera(camera,box)
         a,mask,_=skin.render_plate(geometry,before,blend,camera)
         b,_,_=skin.render_plate(geometry,after,blend,camera)
         if box:quality[name]=detail_quality(a,b,mask)
         canvas=Image.new('RGB',(1024,546),(25,27,30));draw=ImageDraw.Draw(canvas)
-        for x,label,image in ((0,'Before',a),(512,'Baked wrinkle detail',b)):
+        for x,label,image in ((0,'Before',a),(512,'Experimental wrinkle color',b)):
             canvas.paste(Image.fromarray(image),(x,34));draw.text((x+12,10),name+' / '+label,fill='white')
         name=name+'.png';canvas.save(work/name);files.append(name)
         rows.append(f'<figure><a href="{name}"><img src="{name}" alt="Before and baked wrinkle detail"></a></figure>')
     skin.write_json(work/'baked_quality.json',quality)
-    if not all(q['passed'] for q in quality.values()):raise ValueError('bake lost resolved wrinkle detail: '+str(quality))
+    if not all(q['passed'] for q in quality.values()):
+        raise ValueError('bake failed wrinkle-color contrast diagnostic: '+str(quality))
     (work/'review.html').write_text('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-        '<title>Wrinkle material completion</title><style>body{background:#191b1e;color:#eee;font:16px system-ui;margin:24px}'
-        'img{width:100%}figure{margin:24px 0}.patch{width:45%;max-width:384px}</style><h1>Wrinkle material completion</h1>'
+        '<title>Experimental wrinkle-color baseline</title><style>body{background:#191b1e;color:#eee;font:16px system-ui;margin:24px}'
+        'img{width:100%}figure{margin:24px 0}.patch{width:45%;max-width:384px}</style><h1>Experimental wrinkle-color baseline</h1>'
         '<p>Qwen edits an anatomy-free skin material. Its wrinkle detail is attached to the fitted mesh in world coordinates. '
-        'Photographed texels and geometry remain unchanged. These are synthetic color details, not measured wrinkle depth.</p>'
+        'Photographed texels and geometry remain unchanged. These are synthetic color details, not measured wrinkle depth. '
+        'Passing the contrast diagnostic does not establish realistic skin or anatomical accuracy.</p>'
         '<h2>Actual Qwen material edit: before / after</h2><img class="patch" src="input.png"><img class="patch" src="edited.png">'
         '<h2>Final atlas on the fitted mesh</h2>'+''.join(rows))
     files+=['review.html','input.png','edited.png']
@@ -145,18 +186,27 @@ def review(candidate, work, completed):
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage',choices=('generate','bake','review','all'))
-    parser.add_argument('--candidate',required=True);parser.add_argument('--work',required=True)
-    parser.add_argument('--out');parser.add_argument('--prior')
-    parser.add_argument('--steps',type=int,default=10);parser.add_argument('--seed',type=int,default=412)
-    parser.add_argument('--period',type=float,default=.1)
-    args=parser.parse_args()
-    if args.stage in ('generate','all') and not args.prior:parser.error('--prior required')
-    if args.stage in ('bake','review','all') and not args.out:parser.error('--out required')
-    if args.stage in ('generate','all'):generate(args.work,args.prior,steps=args.steps,seed=args.seed)
-    if args.stage in ('bake','all'):print(json.dumps(bake(args.candidate,args.work,args.out,period=args.period),indent=2))
-    if args.stage in ('review','all'):print(json.dumps(review(args.candidate,args.work,args.out),indent=2))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('stage', choices=('generate', 'bake', 'review', 'all'))
+    parser.add_argument('--candidate', required=True)
+    parser.add_argument('--work', required=True)
+    parser.add_argument('--out')
+    parser.add_argument('--prior')
+    parser.add_argument('--steps', type=int, default=10)
+    parser.add_argument('--seed', type=int, default=412)
+    parser.add_argument('--period', type=float, default=.1)
+    args = parser.parse_args()
+    if args.stage in ('generate', 'all') and not args.prior:
+        parser.error('--prior required')
+    if args.stage in ('bake', 'review', 'all') and not args.out:
+        parser.error('--out required')
+    if args.stage in ('generate', 'all'):
+        generate(args.work, args.prior, steps=args.steps, seed=args.seed)
+    if args.stage in ('bake', 'all'):
+        print(json.dumps(bake(args.candidate, args.work, args.out, period=args.period), indent=2))
+    if args.stage in ('review', 'all'):
+        print(json.dumps(review(args.candidate, args.work, args.out), indent=2))
 
 
-if __name__=='__main__':main()
+if __name__ == '__main__':
+    main()

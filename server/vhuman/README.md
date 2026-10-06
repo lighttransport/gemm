@@ -1224,16 +1224,23 @@ Run `python -m unittest server.vhuman.test_photoreal server.vhuman.test_quality
 server.vhuman.test_reconstruction server.vhuman.test_mobile_preprocess
 server.vhuman.test_mobile` for the 74-test preprocessing/material/runtime suite.
 
-### Visible wrinkle material completion
+### Experimental wrinkle-color baseline
 
-Use `reconstruction.wrinkle_skin` for visible ear/jaw/neck detail. The earlier
+`reconstruction.wrinkle_skin` is a reproducible color-transfer experiment, not
+a photorealistic face-completion solution. Visual review found its repeated,
+anatomically unconditioned detail inadequate despite passing the contrast gate.
+See [multiview face completion research](MULTIVIEW_FACE_COMPLETION_RESEARCH.md)
+for model comparisons, licensing, the proposed material pipeline, and quality
+criteria for its replacement. That pipeline is not implemented yet.
+
+The earlier
 whole-view masked edits below were visually too flat: changing many texels did
 not establish successful texture completion. A stronger CFG-4, strength-0.8
 close-up still failed the contrast gate. A blue-skin control verified that
 native masking and text conditioning work; full-noise whole-view generation
 produced wrinkles but also invented another ear, so it was rejected.
 
-The corrected path edits an **anatomy-free skin material** with Qwen, then
+The experimental path edits an **anatomy-free skin material** with Qwen, then
 attaches its luminance detail to the captured GNM mesh through continuous
 world-space triplanar sampling. Side/front coordinates align folds with the
 head-up axis, detail tapers off toward the upper scalp, and a 6mm feather
