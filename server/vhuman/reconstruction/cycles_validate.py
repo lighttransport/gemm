@@ -36,6 +36,18 @@ def validate(out):
         actual=np.empty(len(image.pixels),np.float32);image.pixels.foreach_get(actual)
         if np.max(abs(actual-original))>1e-7:raise ValueError('packed hair coverage changed')
         bpy.data.images.remove(source)
+    if 'skin_hair_crown' in assets:
+        mesh=bpy.data.objects['skin'].data
+        actual=np.empty(len(assets['skin_hair_crown']),np.float32)
+        mesh.attributes['hair_crown_coverage'].data.foreach_get('value',actual)
+        if np.max(abs(actual-assets['skin_hair_crown']))>1e-7:
+            raise ValueError('native crown coverage changed after scene reload')
+        uv=mesh.uv_layers['SourceCamera'];actual_uv=np.empty(len(uv.data)*2,np.float32)
+        uv.data.foreach_get('uv',actual_uv)
+        expected=assets['skin_source_uvs'].reshape(-1,2).copy();expected[:,1]=1-expected[:,1]
+        if np.max(abs(actual_uv.reshape(-1,2)-expected))>1e-7:
+            raise ValueError('source-camera hair UV changed after scene reload')
+        if not mesh.uv_layers['UVMap'].active_render:raise ValueError('hair UV displaced skin atlas UV')
     request=json.loads((out/'request.json').read_text())
     if request.get('motion'):
         motion=np.load(Path(request['motion'])/'motion.npz',allow_pickle=False)
@@ -48,7 +60,7 @@ def validate(out):
             expected=motion['vertices'][frame,assets['skin_native_ids']]
             if np.max(abs(positions.reshape(-1,3)-expected))>1e-7:
                 raise ValueError('native motion coordinates changed after scene reload')
-    result=dict(passed=True,float_maps=checks,hair_points_checked=len(expected_hair),hair_mask_checked=(out/'hair_coverage.png').is_file(),native_motion_checked=bool(request.get('motion')),
+    result=dict(passed=True,float_maps=checks,hair_points_checked=len(expected_hair),hair_mask_checked=(out/'hair_coverage.png').is_file(),native_crown_checked='skin_hair_crown' in assets,native_motion_checked=bool(request.get('motion')),
                 storage='packed scene-linear 32-bit EXR')
     (out/'asset_validation.json').write_text(json.dumps(result,indent=2))
     print('VHUMAN_PACKED_ASSET_VALID',flush=True)

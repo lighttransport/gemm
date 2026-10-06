@@ -241,26 +241,38 @@ def run(request):
     hattex=image_node(materials['hat'].node_tree.nodes,out/'accessory_source.png')
     materials['hat'].node_tree.links.new(hattex.outputs['Color'],principled.inputs['Base Color'])
     materials['hat_cloth'],_=material('inferred_navy_cap_cloth',(.015,.018,.025),.7)
-    materials['hair_undercoat'],_=material('short_hair_undercoat',config['hair']['color_linear'],.85,ior=1.2)
-    materials['hair_inferred'],_=material('inferred_rear_hair',config['hair']['color_linear'],.85,ior=1.2)
     if (out/'hair_coverage.png').is_file():
-        mat=materials['hair_undercoat'];nodes=mat.node_tree.nodes;links=mat.node_tree.links
+        # One opaque surface avoids transparent shells and mesh-cut hairline steps.
+        nodes=skin.node_tree.nodes;links=skin.node_tree.links
         coverage=image_node(nodes,out/'hair_coverage.png',linear=True)
-        transparent=nodes.new('ShaderNodeBsdfTransparent');mix=nodes.new('ShaderNodeMixShader')
-        links.new(coverage.outputs['Color'],mix.inputs[0])
-        links.new(transparent.outputs[0],mix.inputs[1])
-        links.new(nodes.get('Principled BSDF').outputs[0],mix.inputs[2])
-        links.new(mix.outputs[0],nodes.get('Material Output').inputs['Surface'])
+        uv_source=nodes.new('ShaderNodeUVMap');uv_source.uv_map='SourceCamera'
+        links.new(uv_source.outputs['UV'],coverage.inputs['Vector'])
+        crown=nodes.new('ShaderNodeAttribute');crown.attribute_name='hair_crown_coverage'
+        combine=nodes.new('ShaderNodeMath');combine.operation='MAXIMUM'
+        links.new(coverage.outputs['Color'],combine.inputs[0]);links.new(crown.outputs['Fac'],combine.inputs[1])
+        hair_base=nodes.new('ShaderNodeBsdfPrincipled');hair_base.label='Opaque short hair undercoat prior'
+        hair_base.inputs['Base Color'].default_value=(*config['hair']['color_linear'],1)
+        hair_base.inputs['Roughness'].default_value=.85;hair_base.inputs['IOR'].default_value=1.2
+        mix=nodes.new('ShaderNodeMixShader')
+        links.new(combine.outputs[0],mix.inputs[0]);links.new(node.outputs[0],mix.inputs[1])
+        links.new(hair_base.outputs[0],mix.inputs[2]);links.new(mix.outputs[0],nodes.get('Material Output').inputs['Surface'])
     objects={}
     for part in config['parts']:
         name=part['name'];mesh=bpy.data.meshes.new(name)
         mesh.from_pydata(data[name+'_positions'].tolist(),[],data[name+'_triangles'].tolist());mesh.update()
         uv=mesh.uv_layers.new(name='UVMap');values=data[name+'_uvs'].reshape(-1,2).copy();values[:,1]=1-values[:,1]
         uv.data.foreach_set('uv',values.ravel())
+        if name=='skin' and 'skin_hair_crown' in data:
+            field=mesh.attributes.new('hair_crown_coverage','FLOAT','POINT')
+            field.data.foreach_set('value',data['skin_hair_crown'])
+            source=mesh.uv_layers.new(name='SourceCamera');values=data['skin_source_uvs'].reshape(-1,2).copy();values[:,1]=1-values[:,1]
+            source.data.foreach_set('uv',values.ravel())
+            # Preserve atlas UV as default for albedo and signed physical maps.
+            mesh.uv_layers.active_index=0;mesh.uv_layers[0].active_render=True
         obj=bpy.data.objects.new(name,mesh);bpy.context.collection.objects.link(obj);mesh.materials.append(materials[part['material']])
         objects[name]=obj
         for polygon in mesh.polygons:polygon.use_smooth=part['material'] not in ('glass',)
-        if part['material'] in ('skin','hair_undercoat','hair_inferred'):
+        if part['material']=='skin':
             modifier=obj.modifiers.new('skin_subdivision','SUBSURF');modifier.levels=1;modifier.render_levels=2
         if part['material']=='glass':
             modifier=obj.modifiers.new('lens_thickness_prior','SOLIDIFY');modifier.thickness=.001

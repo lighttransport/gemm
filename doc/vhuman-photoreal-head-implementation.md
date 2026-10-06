@@ -337,3 +337,38 @@ Remaining limits include the approximate/jagged inferred haircut boundary,
 unmeasured hair reflectance, source mouth pose and tooth-size alignment, and
 unobserved neck/scalp textures. This is an improved reconstruction baseline,
 not a completed photorealistic likeness.
+
+### Smooth native hairline and opaque undercoat
+
+The separate transparent scalp undercoat and triangle-cut crown meshes are
+replaced by a shader on the native skin surface. A 4 mm smoothstep field in
+metric H space controls inferred crown coverage; the observed mask receives
+one-pixel Gaussian anti-aliasing. The shader combines the two coverage sources
+and mixes opaque skin/hair BSDFs. This removes mesh-cut steps, scalp-shell
+intersections and extra transparent-ray traversals.
+
+Crown coverage is a per-vertex native attribute, so it shares the skin's
+subdivision and deformation rather than a separately transformed shell.
+A `SourceCamera` UV layer maps the observed hair mask. `UVMap` remains the
+active render UV for skin albedo, appearance and signed detail maps. The new
+reload gate checks the native coverage field, source UV coordinates and atlas
+selection, in addition to packed mask pixels, hair coordinates and physical
+maps. Inferred coverage and hair reflectance remain explicit artist priors.
+
+Matched Obama comparison: `offline/after08/` to `offline/after09/`, identical
+native skin coordinates and 12,000 strand paths, camera, lighting, exposure,
+resolution 1024 and 256 samples. Whole HIP pipeline time including reload fell
+from 35.99 to 28.03 seconds (22.1% in these single runs); device peak VRAM from
+2293.24 to 2285.24 MiB. The new scene has no separate scalp meshes. Its 96,000
+hair points, native crown field, both UV layers and packed maps reload exactly.
+Review: `tmp/vhuman-skin-review/hairline-comparison.png`.
+
+All 73 reconstruction/quality tests pass, including metric feather endpoints,
+monotonicity, translation gauge and invalid-width rejection. Capped Hopper
+still avoids the crown prior: `offline/happy23/` draft (512 px / 32 samples),
+10.68 seconds / 2407.26 MiB; native motion and hair/map reload checks pass.
+This draft is a regression check, not a resolution-matched speed comparison.
+
+Remaining close-up limits include the approximate crown/sideburn shape,
+unmeasured hair shading, and source mouth/teeth alignment. Smoother hairline
+coverage does not recover a true posterior haircut or calibrated reflectance.

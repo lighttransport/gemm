@@ -98,6 +98,13 @@ def short_scalp_prior(labels,confidence,eye_y):
     return bool(len(y)>=256 and (np.asarray(labels)==18).sum()<100 and np.mean(y<eye_y)>.5)
 
 
+def crown_coverage(positions,cutoff,width=.004):
+    """Metric smooth transition; coverage follows native vertices under motion."""
+    if width<=0 or not np.isfinite(width):raise ValueError('positive crown feather width required')
+    t=np.clip((np.asarray(positions)[:,1]-cutoff)/width+.5,0,1)
+    return t*t*(3-2*t)
+
+
 def attachment_frames(points):
     x=points[...,1,:]-points[...,0,:]
     x/=np.maximum(np.linalg.norm(x,axis=-1,keepdims=True),1e-12)
@@ -277,24 +284,19 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
     facing=(normals*((camera.origin-p)/np.maximum(np.linalg.norm(camera.origin-p,axis=1)[:,None],1e-9))).sum(1)>.1
     crown_cutoff=None
     if short_hair:
-        Image.fromarray(hair.astype(np.uint8)*255).save(out/'hair_coverage.png')
-        scalp_tri=remap[skin_tri[allowed]]
-        selected=facing[scalp_tri].all(1)
-        if selected.any():
-            scalp=p+normals*.0005
-            texture=projected/[w,h]
-            part('short_hair_undercoat',scalp,scalp_tri[selected],texture[scalp_tri[selected]],'hair_undercoat')
-        # Complete scalp gaps with a labelled close-cropped crown prior.
-        # Its height follows the central observed hairline; no hidden strands
-        # or posterior haircut detail are claimed to have been recovered.
+        from scipy.ndimage import gaussian_filter
+        # Source silhouette anti-aliasing, separate from inferred metric coverage.
+        coverage=gaussian_filter(hair.astype(float),sigma=1.)
+        Image.fromarray(np.uint8(np.clip(coverage*255+.5,0,255))).save(out/'hair_coverage.png')
         pixel=np.floor(projected).astype(int)
         valid=(pixel[:,0]>=0)&(pixel[:,0]<w)&(pixel[:,1]>=0)&(pixel[:,1]<h)&facing&(abs(p[:,0])<.025)
         ids=np.flatnonzero(valid);ids=ids[hair[pixel[ids,1],pixel[ids,0]]]
         crown_cutoff=float(np.percentile(p[ids,1],5)*.95) if len(ids) else .08
-        rear=p[:,1]>crown_cutoff
-        rear_tri=rear[scalp_tri].sum(1)>=2
-        if rear_tri.any():
-            part('inferred_rear_hair',p+normals*.0003,scalp_tri[rear_tri],np.zeros((rear_tri.sum(),3,2)),'hair_inferred')
+        native=arrays['skin_native_ids']
+        arrays['skin_hair_crown']=crown_coverage(full[native],crown_cutoff).astype(np.float32)
+        source_pixels,_=camera.project(arrays['skin_positions'])
+        source_uv=source_pixels/[w,h]
+        arrays['skin_source_uvs']=source_uv[arrays['skin_triangles']].astype(np.float32)
     hair_paths=[];hair_roots=[];hair_triangles=[];hair_weights=[]
     if len(hx) and facing.any():
         from .reference import rasterize
@@ -357,7 +359,8 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
     scene=dict(schema='vhuman.offline_scene.v1',candidate=str(candidate.resolve()),parts=parts,
         camera=camera.as_dict(),source_size=[w,h],curves=list(curves),accessories=accessory_records,
         hair=dict(strands=len(hair_paths),lashes=len(lash_paths),short_hair=short_hair,color_linear=hair_color.tolist(),source_color_linear=source_hair_color.tolist(),color_gain_prior=.25 if short_hair else 1.,
-            crown_gap_completion_prior=short_hair,crown_cutoff_y_m=crown_cutoff,root_attachment='source-camera visible triangle barycentrics',
+            crown_gap_completion_prior=short_hair,crown_cutoff_y_m=crown_cutoff,crown_feather_width_m=.004,source_mask_sigma_px=1.,
+            undercoat='opaque shader on native skin; no overlapping scalp meshes',root_attachment='source-camera visible triangle barycentrics',
             source='visible parsing + front-facing scalp attachment; short undercoat, density, strand shape and depth inferred'),
         optical_eyes=dict(source='analytic GNM-profile shell, iris annulus and recessed pupil cavity',
             pupil_ratio=params_module.pupil_ratio(eye_params),pupil_status=pupil_status,

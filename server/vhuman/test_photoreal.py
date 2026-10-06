@@ -4,10 +4,19 @@ import numpy as np
 from .reconstruction.reference import Camera
 from .reconstruction.temporal import crop_camera
 from .reconstruction.skin_detail import driver_matrix,evaluate
-from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_cap,glasses_temple,short_scalp_prior
+from .reconstruction.offline_assets import bound_tubes,attachment_frames,curved_cap,glasses_temple,short_scalp_prior,crown_coverage
 
 
 class PhotorealTests(unittest.TestCase):
+    def test_crown_feather_is_metric_smooth_and_moves_with_identity(self):
+        points=np.zeros((5,3));points[:,1]=[-.003,-.002,0,.002,.003]
+        actual=crown_coverage(points,0)
+        np.testing.assert_allclose(actual,[0,0,.5,1,1])
+        np.testing.assert_allclose(crown_coverage(points+[0,.07,0],.07),actual,atol=1e-14)
+        fine=np.zeros((101,3));fine[:,1]=np.linspace(-.002,.002,101)
+        self.assertTrue((np.diff(crown_coverage(fine,0))>=0).all())
+        with self.assertRaises(ValueError):crown_coverage(points,0,width=0)
+
     def test_short_scalp_requires_evidence_and_rejects_hat(self):
         labels=np.ones((60,60),int);labels[:20]=17;confidence=np.ones_like(labels,float)
         self.assertTrue(short_scalp_prior(labels,confidence,30))
