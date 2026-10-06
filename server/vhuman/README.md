@@ -1204,6 +1204,65 @@ Run `python -m unittest server.vhuman.test_photoreal server.vhuman.test_quality
 server.vhuman.test_reconstruction server.vhuman.test_mobile_preprocess
 server.vhuman.test_mobile` for the 74-test preprocessing/material/runtime suite.
 
+### Generated detail for unobserved skin
+
+`reconstruction.generated_skin` uses the installed native ROCm Qwen-Image 2.1
+runner and Wan2.2 HIP runner. The [upstream Qwen model](https://github.com/QwenLM/Qwen-Image-2.1)
+supports both text-to-image and image-conditioned editing; this adapter uses
+the repository's single-reference masked editing implementation.
+
+```sh
+python -m server.vhuman.reconstruction.generated_skin all \
+  --candidate tmp/vhuman-public-portraits/obama/head/reconstruction/material12 \
+  --work tmp/vhuman-generated-skin/obama01 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/generated13 \
+  --steps 20 --edit-steps 12 --frames 9 --video-preset fast5
+```
+
+Stages can also run individually (`prepare`, `edit`, `video`, `bake`). Generation
+receipts bind prompts, seeds, source hashes and outputs; matching completed
+image requests can be reused. Each stage releases Qwen before Wan runs, using
+the existing shared AMD device lock. Qwen uses the `low8` INT8 preset; Wan uses
+Q8_0 weights, ROCm PyTorch orchestration and repository HIP projections.
+
+The T2I skin patch supplies bounded fine detail in world-space triplanar
+coordinates. Calibrated left/right/rear renders define the image-edit masks.
+Qwen edits are checked for exact preservation outside those masks. Short static
+Wan clips gate edited detail using optical flow, forward/backward consistency
+and photometric agreement. Accepted flow-aligned frames contribute a temporal
+median, blended with the edited still before transfer. Generated eyes, hair and accessories are excluded
+from transfer. Broad illumination is removed from the transferred residual;
+linear RGB changes are capped at 0.025 and feathered over 6 mm next to observed
+skin. Captured atlas texels are copied back byte-for-byte. Geometry, original
+observation coverage and confidence stay unchanged. A separate generated-support
+map and report accompany the candidate and mobile export.
+
+These are **synthetic appearance priors**, not additional photographic evidence
+or recovered hidden anatomy. A static synthetic clip tests self-consistency;
+it does not establish likeness or multi-view accuracy. Pores are color detail,
+not measured bump/displacement. The configured Qwen model uses the Qwen Research
+License; exported generated-skin assets retain `qwen-research` provenance and do
+not enter the permissive appearance-training corpus. All generated artifacts
+remain in the local work directories.
+
+Obama validation (`generated13`): a 20-step T2I patch, three masked edits using
+12-step schedules (five updates at strength 0.45), and three nine-frame / five-step
+Wan clips. The T2I pass took 754 s, edits about 240 s each, and Wan runs 163–212 s
+including CPU text encoding and loading. Each clip executed 3,000 HIP projection
+calls. Whole-image temporal acceptance was 98.0%, 95.2% and 99.2%; all editable
+pixels passed the temporal gate before the separate parsing/projection checks.
+The bake changed 573,568 unobserved atlas texels; 362,940 received accepted edited
+view support. All 175,326 observed texels remained byte-identical. Geometry,
+portrait and all original observation/confidence maps retained their hashes.
+The change is conservative color detail (about 1.08 sRGB levels RMS over the
+unobserved atlas), not a reconstruction of neck anatomy or unseen markings.
+
+Package: `tmp/vhuman-mobile/obama10`; browser: `tmp/vhuman-browser/player-generated01`;
+verification: `tmp/vhuman-browser/generated-check01`. AMD WebGL2 validation passed
+native/WASM parity, attachments, relighting/detail, audio timing and cancellation
+at 30.1 animated FPS. The 80-test material/mobile suite includes
+`server.vhuman.test_generated_skin`. iPhone device quality remains unverified.
+
 Upstream API references: [Filament build and platform guidance](https://google.github.io/filament/dup/building.html),
 [Apple audio-player timeline](https://developer.apple.com/documentation/avfaudio/avaudioplayernode),
 and [output presentation latency](https://developer.apple.com/documentation/avfaudio/avaudionode/outputpresentationlatency).

@@ -118,6 +118,11 @@ async function main(){
     const config=await (await fetch('./config.json')).json();
     const manifest=json(await bytes(config.package+'avatar.json',config.package_sha256));
     if(manifest.schema!=='vhuman.mobile_avatar.v1')throw Error('Unsupported avatar');
+    if(manifest.material?.synthetic_completion){
+        const note=document.createElement('p');note.className='muted';
+        note.textContent='Unseen skin includes AI-generated texture. Photographed skin is preserved.';
+        status.insertAdjacentElement('afterend',note);
+    }
     const buffers={};
     for(const [name,file] of Object.entries(manifest.files)){
         if(name.includes('/')||name.includes('\\')||file.bytes>256*1024*1024)throw Error('Invalid asset filename/size');

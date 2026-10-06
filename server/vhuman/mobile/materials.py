@@ -26,6 +26,12 @@ def skin_textures(candidate, scene, assets, description, out):
     valid = ids >= 0; y, x = np.nonzero(valid); tid = ids[y, x]; weight = bary[y, x]
     confidence=np.asarray(Image.open(candidate/'skin_confidence.png').convert('L'),float)/255
     color,seams=seam_correct(srgb_to_linear(base/255),confidence,triangles,uv,ids)
+    if (candidate/'generated_skin.json').is_file():
+        # A synthetic completion must not pull new colours across a seam into
+        # photographed skin. The existing scalp material is applied below.
+        observed=np.asarray(Image.open(candidate/'skin_coverage.png'))>0
+        color[observed]=srgb_to_linear(base[observed]/255)
+        seams['photographed_colors_restored_after_seam_filter']=True
     coverage=np.zeros(len(y));hair_report=dict(enabled=False)
     if 'skin_hair_crown' in assets and (scene/'hair_coverage.png').is_file():
         crown = (assets['skin_hair_crown'][triangles[tid]]*weight).sum(1)

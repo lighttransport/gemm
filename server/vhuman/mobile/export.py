@@ -163,6 +163,13 @@ def export(candidate,out, *, scene,profile='iphone12'):
             'GLB is a static reference; native player must apply bindings for motion',
             'corneal transparency is an approximation; mobile optical/SSS shaders require device review',
             'source image and generated-reference redistribution terms require separate receipts'])
+    completion=manifest['material'].get('synthetic_completion')
+    if completion:
+        result['licenses'].append(dict(component='Generated skin appearance',license=completion['license'],
+            generator=completion['generator'],source='https://github.com/QwenLM/Qwen-Image-2.1'))
+        result['validation']['research_generated_skin']=True
+        for name in ('skin_generated_support.png','generated_skin.json'):
+            shutil.copyfile(candidate/name,out/name)
     result['files']={p.name:dict(sha256=sha256(p),bytes=p.stat().st_size) for p in sorted(out.iterdir()) if p.is_file()}
     (out/'avatar.json').write_text(json.dumps(result,indent=2));validate_package(out)
     return result
