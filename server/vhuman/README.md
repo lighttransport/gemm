@@ -1224,7 +1224,59 @@ Run `python -m unittest server.vhuman.test_photoreal server.vhuman.test_quality
 server.vhuman.test_reconstruction server.vhuman.test_mobile_preprocess
 server.vhuman.test_mobile` for the 74-test preprocessing/material/runtime suite.
 
-### Mesh-guided multiview skin completion
+### Visible wrinkle material completion
+
+Use `reconstruction.wrinkle_skin` for visible ear/jaw/neck detail. The earlier
+whole-view masked edits below were visually too flat: changing many texels did
+not establish successful texture completion. A stronger CFG-4, strength-0.8
+close-up still failed the contrast gate. A blue-skin control verified that
+native masking and text conditioning work; full-noise whole-view generation
+produced wrinkles but also invented another ear, so it was rejected.
+
+The corrected path edits an **anatomy-free skin material** with Qwen, then
+attaches its luminance detail to the captured GNM mesh through continuous
+world-space triplanar sampling. Side/front coordinates align folds with the
+head-up axis, detail tapers off toward the upper scalp, and a 6mm feather
+protects the transition to photographed skin. The transfer removes broad
+illumination while retaining larger creases (24px rather than 9px low-frequency
+subtraction, maximum 0.08 rather than 0.025 linear RGB residual). Photographed
+texels, geometry, normal/ORM and evidence maps remain byte-identical. This is
+synthetic wrinkle **color** detail; it does not recover wrinkle depth or a
+subject's hidden anatomy, and keeps the `qwen-research` provenance.
+
+```sh
+python -m server.vhuman.reconstruction.wrinkle_skin all \
+  --candidate tmp/vhuman-public-portraits/obama/head/reconstruction/multiview14 \
+  --prior tmp/vhuman-generated-skin/obama01/skin_prior.png \
+  --work tmp/vhuman-generated-skin/wrinkle-material01 \
+  --out tmp/vhuman-public-portraits/obama/head/reconstruction/wrinkles15
+```
+
+Stages are `generate`, `bake`, `review`, `all`. The material edit uses 384px,
+10 steps, CFG 4, strength 1 and the native ROCm INT8 `low8` backend; the validated
+edit took 471 seconds. Matching generation receipts are reusable. `--period`
+sets the world-space material scale in metres (default 0.1). The review gallery
+shows the actual material edit and before/final-atlas renders, avoiding any
+claim that Qwen successfully edited the entire head view. Pass the workspace
+as `mobile.browser --skin-review` to include it in the browser preview.
+
+Both material and final ear/jaw renders must pass a mid-scale contrast gate
+inside initially flat, eroded skin masks; tiny pixel changes and near-copies are
+rejected. The old ear edit decreased contrast (0.00197 to 0.00183 RMS).
+The final baked left/right views increased it from 0.00184/0.00195 to
+0.01182/0.01190. These are contrast diagnostics, not anatomical fidelity scores.
+All 175,326 photographed texels remain unchanged. The 89-test regression suite
+also checks world-space continuity, scalp taper, crop calibration and protection
+of observations with the larger detail budget.
+
+Artifacts: `tmp/vhuman-mobile/obama12`,
+`tmp/vhuman-browser/player-wrinkles01`, and
+`tmp/vhuman-generated-skin/wrinkle-material01/baked_quality.json`.
+AMD WebGL2 validation (`tmp/vhuman-browser/wrinkles-check01/verification.json`)
+passed native/WASM parity with zero vertex error, all inspection cameras,
+relighting/detail and speech timing/cancellation at 30.1 animated FPS.
+
+### Mesh-guided multiview skin completion (subtle-detail baseline)
 
 `reconstruction.multiview_skin` adds ear, rear-head and elevated crown views
 rendered from the fitted GNM mesh. It orbits calibrated cameras around the

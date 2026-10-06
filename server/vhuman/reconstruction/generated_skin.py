@@ -29,6 +29,7 @@ def write_json(path, value):
 
 
 def qwen_generate(out, prompt, *, reference=None, mask=None, init_image=None, steps=20, seed=317,
+                  strength=None, cfg=1., negative_prompt='', resolution=512,
                   model='/mnt/disk01/models/qimg-21', package='/mnt/disk01/models/qimg-21-fast/int8-smooth-a0.6'):
     """Use the installed HIP backend, releasing it before video generation."""
     from .. import gpu
@@ -42,6 +43,12 @@ def qwen_generate(out, prompt, *, reference=None, mask=None, init_image=None, st
         package=str(Path(package).resolve()),reference_sha256=sha256(reference) if reference else None,
         mask_sha256=sha256(mask) if mask else None)
     if init_image is not None:request['init_image_sha256']=sha256(init_image)
+    if resolution!=512:request['resolution']=resolution
+    strength=(.45 if mask else 1.) if strength is None else strength
+    if not 0<strength<=1 or cfg<1 or (cfg>1 and not negative_prompt):
+        raise ValueError('valid strength and a negative prompt for guided generation required')
+    if strength!=(.45 if mask else 1.) or cfg!=1. or negative_prompt:
+        request.update(strength=strength,cfg=cfg,negative_prompt=negative_prompt)
     if receipt.exists():
         previous=json.loads(receipt.read_text())
         if previous['request']!=request or previous['sha256']!=sha256(out):
@@ -51,9 +58,9 @@ def qwen_generate(out, prompt, *, reference=None, mask=None, init_image=None, st
         attention='sage',condition_resolution=512,python=sys.executable,resident=False,keep_work=True)
     with gpu.execution('rocm',0,Path(model).parent),gpu.device_session(10000):
         try:
-            result=backend.generate(GenRequest(prompt=prompt,out=out,width=512,height=512,steps=steps,
+            result=backend.generate(GenRequest(prompt=prompt,out=out,width=resolution,height=resolution,steps=steps,
                 seed=seed,references=(reference,) if reference else (),init_image=(init_image or reference) if mask else None,
-                mask=mask,mask_as_reference=False,strength=.45 if mask else 1.,true_cfg_scale=1.))
+                mask=mask,mask_as_reference=False,strength=strength,true_cfg_scale=cfg,negative_prompt=negative_prompt))
         finally:backend.close()
     record=dict(request=request,sha256=sha256(out),generator='Qwen-Image-2.1',
         license='qwen-research',synthetic=True,geometry_evidence=False,
@@ -62,12 +69,12 @@ def qwen_generate(out, prompt, *, reference=None, mask=None, init_image=None, st
     return record
 
 
-def band_detail(rgb, limit=.025):
+def band_detail(rgb, limit=.025, broad_sigma=9.):
     """Remove broad illumination; limit invented linear-light detail amplitude."""
     rgb=np.asarray(rgb,float)
     if rgb.ndim!=3 or rgb.shape[2]!=3 or not np.isfinite(rgb).all():
         raise ValueError('finite RGB image required')
-    return np.clip(gaussian_filter(rgb,(.65,.65,0))-gaussian_filter(rgb,(9.,9.,0)),-limit,limit)
+    return np.clip(gaussian_filter(rgb,(.65,.65,0))-gaussian_filter(rgb,(broad_sigma,broad_sigma,0)),-limit,limit)
 
 
 def atlas_surface(geometry, resolution):
@@ -88,13 +95,13 @@ def unseen_weight(points, observed, distance=.006):
     return np.where(observed,0,t*t*(3-2*t))
 
 
-def apply_detail(base, valid, delta, observed):
+def apply_detail(base, valid, delta, observed, limit=.025):
     """Apply a bounded synthetic residual, preserving captured bytes exactly."""
     base=np.asarray(base,np.uint8);delta=np.asarray(delta,float)
     if delta.shape!=(int(valid.sum()),3) or not np.isfinite(delta).all():
         raise ValueError('finite covered-texel RGB residual required')
     result=base.copy()
-    color=srgb_to_linear(base[valid]/255)+np.clip(delta,-.025,.025)
+    color=srgb_to_linear(base[valid]/255)+np.clip(delta,-limit,limit)
     result[valid]=np.uint8(np.clip(linear_to_srgb(np.clip(color,0,1))*255+.5,0,255))
     result[observed]=base[observed]
     return result

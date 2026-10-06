@@ -7,13 +7,53 @@ from unittest.mock import patch
 import numpy as np
 from .reconstruction.generated_skin import (band_detail,unseen_weight,triplanar_detail,
     temporal_consistency,render_plate,orbit_camera,apply_detail)
-from .reconstruction.multiview_skin import fuse_views,contact_sheet,verify_inputs
+from .reconstruction.multiview_skin import fuse_views,contact_sheet,verify_inputs,detail_quality,crop_camera
 from .reconstruction.reference import Camera
+from .reconstruction.wrinkle_skin import material_field
 from .reconstruction.observations import sha256
 from PIL import Image
 
 
 class GeneratedSkinTests(unittest.TestCase):
+    def test_wrinkle_material_is_continuous_in_world_space_and_tapers_off_on_scalp(self):
+        yy,xx=np.mgrid[:64,:64]
+        patch=np.repeat((.3+.07*np.sin(yy*.4+np.sin(xx*.1)))[...,None],3,axis=2)
+        points=np.array([[.02,-.03,.01],[.02,-.03,.01],[.02,.08,.01],
+                         [.1-1e-8,-.03,.01],[.1+1e-8,-.03,.01]])
+        normals=np.tile([0.,0.,1.],(len(points),1))
+        values=material_field(points,normals,patch)
+        self.assertEqual(values[0],values[1]);self.assertEqual(values[2],0)
+        self.assertAlmostEqual(values[3],values[4],places=7)
+        self.assertLessEqual(abs(values).max(),.08)
+        with self.assertRaises(ValueError):material_field(points,normals,patch,period=0)
+
+    def test_flat_completion_gate_rejects_tiny_changes_and_accepts_resolved_creases(self):
+        original=np.full((128,128,3),160,np.uint8);mask=np.ones((128,128),bool)
+        noise=np.random.default_rng(7).integers(-2,3,original.shape)
+        weak=np.uint8(original.astype(int)+noise)
+        self.assertFalse(detail_quality(original,original,mask)['passed'])
+        self.assertFalse(detail_quality(original,weak,mask)['passed'])
+        yy,xx=np.mgrid[:128,:128]
+        creases=sum(22*np.exp(-((yy-row-5*np.sin(xx/23))/2)**2) for row in (25,50,75,100))
+        detailed=np.uint8(np.clip(original.astype(float)-creases[...,None],0,255))
+        report=detail_quality(original,detailed,mask)
+        self.assertTrue(report['passed']);self.assertFalse(report['proves_wrinkle_accuracy'])
+
+    def test_closeup_camera_retains_mesh_projection_calibration(self):
+        points=np.array([[-.1,-.1,-.1],[.1,.1,.1],[0.,0.,0.]])
+        camera=orbit_camera(points,-85,pitch=10);box=(90,190,410,510)
+        before,z=camera.project(points);after,depth=crop_camera(camera,box).project(points)
+        np.testing.assert_allclose(after,(before-np.array(box[:2]))*1.6)
+        np.testing.assert_array_equal(z,depth)
+
+    def test_wrinkle_budget_retains_visible_contrast_but_protects_observations(self):
+        base=np.full((8,8,3),160,np.uint8);valid=np.ones((8,8),bool);observed=np.zeros((8,8),bool);observed[0]=True
+        delta=np.full((64,3),-.07)
+        subtle=apply_detail(base,valid,delta,observed)
+        detailed=apply_detail(base,valid,delta,observed,limit=.08)
+        self.assertTrue((detailed[~observed]<subtle[~observed]).all())
+        np.testing.assert_array_equal(detailed[observed],base[observed])
+
     def test_multiview_input_and_review_reject_tampering(self):
         from .mobile.browser import build
         work=Path(__file__).resolve().parents[2]/'tmp/vhuman-generated-skin-tests'

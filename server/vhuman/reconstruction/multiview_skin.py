@@ -11,6 +11,7 @@ import shutil
 
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw
+from scipy.ndimage import gaussian_filter, binary_erosion
 
 from . import generated_skin as skin
 from .observations import sha256
@@ -18,6 +19,38 @@ from .observations import sha256
 VIEWS=(('ear_left',-85,10),('ear_right',85,10),
        ('rear_left',-140,25),('rear_right',140,25),
        ('crown_front',0,75),('crown_rear',180,65))
+
+
+def crop_camera(camera, box, resolution=512):
+    x0,y0,x1,y1=box
+    if x1<=x0 or y1-y0!=x1-x0:raise ValueError('positive square crop required')
+    scale=resolution/(x1-x0)
+    return skin.Camera(camera.focal*scale,(camera.cx-x0)*scale,(camera.cy-y0)*scale,
+                       camera.origin,camera.rotation,
+                       camera.focal_y*scale if camera.focal_y else None,camera.skew*scale)
+
+
+def detail_quality(original, edited, mask):
+    """Reject flat/no-op edits using mid-scale contrast inside initially flat skin.
+
+    This is a contrast gate, not evidence of anatomical wrinkle accuracy.
+    Changed pixel counts alone can be satisfied by noise or tiny color shifts.
+    """
+    original,edited=np.asarray(original),np.asarray(edited)
+    if original.shape!=edited.shape or original.ndim!=3 or original.shape[2]!=3:
+        raise ValueError('matching RGB images required')
+    bands=[]
+    for rgb in (original,edited):
+        gray=skin.srgb_to_linear(rgb.astype(float)/255)@np.array([.2126,.7152,.0722])
+        bands.append(gaussian_filter(gray,1)-gaussian_filter(gray,12))
+    interior=binary_erosion(np.asarray(mask)>0,iterations=12)
+    flat=interior&(abs(bands[0])<.005)
+    if flat.sum()<256:raise ValueError('insufficient flat interior skin to evaluate completion')
+    before,after=(float(np.sqrt(np.mean(b[flat]**2))) for b in bands)
+    residual=float(np.sqrt(np.mean((bands[1][flat]-bands[0][flat])**2)))
+    return dict(flat_pixels=int(flat.sum()),before_rms=before,after_rms=after,residual_rms=residual,
+                passed=bool(after>=.006 and residual>=.005 and after>=before*1.5),
+                proves_wrinkle_accuracy=False)
 
 
 def verify_inputs(work, record):
