@@ -52,18 +52,23 @@ def generate(work, prior, *, steps=10, seed=412):
     )
 
 
-def _verified_material_receipt(work):
+def _verified_material_receipt(work, *, expected_receipt=None):
     """Bind the material edit to its exact reference, init image and mask."""
-    receipt = json.loads((work/'edited.json').read_text())
-    request = receipt['request']
-    expected = (
-        ('edited.png', receipt['sha256']),
-        ('input.png', request['reference_sha256']),
-        ('input.png', request['init_image_sha256']),
-        ('mask.png', request['mask_sha256']),
-    )
-    if any(sha256(work/name) != digest for name, digest in expected):
-        raise ValueError('wrinkle material generation receipt mismatch')
+    try:
+        receipt = json.loads((work/'edited.json').read_text())
+        request = receipt['request']
+        expected = (
+            ('edited.png', receipt['sha256']),
+            ('input.png', request['reference_sha256']),
+            ('input.png', request['init_image_sha256']),
+            ('mask.png', request['mask_sha256']),
+        )
+        if any(sha256(work/name) != digest for name, digest in expected):
+            raise ValueError('wrinkle material generation receipt mismatch')
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise ValueError('missing or invalid wrinkle material generation receipt') from error
+    if expected_receipt is not None and receipt != expected_receipt:
+        raise ValueError('wrinkle material receipt differs from baked completion')
     return receipt
 
 
@@ -143,6 +148,9 @@ def review(candidate, work, completed):
     manifest=skin.validate_candidate(completed)
     source=skin.validate_candidate(candidate)
     report=json.loads((completed/'generated_skin.json').read_text())
+    if not isinstance(report.get('material_edit'), dict):
+        raise ValueError('baked completion lacks a wrinkle material receipt')
+    _verified_material_receipt(work, expected_receipt=report['material_edit'])
     if (source['geometry_sha256']!=report['source_geometry_sha256']
             or manifest['geometry_sha256']!=report['source_geometry_sha256']
             or sha256(candidate/'skin_basecolor.png')!=report['source_basecolor_sha256']

@@ -1,5 +1,6 @@
 """Synthetic completion protects observations and rejects unstable video evidence."""
 import unittest
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -9,9 +10,122 @@ from .reconstruction.generated_skin import (band_detail,unseen_weight,triplanar_
     temporal_consistency,render_plate,orbit_camera,apply_detail)
 from .reconstruction.multiview_skin import fuse_views,contact_sheet,verify_inputs,detail_quality,crop_camera
 from .reconstruction.reference import Camera
-from .reconstruction.wrinkle_skin import material_field
+from .reconstruction.wrinkle_skin import material_field, review, _verified_material_receipt
+from .reconstruction.provenance import validate_candidate
+from .mobile.export import export
 from .reconstruction.observations import sha256
 from PIL import Image
+
+
+class CompletionProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        parent = Path(__file__).resolve().parents[2]/'tmp/vhuman-generated-skin-tests'
+        parent.mkdir(parents=True, exist_ok=True)
+        directory = tempfile.TemporaryDirectory(dir=parent)
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.work = self.root/'work'
+        self.work.mkdir()
+        for name, color in (('input.png', 'green'), ('edited.png', 'blue'), ('mask.png', 'white')):
+            Image.new('RGB', (32, 32), color).save(self.work/name)
+        self.receipt = dict(sha256=sha256(self.work/'edited.png'), request=dict(
+            reference_sha256=sha256(self.work/'input.png'),
+            init_image_sha256=sha256(self.work/'input.png'),
+            mask_sha256=sha256(self.work/'mask.png'), seed=412))
+        self.write_receipt(self.receipt)
+        self.source = self.root/'source'
+        self.completed = self.root/'completed'
+        for folder in (self.source, self.completed):
+            folder.mkdir()
+            (folder/'geometry.npz').write_bytes(b'geometry fixture; must not render invalid reviews')
+            Image.new('RGB', (32, 32), 'brown').save(folder/'portrait.png')
+            Image.new('RGB', (32, 32), 'brown').save(folder/'skin_basecolor.png')
+        self.manifest = dict(format='vhuman.reconstruction.v1', face_model='gnm_v3',
+            geometry_sha256=sha256(self.source/'geometry.npz'),
+            portrait_sha256=sha256(self.source/'portrait.png'), material={})
+        (self.source/'manifest.json').write_text(json.dumps(self.manifest))
+        self.report = dict(schema='vhuman.synthetic_skin_completion.v1',
+            basecolor_sha256=sha256(self.completed/'skin_basecolor.png'),
+            source_basecolor_sha256=sha256(self.source/'skin_basecolor.png'),
+            source_geometry_sha256=self.manifest['geometry_sha256'],
+            material_edit=self.receipt, license='qwen-research')
+        self.manifest['material']['synthetic_completion'] = self.report
+        self.write_completion()
+
+    def write_receipt(self, receipt):
+        (self.work/'edited.json').write_text(json.dumps(receipt))
+
+    def write_completion(self):
+        (self.completed/'manifest.json').write_text(json.dumps(self.manifest))
+        (self.completed/'generated_skin.json').write_text(json.dumps(self.report))
+
+    def assert_review_rejected(self):
+        with patch('server.vhuman.reconstruction.wrinkle_skin.skin.render_plate') as render:
+            with self.assertRaisesRegex(ValueError, 'receipt'):
+                review(self.source, self.work, self.completed)
+            render.assert_not_called()
+        self.assertFalse((self.work/'review.json').exists())
+
+    def test_valid_and_legacy_candidates_still_validate(self):
+        validate_candidate(self.source)
+        validate_candidate(self.completed)
+        self.assertEqual(_verified_material_receipt(
+            self.work, expected_receipt=self.report['material_edit']), self.receipt)
+        # Earlier completion schemas did not store the optional geometry hash.
+        del self.report['source_geometry_sha256']
+        self.write_completion()
+        validate_candidate(self.completed)
+
+    def test_review_rejects_missing_or_malformed_receipt(self):
+        (self.work/'edited.json').unlink()
+        self.assert_review_rejected()
+        for contents in ('{broken', '{}', 'null'):
+            (self.work/'edited.json').write_text(contents)
+            self.assert_review_rejected()
+
+    def test_review_rejects_changed_material_images(self):
+        for name in ('input.png', 'edited.png', 'mask.png'):
+            with self.subTest(name=name):
+                path = self.work/name
+                original = path.read_bytes()
+                Image.new('RGB', (32, 32), 'red').save(path)
+                self.assert_review_rejected()
+                path.write_bytes(original)
+
+    def test_review_rejects_self_consistent_receipt_from_other_generation(self):
+        other = copy.deepcopy(self.receipt)
+        Image.new('RGB', (32, 32), 'red').save(self.work/'edited.png')
+        other['sha256'] = sha256(self.work/'edited.png')
+        other['request']['seed'] += 1
+        self.write_receipt(other)
+        self.assertEqual(_verified_material_receipt(self.work), other)
+        self.assert_review_rejected()
+
+    def test_export_rejects_stale_atlas_before_writing_output(self):
+        Image.new('RGB', (32, 32), 'red').save(self.completed/'skin_basecolor.png')
+        out = self.root/'export'
+        # A nonexistent scene also proves the completion check runs first.
+        with self.assertRaisesRegex(ValueError, 'basecolor hash mismatch'):
+            export(self.completed, out, scene=self.root/'missing-scene')
+        self.assertFalse(out.exists())
+
+    def test_export_rejects_missing_or_inconsistent_completion_report(self):
+        report_path = self.completed/'generated_skin.json'
+        for contents in (None, '{broken', json.dumps(dict(self.report, license='wrong'))):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    report_path.unlink()
+                else:
+                    report_path.write_text(contents)
+                with self.assertRaisesRegex(ValueError, 'synthetic completion'):
+                    export(self.completed, self.root/'export', scene=self.root/'missing-scene')
+                self.assertFalse((self.root/'export').exists())
+
+    def test_completion_cannot_claim_another_geometry(self):
+        self.report['source_geometry_sha256'] = '0'*64
+        self.write_completion()
+        with self.assertRaisesRegex(ValueError, 'geometry hash mismatch'):
+            validate_candidate(self.completed)
 
 
 class GeneratedSkinTests(unittest.TestCase):

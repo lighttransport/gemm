@@ -1267,6 +1267,14 @@ shows the actual material edit and before/final-atlas renders, avoiding any
 claim that Qwen successfully edited the entire head view. Pass the workspace
 as `mobile.browser --skin-review` to include it in the browser preview.
 
+Review generation verifies the workspace's input, edit and mask hashes and
+requires its receipt to match the one recorded by the bake. Candidate validation
+(including mobile export preflight) checks the completed basecolor hash and
+requires `generated_skin.json` to match the manifest's completion report.
+Replacing an image or copying a receipt from another generation fails before
+rendering a review or writing an export; regenerate the affected stage instead
+of reusing stale provenance.
+
 Both material and final ear/jaw renders must pass a mid-scale contrast gate
 inside initially flat, eroded skin masks; tiny pixel changes and near-copies are
 rejected. The old ear edit decreased contrast (0.00197 to 0.00183 RMS).

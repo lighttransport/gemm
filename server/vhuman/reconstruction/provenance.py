@@ -18,6 +18,23 @@ def validate_candidate(candidate):
         raise ValueError('candidate geometry hash mismatch')
     if manifest.get('portrait_sha256')!=sha256(candidate/'portrait.png'):
         raise ValueError('candidate portrait hash mismatch')
+    completion = manifest.get('material', {}).get('synthetic_completion')
+    if completion is not None:
+        if (not isinstance(completion, dict)
+                or completion.get('schema') != 'vhuman.synthetic_skin_completion.v1'):
+            raise ValueError('invalid synthetic completion report')
+        try:
+            report = json.loads((candidate/'generated_skin.json').read_text())
+            basecolor_hash = sha256(candidate/'skin_basecolor.png')
+        except (OSError, ValueError) as error:
+            raise ValueError('missing or invalid synthetic completion assets') from error
+        if report != completion:
+            raise ValueError('synthetic completion report differs from manifest')
+        if completion.get('basecolor_sha256') != basecolor_hash:
+            raise ValueError('synthetic completion basecolor hash mismatch')
+        if ('source_geometry_sha256' in completion
+                and completion['source_geometry_sha256'] != manifest['geometry_sha256']):
+            raise ValueError('synthetic completion geometry hash mismatch')
     return manifest
 
 
