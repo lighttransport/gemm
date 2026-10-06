@@ -235,3 +235,37 @@ Contrast remains a useful flat-output rejection diagnostic, never a
 photorealism or anatomical-accuracy acceptance metric. A single portrait cannot
 uniquely determine unseen identity-specific details; label their provenance
 and uncertainty even when the completion looks plausible.
+
+## Measured: geometry-conditioned multiview completion (2026-10-07)
+
+`python -m server.vhuman.reconstruction.mv_texture {prepare,generate,bake,eval}`
+renders the fitted GNM head with MV-Adapter's six orthographic cameras: front,
+right, back, left, top and bottom (`mv_conditioning.py`). It projects any
+backend's views onto atlas texels using facing²-weighted, depth-tested
+visibility. It replaces the colour of unseen texels and matches their level to
+photographed skin with a median per-channel gain. Photographed texels stay
+byte-identical. The Obama `material12` candidate was used, on an RX 9070 XT
+with 16 GB.
+
+| backend | licence | time | unseen covered | photographed changed | result |
+|---|---|---|---|---|---|
+| MV-Adapter ig2mv SDXL, 768px, 30 steps | OpenRAIL++-M + Apache-2.0 | 162 s | 98.9% | 0 | Consistent, identity-preserving ears, scalp, nape and crown. Bakes shading (scalp sheen, dark crown patch) and a dark collar at the neck cut. |
+| Qwen-Image-2.1 sequential (CAP4D-style), 12 steps, strength 0.9 | qwen-research | 2947 s | 98.9% | 0 | Masked edits mostly keep the flat fill. Only small smudges near the face boundary. Not usable. |
+
+Notes:
+- MV-Adapter needed text encoders paged to the CPU and the UNet released before
+  VAE decode to fit in 16 GB. `enable_model_cpu_offload` breaks its
+  reference-attention cache.
+- The seam-energy metric does not separate the methods (0.032 for all). It is
+  dominated by real texture detail and needs replacing with a low-pass jump
+  measure.
+- The cross-view spread of the Qwen run is near 0 only because its output is
+  flat.
+
+Next:
+- De-light MV-Adapter views before baking (shading estimated from the GNM
+  normal map, or an intrinsic decomposition).
+- Mask the neck cut and bottom view.
+- Run MV-Adapter as the backbone of the sequential CAP4D-style mode.
+- Qwen-Image-Edit-2509 (Apache-2.0) is pending. It needs about 58 GB and
+  `/mnt/disk01` has about 32 GB free.

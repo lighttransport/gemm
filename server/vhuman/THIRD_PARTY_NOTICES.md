@@ -64,3 +64,18 @@ Source: https://github.com/google-ai-edge/mediapipe/blob/v0.10.21/mediapipe/task
 The C++ executor is an independent implementation. Model weights are downloaded
 separately by `rig/setup_face_video.sh`, verified by SHA256, and remain outside
 the repository. Exported graph receipts retain their source task/tensor hashes.
+
+# Multiview texture completion (evaluation only)
+
+`reconstruction/mvadapter_backend.py` imports MV-Adapter
+(https://github.com/huanngzh/MV-Adapter, Apache-2.0, commit
+`4277e0018232bac82bb2c103caf0893cedb711be`), cloned to `tmp/MV-Adapter`, not
+vendored. Its `mvadapter_ig2mv_sdxl.safetensors` weights are Apache-2.0, but
+they run on Stable Diffusion XL base 1.0 (CreativeML OpenRAIL++-M, use-based
+restrictions). Outputs are tagged `openrail++-m` and are an evaluation
+baseline, not a permissive shipping path.
+
+CAP4D (https://github.com/felixtaubner/cap4d) is CC BY-NC 4.0 and its MMDM
+weights depend on FLAME. No CAP4D code or weights are used. `mv_qwen.sequential`
+is an independent implementation of the published idea (views generated in
+sequence, conditioned on mesh renders and on earlier views), using GNM.
