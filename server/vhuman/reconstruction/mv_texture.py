@@ -222,6 +222,20 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         warnings.simplefilter('ignore',RuntimeWarning)  # texels no view sees
         ref=np.nanmedian(np.where(has,luma,np.nan),0)
     weights*=~(has&((luma<.6*ref)|(luma>1.6*ref)))
+    hybrid=info.get('sources')
+    edit_v=np.array([bool(hybrid) and hybrid.get(v['name'],{}).get('kind')=='raw' for v in views])
+    if hybrid and edit_v.any() and (~edit_v).any():
+        # Hybrid: pull the structure views' (MV-Adapter) tone toward the edited views, measured where they overlap.
+        ge,we,_,_=fuse(colors[edit_v],weights[edit_v]);gm,wm,_,_=fuse(colors[~edit_v],weights[~edit_v])
+        both_g=(we>.05)&(wm>.05)
+        if both_g.sum()>500:
+            # One global per-channel gain: a spatial field interpolated from the left and right overlaps switched
+            # sides at the back midline and drew a vertical seam.
+            lr=np.clip(np.log(np.maximum(ge[both_g],1e-4))-np.log(np.maximum(gm[both_g],1e-4)),-1,1)
+            field=np.broadcast_to(np.median(lr,0),(len(points),3))
+            colors[~edit_v]=np.clip(colors[~edit_v]*np.exp(field)[None],0,1)
+            if two_band:   # tone lives in the low band, which is fused from the separate blurred projection
+                colors_low[~edit_v]=np.clip(colors_low[~edit_v]*np.exp(field)[None],0,1)
     gen,support,spread,count=fuse(colors,weights)
     if two_band:
         low,_,_,_=fuse(colors_low,weights);high,_,_,_=fuse(colors-colors_low,weights**4)
@@ -232,6 +246,14 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         if synth is not None:
             a=np.clip((best-.25)/.35,0,1)[:,None]
             high=a*high+(1-a)*synth
+        if hybrid and edit_v.any() and (~edit_v).any():
+            # Structure views (MV-Adapter) carry little fine detail: where they dominate, take the high band from
+            # the edited side view's scalp/neck instead (triplanar, so no UV seams).
+            side=synthetic_detail(points,normals,work/backend,src=work/backend/'view_right.png',
+                                  scalp_box=(.08,.32,.45,.72),neck_box=(.55,.72,.45,.62))
+            if side is not None:
+                share=np.clip(weights[edit_v].sum(0)/np.maximum(weights.sum(0),1e-12)/.5,0,1)[:,None]
+                high=share*high+(1-share)*side
         gen=np.clip(low+high,0,1)
     gen,support=fill_unsupported(points,gen,support,seen)
     if unseen is not None and unseen.any():
@@ -302,17 +324,19 @@ def local_gain(points, photo, gen, both, k=48, falloff=.03):
     return np.exp(field*np.exp(-d[:,0]/falloff)[:,None])
 
 
-def synthetic_detail(points, normals, gen_dir, *, period=.03, limit=.06):
-    """Triplanar high-band detail from the back-view edit: scalp patch for upward normals, neck patch below."""
-    src=Path(gen_dir)/'back'/'edited.png'
+def synthetic_detail(points, normals, gen_dir, *, period=.03, limit=.06, src=None,
+                     scalp_box=(.10,.34,.38,.62), neck_box=(.62,.80,.38,.62)):
+    """Triplanar high-band detail from an edited view (default: the back-view edit): scalp patch for upward
+    normals, neck patch below. Boxes are (y0, y1, x0, x1) image fractions."""
+    src=Path(src) if src else Path(gen_dir)/'back'/'edited.png'
     if not src.exists():return None
     from scipy.ndimage import gaussian_filter
     from ..mobile.baking import sample
     im=srgb_to_linear(np.asarray(Image.open(src).convert('RGB'))/255);h=im.shape[0]
-    def residual(y0,y1):
-        patch=im[int(y0*h):int(y1*h),int(.38*h):int(.62*h)]
+    def residual(y0,y1,x0,x1):
+        patch=im[int(y0*h):int(y1*h),int(x0*h):int(x1*h)]
         return np.clip(patch-gaussian_filter(patch,(4,4,0)),-limit,limit)
-    scalp,neck=residual(.10,.34),residual(.62,.80)
+    scalp,neck=residual(*scalp_box),residual(*neck_box)
     tw=np.abs(normals)**4;tw/=np.maximum(tw.sum(1,keepdims=True),1e-12)
     out=np.zeros_like(points)
     for patch,mask in ((scalp,normals[:,1]>=0),(neck,normals[:,1]<0)):

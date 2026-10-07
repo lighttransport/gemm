@@ -343,3 +343,30 @@ six views exposed policy failures that the bake cannot fully repair. All bakes c
 - Still open:
   - a 2×2 recipe A/B on the right view (raw vs matted portrait × original vs bare-skin prompt). Queued, not run.
   - MV-Adapter's SDXL base is OpenRAIL++ (evaluation only).
+
+### MV-Adapter + Edit-2511 hybrid, first results (2026-10-08)
+
+`mv_texture compose`:
+- front, right and left from the chained Edit-2511 run (raw edits)
+- back, top and bottom from MV-Adapter
+
+The hybrid bake changes:
+- MV-Adapter views get one global per-channel gain toward the Edit-2511 views, measured on their overlap. A spatial
+  log-ratio field drew a seam at the back midline, so it is not used.
+- Where MV-Adapter views dominate, their detail band is replaced with stubble/skin detail from the Edit-2511 side view
+  (triplanar).
+
+| bake | seam | unseen covered | notes |
+|---|---|---|---|
+| Edit-2511 chained, polar-free | 0.0456 | 90.6% | faint crown X |
+| hybrid, plain | 0.0469 | 91.8% | stubble vs smooth seam behind the ears, pink back |
+| hybrid + global tone + side detail | **0.0466** | 91.8% | no crown star, faces or suits; pink blotch on the back remains |
+
+Edit-2511 cannot refine the back of the head. Both the native and the GGUF reference turn a back-of-head render into a
+doll or an unrelated scene, even as a single-image "add stubble" edit. So refinement there has to be non-generative.
+
+Next:
+- stronger blob de-light for the structure views only (the pink blotch is spatial)
+- stronger synthesized stubble amplitude on the back
+- regenerate the Edit-2511 sides with the recipe the 2×2 A/B selects
+- the hybrid is evaluation-only (SDXL OpenRAIL++)
