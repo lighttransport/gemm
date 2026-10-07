@@ -17,9 +17,13 @@ txt = torch.from_numpy(d['txt'])[None].to('cuda', torch.bfloat16)
 shapes = [[tuple(int(v) for v in s) for s in d['img_shapes']]]
 with torch.no_grad():
     y = m(hidden_states=x, encoder_hidden_states=txt, encoder_hidden_states_mask=torch.ones(txt.shape[:2], device='cuda'),
-          timestep=torch.tensor([d['timestep']], device='cuda', dtype=torch.bfloat16), img_shapes=shapes,
+          timestep=torch.tensor([float(d['timestep'])], device='cuda', dtype=torch.bfloat16), img_shapes=shapes,
           return_dict=False)[0][0].float().cpu().numpy()
 n = int(np.prod(shapes[0][0]))
-a, b = y[:n].ravel(), d['out'][:n].ravel()
-print('noisy tokens', n, 'cos(gguf, native) =', float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30)),
-      'rel_l2 =', float(np.linalg.norm(a - b) / np.linalg.norm(a)))
+np.save(sys.argv[1].replace('.npz', '_gguf.npy'), y)
+outs = [('dump', d['out'])] + [(f, np.load(f)) for f in sys.argv[2:]]
+a = y[:n].ravel().astype(np.float64)
+for name, o in outs:
+    b = o[:n].ravel().astype(np.float64)
+    print(f'{name}: noisy tokens {n} cos(gguf, native) = {a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30):.6f} '
+          f'rel_l2 = {np.linalg.norm(a - b) / np.linalg.norm(a):.4f}')

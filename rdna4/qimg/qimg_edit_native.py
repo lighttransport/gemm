@@ -114,7 +114,15 @@ def load_pipeline(base, int4_path, *, zero_cond_t=None):
             return tuple(to_cpu(v) for v in x)
         return x
 
-    pipe.vae.encode = lambda x, *a, **k: to_cpu(enc(x.to('cuda'), *a, **k))
-    pipe.vae.decode = lambda z, *a, **k: to_cpu(dec(z.to('cuda'), *a, **k))
+    def released(fn):
+        # torch's caching allocator would otherwise keep VAE activations the native DiT needs.
+        def run(x, *a, **k):
+            try:
+                return to_cpu(fn(x.to('cuda'), *a, **k))
+            finally:
+                torch.cuda.empty_cache()
+        return run
+
+    pipe.vae.encode, pipe.vae.decode = released(enc), released(dec)
     pipe.native = native
     return pipe

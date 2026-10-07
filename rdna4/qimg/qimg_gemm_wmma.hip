@@ -222,14 +222,26 @@ QGEMM_INST(qgemm_i4_128x128w8, LdInt4G64, 128, 128, 2, 4)
 QGEMM_INST(qgemm_i4_128x256,   LdInt4G64, 128, 256, 2, 4)
 QGEMM_INST(qgemm_bf16_128x128w8, LdDense, 128, 128, 2, 4)
 
-/* Xb[t,k] = bf16_rne(X[t,k] / smooth[k]) (smooth may be NULL). */
+/* Xb[t,k] = bf16_rne(X[t,k] / smooth[k]) (smooth may be NULL). 8 elements per thread, K % 8 == 0. */
 extern "C" __global__ void cast_f32_bf16_smooth(unsigned short *Xb, const float *X,
                                                 const float *smooth, int K, long n) {
-    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if (i >= n) return;
-    float v = X[i];
-    if (smooth) v /= smooth[i % K];
-    Xb[i] = (unsigned short)(bf16_rne_hi(v) >> 16);
+    const float4 a = *(const float4 *)(X + i), b = *(const float4 *)(X + i + 4);
+    float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    if (smooth) {
+        const int k = (int)(i % K);
+        const float4 sa = *(const float4 *)(smooth + k), sb = *(const float4 *)(smooth + k + 4);
+        const float sv[8] = {sa.x, sa.y, sa.z, sa.w, sb.x, sb.y, sb.z, sb.w};
+#pragma unroll
+        for (int j = 0; j < 8; j++) v[j] /= sv[j];
+    }
+    u32x4 w;
+    w[0] = pack2(bf16_rne_hi(v[0]), bf16_rne_hi(v[1]));
+    w[1] = pack2(bf16_rne_hi(v[2]), bf16_rne_hi(v[3]));
+    w[2] = pack2(bf16_rne_hi(v[4]), bf16_rne_hi(v[5]));
+    w[3] = pack2(bf16_rne_hi(v[6]), bf16_rne_hi(v[7]));
+    *(u32x4 *)(Xb + i) = w;
 }
 
 /* dtb[i] = bf16(sum_z P[z][i]) : fixed-order split-K reduce fused with the bf16 cast of the rank activations. */

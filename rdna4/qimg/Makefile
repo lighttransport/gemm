@@ -17,7 +17,7 @@ TEST_SRC = test_hip_qimg.c
 TARGET = test_hip_qimg
 VERIFY_DIT = verify_qimg_dit
 
-COMMON_DEPS = hip_qimg_runner.h hip_qimg_kernels.h qimg_gemm_wmma.inc \
+COMMON_DEPS = hip_qimg_runner.h hip_qimg_kernels.h qimg_gemm_wmma.inc qimg_fa16.inc \
               ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
               ../../common/safetensors.h ../../common/ggml_dequant.h \
               ../../common/gguf_loader.h ../../common/bpe_tokenizer.h \
@@ -35,8 +35,8 @@ libhip_qimg.so: libhip_qimg_impl.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
 	$(CC) $(CFLAGS) -fPIC -shared -fopenmp -o $@ libhip_qimg_impl.c $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
 # Tiled WMMA GEMM (ported from rdna4/llm/gemm_wmma.hip), embedded for HIPRTC.
-qimg_gemm_wmma.inc: qimg_gemm_wmma.hip
-	python3 -c 'import json,pathlib; print("static const char qimg_gemm_wmma_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
+%.inc: %.hip
+	python3 -c 'import json,pathlib; print("static const char $*_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
 
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
 	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
@@ -48,7 +48,7 @@ run: $(TARGET)
 	@echo "Usage: ./$(TARGET) --dit <dit.safetensors> [--vae <vae.safetensors>] [--steps N] [-o out.ppm] [-d dev]"
 
 clean:
-	rm -f $(TARGET) $(VERIFY_DIT) qimg_gemm_wmma.inc libhip_qimg.so
+	rm -f $(TARGET) $(VERIFY_DIT) qimg_gemm_wmma.inc qimg_fa16.inc libhip_qimg.so
 
 help:
 	@echo "HIP/ROCm Qwen-Image Text-to-Image Runner (HIPRTC-based, no hipcc needed)"

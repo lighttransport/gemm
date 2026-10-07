@@ -23,6 +23,7 @@
 #include "../hip_kernels_common.h"
 #include "hip_qimg_kernels.h"
 #include "qimg_gemm_wmma.inc"
+#include "qimg_fa16.inc"
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
 
@@ -214,13 +215,15 @@ struct hip_qimg_runner {
     int stream_blk_alloc;       /* 1 once both buffers' fields are allocated */
     /* INT4 (Nunchaku/SVDQuant, W4A16 logical layout) path — all blocks resident (no streaming). */
     qimg_int4_linear *int4_linears;  /* [n_blocks * QIMG_INT4_PER_BLOCK] per-block logical-linear descriptors */
+    void *int4_arena; size_t int4_arena_cap;
     qimg_int4_linear *int4_mod;      /* [n_blocks * 2] img_mod/txt_mod RTN-int4 (rank0, no smooth) */
     float *i4_ldf, *i4_luf, *i4_dt, *i4_dly; size_t i4_dt_cap, i4_dly_cap;  /* persistent lora scratch */
     void *d_edit_pos; int edit_n_seg, edit_n_tok, edit_txt_start, edit_n_cond, edit_zero_cond;  /* edit layout */
     hipFunction_t fn_rope_pos;
     int int4_lora_f32;  /* QIMG_INT4_LORA_F32=1: legacy scalar f32 LoRA (A/B oracle) */
     /* Tiled WMMA module (qimg_gemm_wmma.hip); QIMG_INT4_GEMM=legacy keeps the old kernels. */
-    hipModule_t mod_tiled; int use_tiled;
+    hipModule_t mod_tiled; int use_tiled, tiled_oom, step_error;
+    hipModule_t mod_fa16; hipFunction_t fn_fa16, fn_fa16_pack; void *fa16_buf; size_t fa16_cap;  /* QIMG_ATTN=fa16 */
     hipFunction_t fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
     unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
@@ -563,6 +566,20 @@ static void qimg_maybe_quant_stats(hip_qimg_runner *r, void *X,
 /* ---- Upload helpers ---- */
 
 /* Upload safetensor as F32 to GPU (handles FP8 E4M3, BF16, F16, F32 inputs) */
+/* Bump arena for the ~4300 per-tensor INT4 uploads: one hipMalloc instead of thousands of small,
+ * page-rounded ones (measured ~1.5 GB of VRAM overhead at 720 linears). Active only while loading. */
+static char *g_qimg_arena; static size_t g_qimg_arena_off, g_qimg_arena_cap;
+static hipError_t qimg_dev_malloc(void **p, size_t n) {
+    if (g_qimg_arena) {
+        size_t off = (g_qimg_arena_off + 255) & ~(size_t)255;
+        if (off + n <= g_qimg_arena_cap) { *p = g_qimg_arena + off; g_qimg_arena_off = off + n; return hipSuccess; }
+    }
+    return hipMalloc(p, n);
+}
+static int qimg_in_arena(const void *p, const void *base, size_t cap) {
+    return base && (const char *)p >= (const char *)base && (const char *)p < (const char *)base + cap;
+}
+
 static void *qimg_st_upload_f32(st_context *st, const char *name) {
     int idx = safetensors_find(st, name);
     if (idx < 0) return NULL;
@@ -608,7 +625,7 @@ static void *qimg_st_upload_f32(st_context *st, const char *name) {
     }
 
     void *d = NULL;
-    if (hipMalloc(&d, n * sizeof(float)) != hipSuccess) {
+    if (qimg_dev_malloc(&d, n * sizeof(float)) != hipSuccess) {
         fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for %s\n",
                 (float)(n * 4) / (1 << 20), name);
         free(f32);
@@ -635,7 +652,7 @@ static void *qimg_st_upload_fp8_raw(st_context *st, const char *name) {
     size_t nbytes = safetensors_nbytes(st, idx);
     const void *data = safetensors_data(st, idx);
     void *d = NULL;
-    if (hipMalloc(&d, nbytes) != hipSuccess) {
+    if (qimg_dev_malloc(&d, nbytes) != hipSuccess) {
         fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for %s (fp8)\n",
                 (float)nbytes / (1 << 20), name);
         return NULL;
@@ -653,7 +670,7 @@ static void *qimg_st_upload_raw(st_context *st, const char *name) {
     size_t nbytes = safetensors_nbytes(st, idx);
     const void *data = safetensors_data(st, idx);
     void *d = NULL;
-    if (hipMalloc(&d, nbytes) != hipSuccess) {
+    if (qimg_dev_malloc(&d, nbytes) != hipSuccess) {
         fprintf(stderr, "hip_qimg: hipMalloc(%.1f MB) FAILED for %s (raw)\n", (float)nbytes / (1 << 20), name);
         return NULL;
     }
@@ -1162,8 +1179,8 @@ static void op_gemm_int8(hip_qimg_runner *r, void *Y, void *Wq, void *wscale, vo
 /* ---- tiled WMMA path (qimg_gemm_wmma.hip) ---- */
 #define QIMG_LORA_SPLITS 8
 static void qimg_tl_cast(hip_qimg_runner *r, unsigned short *Xb, const void *X, const void *smooth, int K, long n) {
-    void *a[] = {&Xb, (void*)&X, (void*)&smooth, &K, &n};
-    hipModuleLaunchKernel(r->fn_cast_bf16, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL);
+    void *a[] = {&Xb, (void*)&X, (void*)&smooth, &K, &n};   /* 8 elements per thread (K % 8 == 0) */
+    hipModuleLaunchKernel(r->fn_cast_bf16, (unsigned)((n / 8 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL);
 }
 static void qimg_tl_gemm_full(hip_qimg_runner *r, int int4, void *Y, const void *W, const void *S,
                          const unsigned short *X, const void *bias, int N, int K, int M, int accum, int splits,
@@ -1188,18 +1205,33 @@ static void qimg_tl_gemm(hip_qimg_runner *r, int int4, void *Y, const void *W, c
                          const unsigned short *X, const void *bias, int N, int K, int M, int accum) {
     qimg_tl_gemm_split(r, int4, Y, W, S, X, bias, N, K, M, accum, 1);
 }
-static void qimg_tl_reserve(hip_qimg_runner *r, size_t x, size_t dt) {
-    if (x > r->tl_x_cap) { hipDeviceSynchronize(); hipFree(r->tl_xs); hipFree(r->tl_xb);
-        hipMalloc((void**)&r->tl_xs, x * 2); hipMalloc((void**)&r->tl_xb, x * 2); r->tl_x_cap = x; }
-    if (dt > r->tl_dt_cap) { hipDeviceSynchronize(); hipFree(r->tl_dtb); hipFree(r->i4_dt);
-        hipMalloc((void**)&r->tl_dtb, dt * 2); hipMalloc((void**)&r->i4_dt, dt * 4 * QIMG_LORA_SPLITS); r->tl_dt_cap = dt; r->i4_dt_cap = dt; }
+static int qimg_tl_reserve(hip_qimg_runner *r, size_t x, size_t dt, int need_xb) {
+    if (x > r->tl_x_cap || (need_xb && !r->tl_xb)) {
+        hipDeviceSynchronize(); hipFree(r->tl_xs); hipFree(r->tl_xb); r->tl_xs = r->tl_xb = NULL; r->tl_x_cap = 0;
+        if (hipMalloc((void**)&r->tl_xs, x * 2) != hipSuccess ||
+            (need_xb && hipMalloc((void**)&r->tl_xb, x * 2) != hipSuccess)) {
+            { size_t fr = 0, tot = 0; hipMemGetInfo(&fr, &tot);
+              fprintf(stderr, "hip_qimg: tiled int4 scratch alloc failed (%.0f MB, %.0f MB free)\n", (double)x * 2 * (need_xb ? 2 : 1) / 1048576, (double)fr / 1048576); }
+            hipFree(r->tl_xs); r->tl_xs = NULL; return -1;
+        }
+        r->tl_x_cap = x;
+    }
+    if (dt > r->tl_dt_cap) {
+        hipDeviceSynchronize(); hipFree(r->tl_dtb); hipFree(r->i4_dt); r->tl_dtb = NULL; r->i4_dt = NULL; r->tl_dt_cap = r->i4_dt_cap = 0;
+        if (hipMalloc((void**)&r->tl_dtb, dt * 2) != hipSuccess || hipMalloc((void**)&r->i4_dt, dt * 4 * QIMG_LORA_SPLITS) != hipSuccess) {
+            fprintf(stderr, "hip_qimg: tiled LoRA scratch alloc failed\n"); return -1;
+        }
+        r->tl_dt_cap = dt; r->i4_dt_cap = dt;
+    }
+    return 0;
 }
 /* lora_down is pre-multiplied by smooth at load (qimg_fold_smooth_into_lora), so the LoRA reuses the
  * smoothed bf16 activations: X@ld^T == (X/smooth)@(ld*smooth)^T. */
 static void qimg_tiled_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
     int n_out = L->n_out, n_in = L->n_in, rk = L->rank;
     long nx = (long)n_tok * n_in;
-    qimg_tl_reserve(r, (size_t)nx, (size_t)(rk > 0 ? rk : 1) * n_tok);
+    int need_xb = rk > 0 && L->lora_down && L->smooth && !L->lora_folded;
+    if (qimg_tl_reserve(r, (size_t)nx, (size_t)(rk > 0 ? rk : 1) * n_tok, need_xb) != 0) { r->tiled_oom = 1; return; }
     qimg_tl_cast(r, r->tl_xs, X, L->smooth, n_in, nx);                       /* bf16(X / smooth) */
     if (rk > 0 && L->lora_down) {
         /* dt = X @ ld^T first (split-K), then one GEMM: Y = [X/s | dt] @ [Wq | lora_up]^T + bias. */
@@ -1232,7 +1264,10 @@ static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4
     int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank;
     if (r->use_tiled && gs == 64 && (n_in % 64) == 0 && (rk % 32) == 0) {
         qimg_tiled_int4_linear(r, Y, X, L, n_tok);
-        return;
+        if (!r->tiled_oom) return;
+        r->tiled_oom = 0;
+        if (L->lora_folded) { r->step_error = 1; return; }  /* legacy LoRA expects unsmoothed X: fail the step */
+        /* out of scratch: fall through to the legacy kernels for this call */
     }
     /* Simple RTN int4-g16 path (no swizzle/LoRA/smooth): plain nibble + per-g16
      * bf16 scale via the validated gemm_int4w_g16 kernel. */
@@ -1340,6 +1375,23 @@ static void op_gated_add(hip_qimg_runner *r, void *x, void *proj,
 static void op_attn(hip_qimg_runner *r, void *d_out, void *d_q,
                     void *d_k, void *d_v,
                     int n_tok, int n_heads, int head_dim) {
+    if (r->fn_fa16 && head_dim == 128 && !getenv("QIMG_FP8_ATTN_PERROW")) {
+        size_t ne = (size_t)n_tok * n_heads * head_dim, need = ne * 2 * 3;
+        if (need > r->fa16_cap) {
+            hipDeviceSynchronize(); hipFree(r->fa16_buf); r->fa16_buf = NULL; r->fa16_cap = 0;
+            if (hipMalloc(&r->fa16_buf, need) == hipSuccess) r->fa16_cap = need;
+        }
+        if (r->fa16_buf) {
+            void *Qh = r->fa16_buf, *Kt = (char *)r->fa16_buf + ne * 2, *Vt = (char *)r->fa16_buf + ne * 4;
+            void *pa[] = {&Qh, &Kt, &Vt, &d_q, &d_k, &d_v, &n_tok, &n_heads};
+            hipModuleLaunchKernel(r->fn_fa16_pack, (unsigned)((ne / 8 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, pa, NULL);
+            float isd = 1.0f / sqrtf((float)head_dim);
+            void *fa[] = {&d_out, &Qh, &Kt, &Vt, &n_tok, &n_heads, &isd};
+            hipModuleLaunchKernel(r->fn_fa16, (unsigned)n_heads, (unsigned)((n_tok + 255) / 256), 1, 512, 1, 1, 0, NULL, fa, NULL);
+            return;
+        }
+        fprintf(stderr, "hip_qimg: fa16 scratch alloc failed; using legacy attention\n");
+    }
     if (r->use_attn_fp8 && head_dim == 128 && r->fn_flash_attn_fp8_perrow
         && getenv("QIMG_FP8_ATTN_PERROW")) {
         size_t qkv_bytes = (size_t)n_tok * n_heads * head_dim;
@@ -1754,6 +1806,21 @@ static void qimg_tiled_selftest_one(hip_qimg_runner *r, int M, int K, int N) {
 }
 static void qimg_tiled_selftest(hip_qimg_runner *r) {
     if (!r->fn_qg_i4_128) { fprintf(stderr,"tiled selftest: module missing\n"); return; }
+    {   /* bandwidth sanity of the cast at the fc2 edit shape: 12252 x 12288 */
+        long n = 12252L * 12288; void *x, *xb, *sm; hipMalloc(&x, n * 4); hipMalloc(&xb, n * 2); hipMalloc(&sm, 12288 * 4);
+        hipMemset(x, 0, n * 4); hipMemset(sm, 0x3f, 12288 * 4);
+        hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+        for (int pass = 0; pass < 2; pass++) {
+            qimg_tl_cast(r, (unsigned short *)xb, x, pass ? sm : NULL, 12288, n); hipDeviceSynchronize();
+            hipEventRecord(e0, NULL); for (int i = 0; i < 5; i++) qimg_tl_cast(r, (unsigned short *)xb, x, pass ? sm : NULL, 12288, n);
+            hipEventRecord(e1, NULL); hipDeviceSynchronize(); float ms = 0; hipEventElapsedTime(&ms, e0, e1); ms /= 5;
+            fprintf(stderr, "hip_qimg: cast bench smooth=%d %.2f ms  %.0f GB/s\n", pass, ms, n * 6.0 / (ms * 1e-3) / 1e9);
+        }
+        hipEventRecord(e0, NULL); for (int i = 0; i < 5; i++) hipMemcpyAsync(xb, x, n * 2, hipMemcpyDeviceToDevice, NULL);
+        hipEventRecord(e1, NULL); hipDeviceSynchronize(); { float ms = 0; hipEventElapsedTime(&ms, e0, e1); ms /= 5;
+        fprintf(stderr, "hip_qimg: D2D copy %.2f ms  %.0f GB/s (read+write)\n", ms, n * 4.0 / (ms * 1e-3) / 1e9); }
+        hipFree(x); hipFree(xb); hipFree(sm);
+    }
     int shapes[][2]={{3072,3072},{12288,3072},{3072,12288}};
     int Ms[2]={4096+300, 300};
     for(int t=0;t<2;t++)for(int i=0;i<3;i++)qimg_tiled_selftest_one(r,Ms[t],shapes[i][1],shapes[i][0]);
@@ -1872,6 +1939,13 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
           { const char *v = getenv("QIMG_TILED_VARIANT"); r->tl_variant = v ? atoi(v) : 1; }
       } else r->use_tiled = 0;
       if (verbose) fprintf(stderr, "hip_qimg: int4 GEMM path: %s\n", r->use_tiled ? "tiled WMMA" : "legacy"); }
+    { const char *a = getenv("QIMG_ATTN");   /* fa16 (default) | legacy */
+      if (!(a && !strcmp(a, "legacy")) &&
+          hip_compile_kernels(&r->mod_fa16, device_id, qimg_fa16_source, "qimg_fa16.hip", compile_verbose, "hip_qimg") >= 0) {
+          hipModuleGetFunction(&r->fn_fa16, r->mod_fa16, "fa_db");
+          hipModuleGetFunction(&r->fn_fa16_pack, r->mod_fa16, "fa16_pack");
+      }
+      if (verbose) fprintf(stderr, "hip_qimg: attention: %s\n", r->fn_fa16 ? "fa16 (rdna4/fa2 f16 WMMA)" : "legacy"); }
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
     GET(fn_adaln, "adaln_modulate_f32");
@@ -2230,12 +2304,37 @@ int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
     }
     r->int4_linears = (qimg_int4_linear *)calloc((size_t)r->n_blocks * QIMG_INT4_PER_BLOCK, sizeof(qimg_int4_linear));
     if (!r->int4_linears) return -1;
+    {   /* arena sized from the file: f32-expanded tensors (smooth/bias/norms) take 4 B/elem */
+        size_t need = 0;
+        for (int i = 0; i < st->n_tensors; i++) {
+            const char *nm = safetensors_name(st, i);
+            if (!strstr(nm, "transformer_blocks.")) continue;
+            int raw = strstr(nm, ".qint4") || strstr(nm, ".wscale") || strstr(nm, ".lora_down") || strstr(nm, ".lora_up");
+            size_t nb = safetensors_nbytes(st, i), el = 1; const uint64_t *sh = safetensors_shape(st, i);
+            for (int d = 0; d < safetensors_ndims(st, i); d++) el *= sh[d];
+            need += (raw ? nb : el * 4) + 256;
+        }
+        if (hipMalloc((void **)&g_qimg_arena, need) == hipSuccess) {
+            g_qimg_arena_off = 0; g_qimg_arena_cap = need; r->int4_arena = g_qimg_arena; r->int4_arena_cap = need;
+            fprintf(stderr, "hip_qimg: int4 arena %.0f MB\n", (double)need / 1048576);
+        } else g_qimg_arena = NULL;
+    }
     int loaded = 0;
     for (int b = 0; b < r->n_blocks; b++) {
         for (int j = 0; j < QIMG_INT4_PER_BLOCK; j++) {
             char key[160];
             snprintf(key, sizeof(key), "transformer_blocks.%d.%s", b, qimg_int4_linear_suffix[j]);
-            if (qimg_upload_int4_linear(st, key, &r->int4_linears[(size_t)b * QIMG_INT4_PER_BLOCK + j]) == 0) loaded++;
+            if (qimg_upload_int4_linear(st, key, &r->int4_linears[(size_t)b * QIMG_INT4_PER_BLOCK + j]) == 0) {
+                loaded++;
+                /* tiled path: lora_down *= smooth so the LoRA shares the smoothed bf16 activations */
+                qimg_int4_linear *Lj = &r->int4_linears[(size_t)b * QIMG_INT4_PER_BLOCK + j];
+                int aliased = 0;   /* Nunchaku fused-QKV splits share one lora_down: fold it once */
+                for (int jj = 0; jj < j; jj++) {
+                    qimg_int4_linear *Lp = &r->int4_linears[(size_t)b * QIMG_INT4_PER_BLOCK + jj];
+                    if (Lp->lora_down && Lp->lora_down == Lj->lora_down) { Lj->lora_folded = Lp->lora_folded; aliased = 1; }
+                }
+                if (r->use_tiled && !aliased) qimg_fold_smooth_into_lora(Lj);
+            }
         }
     }
     /* BF16 globals (converter passthrough) — reuse the auto-dtype path: all BF16 here -> f32 upload. */
@@ -2272,6 +2371,7 @@ int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
                 "sample to_q n_out=%d n_in=%d rank=%d group=%d\n",
                 r->n_blocks, loaded, r->n_blocks * QIMG_INT4_PER_BLOCK, s->n_out, s->n_in, s->rank, s->group_size);
         size_t free_now = 0, t = 0; hipMemGetInfo(&free_now, &t);
+    g_qimg_arena = NULL;  /* later uploads (and other runners) use plain hipMalloc */
         fprintf(stderr, "hip_qimg: logical-INT4 weights resident: %.0f MB (of %.0f MB VRAM; no block streaming)\n",
                 (double)(free_entry - free_now) / 1e6, (double)vram_total / 1e6);
     }
@@ -2691,13 +2791,14 @@ void hip_qimg_unload_dit(hip_qimg_runner *r) {
     size_t cap = (size_t)(n4 + nm) * 6 + 8;
     void **seen = (void **)malloc(cap * sizeof(void *)); size_t ns = 0;
     #define FREE1(p) do{ if(p){ size_t _j; for(_j=0;_j<ns;_j++) if(seen[_j]==(void*)(p)) break; \
-        if(_j==ns){ hipFree(p); seen[ns++]=(void*)(p);} (p)=NULL; } }while(0)
+        if(_j==ns){ if(!qimg_in_arena((p), r->int4_arena, r->int4_arena_cap)) hipFree(p); seen[ns++]=(void*)(p);} (p)=NULL; } }while(0)
     for (int i = 0; i < n4; i++) { qimg_int4_linear *L=&r->int4_linears[i];
         FREE1(L->qint4); FREE1(L->wscale); FREE1(L->smooth); FREE1(L->lora_down); FREE1(L->lora_up); FREE1(L->bias); }
     for (int i = 0; i < nm; i++) { qimg_int4_linear *L=&r->int4_mod[i];
         FREE1(L->qint4); FREE1(L->wscale); FREE1(L->smooth); FREE1(L->lora_down); FREE1(L->lora_up); FREE1(L->bias); }
     #undef FREE1
     free(seen);
+    if (r->int4_arena) { hipFree(r->int4_arena); r->int4_arena = NULL; r->int4_arena_cap = 0; }
     free(r->int4_linears); r->int4_linears = NULL;
     free(r->int4_mod); r->int4_mod = NULL;
     if (r->gpu_blocks) {
@@ -2785,6 +2886,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
                       const float *img_tokens, int n_img,
                       const float *txt_tokens, int n_txt,
                       float timestep, float *out) {
+    r->step_error = 0;
     int dim = r->dim;
     int nh = r->n_heads, hd = r->head_dim;
     int in_ch = r->in_ch, txt_dim = r->txt_dim, mlp_h = r->mlp_h;
@@ -2853,7 +2955,12 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     /* Pre-size the int4 LoRA scratch once for this step's largest linear
      * (rank-128 down, mlp_h-wide up, max(n_img,n_txt) tokens), so the per-block
      * grow path never reallocs a buffer the GPU is mid-using. */
-    if (r->use_int4) {
+    if (r->use_int4 && r->use_tiled) {
+        /* tiled path: only the bf16 activation (largest n_in = mlp_h) and rank scratch; the legacy
+         * n_out*n_tok f32 LoRA buffer (~600 MB at edit sizes) is never touched. */
+        int mt = n_img > n_txt ? n_img : n_txt;
+        if (qimg_tl_reserve(r, (size_t)mt * mlp_h, (size_t)128 * mt, 0) != 0) r->step_error = 1;
+    } else if (r->use_int4) {
         int mt = n_img > n_txt ? n_img : n_txt;
         if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
         size_t need_dt=(size_t)128*mt, need_dly=(size_t)mlp_h*mt;
@@ -3014,7 +3121,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
             if (r->edit_n_seg > 0) {   /* multi-segment (edit) layout: exact diffusers QwenEmbedRope positions */
                 void *pa[] = {&d_img_q, &d_img_k, &n_img, &nh, &hd, &r->d_edit_pos,
                               &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
-                hipModuleLaunchKernel(r->fn_rope_pos, (unsigned)n_img, 1, 1, (unsigned)nh, 1, 1, 0, NULL, pa, NULL);
+                hipModuleLaunchKernel(r->fn_rope_pos, (unsigned)n_img, 1, 1, (unsigned)(hd / 2), 1, 1, 0, NULL, pa, NULL);
                 txt_start = r->edit_txt_start;
             } else
             hipModuleLaunchKernel(r->fn_rope_2d, (unsigned)n_img, 1, 1,
@@ -3108,11 +3215,12 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     }
 
     /* Cleanup */
+    if (r->step_error) fprintf(stderr, "hip_qimg: DiT step failed (tiled int4 scratch out of memory)\n");
     hipFree(d_img); hipFree(d_txt); hipFree(d_t_emb); hipFree(d_t_emb0); hipFree(d_img_mod0); hipFree(d_t_silu0);
     hipFree(d_scratch1); hipFree(d_scratch2); hipFree(d_scratch3);
     hipFree(d_q); hipFree(d_k); hipFree(d_v); hipFree(d_attn_out);
 
-    return 0;
+    return r->step_error ? -1 : 0;
 }
 
 
