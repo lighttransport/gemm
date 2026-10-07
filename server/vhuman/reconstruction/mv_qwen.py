@@ -24,6 +24,12 @@ PROMPT=('Photorealistic texture render of this exact bald human head on a plain 
     'Soft even diffuse light, no shadows, no highlights. Preserve the exact silhouette, pose and existing '
     'facial details. No glasses, hats, jewelry, text or extra features.')
 
+EDIT_PROMPT=('Picture 1 is a 3D render of a bald human head whose skin is only partly textured; flat uniform '
+    'beige areas are untextured. Picture 2 is a photo of the same person. Complete Picture 1: replace the flat '
+    'beige areas with realistic skin of this person (same skin tone, pores, natural ear anatomy, very short '
+    'dark hair stubble on the scalp where hair grows). Keep the exact camera, pose, silhouette, ears and all '
+    'already-textured regions unchanged. Soft even diffuse light, no shadows, no highlights, plain gray background.')
+
 
 def _mask(view):
     return np.uint8((view['valid']&(view['known']<.5))*255)
@@ -44,7 +50,8 @@ def _commit(atlas, known, geometry, frame, view, image, valid, points, normals):
     k=known[valid];k[take]=1;known[valid]=k
 
 
-def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9):
+def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9, editor=None):
+    """editor: optional qwen_edit_backend.Editor (Apache-2.0 Edit-2511) instead of Qwen-Image-2.1."""
     candidate,out=Path(candidate),Path(out)
     with np.load(candidate/'geometry.npz',allow_pickle=False) as z:geometry=dict(z)
     base=np.asarray(Image.open(candidate/'skin_basecolor.png').convert('RGB'))
@@ -64,16 +71,26 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9)
         small(view['rgb']).save(folder/'input.png');small(mask,Image.Resampling.NEAREST).save(folder/'mask.png')
         _sheet(view['rgb'],portrait,previous if previous is not None else view['rgb'],
                np.uint8(view['normal']*255+.5)).save(folder/'reference.png')
-        receipt=skin.qwen_generate(folder/'edited.png',PROMPT+' The reference shows: upper left the target view, '
-            'upper right the portrait, lower left the previous view, lower right the surface normals.',
-            reference=folder/'reference.png',init_image=folder/'input.png',mask=folder/'mask.png',
-            steps=steps,seed=seed+index,strength=strength)
-        seconds+=receipt['seconds']
+        if editor is None:
+            receipt=skin.qwen_generate(folder/'edited.png',PROMPT+' The reference shows: upper left the target view, '
+                'upper right the portrait, lower left the previous view, lower right the surface normals.',
+                reference=folder/'reference.png',init_image=folder/'input.png',mask=folder/'mask.png',
+                steps=steps,seed=seed+index,strength=strength)
+            seconds+=receipt['seconds']
+        else:
+            inputs=[np.asarray(small(view['rgb'])),portrait]+([np.asarray(small(previous))] if previous is not None else [])
+            edited,took=editor(inputs,EDIT_PROMPT+(' Picture 3 is the previously completed neighbouring view; keep '
+                'skin tone and texture consistent with it.' if len(inputs)==3 else ''),steps=steps,seed=seed+index)
+            Image.fromarray(edited).save(folder/'edited.png');seconds+=took
         image=np.asarray(Image.open(folder/'edited.png').convert('RGB').resize((res,res),Image.Resampling.LANCZOS))
         # Keep known pixels exact at full resolution; only masked pixels are new.
         m=mask>0;image=np.where(m[...,None],image,view['rgb'])
         results[name]=image;previous=image
         _commit(atlas,known,geometry,frame,by_name[name],image,valid,points,normals)
+    if editor is not None:
+        from .qwen_edit_backend import GENERATOR,LICENSE
+        return [results[v['name']] for v in views],dict(generator=GENERATOR+' sequential (CAP4D-style)',
+            license=LICENSE,steps=steps,seed=seed,order=list(ORDER),seconds=seconds)
     return [results[v['name']] for v in views],dict(generator='Qwen-Image-2.1 sequential (CAP4D-style)',
         license='qwen-research',steps=steps,seed=seed,strength=strength,order=list(ORDER),seconds=seconds)
 
