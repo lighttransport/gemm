@@ -10,6 +10,7 @@ grid: the four horizontal views tiled 2x2 and edited in one 1024px call, so the
 """
 from pathlib import Path
 import json
+import os
 import time
 
 import numpy as np
@@ -126,7 +127,11 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
             seconds+=receipt['seconds']
         else:
             big=np.asarray(Image.fromarray(view['rgb']).resize((1024,1024),Image.Resampling.LANCZOS))
-            inputs=[portrait]+([np.asarray(Image.fromarray(previous_ref).resize((1024,1024)))] if previous is not None else [])+[big]
+            # Chaining the previous view (CAP4D-style) propagated editor hallucinations (suit, hair helmet,
+            # scenery) from the front view into every later view; consistency comes from the bake's fusion
+            # instead. QIMG_CHAIN_VIEWS=1 restores the third reference.
+            chain=os.environ.get('QIMG_CHAIN_VIEWS')=='1' and previous is not None
+            inputs=[portrait]+([np.asarray(Image.fromarray(previous_ref).resize((1024,1024)))] if chain else [])+[big]
             edited,took=editor(inputs,EDIT_PROMPT+(' Picture 2 is the previously completed neighbouring view; keep skin '
                 'tone and texture consistent with it.' if len(inputs)==3 else ''),steps=steps,seed=seed+index,
                 negative=SEQ_NEGATIVE)
