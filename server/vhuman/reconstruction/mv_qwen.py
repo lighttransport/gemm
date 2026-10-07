@@ -9,6 +9,7 @@ grid: the four horizontal views tiled 2x2 and edited in one 1024px call, so the
   generator sees all of them jointly; top and bottom keep the projected state.
 """
 from pathlib import Path
+import time
 
 import numpy as np
 from PIL import Image
@@ -60,8 +61,10 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
     portrait=np.asarray(Image.open(candidate/'portrait.png').convert('RGB'))
     res=views[0]['depth'].shape[0];by_name={v['name']:v for v in views};results={};seconds=0.;previous=None
     for index,name in enumerate(ORDER):
-        _,current=cond.render_conditions(geometry,atlas,known,res)
-        view=next(v for v in current if v['name']==name);view['camera']=by_name[name]['camera']
+        t_render=time.time()
+        _,current=cond.render_conditions(geometry,atlas,known,res,only=(name,))   # only the view being edited
+        view=current[0];view['camera']=by_name[name]['camera']
+        t_render=time.time()-t_render
         mask=_mask(view)
         if (mask>0).sum()<.02*view['valid'].sum():
             results[name]=view['rgb'];previous=view['rgb'];continue
@@ -86,7 +89,10 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
         # Keep known pixels exact at full resolution; only masked pixels are new.
         m=mask>0;image=np.where(m[...,None],image,view['rgb'])
         results[name]=image;previous=image
+        t_commit=time.time()
         _commit(atlas,known,geometry,frame,by_name[name],image,valid,points,normals)
+        print(f'[mv_qwen] {name}: render {t_render:.1f}s edit {took if editor is not None else receipt["seconds"]:.1f}s '
+              f'commit {time.time()-t_commit:.1f}s',flush=True)
     if editor is not None:
         from .qwen_edit_backend import LICENSE
         return [results[v['name']] for v in views],dict(generator=editor.generator+' sequential (CAP4D-style)',

@@ -43,11 +43,14 @@ class NativeEditor:
 
     def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
                  negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
-        started=time.time()
+        started=time.time();dit0=self.pipe.native.seconds;hits0=self.pipe.vision_cache_hits
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
         out=self.pipe(image=images,prompt=prompt,negative_prompt=negative,true_cfg_scale=cfg,height=size,width=size,
             num_inference_steps=steps,generator=self.torch.Generator().manual_seed(seed)).images[0]
-        return np.asarray(out.convert('RGB')),time.time()-started
+        total=time.time()-started;dit=self.pipe.native.seconds-dit0
+        print(f'[qwen_edit] total {total:.1f}s native DiT {dit:.1f}s other (encode+VAE+host) {total-dit:.1f}s '
+              f'vision-cache hits {self.pipe.vision_cache_hits-hits0}',flush=True)
+        return np.asarray(out.convert('RGB')),total
 
 
 class Editor:

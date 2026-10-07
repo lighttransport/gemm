@@ -52,7 +52,7 @@ def ortho_camera(elevation, azimuth, resolution):
     return Camera(focal,resolution/2,resolution/2,position,np.stack((right,up,-look)))
 
 
-def render_conditions(geometry, atlas, known, resolution=768):
+def render_conditions(geometry, atlas, known, resolution=768, only=None):
     """Return per-view dict of pos/normal maps (std-frame, [0,1]), RGB, known mask, depth.
 
     atlas: linear RGB UV texture; known: UV weight in [0,1] of photographed support.
@@ -62,6 +62,7 @@ def render_conditions(geometry, atlas, known, resolution=768):
     n=frame.direction(vertex_normals(points,tri))
     views=[]
     for name,elevation,azimuth in VIEWS:
+        if only is not None and name not in only:continue
         camera=ortho_camera(elevation,azimuth,resolution)
         ids,bary,depth=rasterize(p,tri,camera,(resolution,resolution));valid=ids>=0
         faces=tri[ids[valid]];w=bary[valid].astype(float)

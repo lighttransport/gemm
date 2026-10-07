@@ -37,6 +37,7 @@ class NativeDiT:
             raise RuntimeError('hip_qimg_load_dit_int4 failed: ' + str(int4_path))
         self.layout = None
         self.seconds = 0.
+        self.calls = 0
 
     def step(self, tokens, txt, t1000, img_shapes, zero_cond_t):
         """tokens [N,64] f32 (noisy + refs), txt [T,3584] f32 -> velocity [N,64] (ref rows meaningless)."""
@@ -77,6 +78,7 @@ def load_pipeline(base, int4_path, *, zero_cond_t=None):
     def forward(hidden_states, encoder_hidden_states=None, encoder_hidden_states_mask=None, timestep=None,
                 img_shapes=None, txt_seq_lens=None, guidance=None, attention_kwargs=None, return_dict=True, **_):
         outs = []
+        native.calls += 1
         for b in range(hidden_states.shape[0]):
             txt = encoder_hidden_states[b]
             if encoder_hidden_states_mask is not None:   # drop padding: native attention has no mask
@@ -124,5 +126,25 @@ def load_pipeline(base, int4_path, *, zero_cond_t=None):
         return run
 
     pipe.vae.encode, pipe.vae.decode = released(enc), released(dec)
+
+    # The negative-prompt encode re-runs the Qwen2.5-VL vision tower on the same reference images
+    # (~16k patches per view on the CPU). Its output depends only on pixels and grid, so memoize it.
+    visual = pipe.text_encoder.model.visual
+    vis_forward, vis_cache = visual.forward, {}
+
+    def cached_visual(pixel_values, grid_thw=None, **kwargs):
+        import hashlib
+        key = (hashlib.sha1(pixel_values.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+               None if grid_thw is None else tuple(grid_thw.flatten().tolist()), tuple(sorted(kwargs)))
+        if key not in vis_cache:
+            if len(vis_cache) >= 4:
+                vis_cache.pop(next(iter(vis_cache)))
+            vis_cache[key] = vis_forward(pixel_values, grid_thw=grid_thw, **kwargs)
+        else:
+            pipe.vision_cache_hits += 1
+        return vis_cache[key]
+
+    visual.forward = cached_visual
+    pipe.vision_cache_hits = 0
     pipe.native = native
     return pipe
