@@ -54,6 +54,11 @@ void hip_qimg_free(hip_qimg_runner *r);
  *   txt_tokens: [n_txt, 3584] text hidden states (CPU)
  *   out: [n_img, 64] velocity prediction (CPU, pre-allocated)
  *   Returns 0 on success. */
+/* Qwen-Image-Edit layout for subsequent hip_qimg_dit_step calls: img_tokens = [noisy | ref_1 | ...],
+ * fhw = n_seg x (frame, h_patches, w_patches); zero_cond_t (Edit-2511) modulates ref tokens with t=0.
+ * Callers use only the first f*h*w output rows. n_seg = 0 restores plain text-to-image. */
+int hip_qimg_set_edit_layout(hip_qimg_runner *r, int n_seg, const int *fhw, int zero_cond_t);
+
 int hip_qimg_dit_step(hip_qimg_runner *r,
                       const float *img_tokens, int n_img,
                       const float *txt_tokens, int n_txt,

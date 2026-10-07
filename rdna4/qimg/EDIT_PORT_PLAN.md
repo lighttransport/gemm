@@ -109,3 +109,16 @@ Add `hip_qimg_dit_step_edit(r, img_tokens, n_img, ref_tokens, n_ref, ref_shapes[
   (about +0.4 GB).
 - **Gate failures:** ROCm parity gates on qimg21 already miss 0.99996. Use
   cos ≥ 0.99 at the image level as the practical gate.
+
+## Text encoders are stock checkpoints (verified 2026-10-07)
+
+Checked by sampled tensor byte equality over HTTP range reads.
+
+| model | encoder | tensors | sampled, byte-identical |
+|---|---|---|---|
+| Qwen-Image-Edit-2511 | stock `Qwen/Qwen2.5-VL-7B-Instruct` | 729 (same names) | 13/13 (LM layers 0/17/20/27, final norm, vision block 0, merger, patch embed) |
+| Qwen-Image-2.1 | stock `Qwen/Qwen3-VL-8B-Instruct` | 750 (same names) | 14/14 |
+
+So the official quantized releases are valid drop-ins, for example `Qwen/Qwen3-VL-8B-Instruct-FP8` (block-128 FP8).
+That cuts the CPU-bound prompt encode (currently bf16 on the CPU), or lets the encoder be paged onto the GPU between
+DiT runs.

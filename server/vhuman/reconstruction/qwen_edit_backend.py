@@ -18,9 +18,41 @@ ROOT=Path('/mnt/disk01/models/qwen-image-edit-2511')
 GGUF=ROOT/'qwen-image-edit-2511-Q4_K_M.gguf'
 LICENSE='apache-2.0'
 GENERATOR='Qwen-Image-Edit-2511 Q4_K_M (diffusers GGUF)'
+INT4=ROOT/'edit2511-int4-r128.safetensors'
+NATIVE_GENERATOR='Qwen-Image-Edit-2511 SVDQuant INT4 r128 (native RDNA4 DiT)'
+REPO=Path(__file__).resolve().parents[3]
+
+
+def make_editor():
+    """Native INT4 DiT when packed (QWEN_EDIT_BACKEND=gguf forces the diffusers GGUF fallback)."""
+    import os
+    if os.environ.get('QWEN_EDIT_BACKEND','native')=='native' and INT4.exists() and (REPO/'rdna4/qimg/libhip_qimg.so').exists():
+        return NativeEditor()
+    return Editor()
+
+
+class NativeEditor:
+    generator=NATIVE_GENERATOR
+
+    def __init__(self):
+        import sys,torch
+        sys.path.insert(0,str(REPO/'rdna4/qimg'))
+        from qimg_edit_native import load_pipeline
+        self.torch=torch
+        self.pipe=load_pipeline(str(ROOT/'base'),str(INT4))
+
+    def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
+                 negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
+        started=time.time()
+        images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
+        out=self.pipe(image=images,prompt=prompt,negative_prompt=negative,true_cfg_scale=cfg,height=size,width=size,
+            num_inference_steps=steps,generator=self.torch.Generator().manual_seed(seed)).images[0]
+        return np.asarray(out.convert('RGB')),time.time()-started
 
 
 class Editor:
+    generator=GENERATOR
+
     def __init__(self):
         import torch
         from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel, GGUFQuantizationConfig

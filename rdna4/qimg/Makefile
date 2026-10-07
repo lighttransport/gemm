@@ -30,6 +30,10 @@ COMMON_DEPS = hip_qimg_runner.h hip_qimg_kernels.h qimg_gemm_wmma.inc \
 
 all: $(TARGET) $(VERIFY_DIT)
 
+# Shared library for the Python (ctypes) Qwen-Image-Edit driver: qimg_edit_native.py
+libhip_qimg.so: libhip_qimg_impl.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
+	$(CC) $(CFLAGS) -fPIC -shared -fopenmp -o $@ libhip_qimg_impl.c $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
+
 # Tiled WMMA GEMM (ported from rdna4/llm/gemm_wmma.hip), embedded for HIPRTC.
 qimg_gemm_wmma.inc: qimg_gemm_wmma.hip
 	python3 -c 'import json,pathlib; print("static const char qimg_gemm_wmma_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
@@ -44,7 +48,7 @@ run: $(TARGET)
 	@echo "Usage: ./$(TARGET) --dit <dit.safetensors> [--vae <vae.safetensors>] [--steps N] [-o out.ppm] [-d dev]"
 
 clean:
-	rm -f $(TARGET) $(VERIFY_DIT) qimg_gemm_wmma.inc
+	rm -f $(TARGET) $(VERIFY_DIT) qimg_gemm_wmma.inc libhip_qimg.so
 
 help:
 	@echo "HIP/ROCm Qwen-Image Text-to-Image Runner (HIPRTC-based, no hipcc needed)"

@@ -85,8 +85,8 @@ def generate(work, backend, **options):
         images,info=(mv_qwen.sequential if backend=='qwen_seq' else mv_qwen.grid)(candidate,frame,views,out,**options)
     elif backend=='qwen_edit_seq':
         from . import mv_qwen
-        from .qwen_edit_backend import Editor
-        images,info=mv_qwen.sequential(candidate,frame,views,out,editor=Editor(),**{'steps':20,**options})
+        from .qwen_edit_backend import make_editor
+        images,info=mv_qwen.sequential(candidate,frame,views,out,editor=make_editor(),**{'steps':12,**options})
     else:raise ValueError('unknown backend '+backend)
     for v,im in zip(views,images):Image.fromarray(im).save(out/f"view_{v['name']}.png")
     info.update(synthetic=True,geometry_evidence=False,

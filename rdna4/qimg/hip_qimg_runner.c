@@ -216,6 +216,8 @@ struct hip_qimg_runner {
     qimg_int4_linear *int4_linears;  /* [n_blocks * QIMG_INT4_PER_BLOCK] per-block logical-linear descriptors */
     qimg_int4_linear *int4_mod;      /* [n_blocks * 2] img_mod/txt_mod RTN-int4 (rank0, no smooth) */
     float *i4_ldf, *i4_luf, *i4_dt, *i4_dly; size_t i4_dt_cap, i4_dly_cap;  /* persistent lora scratch */
+    void *d_edit_pos; int edit_n_seg, edit_n_tok, edit_txt_start, edit_n_cond, edit_zero_cond;  /* edit layout */
+    hipFunction_t fn_rope_pos;
     int int4_lora_f32;  /* QIMG_INT4_LORA_F32=1: legacy scalar f32 LoRA (A/B oracle) */
     /* Tiled WMMA module (qimg_gemm_wmma.hip); QIMG_INT4_GEMM=legacy keeps the old kernels. */
     hipModule_t mod_tiled; int use_tiled;
@@ -1884,6 +1886,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         r->fn_flash_attn_wmma_sp = NULL;
     GET(fn_rope_2d, "rope_2d_f32");
     GET(fn_rope_1d, "rope_1d_f32");
+    GET(fn_rope_pos, "rope_pos_f32");
     GET(fn_bf16_trunc, "truncate_bf16_f32");
     GET(fn_patchify, "patchify_f32");
     GET(fn_unpatchify, "unpatchify_f32");
@@ -2713,6 +2716,71 @@ void hip_qimg_unload_dit(hip_qimg_runner *r) {
 
 /* ---- DiT single step ---- */
 
+/* Timestep embedding: sinusoidal(256) -> fc1 -> SiLU -> fc2 (device [dim], caller frees). */
+static void *qimg_time_embed(hip_qimg_runner *r, float timestep) {
+    int dim = r->dim;
+    float t_sin[256]; int half = 128;
+    for (int i = 0; i < half; i++) {
+        float freq = expf(-(float)i / (float)half * logf(10000.0f));
+        float angle = timestep * freq;
+        t_sin[i] = cosf(angle); t_sin[half + i] = sinf(angle);
+    }
+    void *d_t_sin = NULL, *d_a = NULL, *d_b = NULL;
+    hipMalloc(&d_t_sin, 256 * sizeof(float)); hipMalloc(&d_a, (size_t)dim * 4); hipMalloc(&d_b, (size_t)dim * 4);
+    hipMemcpy(d_t_sin, t_sin, 256 * sizeof(float), hipMemcpyHostToDevice);
+    qimg_set_gemm_context(r, -1, "time_fc1");
+    op_wgemm_bf16_auto(r, r->is_fp8_t_fc1, d_a, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
+    op_silu(r, d_a, dim);
+    qimg_set_gemm_context(r, -1, "time_fc2");
+    op_wgemm_bf16_auto(r, r->is_fp8_t_fc2, d_b, r->d_t_fc2_w, d_a, r->d_t_fc2_b, dim, dim, 1);
+    hipFree(d_a); hipFree(d_t_sin);
+    return d_b;
+}
+
+#define QIMG_MOD(base, i) ((void *)((char *)(base) + (size_t)(i) * dim * sizeof(float)))
+/* Image-stream adaLN / gated residual with zero_cond_t: rows [0,n_cond) use mod, [n_cond,n) use mod0.
+ * which = 0 (shift1/scale1) or 3 (shift2/scale2); gate index 2 or 5. */
+static void qimg_img_adaln(hip_qimg_runner *r, void *out, void *x, void *mod, void *mod0, int which,
+                           int n, int n_cond, int dim) {
+    op_adaln(r, out, x, QIMG_MOD(mod, which), QIMG_MOD(mod, which + 1), n_cond, dim);
+    if (mod0 && n > n_cond) {
+        size_t o = (size_t)n_cond * dim * sizeof(float);
+        op_adaln(r, (char *)out + o, (char *)x + o, QIMG_MOD(mod0, which), QIMG_MOD(mod0, which + 1), n - n_cond, dim);
+    }
+}
+static void qimg_img_gated_add(hip_qimg_runner *r, void *x, void *proj, void *mod, void *mod0, int gate,
+                               int n, int n_cond, int dim) {
+    op_gated_add(r, x, proj, QIMG_MOD(mod, gate), n_cond, dim);
+    if (mod0 && n > n_cond) {
+        size_t o = (size_t)n_cond * dim * sizeof(float);
+        op_gated_add(r, (char *)x + o, (char *)proj + o, QIMG_MOD(mod0, gate), n - n_cond, dim);
+    }
+}
+#undef QIMG_MOD
+
+/* Edit layout: segments (frame,h,w) in patch units; segment 0 = noisy latent, 1.. = reference latents.
+ * Per-token RoPE positions follow diffusers QwenEmbedRope(scale_rope=True): frame = segment index,
+ * h in [-(h - h/2), h/2), w likewise; text starts at max over segments of max(h/2, w/2). */
+int hip_qimg_set_edit_layout(hip_qimg_runner *r, int n_seg, const int *fhw, int zero_cond_t) {
+    hipFree(r->d_edit_pos); r->d_edit_pos = NULL; r->edit_n_seg = 0; r->edit_zero_cond = 0;
+    if (n_seg <= 0) return 0;
+    long n = 0; for (int s = 0; s < n_seg; s++) n += (long)fhw[3*s] * fhw[3*s+1] * fhw[3*s+2];
+    int *pos = (int *)malloc((size_t)n * 3 * sizeof(int)); long t = 0; int txt = 0;
+    for (int s = 0; s < n_seg; s++) {
+        int f = fhw[3*s], h = fhw[3*s+1], w = fhw[3*s+2];
+        for (int fi = 0; fi < f; fi++) for (int y = 0; y < h; y++) for (int x = 0; x < w; x++, t++) {
+            pos[3*t] = s + fi; pos[3*t+1] = y - (h - h / 2); pos[3*t+2] = x - (w - w / 2);
+        }
+        if (h / 2 > txt) txt = h / 2;
+        if (w / 2 > txt) txt = w / 2;
+    }
+    hipMalloc(&r->d_edit_pos, (size_t)n * 3 * sizeof(int));
+    hipMemcpy(r->d_edit_pos, pos, (size_t)n * 3 * sizeof(int), hipMemcpyHostToDevice); free(pos);
+    r->edit_n_seg = n_seg; r->edit_n_tok = (int)n; r->edit_txt_start = txt;
+    r->edit_n_cond = fhw[0] * fhw[1] * fhw[2]; r->edit_zero_cond = zero_cond_t;
+    return 0;
+}
+
 int hip_qimg_dit_step(hip_qimg_runner *r,
                       const float *img_tokens, int n_img,
                       const float *txt_tokens, int n_txt,
@@ -2739,28 +2807,9 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     op_bf16_trunc(r, d_img_in, n_img * in_ch);
     op_bf16_trunc(r, d_txt_in, n_txt * txt_dim);
 
-    /* 1. Timestep embedding: sinusoidal(256) → SiLU(GEMM) → GEMM */
-    float t_sin[256];
-    int half = 128;
-    for (int i = 0; i < half; i++) {
-        float freq = expf(-(float)i / (float)half * logf(10000.0f));
-        float angle = timestep * freq;
-        t_sin[i]        = cosf(angle);
-        t_sin[half + i] = sinf(angle);
-    }
-    void *d_t_sin = NULL;
-    hipMalloc(&d_t_sin, 256 * sizeof(float));
-    hipMemcpy(d_t_sin, t_sin, 256 * sizeof(float), hipMemcpyHostToDevice);
-
-    qimg_set_gemm_context(r, -1, "time_fc1");
-    op_wgemm_bf16_auto(r, r->is_fp8_t_fc1, d_t_emb, r->d_t_fc1_w, d_t_sin, r->d_t_fc1_b, dim, 256, 1);
-    op_silu(r, d_t_emb, dim);
-    void *d_t_emb2 = NULL;
-    hipMalloc(&d_t_emb2, (size_t)dim * sizeof(float));
-    qimg_set_gemm_context(r, -1, "time_fc2");
-    op_wgemm_bf16_auto(r, r->is_fp8_t_fc2, d_t_emb2, r->d_t_fc2_w, d_t_emb, r->d_t_fc2_b, dim, dim, 1);
-    hipFree(d_t_emb); d_t_emb = d_t_emb2;
-    hipFree(d_t_sin);
+    /* 1. Timestep embedding: sinusoidal(256) → SiLU(GEMM) → GEMM (+ t=0 copy for zero_cond_t) */
+    hipFree(d_t_emb); d_t_emb = qimg_time_embed(r, timestep);
+    void *d_t_emb0 = r->edit_zero_cond ? qimg_time_embed(r, 0.0f) : NULL;
 
     /* 2. Text input: RMSNorm → Linear */
     if (r->d_txt_norm_w) {
@@ -2817,6 +2866,10 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     hipMalloc(&d_t_silu, (size_t)dim * sizeof(float));
     hipMalloc(&d_img_mod, (size_t)6 * dim * sizeof(float));
     hipMalloc(&d_txt_mod, (size_t)6 * dim * sizeof(float));
+    /* zero_cond_t: reference tokens [n_cond, n_img) are modulated with t=0. */
+    int n_cond = (r->edit_n_seg > 0 && r->edit_zero_cond) ? r->edit_n_cond : n_img;
+    void *d_img_mod0 = NULL, *d_t_silu0 = NULL;
+    if (n_cond < n_img) { hipMalloc(&d_img_mod0, (size_t)6 * dim * sizeof(float)); hipMalloc(&d_t_silu0, (size_t)dim * sizeof(float)); }
     if (r->mem_stats_enabled && !r->mem_report_printed) {
         size_t state_bytes = ((size_t)n_img + (size_t)n_txt) * (size_t)dim * sizeof(float)
                            + (size_t)dim * sizeof(float);
@@ -2892,6 +2945,15 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
             r->i8_ws[(size_t)L*QIMG_I8_PER_BLOCK+12], r->use_int8_smooth ? r->i8_sm[(size_t)L*QIMG_I8_PER_BLOCK+12] : NULL,
             d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
         else op_wgemm_bf16(r, d_img_mod, blk.img_mod_w, d_t_silu, blk.img_mod_b, 6 * dim, dim, 1);
+        if (d_img_mod0) {
+            hipMemcpyAsync(d_t_silu0, d_t_emb0, (size_t)dim * sizeof(float), hipMemcpyDeviceToDevice, NULL);
+            op_silu(r, d_t_silu0, dim);
+            if (r->use_int4) op_int4_linear(r, d_img_mod0, d_t_silu0, &r->int4_mod[2*L], 1);
+            else if (r->use_int8 && r->i8_ws) op_gemm_int8(r, d_img_mod0, blk.img_mod_w,
+                r->i8_ws[(size_t)L*QIMG_I8_PER_BLOCK+12], r->use_int8_smooth ? r->i8_sm[(size_t)L*QIMG_I8_PER_BLOCK+12] : NULL,
+                d_t_silu0, blk.img_mod_b, 6 * dim, dim, 1);
+            else op_wgemm_bf16(r, d_img_mod0, blk.img_mod_w, d_t_silu0, blk.img_mod_b, 6 * dim, dim, 1);
+        }
         qimg_set_gemm_context(r, L, "txt_mod");
         if (r->use_int4) op_int4_linear(r, d_txt_mod, d_t_silu, &r->int4_mod[2*L+1], 1);
         else if (r->use_int8 && r->i8_ws) op_gemm_int8(r, d_txt_mod, blk.txt_mod_w,
@@ -2901,12 +2963,6 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         /* Modulation offsets */
         #define MOD_OFF(base, idx) ((void *)((char *)(base) + (size_t)(idx) * dim * sizeof(float)))
-        void *img_sh1 = MOD_OFF(d_img_mod, 0);
-        void *img_sc1 = MOD_OFF(d_img_mod, 1);
-        void *img_g1  = MOD_OFF(d_img_mod, 2);
-        void *img_sh2 = MOD_OFF(d_img_mod, 3);
-        void *img_sc2 = MOD_OFF(d_img_mod, 4);
-        void *img_g2  = MOD_OFF(d_img_mod, 5);
 
         void *txt_sh1 = MOD_OFF(d_txt_mod, 0);
         void *txt_sc1 = MOD_OFF(d_txt_mod, 1);
@@ -2917,7 +2973,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         #undef MOD_OFF
 
         /* adaLN image → d_scratch1 */
-        op_adaln(r, d_scratch1, d_img, img_sh1, img_sc1, n_img, dim);
+        qimg_img_adaln(r, d_scratch1, d_img, d_img_mod, d_img_mod0, 0, n_img, n_cond, dim);
         /* adaLN text → d_scratch2 */
         op_adaln(r, d_scratch2, d_txt, txt_sh1, txt_sc1, n_txt, dim);
 
@@ -2954,10 +3010,16 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
             void *rope2d_args[] = {&d_img_q, &d_img_k,
                                    &n_img, &nh, &hd, &hp_rope, &wp_rope,
                                    &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
+            int txt_start = hp_rope > wp_rope ? hp_rope / 2 : wp_rope / 2;
+            if (r->edit_n_seg > 0) {   /* multi-segment (edit) layout: exact diffusers QwenEmbedRope positions */
+                void *pa[] = {&d_img_q, &d_img_k, &n_img, &nh, &hd, &r->d_edit_pos,
+                              &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
+                hipModuleLaunchKernel(r->fn_rope_pos, (unsigned)n_img, 1, 1, (unsigned)nh, 1, 1, 0, NULL, pa, NULL);
+                txt_start = r->edit_txt_start;
+            } else
             hipModuleLaunchKernel(r->fn_rope_2d, (unsigned)n_img, 1, 1,
                                   (unsigned)nh, 1, 1, 0, NULL, rope2d_args, NULL);
 
-            int txt_start = hp_rope > wp_rope ? hp_rope / 2 : wp_rope / 2;
             void *rope1d_args[] = {&d_txt_q, &d_txt_k,
                                    &n_txt, &nh, &hd, &txt_start,
                                    &t_dim_rope, &h_dim_rope, &w_dim_rope, &rope_theta};
@@ -2977,17 +3039,17 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         op_proj(r, d_scratch2, blk.attn_add_out_w, d_txt_attn, blk.attn_add_out_b, dim, dim, n_txt, L, 7);
 
         /* Gated residual */
-        op_gated_add(r, d_img, d_scratch1, img_g1, n_img, dim);
+        qimg_img_gated_add(r, d_img, d_scratch1, d_img_mod, d_img_mod0, 2, n_img, n_cond, dim);
         op_gated_add(r, d_txt, d_scratch2, txt_g1, n_txt, dim);
 
         /* MLP: Image (GELU) */
-        op_adaln(r, d_scratch1, d_img, img_sh2, img_sc2, n_img, dim);
+        qimg_img_adaln(r, d_scratch1, d_img, d_img_mod, d_img_mod0, 3, n_img, n_cond, dim);
         qimg_set_gemm_context(r, L, "img_mlp_fc1");
         op_proj(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b, mlp_h, dim, n_img, L, 8);
         op_gelu(r, d_scratch3, n_img * mlp_h);
         qimg_set_gemm_context(r, L, "img_mlp_fc2");
         op_proj(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b, dim, mlp_h, n_img, L, 9);
-        op_gated_add(r, d_img, d_scratch1, img_g2, n_img, dim);
+        qimg_img_gated_add(r, d_img, d_scratch1, d_img_mod, d_img_mod0, 5, n_img, n_cond, dim);
 
         /* MLP: Text (GELU) */
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
@@ -3046,7 +3108,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     }
 
     /* Cleanup */
-    hipFree(d_img); hipFree(d_txt); hipFree(d_t_emb);
+    hipFree(d_img); hipFree(d_txt); hipFree(d_t_emb); hipFree(d_t_emb0); hipFree(d_img_mod0); hipFree(d_t_silu0);
     hipFree(d_scratch1); hipFree(d_scratch2); hipFree(d_scratch3);
     hipFree(d_q); hipFree(d_k); hipFree(d_v); hipFree(d_attn_out);
 

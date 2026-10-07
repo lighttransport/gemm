@@ -1,1 +1,2 @@
 qimg_gemm_wmma.inc
+libhip_qimg.so

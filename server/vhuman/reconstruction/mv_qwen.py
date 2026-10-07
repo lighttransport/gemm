@@ -88,8 +88,8 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
         results[name]=image;previous=image
         _commit(atlas,known,geometry,frame,by_name[name],image,valid,points,normals)
     if editor is not None:
-        from .qwen_edit_backend import GENERATOR,LICENSE
-        return [results[v['name']] for v in views],dict(generator=GENERATOR+' sequential (CAP4D-style)',
+        from .qwen_edit_backend import LICENSE
+        return [results[v['name']] for v in views],dict(generator=editor.generator+' sequential (CAP4D-style)',
             license=LICENSE,steps=steps,seed=seed,order=list(ORDER),seconds=seconds)
     return [results[v['name']] for v in views],dict(generator='Qwen-Image-2.1 sequential (CAP4D-style)',
         license='qwen-research',steps=steps,seed=seed,strength=strength,order=list(ORDER),seconds=seconds)
