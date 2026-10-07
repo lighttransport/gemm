@@ -103,7 +103,7 @@ def fuse(colors, weights):
     return mean,w,spread,(weights>.01).sum(0)
 
 
-def bake(work, backend, out, *, delight=True, source='auto', polar='auto'):
+def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_band=True, band_sigma=4.):
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
     info=json.loads((work/backend/'generation.json').read_text())
     for name,digest in info['views'].items():
@@ -136,18 +136,32 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto'):
     # portrait-free ones ignore the top-down camera). Use only horizontal views, accepting grazing angles
     # (facing >= 0.05, still weighted by facing^2) for texels no view sees head-on; fill_unsupported covers the rest.
     polar_mode=('skip' if use_raw else 'composite') if polar=='auto' else polar
+    unseen=grazing_facing=None
     is_polar=np.array([v['name'] in POLAR_VIEWS for v in views])
-    colors,weights=cond.project_views(frame,views,images,points,normals)
-    if polar_mode=='skip':
-        side=[i for i,p in enumerate(is_polar) if not p]
-        gc,gw=cond.project_views(frame,[views[i] for i in side],[images[i] for i in side],points,normals,min_facing=.05)
-        weights[is_polar]=0
-        unseen=weights[~is_polar].sum(0)<=.01        # no horizontal view sees these head-on
-        for k,i in enumerate(side):
-            colors[i]=np.where(unseen[:,None],gc[k],colors[i]);weights[i]=np.where(unseen,gw[k],weights[i])
-    elif use_raw and not polar_ok:   # polar composites only fill texels the horizontal (raw) views do not see
-        side=weights[~is_polar].sum(0)>.01
-        weights[is_polar]*=np.where(side,.05,1.)[None]
+    def project(imgs):
+        """Projection with the polar policy applied; returns colors, weights, unseen, grazing facing."""
+        colors,weights=cond.project_views(frame,views,imgs,points,normals)
+        unseen=grazing=None
+        if polar_mode=='skip':
+            side=[i for i,p in enumerate(is_polar) if not p]
+            gc,gw=cond.project_views(frame,[views[i] for i in side],[imgs[i] for i in side],points,normals,min_facing=.05)
+            weights[is_polar]=0
+            unseen=weights[~is_polar].sum(0)<=.01        # no horizontal view sees these head-on
+            grazing=np.sqrt(gw.max(0))                    # weights are facing^2 (0 where not visible)
+            for k,i in enumerate(side):
+                colors[i]=np.where(unseen[:,None],gc[k],colors[i]);weights[i]=np.where(unseen,gw[k],weights[i])
+        elif use_raw and not polar_ok:   # polar composites only fill texels the horizontal (raw) views do not see
+            side_seen=weights[~is_polar].sum(0)>.01
+            weights[is_polar]*=np.where(side_seen,.05,1.)[None]
+        return colors,weights,unseen,grazing
+    colors,weights,unseen,grazing_facing=project(images)
+    # Two-band fusion: overlapping generations have misaligned fine detail (stubble), so averaging ghosts it
+    # (the crown "star"). Tone (low band) is fused with facing^2 weights; detail (high band) with facing^8,
+    # i.e. nearly winner-take-all from the best-facing view.
+    if two_band:
+        from scipy.ndimage import gaussian_filter
+        low_images=[np.uint8(np.clip(gaussian_filter(im.astype(np.float32),(band_sigma,band_sigma,0))+.5,0,255)) for im in images]
+        colors_low,_,_,_=project(low_images)
     linear=srgb_to_linear(base[valid]/255);seen=observed[valid]
     weights*=neck_cut_weight(geometry,points)[None]
     # Reject per-view outliers (cast shadows, collars) against the cross-view
@@ -158,7 +172,21 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto'):
         ref=np.nanmedian(np.where(has,luma,np.nan),0)
     weights*=~(has&((luma<.6*ref)|(luma>1.6*ref)))
     gen,support,spread,count=fuse(colors,weights)
+    if two_band:
+        low,_,_,_=fuse(colors_low,weights);high,_,_,_=fuse(colors-colors_low,weights**4)
+        # Grazing projections smear one pixel over many texels (radial streaks -> crown "star"): fade the
+        # projected detail out with the best facing cosine and substitute world-space triplanar detail.
+        best=np.sqrt(np.maximum(weights.max(0),0))
+        synth=synthetic_detail(points,normals,work/backend)
+        if synth is not None:
+            a=np.clip((best-.25)/.35,0,1)[:,None]
+            high=a*high+(1-a)*synth
+        gen=np.clip(low+high,0,1)
     gen,support=fill_unsupported(points,gen,support,seen)
+    if unseen is not None and unseen.any():
+        detail_src=work/backend/'back'/'edited.png'
+        gen=fill_pole(points,normals,gen,support,seen,unseen,grazing_facing,
+                      np.asarray(Image.open(detail_src).convert('RGB')) if detail_src.exists() else None)
     # Generators relight; match their per-channel level to photographed skin
     # over texels both observed and generated (robust median ratio).
     both=seen&(support>.05)
@@ -182,7 +210,7 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto'):
         source_geometry_sha256=record['geometry_sha256'],work=str(work.resolve()),
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
         basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
-        view_source=('raw edits' if use_raw else 'composites')+f', polar={polar_mode}',
+        view_source=('raw edits' if use_raw else 'composites')+f', polar={polar_mode}'+(f', two-band sigma {band_sigma}' if two_band else ''),
         photographed_texels_changed=int(np.any(result[observed]!=base[observed],axis=-1).sum()),
         generated_texels=int((blend>.01).sum()),
         unseen_texels=int((~seen).sum()),unseen_covered=float((support[~seen]>.05).mean()),
@@ -220,6 +248,54 @@ def local_gain(points, photo, gen, both, k=48, falloff=.03):
     d,j=cKDTree(points[both]).query(points,k=k)
     w=1/(d+.002);field=(log[j]*w[...,None]).sum(1)/w.sum(1)[:,None]
     return np.exp(field*np.exp(-d[:,0]/falloff)[:,None])
+
+
+def synthetic_detail(points, normals, gen_dir, *, period=.03, limit=.06):
+    """Triplanar high-band detail from the back-view edit: scalp patch for upward normals, neck patch below."""
+    src=Path(gen_dir)/'back'/'edited.png'
+    if not src.exists():return None
+    from scipy.ndimage import gaussian_filter
+    from ..mobile.baking import sample
+    im=srgb_to_linear(np.asarray(Image.open(src).convert('RGB'))/255);h=im.shape[0]
+    def residual(y0,y1):
+        patch=im[int(y0*h):int(y1*h),int(.38*h):int(.62*h)]
+        return np.clip(patch-gaussian_filter(patch,(4,4,0)),-limit,limit)
+    scalp,neck=residual(.10,.34),residual(.62,.80)
+    tw=np.abs(normals)**4;tw/=np.maximum(tw.sum(1,keepdims=True),1e-12)
+    out=np.zeros_like(points)
+    for patch,mask in ((scalp,normals[:,1]>=0),(neck,normals[:,1]<0)):
+        for axis,pair in enumerate(((1,2),(0,2),(0,1))):
+            uv=points[mask][:,pair]/period;uv=1-np.abs(np.mod(uv,2)-1)
+            out[mask]+=sample(patch,uv)*tw[mask][:,axis,None]
+    return out
+
+
+def fill_pole(points, normals, gen, support, seen, unseen, facing, detail_image, *, sigma=.01, full=.3):
+    """Replace the grazing-angle star at the crown/chin poles with a smooth fill plus world-space detail.
+
+    Low frequency: Gaussian (sigma metres) average of nearby well-seen generated texels. High frequency:
+    stubble/skin residual from a scalp patch of the back-view edit, mapped triplanar (no UV seams, no
+    directional pinch). Grazing projections keep weight where facing >= full; the fill takes over below.
+    """
+    good=(~unseen)&(~seen)&(support>.05)
+    if good.sum()<64:return gen
+    tree=cKDTree(points[good]);d,j=tree.query(points[unseen],k=32)
+    w=np.exp(-.5*(d/sigma)**2)+1e-12;low=(gen[good][j]*w[...,None]).sum(1)/w.sum(1)[:,None]
+    fill=low
+    if detail_image is not None:
+        from scipy.ndimage import gaussian_filter
+        h=detail_image.shape[0];patch=srgb_to_linear(detail_image[int(.12*h):int(.38*h),int(.35*h):int(.65*h)]/255)
+        residual=np.clip(patch-gaussian_filter(patch,(6,6,0)),-.06,.06)
+        tw=np.abs(normals[unseen])**4;tw/=np.maximum(tw.sum(1,keepdims=True),1e-12)
+        from ..mobile.baking import sample
+        det=np.zeros_like(low)
+        for axis,pair in enumerate(((1,2),(0,2),(0,1))):
+            uv=points[unseen][:,pair]/.03;uv=1-np.abs(np.mod(uv,2)-1)
+            det+=sample(residual,uv)*tw[:,axis,None]
+        fill=np.clip(low+det,0,1)
+    a=np.clip(facing[unseen]/full,0,1)[:,None]**2      # 0 at the pole -> synthesized fill
+    gen=gen.copy();gen[unseen]=a*gen[unseen]+(1-a)*fill
+    return gen
 
 
 def fill_unsupported(points, gen, support, seen, threshold=.05):
@@ -283,7 +359,7 @@ def main():
     p.add_argument('stage',choices=('prepare','generate','regen-polar','bake','eval'))
     p.add_argument('--candidate');p.add_argument('--work',required=True)
     p.add_argument('--backend',choices=BACKENDS,default='mvadapter');p.add_argument('--out',nargs='*')
-    p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
+    p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--one-band',action='store_true');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
     if a.stage=='generate':
@@ -295,7 +371,7 @@ def main():
         record=check(a.work);frame,views=conditions(Path(record['candidate']),record['resolution'])
         print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,make_editor(),
             **({'steps':a.steps} if a.steps else {})),indent=1))
-    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar),indent=1))
+    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
 
