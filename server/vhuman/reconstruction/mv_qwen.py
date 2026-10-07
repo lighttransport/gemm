@@ -24,12 +24,11 @@ PROMPT=('Photorealistic texture render of this exact bald human head on a plain 
     'Soft even diffuse light, no shadows, no highlights. Preserve the exact silhouette, pose and existing '
     'facial details. No glasses, hats, jewelry, text or extra features.')
 
-EDIT_PROMPT=('Picture 1 is a 3D render of a bald human head whose skin is only partly textured; flat uniform '
-    'beige areas are untextured. Picture 2 is a photo of the same person. Complete Picture 1: replace the flat '
-    'beige areas with realistic skin of this person (same skin tone, pores, natural ear anatomy, very short '
-    'dark hair stubble on the scalp where hair grows). Keep the exact camera, pose, silhouette, ears and all '
-    'already-textured regions unchanged. Soft even diffuse light, no shadows, no highlights, plain gray background.')
-
+EDIT_PROMPT=('Picture 1 is a photo of a person. The LAST picture is a 3D render of the same bald head, partly '
+    'untextured (flat uniform beige). Edit only the last picture: replace the flat beige areas with realistic skin of '
+    'the person in Picture 1, matching the skin tone of the already-textured face, natural ear anatomy, and very short '
+    'dark hair stubble on the scalp where hair grows. Do not move, zoom, crop or change the camera; keep the silhouette, '
+    'all textured regions and the gray background identical. Even diffuse light, no shadows, no highlights.')
 
 def _mask(view):
     return np.uint8((view['valid']&(view['known']<.5))*255)
@@ -78,9 +77,10 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
                 steps=steps,seed=seed+index,strength=strength)
             seconds+=receipt['seconds']
         else:
-            inputs=[np.asarray(small(view['rgb'])),portrait]+([np.asarray(small(previous))] if previous is not None else [])
-            edited,took=editor(inputs,EDIT_PROMPT+(' Picture 3 is the previously completed neighbouring view; keep '
-                'skin tone and texture consistent with it.' if len(inputs)==3 else ''),steps=steps,seed=seed+index)
+            big=np.asarray(Image.fromarray(view['rgb']).resize((1024,1024),Image.Resampling.LANCZOS))
+            inputs=[portrait]+([np.asarray(Image.fromarray(previous).resize((1024,1024)))] if previous is not None else [])+[big]
+            edited,took=editor(inputs,EDIT_PROMPT+(' Picture 2 is the previously completed neighbouring view; keep skin '
+                'tone and texture consistent with it.' if len(inputs)==3 else ''),steps=steps,seed=seed+index)
             Image.fromarray(edited).save(folder/'edited.png');seconds+=took
         image=np.asarray(Image.open(folder/'edited.png').convert('RGB').resize((res,res),Image.Resampling.LANCZOS))
         # Keep known pixels exact at full resolution; only masked pixels are new.

@@ -3,6 +3,10 @@
 The 13 GB transformer is resident on the 16 GB GPU; the Qwen2.5-VL text/vision
 encoder (16.6 GB bf16) runs on the CPU and only its embeddings move to the GPU.
 Edit outputs whole images: callers composite photographed pixels back.
+
+Alignment: the pipeline sizes condition latents to ~1 MP, so the output must be 1024^2 and the
+target view must be the LAST image; a 512^2 output reproduces only the top-left quarter of the
+condition grid (verified on the right view: 512 zooms, 1024 is pixel-aligned).
 """
 from pathlib import Path
 import time
@@ -28,7 +32,7 @@ class Editor:
         self.pipe.transformer.to('cuda');self.pipe.vae.to('cuda');self.pipe.vae.enable_tiling()
         self.pipe.text_encoder.to('cpu')
 
-    def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=512,
+    def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
                  negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
         torch=self.torch;started=time.time()
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
