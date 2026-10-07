@@ -234,9 +234,10 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
             # One global per-channel gain: a spatial field interpolated from the left and right overlaps switched
             # sides at the back midline and drew a vertical seam.
             lr=np.clip(np.log(np.maximum(ge[both_g],1e-4))-np.log(np.maximum(gm[both_g],1e-4)),-1,1)
-            # Separate scalp (stubble darkens the tone) and skin gains, blended by how upward-facing the normal is;
-            # both regions are left/right symmetric, so no midline seam.
-            up=np.clip((normals[:,1]-.1)/.4,0,1)
+            # Separate scalp (stubble darkens the tone) and skin gains. Scalp is by height (the back of the skull
+            # faces backwards, so a normal test missed it): ramps in from ~13 cm to ~9 cm below the vertex (about
+            # ear-top level). Both regions are left/right symmetric, so no midline seam.
+            up=np.clip((points[:,1]-(points[:,1].max()-.13))/.04,0,1)
             ws=up[both_g]>.5
             g_all=np.median(lr,0)
             g_scalp=np.median(lr[ws],0) if ws.sum()>300 else g_all
