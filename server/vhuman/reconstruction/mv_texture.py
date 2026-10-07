@@ -27,6 +27,7 @@ from .observations import sha256
 from .provenance import validate_candidate
 from .reference import srgb_to_linear, linear_to_srgb
 
+POLAR_VIEWS=('top','bottom')
 BACKENDS=('mvadapter','qwen_seq','qwen_grid','qwen_edit_seq')
 RES=768
 
@@ -102,7 +103,7 @@ def fuse(colors, weights):
     return mean,w,spread,(weights>.01).sum(0)
 
 
-def bake(work, backend, out, *, delight=True):
+def bake(work, backend, out, *, delight=True, source='auto'):
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
     info=json.loads((work/backend/'generation.json').read_text())
     for name,digest in info['views'].items():
@@ -111,7 +112,19 @@ def bake(work, backend, out, *, delight=True):
     geometry,base,observed=load(candidate)
     frame,views=conditions(candidate,record['resolution'])
     valid,points,normals=skin.atlas_surface(geometry,len(base))
-    images=[np.asarray(Image.open(work/backend/f"view_{v['name']}.png").convert('RGB')) for v in views]
+    # source='raw': fuse each view's full editor output (<name>/edited.png) instead of the sequential
+    # composite view_<name>.png, whose earlier-view regions are re-renders (hard commit seams). 'auto'
+    # uses raw outputs when every view has one (sequential backends).
+    def load_view(v):
+        raw=work/backend/v['name']/'edited.png'
+        # Top/bottom raw edits hallucinate faces (portrait-conditioned editor on a top-down head): keep
+        # their sequential composite, which only adds the hole no earlier view covered.
+        path=raw if use_raw and raw.exists() and v['name'] not in POLAR_VIEWS else work/backend/f"view_{v['name']}.png"
+        im=Image.open(path).convert('RGB')
+        return np.asarray(im.resize((record['resolution'],)*2,Image.Resampling.LANCZOS) if im.size[0]!=record['resolution'] else im)
+    raw_all=all((work/backend/v['name']/'edited.png').exists() for v in views)
+    use_raw=source=='raw' or (source=='auto' and raw_all)
+    images=[load_view(v) for v in views]
     delight_report=None
     if delight:
         from .mv_delight import delight as remove_light
@@ -119,6 +132,10 @@ def bake(work, backend, out, *, delight=True):
         for i,v in enumerate(views):
             images[i],delight_report[v['name']]=remove_light(images[i],v['normal'],v['valid'])
     colors,weights=cond.project_views(frame,views,images,points,normals)
+    if use_raw:   # polar views only fill texels the horizontal (raw) views do not see
+        polar=np.array([v['name'] in POLAR_VIEWS for v in views])
+        side=weights[~polar].sum(0)>.01
+        weights[polar]*=np.where(side,.05,1.)[None]
     linear=srgb_to_linear(base[valid]/255);seen=observed[valid]
     weights*=neck_cut_weight(geometry,points)[None]
     # Reject per-view outliers (cast shadows, collars) against the cross-view
@@ -153,6 +170,7 @@ def bake(work, backend, out, *, delight=True):
         source_geometry_sha256=record['geometry_sha256'],work=str(work.resolve()),
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
         basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
+        view_source='raw edits (horizontal) + composite polar views' if use_raw else 'composites',
         photographed_texels_changed=int(np.any(result[observed]!=base[observed],axis=-1).sum()),
         generated_texels=int((blend>.01).sum()),
         unseen_texels=int((~seen).sum()),unseen_covered=float((support[~seen]>.05).mean()),
@@ -253,13 +271,13 @@ def main():
     p.add_argument('stage',choices=('prepare','generate','bake','eval'))
     p.add_argument('--candidate');p.add_argument('--work',required=True)
     p.add_argument('--backend',choices=BACKENDS,default='mvadapter');p.add_argument('--out',nargs='*')
-    p.add_argument('--no-delight',action='store_true');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
+    p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
     if a.stage=='generate':
         opts=dict(seed=a.seed);opts.update(steps=a.steps) if a.steps else None
         print(json.dumps(generate(a.work,a.backend,**opts),indent=1))
-    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight),indent=1))
+    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
 
