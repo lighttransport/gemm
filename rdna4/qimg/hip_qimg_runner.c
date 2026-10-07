@@ -22,6 +22,7 @@
 #include "../rocew.h"
 #include "../hip_kernels_common.h"
 #include "hip_qimg_kernels.h"
+#include "qimg_gemm_wmma.inc"
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
 
@@ -113,6 +114,7 @@ typedef struct {
     void  *lora_down;  /* device bf16  [rank, n_in] */
     void  *lora_up;    /* device bf16  [n_out, rank] */
     float *bias;       /* device f32   [n_out] */
+    int lora_folded;   /* lora_down pre-multiplied by smooth (tiled path) */
     int n_out, n_in, rank, group_size;
 } qimg_int4_linear;
 
@@ -159,7 +161,7 @@ struct hip_qimg_runner {
     hipFunction_t fn_q_quant_perrow, fn_k_quant_repack_perrow, fn_flash_attn_fp8_perrow;
     int use_attn_fp8;  /* 1 = QIMG_FP8_ATTN=1 enables FP8 WMMA flash attention */
     hipFunction_t fn_rope_2d, fn_rope_1d, fn_bf16_trunc, fn_add;
-    hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w;  /* int4 dequant/expand + fused W4A16 GEMM */
+    hipFunction_t fn_dequant_int4_main, fn_expand_bf16, fn_gemm_int4w, fn_gemm_bf16w;  /* + BF16 LoRA WMMA */  /* int4 dequant/expand + fused W4A16 GEMM */
     hipFunction_t fn_quant_act_int8, fn_gemm_w8a8, fn_gemm_w8a8_wmma, fn_gemm_w8a8_pgr2;  /* INT8 W8A8 GEMMs */
     hipFunction_t fn_gemm_int4w_g16;  /* simple RTN int4-g16 BF16-act WMMA GEMM (no LoRA/swizzle) */
     hipFunction_t fn_patchify, fn_unpatchify, fn_euler_step, fn_cfg_combine;
@@ -214,6 +216,11 @@ struct hip_qimg_runner {
     qimg_int4_linear *int4_linears;  /* [n_blocks * QIMG_INT4_PER_BLOCK] per-block logical-linear descriptors */
     qimg_int4_linear *int4_mod;      /* [n_blocks * 2] img_mod/txt_mod RTN-int4 (rank0, no smooth) */
     float *i4_ldf, *i4_luf, *i4_dt, *i4_dly; size_t i4_dt_cap, i4_dly_cap;  /* persistent lora scratch */
+    int int4_lora_f32;  /* QIMG_INT4_LORA_F32=1: legacy scalar f32 LoRA (A/B oracle) */
+    /* Tiled WMMA module (qimg_gemm_wmma.hip); QIMG_INT4_GEMM=legacy keeps the old kernels. */
+    hipModule_t mod_tiled; int use_tiled;
+    hipFunction_t fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
+    unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
     /* INT8 SmoothQuant (W8A8) path: int8 weights stream via the fp8 byte path (same 1 B/param);
      * the small per-linear scales stay resident. d_xq_int8/d_x_iscale = per-token quant scratch. */
@@ -1150,8 +1157,81 @@ static void op_gemm_int8(hip_qimg_runner *r, void *Y, void *Wq, void *wscale, vo
     }
 }
 
+/* ---- tiled WMMA path (qimg_gemm_wmma.hip) ---- */
+#define QIMG_LORA_SPLITS 8
+static void qimg_tl_cast(hip_qimg_runner *r, unsigned short *Xb, const void *X, const void *smooth, int K, long n) {
+    void *a[] = {&Xb, (void*)&X, (void*)&smooth, &K, &n};
+    hipModuleLaunchKernel(r->fn_cast_bf16, (unsigned)((n + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL);
+}
+static void qimg_tl_gemm_full(hip_qimg_runner *r, int int4, void *Y, const void *W, const void *S,
+                         const unsigned short *X, const void *bias, int N, int K, int M, int accum, int splits,
+                         const unsigned short *X2, const void *W2, int K2) {
+    /* Tile choice: narrow N (LoRA rank) -> 64x64 for CTA count; small M -> 64x128;
+     * else variant (QIMG_TILED_VARIANT): 0 = 128x128/128thr, 1 = 128x128/256thr, 2 = 128x256/256thr. */
+    hipFunction_t f; int bm, bn, thr;
+    if (!int4 && N <= 128)      { f = r->fn_qg_bf16_64x64; bm = 64; bn = 64; thr = 128; }
+    else if (M <= 64)           { f = int4 ? r->fn_qg_i4_64 : r->fn_qg_bf16_64; bm = 64; bn = 128; thr = 128; }
+    else if (r->tl_variant == 2 && int4) { f = r->fn_qg_i4_256; bm = 128; bn = 256; thr = 256; }
+    else if (r->tl_variant >= 1) { f = int4 ? r->fn_qg_i4_w8 : r->fn_qg_bf16_w8; bm = 128; bn = 128; thr = 256; }
+    else                        { f = int4 ? r->fn_qg_i4_128 : r->fn_qg_bf16_128; bm = 128; bn = 128; thr = 128; }
+    void *a[] = {&Y, (void*)&W, (void*)&S, (void*)&X, (void*)&bias, &N, &K, &M, &accum, (void*)&X2, (void*)&W2, &K2};
+    unsigned tiles = (unsigned)(((M + bm - 1) / bm) * ((N + bn - 1) / bn));  /* 1-D grouped grid */
+    hipModuleLaunchKernel(f, tiles, (unsigned)splits, 1, thr, 1, 1, 0, NULL, a, NULL);
+}
+static void qimg_tl_gemm_split(hip_qimg_runner *r, int int4, void *Y, const void *W, const void *S,
+                         const unsigned short *X, const void *bias, int N, int K, int M, int accum, int splits) {
+    qimg_tl_gemm_full(r, int4, Y, W, S, X, bias, N, K, M, accum, splits, NULL, NULL, 0);
+}
+static void qimg_tl_gemm(hip_qimg_runner *r, int int4, void *Y, const void *W, const void *S,
+                         const unsigned short *X, const void *bias, int N, int K, int M, int accum) {
+    qimg_tl_gemm_split(r, int4, Y, W, S, X, bias, N, K, M, accum, 1);
+}
+static void qimg_tl_reserve(hip_qimg_runner *r, size_t x, size_t dt) {
+    if (x > r->tl_x_cap) { hipDeviceSynchronize(); hipFree(r->tl_xs); hipFree(r->tl_xb);
+        hipMalloc((void**)&r->tl_xs, x * 2); hipMalloc((void**)&r->tl_xb, x * 2); r->tl_x_cap = x; }
+    if (dt > r->tl_dt_cap) { hipDeviceSynchronize(); hipFree(r->tl_dtb); hipFree(r->i4_dt);
+        hipMalloc((void**)&r->tl_dtb, dt * 2); hipMalloc((void**)&r->i4_dt, dt * 4 * QIMG_LORA_SPLITS); r->tl_dt_cap = dt; r->i4_dt_cap = dt; }
+}
+/* lora_down is pre-multiplied by smooth at load (qimg_fold_smooth_into_lora), so the LoRA reuses the
+ * smoothed bf16 activations: X@ld^T == (X/smooth)@(ld*smooth)^T. */
+static void qimg_tiled_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
+    int n_out = L->n_out, n_in = L->n_in, rk = L->rank;
+    long nx = (long)n_tok * n_in;
+    qimg_tl_reserve(r, (size_t)nx, (size_t)(rk > 0 ? rk : 1) * n_tok);
+    qimg_tl_cast(r, r->tl_xs, X, L->smooth, n_in, nx);                       /* bf16(X / smooth) */
+    if (rk > 0 && L->lora_down) {
+        /* dt = X @ ld^T first (split-K), then one GEMM: Y = [X/s | dt] @ [Wq | lora_up]^T + bias. */
+        const unsigned short *xa = L->smooth && !L->lora_folded ? NULL : r->tl_xs;
+        if (!xa) { qimg_tl_cast(r, r->tl_xb, X, NULL, n_in, nx); xa = r->tl_xb; }
+        int splits = n_in >= 2048 ? QIMG_LORA_SPLITS : 1; long nd = (long)n_tok * rk;
+        qimg_tl_gemm_split(r, 0, r->i4_dt, L->lora_down, NULL, xa, NULL, rk, n_in, n_tok, 0, splits);
+        void *ra[] = {&r->tl_dtb, &r->i4_dt, &splits, &nd};
+        hipModuleLaunchKernel(r->fn_splitk_bf16, (unsigned)((nd + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ra, NULL);
+        qimg_tl_gemm_full(r, 1, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, 0, 1,
+                          r->tl_dtb, L->lora_up, rk);
+    } else
+        qimg_tl_gemm(r, 1, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, 0);
+}
+
+/* In place: lora_down[j,k] *= smooth[k] (bf16 RNE). After this the legacy LoRA path is invalid. */
+static void qimg_fold_smooth_into_lora(qimg_int4_linear *L) {
+    if (!L->smooth || !L->lora_down || L->rank <= 0 || L->lora_folded) return;
+    size_t n = (size_t)L->rank * L->n_in;
+    uint16_t *ld = (uint16_t*)malloc(n * 2); float *sm = (float*)malloc((size_t)L->n_in * 4);
+    hipMemcpy(ld, L->lora_down, n * 2, hipMemcpyDeviceToHost); hipMemcpy(sm, L->smooth, (size_t)L->n_in * 4, hipMemcpyDeviceToHost);
+    for (size_t i = 0; i < n; i++) {
+        unsigned u = (unsigned)ld[i] << 16; float v; memcpy(&v, &u, 4); v *= sm[i % L->n_in];
+        memcpy(&u, &v, 4); u += ((u >> 16) & 1u) + 0x7FFFu; ld[i] = (uint16_t)(u >> 16);
+    }
+    hipMemcpy(L->lora_down, ld, n * 2, hipMemcpyHostToDevice); free(ld); free(sm); L->lora_folded = 1;
+}
+
 static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
     int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank;
+    if (r->use_tiled && gs == 64 && (n_in % 64) == 0 && (rk % 32) == 0) {
+        qimg_tiled_int4_linear(r, Y, X, L, n_tok);
+        return;
+    }
     /* Simple RTN int4-g16 path (no swizzle/LoRA/smooth): plain nibble + per-g16
      * bf16 scale via the validated gemm_int4w_g16 kernel. */
     if (gs == 16 && r->fn_gemm_int4w_g16) {
@@ -1163,7 +1243,18 @@ static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4
     /* fused W4A16: dequant-in-LDS bf16 WMMA (main+smooth+bias) — replaces dense materialize */
     void *ga[]={&Y,(void*)&L->qint4,&X,(void*)&L->bias,(void*)&L->wscale,(void*)&L->smooth,&n_out,&n_in,&n_tok};
     hipModuleLaunchKernel(r->fn_gemm_int4w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,ga,NULL);
-    if (rk > 0 && L->lora_down) {                                     /* rank-128 residual (skip for mod: rank 0) */
+    if (rk > 0 && L->lora_down && r->fn_gemm_bf16w && !r->int4_lora_f32) {
+        /* rank-r residual on BF16 WMMA: dt[n_tok,rk] = X@lora_down^T ; Y += dt@lora_up^T.
+         * Same-stream ordering protects the shared dt scratch; only regrowth syncs. */
+        if ((size_t)rk*n_tok > r->i4_dt_cap) { hipDeviceSynchronize(); hipFree(r->i4_dt); hipMalloc(&r->i4_dt,(size_t)rk*n_tok*4); r->i4_dt_cap=(size_t)rk*n_tok; }
+        void *dt=r->i4_dt; int zero=0, one=1;
+        void *a1[]={&dt,(void*)&L->lora_down,&X,&rk,&n_in,&n_tok,&zero};
+        hipModuleLaunchKernel(r->fn_gemm_bf16w,(unsigned)((rk+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,a1,NULL);
+        void *a2[]={&Y,(void*)&L->lora_up,&dt,&n_out,&rk,&n_tok,&one};
+        hipModuleLaunchKernel(r->fn_gemm_bf16w,(unsigned)((n_out+127)/128),(unsigned)((n_tok+127)/128),1,256,1,1,0,NULL,a2,NULL);
+        return;
+    }
+    if (rk > 0 && L->lora_down) {                                     /* legacy scalar f32 residual (QIMG_INT4_LORA_F32=1) */
         if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
         /* Growing these shared scratch buffers means hipFree+hipMalloc; sync
          * first so we never free a buffer a prior launch is still reading. Skip
@@ -1562,6 +1653,110 @@ static void qimg_int4_g16_selftest(hip_qimg_runner *r) {
         for (int s = 0; s < 5; s++) qimg_int4_g16_selftest_one(r, Ms[t], shapes[s][1], shapes[s][0]);
 }
 
+/* QIMG_LORA_SELFTEST=1: BF16-WMMA LoRA residual (Y += (X@ld^T)@lu^T) vs a host double oracle that
+ * applies the kernels' BF16 truncation of X and of the rank intermediate, plus timing vs the legacy
+ * scalar-f32 path at a 1024^2 image-token count. */
+static float qimg_bf16r(float v){ unsigned b; memcpy(&b,&v,4); b&=0xFFFF0000u; memcpy(&v,&b,4); return v; }
+static void qimg_lora_selftest_one(hip_qimg_runner *r, int M, int K, int N, int R) {
+    unsigned int s=777;
+    #define RND ((s=s*1664525u+1013904223u),((float)(s>>8)*(1.0f/16777216.0f)*2.0f-1.0f))
+    float *X=(float*)malloc((size_t)M*K*4), *Y0=(float*)malloc((size_t)M*N*4);
+    unsigned short *ld=(unsigned short*)malloc((size_t)R*K*2), *lu=(unsigned short*)malloc((size_t)N*R*2);
+    for(long i=0;i<(long)M*K;i++)X[i]=RND; for(long i=0;i<(long)M*N;i++)Y0[i]=RND;
+    for(long i=0;i<(long)R*K;i++){float v=RND*.05f;unsigned b;memcpy(&b,&v,4);ld[i]=(unsigned short)(b>>16);}
+    for(long i=0;i<(long)N*R;i++){float v=RND*.05f;unsigned b;memcpy(&b,&v,4);lu[i]=(unsigned short)(b>>16);}
+    #undef RND
+    #define BF(u) ({unsigned _b=((unsigned)(u))<<16; float _f; memcpy(&_f,&_b,4); _f;})
+    int Mc = M < 64 ? M : 64;  /* host oracle on the first rows only */
+    double *dt=(double*)malloc((size_t)Mc*R*8);
+    for(int m=0;m<Mc;m++)for(int j=0;j<R;j++){double a=0;for(int k=0;k<K;k++)a+=(double)qimg_bf16r(X[(long)m*K+k])*BF(ld[(long)j*K+k]);dt[m*R+j]=qimg_bf16r((float)a);}
+    void *dX,*dld,*dlu,*dY,*ddt; hipMalloc(&dX,(size_t)M*K*4);hipMalloc(&dld,(size_t)R*K*2);hipMalloc(&dlu,(size_t)N*R*2);hipMalloc(&dY,(size_t)M*N*4);hipMalloc(&ddt,(size_t)M*R*4);
+    hipMemcpy(dX,X,(size_t)M*K*4,hipMemcpyHostToDevice);hipMemcpy(dld,ld,(size_t)R*K*2,hipMemcpyHostToDevice);
+    hipMemcpy(dlu,lu,(size_t)N*R*2,hipMemcpyHostToDevice);hipMemcpy(dY,Y0,(size_t)M*N*4,hipMemcpyHostToDevice);
+    int zero=0,one=1;
+    void *a1[]={&ddt,&dld,&dX,&R,&K,&M,&zero}, *a2[]={&dY,&dlu,&ddt,&N,&R,&M,&one};
+    hipEvent_t e0,e1; hipEventCreate(&e0); hipEventCreate(&e1); hipEventRecord(e0,NULL);
+    hipModuleLaunchKernel(r->fn_gemm_bf16w,(unsigned)((R+127)/128),(unsigned)((M+127)/128),1,256,1,1,0,NULL,a1,NULL);
+    hipModuleLaunchKernel(r->fn_gemm_bf16w,(unsigned)((N+127)/128),(unsigned)((M+127)/128),1,256,1,1,0,NULL,a2,NULL);
+    hipEventRecord(e1,NULL); hipError_t le=hipDeviceSynchronize(); float ms_w=0; hipEventElapsedTime(&ms_w,e0,e1);
+    float *Yg=(float*)malloc((size_t)M*N*4); hipMemcpy(Yg,dY,(size_t)M*N*4,hipMemcpyDeviceToHost);
+    double dot=0,nr=0,ng=0; for(int m=0;m<Mc;m++)for(int n=0;n<N;n++){double a=0;for(int j=0;j<R;j++)a+=dt[m*R+j]*BF(lu[(long)n*R+j]);
+        a+=Y0[(long)m*N+n]; double b=Yg[(long)m*N+n]; dot+=a*b;nr+=a*a;ng+=b*b;}
+    double cosv=dot/(sqrt(nr)*sqrt(ng)+1e-30);
+    /* legacy scalar f32 path timing (expand + two op_gemm + add) */
+    float *ldf,*luf,*dly; hipMalloc((void**)&ldf,(size_t)R*K*4);hipMalloc((void**)&luf,(size_t)N*R*4);hipMalloc((void**)&dly,(size_t)M*N*4);
+    int ldn=R*K,lun=N*R,ny=M*N; void *x1[]={&dld,&ldf,&ldn},*x2[]={&dlu,&luf,&lun},*aa[]={&dY,&dly,&ny};
+    hipEventRecord(e0,NULL);
+    hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((ldn+255)/256),1,1,256,1,1,0,NULL,x1,NULL);
+    hipModuleLaunchKernel(r->fn_expand_bf16,(unsigned)((lun+255)/256),1,1,256,1,1,0,NULL,x2,NULL);
+    op_gemm(r,ddt,ldf,dX,NULL,R,K,M); op_gemm(r,dly,luf,ddt,NULL,N,R,M);
+    hipModuleLaunchKernel(r->fn_add,(unsigned)((ny+255)/256),1,1,256,1,1,0,NULL,aa,NULL);
+    hipEventRecord(e1,NULL); hipDeviceSynchronize(); float ms_f=0; hipEventElapsedTime(&ms_f,e0,e1);
+    #undef BF
+    fprintf(stderr,"hip_qimg: lora-wmma selftest M%-5d K%-5d N%-5d R%d cos=%.6f wmma=%.2fms legacy_f32=%.2fms (%.1fx) err=%d %s\n",
+        M,K,N,R,cosv,ms_w,ms_f,ms_f/(ms_w+1e-9),le,(le==0&&cosv>0.9999)?"PASS":"FAIL");
+    hipFree(dX);hipFree(dld);hipFree(dlu);hipFree(dY);hipFree(ddt);hipFree(ldf);hipFree(luf);hipFree(dly);
+    free(X);free(Y0);free(ld);free(lu);free(dt);free(Yg);
+}
+static void qimg_lora_selftest(hip_qimg_runner *r) {
+    if(getenv("QIMG_LORA_SELFTEST_SMALL")){qimg_lora_selftest_one(r,128,128,128,128);qimg_lora_selftest_one(r,128,256,128,128);qimg_lora_selftest_one(r,256,128,256,128);return;}
+    int shapes[][2]={{3072,3072},{12288,3072},{3072,12288}};  /* N,K */
+    int Ms[3]={4096+12, 300, 1};  /* 1024^2 img tokens, txt, mod */
+    for(int t=0;t<3;t++)for(int i=0;i<3;i++)qimg_lora_selftest_one(r,Ms[t],shapes[i][1],shapes[i][0],128);
+}
+
+/* QIMG_TILED_SELFTEST=1: tiled WMMA int4 linear (main+smooth+bias+LoRA) vs the legacy validated kernels
+ * (gemm_int4w_bf16a_wmma_t + scalar f32 LoRA) on random SVDQuant-shaped weights; reports cos + timing. */
+static void qimg_tiled_selftest_one(hip_qimg_runner *r, int M, int K, int N) {
+    int R = getenv("QIMG_TILED_SELFTEST_R0") ? 0 : 128; unsigned int s = 4242;
+    #define RND ((s=s*1664525u+1013904223u),((float)(s>>8)*(1.0f/16777216.0f)*2.0f-1.0f))
+    #define TOBF(v) ({float _v=(v); unsigned _b; memcpy(&_b,&_v,4); (unsigned short)(_b>>16);})
+    unsigned char *q=(unsigned char*)malloc((size_t)N*K/2); unsigned short *ws=(unsigned short*)malloc((size_t)N*(K/64)*2);
+    unsigned short *ld=(unsigned short*)malloc((size_t)R*K*2), *lu=(unsigned short*)malloc((size_t)N*R*2);
+    float *sm=(float*)malloc((size_t)K*4), *bi=(float*)malloc((size_t)N*4), *X=(float*)malloc((size_t)M*K*4);
+    for(long i=0;i<(long)N*K/2;i++){s=s*1664525u+1013904223u;q[i]=(unsigned char)(s>>13);}
+    for(long i=0;i<(long)N*(K/64);i++)ws[i]=TOBF(.01f+.01f*fabsf(RND));
+    for(long i=0;i<(long)R*K;i++)ld[i]=TOBF(RND*.03f); for(long i=0;i<(long)N*R;i++)lu[i]=TOBF(RND*.03f);
+    for(int i=0;i<K;i++)sm[i]=.5f+fabsf(RND); for(int i=0;i<N;i++)bi[i]=RND*.1f; for(long i=0;i<(long)M*K;i++)X[i]=RND;
+    #undef RND
+    #undef TOBF
+    qimg_int4_linear L; memset(&L,0,sizeof L); L.n_out=N;L.n_in=K;L.group_size=64;L.rank=R;
+    hipMalloc((void**)&L.qint4,(size_t)N*K/2); hipMemcpy(L.qint4,q,(size_t)N*K/2,hipMemcpyHostToDevice);
+    hipMalloc((void**)&L.wscale,(size_t)N*(K/64)*2); hipMemcpy(L.wscale,ws,(size_t)N*(K/64)*2,hipMemcpyHostToDevice);
+    hipMalloc((void**)&L.lora_down,(size_t)R*K*2); hipMemcpy(L.lora_down,ld,(size_t)R*K*2,hipMemcpyHostToDevice);
+    hipMalloc((void**)&L.lora_up,(size_t)N*R*2); hipMemcpy(L.lora_up,lu,(size_t)N*R*2,hipMemcpyHostToDevice);
+    hipMalloc((void**)&L.smooth,(size_t)K*4); hipMemcpy(L.smooth,sm,(size_t)K*4,hipMemcpyHostToDevice);
+    hipMalloc((void**)&L.bias,(size_t)N*4); hipMemcpy(L.bias,bi,(size_t)N*4,hipMemcpyHostToDevice);
+    void *dX,*dY0,*dY1; hipMalloc(&dX,(size_t)M*K*4); hipMalloc(&dY0,(size_t)M*N*4); hipMalloc(&dY1,(size_t)M*N*4);
+    hipMemcpy(dX,X,(size_t)M*K*4,hipMemcpyHostToDevice);
+    hipEvent_t e0,e1; hipEventCreate(&e0); hipEventCreate(&e1); float ms[2]={0,0};
+    int keep=r->use_tiled, keepf=r->int4_lora_f32;
+    for (int pass=0; pass<2; pass++) {             /* 0 = legacy oracle, 1 = tiled */
+        r->use_tiled = pass; r->int4_lora_f32 = (pass==0);
+        if (pass==1) qimg_fold_smooth_into_lora(&L);
+        void *Y = pass ? dY1 : dY0;
+        op_int4_linear(r, Y, dX, &L, M); hipDeviceSynchronize();   /* warm-up / scratch growth */
+        hipEventRecord(e0,NULL); for(int it=0;it<3;it++) op_int4_linear(r, Y, dX, &L, M); hipEventRecord(e1,NULL);
+        hipDeviceSynchronize(); hipEventElapsedTime(&ms[pass],e0,e1); ms[pass]/=3;
+    }
+    r->use_tiled=keep; r->int4_lora_f32=keepf;
+    hipError_t le=hipDeviceSynchronize();
+    float *a=(float*)malloc((size_t)M*N*4),*b=(float*)malloc((size_t)M*N*4);
+    hipMemcpy(a,dY0,(size_t)M*N*4,hipMemcpyDeviceToHost); hipMemcpy(b,dY1,(size_t)M*N*4,hipMemcpyDeviceToHost);
+    double d=0,na=0,nb=0; for(long i=0;i<(long)M*N;i++){d+=(double)a[i]*b[i];na+=(double)a[i]*a[i];nb+=(double)b[i]*b[i];}
+    double cosv=d/(sqrt(na)*sqrt(nb)+1e-30), tf=2.0*M*N*(double)(K+R)+2.0*M*R*(double)K;
+    fprintf(stderr,"hip_qimg: tiled int4 selftest M%-5d K%-5d N%-5d cos(tiled,legacy)=%.6f legacy=%.2fms tiled=%.2fms (%.1fx, %.1f TFLOPS) err=%d %s\n",
+        M,K,N,cosv,ms[0],ms[1],ms[0]/(ms[1]+1e-9),tf/(ms[1]*1e-3)/1e12,le,(le==0&&cosv>0.9995)?"PASS":"FAIL");
+    hipFree(L.qint4);hipFree(L.wscale);hipFree(L.lora_down);hipFree(L.lora_up);hipFree(L.smooth);hipFree(L.bias);
+    hipFree(dX);hipFree(dY0);hipFree(dY1); free(q);free(ws);free(ld);free(lu);free(sm);free(bi);free(X);free(a);free(b);
+}
+static void qimg_tiled_selftest(hip_qimg_runner *r) {
+    if (!r->fn_qg_i4_128) { fprintf(stderr,"tiled selftest: module missing\n"); return; }
+    int shapes[][2]={{3072,3072},{12288,3072},{3072,12288}};
+    int Ms[2]={4096+300, 300};
+    for(int t=0;t<2;t++)for(int i=0;i<3;i++)qimg_tiled_selftest_one(r,Ms[t],shapes[i][1],shapes[i][0]);
+}
+
 hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     if (rocewInit(ROCEW_INIT_HIP | ROCEW_INIT_HIPRTC) != ROCEW_SUCCESS) {
         fprintf(stderr, "hip_qimg: rocewInit failed (HIP/HIPRTC libraries not found)\n");
@@ -1611,6 +1806,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
         { const char *ar = getenv("QIMG_ACT_FP8_RT"); r->act_fp8_rt = (ar && atoi(ar)); }
         { const char *wr = getenv("QIMG_W_INT8_RT"); r->w_int8_rt = (wr && atoi(wr)); }
         { const char *wr = getenv("QIMG_W_INT4_RT"); r->w_int4_rt = (wr && atoi(wr)); }
+        { const char *lf = getenv("QIMG_INT4_LORA_F32"); r->int4_lora_f32 = (lf && atoi(lf)); }
         r->fp8_fp8_allow = getenv("QIMG_FP8_FP8_ALLOW");
         r->fp8_fp8_deny = getenv("QIMG_FP8_FP8_DENY");
         r->fp8_fp8_block_min = -1;
@@ -1657,6 +1853,23 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
     GET(fn_add, "add_inplace_f32");
     GET(fn_expand_bf16, "expand_bf16_f32");
     GET(fn_gemm_int4w, "gemm_int4w_bf16a_wmma_t");
+    GET(fn_gemm_bf16w, "gemm_bf16w_bf16a_wmma_t");
+    { const char *g = getenv("QIMG_INT4_GEMM");
+      r->use_tiled = !(g && !strcmp(g, "legacy"));
+      if (r->use_tiled && hip_compile_kernels(&r->mod_tiled, device_id, qimg_gemm_wmma_source, "qimg_gemm_wmma.hip", compile_verbose, "hip_qimg") >= 0) {
+          hipModuleGetFunction(&r->fn_qg_bf16_128, r->mod_tiled, "qgemm_bf16_128x128");
+          hipModuleGetFunction(&r->fn_qg_bf16_64, r->mod_tiled, "qgemm_bf16_64x128");
+          hipModuleGetFunction(&r->fn_qg_i4_128, r->mod_tiled, "qgemm_i4_128x128");
+          hipModuleGetFunction(&r->fn_qg_i4_64, r->mod_tiled, "qgemm_i4_64x128");
+          hipModuleGetFunction(&r->fn_cast_bf16, r->mod_tiled, "cast_f32_bf16_smooth");
+          hipModuleGetFunction(&r->fn_qg_bf16_64x64, r->mod_tiled, "qgemm_bf16_64x64");
+          hipModuleGetFunction(&r->fn_splitk_bf16, r->mod_tiled, "splitk_reduce_bf16");
+          hipModuleGetFunction(&r->fn_qg_i4_w8, r->mod_tiled, "qgemm_i4_128x128w8");
+          hipModuleGetFunction(&r->fn_qg_i4_256, r->mod_tiled, "qgemm_i4_128x256");
+          hipModuleGetFunction(&r->fn_qg_bf16_w8, r->mod_tiled, "qgemm_bf16_128x128w8");
+          { const char *v = getenv("QIMG_TILED_VARIANT"); r->tl_variant = v ? atoi(v) : 1; }
+      } else r->use_tiled = 0;
+      if (verbose) fprintf(stderr, "hip_qimg: int4 GEMM path: %s\n", r->use_tiled ? "tiled WMMA" : "legacy"); }
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
     GET(fn_adaln, "adaln_modulate_f32");
@@ -1965,6 +2178,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
 
     if (verbose) fprintf(stderr, "hip_qimg: kernels compiled OK\n");
     if (getenv("QIMG_INT4_SELFTEST")) qimg_int4_g16_selftest(r);
+    if (getenv("QIMG_LORA_SELFTEST")) qimg_lora_selftest(r);
+    if (getenv("QIMG_TILED_SELFTEST")) qimg_tiled_selftest(r);
     return r;
 }
 

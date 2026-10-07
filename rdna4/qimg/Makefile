@@ -17,7 +17,7 @@ TEST_SRC = test_hip_qimg.c
 TARGET = test_hip_qimg
 VERIFY_DIT = verify_qimg_dit
 
-COMMON_DEPS = hip_qimg_runner.h hip_qimg_kernels.h \
+COMMON_DEPS = hip_qimg_runner.h hip_qimg_kernels.h qimg_gemm_wmma.inc \
               ../rocew.h ../hip_kernels_common.h ../hip_runner_common.h \
               ../../common/safetensors.h ../../common/ggml_dequant.h \
               ../../common/gguf_loader.h ../../common/bpe_tokenizer.h \
@@ -30,6 +30,10 @@ COMMON_DEPS = hip_qimg_runner.h hip_qimg_kernels.h \
 
 all: $(TARGET) $(VERIFY_DIT)
 
+# Tiled WMMA GEMM (ported from rdna4/llm/gemm_wmma.hip), embedded for HIPRTC.
+qimg_gemm_wmma.inc: qimg_gemm_wmma.hip
+	python3 -c 'import json,pathlib; print("static const char qimg_gemm_wmma_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@
+
 $(TARGET): $(TEST_SRC) $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
 	$(CC) $(CFLAGS) -fopenmp -o $@ $(TEST_SRC) $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
@@ -40,7 +44,7 @@ run: $(TARGET)
 	@echo "Usage: ./$(TARGET) --dit <dit.safetensors> [--vae <vae.safetensors>] [--steps N] [-o out.ppm] [-d dev]"
 
 clean:
-	rm -f $(TARGET) $(VERIFY_DIT)
+	rm -f $(TARGET) $(VERIFY_DIT) qimg_gemm_wmma.inc
 
 help:
 	@echo "HIP/ROCm Qwen-Image Text-to-Image Runner (HIPRTC-based, no hipcc needed)"

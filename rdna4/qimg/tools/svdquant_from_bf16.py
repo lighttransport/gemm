@@ -106,9 +106,27 @@ def reconstruct_and_check(W, lam, lora_up, lora_down_emit, qint4, wscale, group=
     return cos, rel
 
 
+class ShardedSource:
+    """safe_open-like view over a diffusers sharded dir (e.g. Qwen-Image-Edit-2511/transformer)."""
+    def __init__(self, directory):
+        import json, os
+        index = json.load(open(os.path.join(directory, "diffusion_pytorch_model.safetensors.index.json")))
+        self.where = index["weight_map"]
+        self.files = {f: safe_open(os.path.join(directory, f), "pt", "cpu") for f in set(self.where.values())}
+    def keys(self):
+        return self.where.keys()
+    def get_tensor(self, k):
+        return self.files[self.where[k]].get_tensor(k)
+
+
+def open_source(path):
+    import os
+    return ShardedSource(path) if os.path.isdir(path) else safe_open(path, "pt", "cpu")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bf16", default="/mnt/disk1/models/qwen-image/_bf16dl/split_files/diffusion_models/qwen_image_bf16.safetensors")
+    ap.add_argument("--bf16", help="single bf16 safetensors or a diffusers transformer/ dir with index.json", default="/mnt/disk1/models/qwen-image/_bf16dl/split_files/diffusion_models/qwen_image_bf16.safetensors")
     ap.add_argument("--calib", nargs="*", default=[], help="QIMG_CALIB_DUMP safetensors (merged by max). Empty => no smoothing.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--blocks", default="all", help="'all' or comma-separated indices (dev subset)")
@@ -126,7 +144,7 @@ def main():
     if not a.no_smooth and not calib:
         print("[warn] no calibration stats loaded -> smoothing lambda=1 (weight-only SVDQuant)", file=sys.stderr)
 
-    src = safe_open(a.bf16, "pt", "cpu")
+    src = open_source(a.bf16)
     keys = set(src.keys())
     if a.blocks == "all":
         nblk = 1 + max(int(k.split(".")[1]) for k in keys if k.startswith("transformer_blocks."))
