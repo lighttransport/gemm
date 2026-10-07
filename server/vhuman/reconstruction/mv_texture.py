@@ -224,7 +224,7 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         warnings.simplefilter('ignore',RuntimeWarning)  # texels no view sees
         ref=np.nanmedian(np.where(has,luma,np.nan),0)
     weights*=~(has&((luma<.6*ref)|(luma>1.6*ref)))
-    hybrid=info.get('sources')
+    hybrid=info.get('sources');detail_gain=None
     edit_v=np.array([bool(hybrid) and hybrid.get(v['name'],{}).get('kind')=='raw' for v in views])
     if hybrid and edit_v.any() and (~edit_v).any():
         # Hybrid: pull the structure views' (MV-Adapter) tone toward the edited views, measured where they overlap.
@@ -234,7 +234,14 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
             # One global per-channel gain: a spatial field interpolated from the left and right overlaps switched
             # sides at the back midline and drew a vertical seam.
             lr=np.clip(np.log(np.maximum(ge[both_g],1e-4))-np.log(np.maximum(gm[both_g],1e-4)),-1,1)
-            field=np.broadcast_to(np.median(lr,0),(len(points),3))
+            # Separate scalp (stubble darkens the tone) and skin gains, blended by how upward-facing the normal is;
+            # both regions are left/right symmetric, so no midline seam.
+            up=np.clip((normals[:,1]-.1)/.4,0,1)
+            ws=up[both_g]>.5
+            g_all=np.median(lr,0)
+            g_scalp=np.median(lr[ws],0) if ws.sum()>300 else g_all
+            g_skin=np.median(lr[~ws],0) if (~ws).sum()>300 else g_all
+            field=up[:,None]*g_scalp[None]+(1-up[:,None])*g_skin[None]
             colors[~edit_v]=np.clip(colors[~edit_v]*np.exp(field)[None],0,1)
             if two_band:   # tone lives in the low band, which is fused from the separate blurred projection
                 colors_low[~edit_v]=np.clip(colors_low[~edit_v]*np.exp(field)[None],0,1)
@@ -254,7 +261,16 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
             side=synthetic_detail(points,normals,work/backend,src=work/backend/'view_right.png',
                                   scalp_box=(.08,.32,.45,.72),neck_box=(.55,.72,.45,.62))
             if side is not None:
-                share=np.clip(weights[edit_v].sum(0)/np.maximum(weights.sum(0),1e-12)/.5,0,1)[:,None]
+                share_raw=weights[edit_v].sum(0)/np.maximum(weights.sum(0),1e-12)
+                share=np.clip(share_raw/.5,0,1)[:,None]
+                # Triplanar blending averages three projections, so the synthesized stubble came out fainter than
+                # the real edited stubble: match its amplitude on scalp texels (upward-facing).
+                # Reference = the stubble patch itself (texels the edits see well include the smooth forehead).
+                syn_m=(normals[:,1]>.0)&(share_raw<.2)
+                patch_std=synthetic_detail.last_patch_std
+                if syn_m.sum()>500 and patch_std:
+                    amp=float(np.clip(patch_std/max(side[syn_m].std(),1e-6),.5,4.))
+                    side=side*amp;detail_gain=amp
                 high=share*high+(1-share)*side
         gen=np.clip(low+high,0,1)
     gen,support=fill_unsupported(points,gen,support,seen)
@@ -286,7 +302,7 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
         basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
         view_source=('raw edits' if use_raw else 'composites')+f', polar={polar_mode}'+(f', two-band sigma {band_sigma}' if two_band else ''),
-        clothing_excluded_fraction=exclusion_report,
+        clothing_excluded_fraction=exclusion_report,detail_gain=detail_gain,
         photographed_texels_changed=int(np.any(result[observed]!=base[observed],axis=-1).sum()),
         generated_texels=int((blend>.01).sum()),
         unseen_texels=int((~seen).sum()),unseen_covered=float((support[~seen]>.05).mean()),
@@ -339,6 +355,7 @@ def synthetic_detail(points, normals, gen_dir, *, period=.03, limit=.06, src=Non
         patch=im[int(y0*h):int(y1*h),int(x0*h):int(x1*h)]
         return np.clip(patch-gaussian_filter(patch,(4,4,0)),-limit,limit)
     scalp,neck=residual(*scalp_box),residual(*neck_box)
+    synthetic_detail.last_patch_std=float(scalp.std())
     tw=np.abs(normals)**4;tw/=np.maximum(tw.sum(1,keepdims=True),1e-12)
     out=np.zeros_like(points)
     for patch,mask in ((scalp,normals[:,1]>=0),(neck,normals[:,1]<0)):
