@@ -293,3 +293,21 @@ of the observed boundary.
 | input (flat fill) | 0.0467 | – | flat |
 | MV-Adapter, raw | 0.0447 | 0.094 | dark crown patch, scalp sheen, black collar |
 | MV-Adapter, de-lit + local gain | 0.0472 | 0.067 | patch, sheen and collar removed; a faint pink band remains on the back of the head (generator chroma) |
+
+### Qwen-Image-Edit-2511 (Apache-2.0) and Qwen-Image-2.1 editing (2026-10-07)
+
+- **Alignment rule (Edit-2511):** the pipeline sizes condition latents to about 1 MP.
+  - The output must be 1024² and the target render must be the **last** image.
+  - A 512² output reproduces only the top-left quarter of the scene, which looks like a zoom.
+  - At 1024² the edit is pixel-aligned with the GNM render. It fills scalp stubble and neck skin and keeps the textured face.
+- **diffusers GGUF Q4_K_M:** works on 16 GB with the Qwen2.5-VL encoder on the CPU, but takes about 108 s/step at 1024².
+  Nunchaku has no ROCm build.
+- **Native RDNA4 INT4 DiT** (`rdna4/qimg`, `EDIT_PORT_PLAN.md`):
+  - Our own SVDQuant pack, plus the edit layout (multi-segment RoPE and `zero_cond_t`).
+  - On the real 12.8k-token edit step (noisy + portrait + target references), parity against diffusers is cos 0.9986.
+  - `qwen_edit_seq` uses it automatically when `edit2511-int4-r128.safetensors` exists.
+- **Text encoders:** both are byte-identical to stock Qwen2.5-VL-7B (Edit-2511) and Qwen3-VL-8B (2.1), so the official
+  FP8/AWQ builds can replace them.
+- **Qwen-Image-2.1** supports up to 10 reference images, but our native qimg21 backend allows 1. The earlier flat result
+  came from a contact sheet plus masked inpaint, not from 2.1's multi-reference edit. `qwen21_edit_backend.py` re-tests it
+  through diffusers with fp8-stored weights.
