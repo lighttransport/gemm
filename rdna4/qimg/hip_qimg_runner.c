@@ -227,6 +227,7 @@ struct hip_qimg_runner {
     int int4_lora_f32;  /* QIMG_INT4_LORA_F32=1: legacy scalar f32 LoRA (A/B oracle) */
     /* Tiled WMMA module (qimg_gemm_wmma.hip); QIMG_INT4_GEMM=legacy keeps the old kernels. */
     hipModule_t mod_tiled; int use_tiled, tiled_oom, step_error, pending_gelu, gelu_fused;
+    int fast_attn, fast_ew;   /* fa16 / vectorized elementwise: on for the INT4 (edit) DiT; QIMG_ATTN=fa16, QIMG_EW=1 force */
     hipModule_t mod_fa16; hipFunction_t fn_fa16, fn_fa16_pack, fn_fa16_nrp, fn_fa16_vt, fn_fa16_dbvt; void *fa16_buf; size_t fa16_cap; void *fa16_vt_buf; size_t fa16_vt_cap;  /* QIMG_ATTN=fa16 */
     hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4w_w8, fn_qg_i8_w8, fn_qg_i8_64, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
     unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
@@ -1075,7 +1076,7 @@ static void op_wgemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
 }
 
 static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
-    if (r->fn_ew_trunc && n % 4 == 0) { long nl = n; void *a[] = {&x, &nl};
+    if (r->fn_ew_trunc && r->fast_ew && n % 4 == 0) { long nl = n; void *a[] = {&x, &nl};
         hipModuleLaunchKernel(r->fn_ew_trunc, (unsigned)((nl / 4 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_bf16_trunc, (unsigned)((n+255)/256), 1, 1,
@@ -1366,7 +1367,7 @@ static void op_silu(hip_qimg_runner *r, void *x, int n) {
 }
 
 static void op_gelu(hip_qimg_runner *r, void *x, int n) {
-    if (r->fn_ew_gelu && n % 4 == 0) { long nl = n; void *a[] = {&x, &nl};
+    if (r->fn_ew_gelu && r->fast_ew && n % 4 == 0) { long nl = n; void *a[] = {&x, &nl};
         hipModuleLaunchKernel(r->fn_ew_gelu, (unsigned)((nl / 4 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_gelu, (unsigned)((n+255)/256), 1, 1,
@@ -1375,7 +1376,7 @@ static void op_gelu(hip_qimg_runner *r, void *x, int n) {
 
 static void op_adaln(hip_qimg_runner *r, void *out, void *x,
                      void *shift, void *scale, int N, int dim) {
-    if (r->fn_ew_adaln && dim % 1024 == 0 && dim <= 4096) { void *a[] = {&out, &x, &shift, &scale, &dim};
+    if (r->fn_ew_adaln && r->fast_ew && dim % 1024 == 0 && dim <= 4096) { void *a[] = {&out, &x, &shift, &scale, &dim};
         hipModuleLaunchKernel(r->fn_ew_adaln, (unsigned)N, 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&out, &x, &shift, &scale, &N, &dim};
     hipModuleLaunchKernel(r->fn_adaln, (unsigned)N, 1, 1, 256, 1, 1,
@@ -1384,7 +1385,7 @@ static void op_adaln(hip_qimg_runner *r, void *out, void *x,
 
 static void op_rmsnorm_ph(hip_qimg_runner *r, void *x, void *w,
                           int N, int n_heads, int head_dim) {
-    if (r->fn_ew_rms && head_dim == 128) { void *a[] = {&x, &w, &N, &n_heads};
+    if (r->fn_ew_rms && r->fast_ew && head_dim == 128) { void *a[] = {&x, &w, &N, &n_heads};
         hipModuleLaunchKernel(r->fn_ew_rms, (unsigned)(((long)N * n_heads + 7) / 8), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&x, &w, &N, &n_heads, &head_dim};
     hipModuleLaunchKernel(r->fn_rmsnorm_ph, (unsigned)N, (unsigned)n_heads, 1,
@@ -1393,7 +1394,7 @@ static void op_rmsnorm_ph(hip_qimg_runner *r, void *x, void *w,
 
 static void op_gated_add(hip_qimg_runner *r, void *x, void *proj,
                          void *gate, int N, int dim) {
-    if (r->fn_ew_gadd && dim % 4 == 0) { long nl = (long)N * dim; void *a[] = {&x, &proj, &gate, &dim, &nl};
+    if (r->fn_ew_gadd && r->fast_ew && dim % 4 == 0) { long nl = (long)N * dim; void *a[] = {&x, &proj, &gate, &dim, &nl};
         hipModuleLaunchKernel(r->fn_ew_gadd, (unsigned)((nl / 4 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     int total = N * dim;
     void *args[] = {&x, &proj, &gate, &N, &dim};
@@ -1404,7 +1405,7 @@ static void op_gated_add(hip_qimg_runner *r, void *x, void *proj,
 static void op_attn(hip_qimg_runner *r, void *d_out, void *d_q,
                     void *d_k, void *d_v,
                     int n_tok, int n_heads, int head_dim) {
-    if (r->fn_fa16 && head_dim == 128 && !getenv("QIMG_FP8_ATTN_PERROW")) {
+    if (r->fn_fa16 && r->fast_attn && head_dim == 128 && !getenv("QIMG_FP8_ATTN_PERROW")) {
         size_t ne = (size_t)n_tok * n_heads * head_dim, need = ne * 2 * 3;
         if (need > r->fa16_cap) {
             hipDeviceSynchronize(); hipFree(r->fa16_buf); r->fa16_buf = NULL; r->fa16_cap = 0;
@@ -1990,7 +1991,9 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
                 hipModuleGetFunction(&r->fn_fa16_dbvt, r->mod_fa16, "fa_db_vt");
             } }
       }
-      if (verbose) fprintf(stderr, "hip_qimg: attention: %s\n", r->fn_fa16 ? "fa16 (rdna4/fa2 f16 WMMA)" : "legacy"); }
+      if (verbose) fprintf(stderr, "hip_qimg: attention: %s\n", r->fn_fa16 ? "fa16 available (INT4/edit DiT default)" : "legacy"); }
+    { const char *a = getenv("QIMG_ATTN"); r->fast_attn = a && !strcmp(a, "fa16");
+      const char *e = getenv("QIMG_EW");   r->fast_ew = e && atoi(e); }
     GET(fn_silu, "silu_f32");
     GET(fn_gelu, "gelu_f32");
     GET(fn_adaln, "adaln_modulate_f32");
@@ -2339,6 +2342,9 @@ int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
     st_context *st = safetensors_open(path);
     if (!st) return -1;
     r->dit_st = st; r->use_int4 = 1;
+    /* Validated on the INT4 edit DiT only: other (FP8/BF16 text-to-image) paths keep their previous kernels. */
+    { const char *a = getenv("QIMG_ATTN"); if (!(a && !strcmp(a, "legacy"))) r->fast_attn = 1;
+      const char *e = getenv("QIMG_EW_LEGACY"); if (!(e && atoi(e))) r->fast_ew = 1; }
     size_t free_entry = 0, vram_total = 0; hipMemGetInfo(&free_entry, &vram_total);  /* for the residency delta */
     r->dim = 3072; r->n_heads = 24; r->head_dim = 128;
     r->in_ch = 64; r->txt_dim = 3584; r->mlp_h = 12288;
@@ -2870,7 +2876,7 @@ void hip_qimg_unload_dit(hip_qimg_runner *r) {
 /* Edit layout + fa16: RMSNorm + RoPE + f16 pack in one pass, then fa_db. Returns 0 if it ran. */
 static int qimg_fused_qkv_attn(hip_qimg_runner *r, void *d_out, void *d_q, void *d_k, void *d_v, int n_tok, int n_txt,
                                int n_heads, const qimg_block_gpu *blk, int t_dim, int h_dim, int w_dim, float theta) {
-    if (!r->fn_fa16_nrp || !r->fn_fa16 || r->edit_n_seg <= 0) return -1;
+    if (!r->fn_fa16_nrp || !r->fn_fa16 || !r->fast_attn || r->edit_n_seg <= 0) return -1;
     size_t ne = (size_t)n_tok * n_heads * 128, need = ne * 2 * 3;
     if (need > r->fa16_cap) {
         hipDeviceSynchronize(); hipFree(r->fa16_buf); r->fa16_buf = NULL; r->fa16_cap = 0;
