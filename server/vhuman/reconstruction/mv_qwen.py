@@ -32,6 +32,48 @@ EDIT_PROMPT=('Picture 1 is a photo of a person. The LAST picture is a 3D render 
     'dark hair stubble on the scalp where hair grows. Do not move, zoom, crop or change the camera; keep the silhouette, '
     'all textured regions and the gray background identical. Even diffuse light, no shadows, no highlights.')
 
+SEQ_NEGATIVE=('blurry, hat, glasses, text, extra ears, shadows, highlights, clothing, shirt, collar, background, '
+              'scenery, window, room, long hair, hair on the neck')
+
+
+def matted_portrait(candidate):
+    """Portrait reference without its photo context: BiRefNet foreground (keeps hair), cut just below the chin
+    (face mask) to drop clothing, on 50% gray. The raw photo's background and shirt leaked into edits."""
+    candidate=Path(candidate)
+    img=Image.open(candidate/'portrait.png').convert('RGB');rgb=np.asarray(img,float)
+    alpha=None
+    try:
+        import torch
+        from torchvision import transforms
+        from transformers import AutoModelForImageSegmentation
+        net=AutoModelForImageSegmentation.from_pretrained('/mnt/disk01/models/BiRefNet',trust_remote_code=True).eval().float()
+        x=transforms.Compose([transforms.Resize((1024,1024)),transforms.ToTensor(),
+                              transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])(img)[None]
+        with torch.no_grad():
+            pred=net(x)[-1].sigmoid()[0,0].numpy()
+        alpha=np.asarray(Image.fromarray(np.uint8(pred*255)).resize(img.size),float)/255
+        del net
+    except Exception as error:   # fall back to the face mask (drops hair) rather than failing the run
+        print(f'[mv_qwen] BiRefNet matte unavailable ({error}); using face silhouette',flush=True)
+    face=candidate/'parsing_0_silhouette.png'
+    if face.exists():
+        f=np.asarray(Image.open(face).convert('L').resize(img.size),float)/255
+        if alpha is None:alpha=f
+        ys,xs=np.where(f>.5)
+        if len(ys):   # below mid-face keep only the (dilated) face: drops collar, tie and shirt beside the jaw
+            from scipy.ndimage import binary_dilation
+            mid=(ys.min()+ys.max())//2
+            near=binary_dilation(f>.5,iterations=max(2,int(.02*rgb.shape[0])))
+            alpha[mid:]*=near[mid:]
+    if alpha is None:return np.uint8(rgb)
+    out=rgb*alpha[...,None]+127.5*(1-alpha[...,None])
+    ys,xs=np.where(alpha>.5)
+    if len(ys):
+        pad=int(.05*max(rgb.shape[:2]))
+        out=out[max(ys.min()-pad,0):ys.max()+pad,max(xs.min()-pad,0):xs.max()+pad]
+    return np.uint8(np.clip(out+.5,0,255))
+
+
 def _mask(view):
     return np.uint8((view['valid']&(view['known']<.5))*255)
 
@@ -59,7 +101,7 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
     atlas=srgb_to_linear(base/255)
     known=(np.asarray(Image.open(candidate/'skin_coverage.png'))>0).astype(float)
     valid,points,normals=skin.atlas_surface(geometry,len(base))
-    portrait=np.asarray(Image.open(candidate/'portrait.png').convert('RGB'))
+    portrait=matted_portrait(candidate)
     res=views[0]['depth'].shape[0];by_name={v['name']:v for v in views};results={};seconds=0.;previous=None
     for index,name in enumerate(ORDER):
         t_render=time.time()
@@ -84,7 +126,8 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
             big=np.asarray(Image.fromarray(view['rgb']).resize((1024,1024),Image.Resampling.LANCZOS))
             inputs=[portrait]+([np.asarray(Image.fromarray(previous).resize((1024,1024)))] if previous is not None else [])+[big]
             edited,took=editor(inputs,EDIT_PROMPT+(' Picture 2 is the previously completed neighbouring view; keep skin '
-                'tone and texture consistent with it.' if len(inputs)==3 else ''),steps=steps,seed=seed+index)
+                'tone and texture consistent with it.' if len(inputs)==3 else ''),steps=steps,seed=seed+index,
+                negative=SEQ_NEGATIVE)
             Image.fromarray(edited).save(folder/'edited.png');seconds+=took
         image=np.asarray(Image.open(folder/'edited.png').convert('RGB').resize((res,res),Image.Resampling.LANCZOS))
         # Keep known pixels exact at full resolution; only masked pixels are new.

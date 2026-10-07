@@ -30,6 +30,23 @@ def condition_size(size):
     plus.VAE_IMAGE_SIZE=size*size
 
 
+def reference_areas(areas):
+    """Per-image VAE areas for the next pipeline call (targets keep the output grid; references may be smaller).
+
+    Edit-Plus calls calculate_dimensions(VAE_IMAGE_SIZE, ratio) once per image in order; this queue overrides
+    those calls. The native DiT handles any per-segment latent shape.
+    """
+    import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus as plus
+    if not hasattr(plus, '_orig_calculate_dimensions'):
+        plus._orig_calculate_dimensions = plus.calculate_dimensions
+        def calc(target_area, ratio):
+            if target_area == plus.VAE_IMAGE_SIZE and plus._area_queue:
+                target_area = plus._area_queue.pop(0)
+            return plus._orig_calculate_dimensions(target_area, ratio)
+        plus.calculate_dimensions = calc
+    plus._area_queue = list(areas)
+
+
 def make_editor():
     """Native INT4 DiT when packed (QWEN_EDIT_BACKEND=gguf forces the diffusers GGUF fallback)."""
     import os
@@ -50,11 +67,28 @@ class NativeEditor:
         import os
         if os.environ.get('QIMG_ENCODER_DTYPE','fp32')=='fp32':   # identity-checked; 3.8x faster on Zen 2
             self.pipe.text_encoder.to(torch.float32)
+        if os.environ.get('QIMG_VISION_CACHE')=='1':
+            # positive and negative encodes see the same images: reuse the vision tower output (copies, since
+            # transformers mutates pooler_output in place)
+            import copy,hashlib
+            visual=self.pipe.text_encoder.model.visual;fwd=visual.forward;cache={}
+            def cached(pixel_values,grid_thw=None,**kw):
+                key=(hashlib.sha1(pixel_values.detach().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest(),
+                     None if grid_thw is None else tuple(grid_thw.flatten().tolist()))
+                if key not in cache:
+                    if len(cache)>=4:cache.pop(next(iter(cache)))
+                    cache[key]=copy.copy(fwd(pixel_values,grid_thw=grid_thw,**kw))
+                return copy.copy(cache[key])
+            visual.forward=cached
 
     def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
                  negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
         """Same flow as Editor (GGUF), which preserves identity: CPU prompt encode, cuda pipeline + generator."""
         torch=self.torch;condition_size(size)
+        import os
+        ref_side=int(os.environ.get('QIMG_REF_SIDE','0'))   # e.g. 512: references at 512^2, target at size^2
+        if ref_side:
+            reference_areas([ref_side*ref_side]*(len(images)-1)+[size*size])
         started=time.time();dit0=self.pipe.native.seconds
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
         with torch.no_grad():
