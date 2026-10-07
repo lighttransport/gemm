@@ -149,6 +149,7 @@ __device__ __forceinline__ void qgemm_kloop(
 }
 
 /* Y[M,N] (+)= X[M,K] W^T (+ X2[M,K2] W2^T, dense bf16: the fused SVDQuant lora_up phase) + bias.
+ * accum: bit0 = add into Y, bit1 = tanh-GELU epilogue.
  * gridDim.y > 1: split-K partials of the main phase to Y + z*M*N (no X2, no accum). */
 template <typename LB, int BM, int BN, int WAVES_M, int WAVES_N>
 __device__ __forceinline__ void qgemm_body(
@@ -197,7 +198,12 @@ __device__ __forceinline__ void qgemm_body(
             for (int v = 0; v < 8; v++) {
                 if (row0 + v < M) {
                     float *y = Y + (size_t)(row0 + v) * N + col;
-                    *y = (accum ? *y : 0.f) + acc[i][j][v] + bv;
+                    float o = ((accum & 1) ? *y : 0.f) + acc[i][j][v] + bv;
+                    if (accum & 2) {   /* fused tanh-GELU epilogue (fc1) */
+                        float u = 0.7978845608f * (o + 0.044715f * o * o * o);
+                        o = o / (1.0f + __expf(-2.0f * u));
+                    }
+                    *y = o;
                 }
             }
         }
@@ -251,4 +257,86 @@ extern "C" __global__ void splitk_reduce_bf16(unsigned short *dtb, const float *
     float v = P[i];
     for (int z = 1; z < splits; z++) v += P[(long)z * n + i];
     dtb[i] = (unsigned short)(bf16_rne_hi(v) >> 16);
+}
+
+/* ---- vectorized elementwise / normalization kernels (replace the scalar qimg ones) ---- */
+__device__ __forceinline__ float wave_sum(float v) {
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) v += __shfl_xor(v, m, 32);
+    return v;
+}
+
+/* tanh-GELU, 4 per thread: 0.5v(1+tanh(u)) == v / (1 + exp(-2u)). n % 4 == 0. */
+extern "C" __global__ void ew_gelu4(float *x, long n) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) return;
+    float4 v = *(float4 *)(x + i);
+    float *p = (float *)&v;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float a = p[j], u = 0.7978845608f * (a + 0.044715f * a * a * a);
+        p[j] = a / (1.0f + __expf(-2.0f * u));
+    }
+    *(float4 *)(x + i) = v;
+}
+
+/* x[t,c] += gate[c] * proj[t,c], 4 per thread (dim % 4 == 0). */
+extern "C" __global__ void ew_gated_add4(float *x, const float *proj, const float *gate, int dim, long n) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) return;
+    int c = (int)(i % dim);
+    float4 a = *(float4 *)(x + i), p = *(const float4 *)(proj + i), g = *(const float4 *)(gate + c);
+    a.x += g.x * p.x; a.y += g.y * p.y; a.z += g.z * p.z; a.w += g.w * p.w;
+    *(float4 *)(x + i) = a;
+}
+
+/* BF16 round-to-nearest-even truncation in place, 4 per thread. */
+extern "C" __global__ void ew_trunc4(float *x, long n) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) return;
+    float4 v = *(float4 *)(x + i);
+    unsigned *u = (unsigned *)&v;
+#pragma unroll
+    for (int j = 0; j < 4; j++) u[j] = (u[j] + 0x7FFFu + ((u[j] >> 16) & 1u)) & 0xFFFF0000u;
+    *(float4 *)(x + i) = v;
+}
+
+/* Per-head RMSNorm (head_dim 128): one wave per (token, head), 4 elements per lane; 8 waves per block. */
+extern "C" __global__ void ew_rmsnorm_ph(float *x, const float *w, int N, int n_heads) {
+    int wave = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (wave >= N * n_heads) return;
+    float *h = x + (long)wave * 128 + lane * 4;   /* (tok, head) rows are contiguous 128-float slices */
+    float4 v = *(float4 *)h;
+    float inv = rsqrtf(wave_sum(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w) / 128.0f + 1e-6f);
+    float4 g = *(const float4 *)(w + lane * 4);
+    v.x *= inv * g.x; v.y *= inv * g.y; v.z *= inv * g.z; v.w *= inv * g.w;
+    *(float4 *)h = v;
+}
+
+/* adaLN: out = LayerNorm(x) * (1 + scale) + shift, one 256-thread block per token, dim <= 4096 and
+ * dim % 1024 == 0; values stay in registers (two-pass mean/var without a second global read). */
+extern "C" __global__ void ew_adaln(float *out, const float *x, const float *shift, const float *scale, int dim) {
+    __shared__ float red[8];
+    const int t = blockIdx.x, tid = threadIdx.x, nv = dim / 1024;
+    const float *xr = x + (long)t * dim;
+    float4 v[4];
+    float s = 0.f;
+    for (int k = 0; k < nv; k++) { v[k] = *(const float4 *)(xr + (k * 256 + tid) * 4); s += v[k].x + v[k].y + v[k].z + v[k].w; }
+    s = wave_sum(s); if ((tid & 31) == 0) red[tid >> 5] = s; __syncthreads();
+    float mean = 0.f; for (int i = 0; i < 8; i++) mean += red[i]; mean /= dim; __syncthreads();
+    float q = 0.f;
+    for (int k = 0; k < nv; k++) {
+        float a = v[k].x - mean, b = v[k].y - mean, c = v[k].z - mean, d = v[k].w - mean;
+        q += a * a + b * b + c * c + d * d;
+    }
+    q = wave_sum(q); if ((tid & 31) == 0) red[tid >> 5] = q; __syncthreads();
+    float var = 0.f; for (int i = 0; i < 8; i++) var += red[i];
+    const float inv = rsqrtf(var / dim + 1e-6f);
+    for (int k = 0; k < nv; k++) {
+        int c = (k * 256 + tid) * 4;
+        float4 sc = *(const float4 *)(scale + c), sh = *(const float4 *)(shift + c), o;
+        o.x = (v[k].x - mean) * inv * (1.f + sc.x) + sh.x; o.y = (v[k].y - mean) * inv * (1.f + sc.y) + sh.y;
+        o.z = (v[k].z - mean) * inv * (1.f + sc.z) + sh.z; o.w = (v[k].w - mean) * inv * (1.f + sc.w) + sh.w;
+        *(float4 *)(out + (long)t * dim + c) = o;
+    }
 }

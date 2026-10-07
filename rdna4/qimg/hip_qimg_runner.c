@@ -222,9 +222,9 @@ struct hip_qimg_runner {
     hipFunction_t fn_rope_pos;
     int int4_lora_f32;  /* QIMG_INT4_LORA_F32=1: legacy scalar f32 LoRA (A/B oracle) */
     /* Tiled WMMA module (qimg_gemm_wmma.hip); QIMG_INT4_GEMM=legacy keeps the old kernels. */
-    hipModule_t mod_tiled; int use_tiled, tiled_oom, step_error;
-    hipModule_t mod_fa16; hipFunction_t fn_fa16, fn_fa16_pack; void *fa16_buf; size_t fa16_cap;  /* QIMG_ATTN=fa16 */
-    hipFunction_t fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
+    hipModule_t mod_tiled; int use_tiled, tiled_oom, step_error, pending_gelu, gelu_fused;
+    hipModule_t mod_fa16; hipFunction_t fn_fa16, fn_fa16_pack, fn_fa16_nrp, fn_fa16_vt, fn_fa16_dbvt; void *fa16_buf; size_t fa16_cap; void *fa16_vt_buf; size_t fa16_vt_cap;  /* QIMG_ATTN=fa16 */
+    hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
     unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
     /* INT8 SmoothQuant (W8A8) path: int8 weights stream via the fp8 byte path (same 1 B/param);
@@ -1068,6 +1068,8 @@ static void op_wgemm(hip_qimg_runner *r, void *Y, void *W, void *X, void *bias,
 }
 
 static void op_bf16_trunc(hip_qimg_runner *r, void *x, int n) {
+    if (r->fn_ew_trunc && n % 4 == 0) { long nl = n; void *a[] = {&x, &nl};
+        hipModuleLaunchKernel(r->fn_ew_trunc, (unsigned)((nl / 4 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_bf16_trunc, (unsigned)((n+255)/256), 1, 1,
                           256, 1, 1, 0, NULL, args, NULL);
@@ -1231,6 +1233,7 @@ static void qimg_tiled_int4_linear(hip_qimg_runner *r, void *Y, void *X, const q
     int n_out = L->n_out, n_in = L->n_in, rk = L->rank;
     long nx = (long)n_tok * n_in;
     int need_xb = rk > 0 && L->lora_down && L->smooth && !L->lora_folded;
+    int act = r->pending_gelu ? 2 : 0;   /* caller asked for GELU fused into this linear's epilogue */
     if (qimg_tl_reserve(r, (size_t)nx, (size_t)(rk > 0 ? rk : 1) * n_tok, need_xb) != 0) { r->tiled_oom = 1; return; }
     qimg_tl_cast(r, r->tl_xs, X, L->smooth, n_in, nx);                       /* bf16(X / smooth) */
     if (rk > 0 && L->lora_down) {
@@ -1241,10 +1244,11 @@ static void qimg_tiled_int4_linear(hip_qimg_runner *r, void *Y, void *X, const q
         qimg_tl_gemm_split(r, 0, r->i4_dt, L->lora_down, NULL, xa, NULL, rk, n_in, n_tok, 0, splits);
         void *ra[] = {&r->tl_dtb, &r->i4_dt, &splits, &nd};
         hipModuleLaunchKernel(r->fn_splitk_bf16, (unsigned)((nd + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ra, NULL);
-        qimg_tl_gemm_full(r, 1, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, 0, 1,
+        qimg_tl_gemm_full(r, 1, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, act, 1,
                           r->tl_dtb, L->lora_up, rk);
     } else
-        qimg_tl_gemm(r, 1, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, 0);
+        qimg_tl_gemm(r, 1, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, act);
+    if (act) r->gelu_fused = 1;
 }
 
 /* In place: lora_down[j,k] *= smooth[k] (bf16 RNE). After this the legacy LoRA path is invalid. */
@@ -1345,6 +1349,8 @@ static void op_silu(hip_qimg_runner *r, void *x, int n) {
 }
 
 static void op_gelu(hip_qimg_runner *r, void *x, int n) {
+    if (r->fn_ew_gelu && n % 4 == 0) { long nl = n; void *a[] = {&x, &nl};
+        hipModuleLaunchKernel(r->fn_ew_gelu, (unsigned)((nl / 4 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&x, &n};
     hipModuleLaunchKernel(r->fn_gelu, (unsigned)((n+255)/256), 1, 1,
                           256, 1, 1, 0, NULL, args, NULL);
@@ -1352,6 +1358,8 @@ static void op_gelu(hip_qimg_runner *r, void *x, int n) {
 
 static void op_adaln(hip_qimg_runner *r, void *out, void *x,
                      void *shift, void *scale, int N, int dim) {
+    if (r->fn_ew_adaln && dim % 1024 == 0 && dim <= 4096) { void *a[] = {&out, &x, &shift, &scale, &dim};
+        hipModuleLaunchKernel(r->fn_ew_adaln, (unsigned)N, 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&out, &x, &shift, &scale, &N, &dim};
     hipModuleLaunchKernel(r->fn_adaln, (unsigned)N, 1, 1, 256, 1, 1,
                           256 * sizeof(float), NULL, args, NULL);
@@ -1359,6 +1367,8 @@ static void op_adaln(hip_qimg_runner *r, void *out, void *x,
 
 static void op_rmsnorm_ph(hip_qimg_runner *r, void *x, void *w,
                           int N, int n_heads, int head_dim) {
+    if (r->fn_ew_rms && head_dim == 128) { void *a[] = {&x, &w, &N, &n_heads};
+        hipModuleLaunchKernel(r->fn_ew_rms, (unsigned)(((long)N * n_heads + 7) / 8), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     void *args[] = {&x, &w, &N, &n_heads, &head_dim};
     hipModuleLaunchKernel(r->fn_rmsnorm_ph, (unsigned)N, (unsigned)n_heads, 1,
                           32, 1, 1, 0, NULL, args, NULL);
@@ -1366,6 +1376,8 @@ static void op_rmsnorm_ph(hip_qimg_runner *r, void *x, void *w,
 
 static void op_gated_add(hip_qimg_runner *r, void *x, void *proj,
                          void *gate, int N, int dim) {
+    if (r->fn_ew_gadd && dim % 4 == 0) { long nl = (long)N * dim; void *a[] = {&x, &proj, &gate, &dim, &nl};
+        hipModuleLaunchKernel(r->fn_ew_gadd, (unsigned)((nl / 4 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, a, NULL); return; }
     int total = N * dim;
     void *args[] = {&x, &proj, &gate, &N, &dim};
     hipModuleLaunchKernel(r->fn_gated_add, (unsigned)((total+255)/256), 1, 1,
@@ -1933,6 +1945,13 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
           hipModuleGetFunction(&r->fn_cast_bf16, r->mod_tiled, "cast_f32_bf16_smooth");
           hipModuleGetFunction(&r->fn_qg_bf16_64x64, r->mod_tiled, "qgemm_bf16_64x64");
           hipModuleGetFunction(&r->fn_splitk_bf16, r->mod_tiled, "splitk_reduce_bf16");
+          if (!getenv("QIMG_EW_LEGACY")) {   /* vectorized elementwise kernels */
+              hipModuleGetFunction(&r->fn_ew_gelu, r->mod_tiled, "ew_gelu4");
+              hipModuleGetFunction(&r->fn_ew_gadd, r->mod_tiled, "ew_gated_add4");
+              hipModuleGetFunction(&r->fn_ew_trunc, r->mod_tiled, "ew_trunc4");
+              hipModuleGetFunction(&r->fn_ew_rms, r->mod_tiled, "ew_rmsnorm_ph");
+              hipModuleGetFunction(&r->fn_ew_adaln, r->mod_tiled, "ew_adaln");
+          }
           hipModuleGetFunction(&r->fn_qg_i4_w8, r->mod_tiled, "qgemm_i4_128x128w8");
           hipModuleGetFunction(&r->fn_qg_i4_256, r->mod_tiled, "qgemm_i4_128x256");
           hipModuleGetFunction(&r->fn_qg_bf16_w8, r->mod_tiled, "qgemm_bf16_128x128w8");
@@ -1944,6 +1963,12 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
           hip_compile_kernels(&r->mod_fa16, device_id, qimg_fa16_source, "qimg_fa16.hip", compile_verbose, "hip_qimg") >= 0) {
           hipModuleGetFunction(&r->fn_fa16, r->mod_fa16, "fa_db");
           hipModuleGetFunction(&r->fn_fa16_pack, r->mod_fa16, "fa16_pack");
+          if (!getenv("QIMG_NO_FUSED_QKV")) hipModuleGetFunction(&r->fn_fa16_nrp, r->mod_fa16, "fa16_norm_rope_pack");
+          { const char *vt = getenv("QIMG_FA_VT");
+            if (!(vt && !strcmp(vt, "0"))) {
+                hipModuleGetFunction(&r->fn_fa16_vt, r->mod_fa16, "fa16_vt");
+                hipModuleGetFunction(&r->fn_fa16_dbvt, r->mod_fa16, "fa_db_vt");
+            } }
       }
       if (verbose) fprintf(stderr, "hip_qimg: attention: %s\n", r->fn_fa16 ? "fa16 (rdna4/fa2 f16 WMMA)" : "legacy"); }
     GET(fn_silu, "silu_f32");
@@ -2817,6 +2842,43 @@ void hip_qimg_unload_dit(hip_qimg_runner *r) {
 
 /* ---- DiT single step ---- */
 
+/* Edit layout + fa16: RMSNorm + RoPE + f16 pack in one pass, then fa_db. Returns 0 if it ran. */
+static int qimg_fused_qkv_attn(hip_qimg_runner *r, void *d_out, void *d_q, void *d_k, void *d_v, int n_tok, int n_txt,
+                               int n_heads, const qimg_block_gpu *blk, int t_dim, int h_dim, int w_dim, float theta) {
+    if (!r->fn_fa16_nrp || !r->fn_fa16 || r->edit_n_seg <= 0) return -1;
+    size_t ne = (size_t)n_tok * n_heads * 128, need = ne * 2 * 3;
+    if (need > r->fa16_cap) {
+        hipDeviceSynchronize(); hipFree(r->fa16_buf); r->fa16_buf = NULL; r->fa16_cap = 0;
+        if (hipMalloc(&r->fa16_buf, need) != hipSuccess) return -1;
+        r->fa16_cap = need;
+    }
+    void *Qh = r->fa16_buf, *Kt = (char *)r->fa16_buf + ne * 2, *Vt = (char *)r->fa16_buf + ne * 4;
+    int ts = r->edit_txt_start;
+    void *a[] = {&Qh, &Kt, &Vt, &d_q, &d_k, &d_v, &n_tok, &n_heads, &n_txt,
+                 (void *)&blk->norm_q_w, (void *)&blk->norm_k_w, (void *)&blk->norm_added_q_w, (void *)&blk->norm_added_k_w,
+                 &r->d_edit_pos, &ts, &t_dim, &h_dim, &w_dim, &theta};
+    hipModuleLaunchKernel(r->fn_fa16_nrp, (unsigned)(((long)n_tok * n_heads + 7) / 8), 1, 1, 256, 1, 1, 0, NULL, a, NULL);
+    float isd = 1.0f / sqrtf(128.0f);
+    if (r->fn_fa16_dbvt && r->fn_fa16_vt) {
+        int np = (n_tok + 31) / 32 * 32; size_t nv = (size_t)n_heads * 128 * np;
+        if (nv * 2 > r->fa16_vt_cap) {
+            hipDeviceSynchronize(); hipFree(r->fa16_vt_buf); r->fa16_vt_buf = NULL; r->fa16_vt_cap = 0;
+            if (hipMalloc(&r->fa16_vt_buf, nv * 2) == hipSuccess) r->fa16_vt_cap = nv * 2;
+        }
+        if (r->fa16_vt_buf) {
+            void *V2 = r->fa16_vt_buf;
+            void *ta[] = {&V2, &Vt, &n_tok, &n_heads, &np};
+            hipModuleLaunchKernel(r->fn_fa16_vt, (unsigned)((nv + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ta, NULL);
+            void *fa[] = {&d_out, &Qh, &Kt, &V2, &n_tok, &n_heads, &isd, &np};
+            hipModuleLaunchKernel(r->fn_fa16_dbvt, (unsigned)n_heads, (unsigned)((n_tok + 255) / 256), 1, 512, 1, 1, 0, NULL, fa, NULL);
+            return 0;
+        }
+    }
+    void *fa[] = {&d_out, &Qh, &Kt, &Vt, &n_tok, &n_heads, &isd};
+    hipModuleLaunchKernel(r->fn_fa16, (unsigned)n_heads, (unsigned)((n_tok + 255) / 256), 1, 512, 1, 1, 0, NULL, fa, NULL);
+    return 0;
+}
+
 /* Timestep embedding: sinusoidal(256) -> fc1 -> SiLU -> fc2 (device [dim], caller frees). */
 static void *qimg_time_embed(hip_qimg_runner *r, float timestep) {
     int dim = r->dim;
@@ -3112,6 +3174,10 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         qimg_set_gemm_context(r, L, "txt_v");
         op_proj(r, d_txt_v, blk.attn_add_v_w, d_scratch2, blk.attn_add_v_b, dim, dim, n_txt, L, 6);
 
+        if (hd == 128 && qimg_fused_qkv_attn(r, d_attn_out, d_q, d_k, d_v, n_total, n_txt, nh, &blk,
+                                             t_dim_rope, h_dim_rope, w_dim_rope, rope_theta) == 0) {
+            /* norm + RoPE + pack + attention done in the fused path */
+        } else {
         /* QK RMSNorm */
         op_rmsnorm_ph(r, d_img_q, blk.norm_q_w, n_img, nh, hd);
         op_rmsnorm_ph(r, d_img_k, blk.norm_k_w, n_img, nh, hd);
@@ -3142,6 +3208,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         /* Joint attention */
         op_attn(r, d_attn_out, d_q, d_k, d_v, n_total, nh, hd);
+        }
 
         /* Output projections */
         void *d_img_attn = (char *)d_attn_out + (size_t)n_txt * dim * sizeof(float);
@@ -3163,8 +3230,10 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
             int cn = n_img - c0 < mlp_chunk ? n_img - c0 : mlp_chunk;
             void *rows = (char *)d_scratch1 + (size_t)c0 * dim * sizeof(float);
             qimg_set_gemm_context(r, L, "img_mlp_fc1");
+            r->pending_gelu = 1; r->gelu_fused = 0;
             op_proj(r, d_scratch3, blk.img_mlp_fc1_w, rows, blk.img_mlp_fc1_b, mlp_h, dim, cn, L, 8);
-            op_gelu(r, d_scratch3, cn * mlp_h);
+            r->pending_gelu = 0;
+            if (!r->gelu_fused) op_gelu(r, d_scratch3, cn * mlp_h);
             qimg_set_gemm_context(r, L, "img_mlp_fc2");
             op_proj(r, rows, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b, dim, mlp_h, cn, L, 9);
         }
@@ -3173,8 +3242,10 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
         /* MLP: Text (GELU) */
         op_adaln(r, d_scratch2, d_txt, txt_sh2, txt_sc2, n_txt, dim);
         qimg_set_gemm_context(r, L, "txt_mlp_fc1");
+        r->pending_gelu = 1; r->gelu_fused = 0;
         op_proj(r, d_scratch3, blk.txt_mlp_fc1_w, d_scratch2, blk.txt_mlp_fc1_b, mlp_h, dim, n_txt, L, 10);
-        op_gelu(r, d_scratch3, n_txt * mlp_h);
+        r->pending_gelu = 0;
+        if (!r->gelu_fused) op_gelu(r, d_scratch3, n_txt * mlp_h);
         qimg_set_gemm_context(r, L, "txt_mlp_fc2");
         op_proj(r, d_scratch2, blk.txt_mlp_fc2_w, d_scratch3, blk.txt_mlp_fc2_b, dim, mlp_h, n_txt, L, 11);
         op_gated_add(r, d_txt, d_scratch2, txt_g2, n_txt, dim);
