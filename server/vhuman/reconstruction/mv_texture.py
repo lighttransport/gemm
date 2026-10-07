@@ -29,6 +29,7 @@ from .reference import srgb_to_linear, linear_to_srgb
 
 POLAR_VIEWS=('top','bottom')
 FACELESS_VIEWS=('back','top','bottom')
+DEFAULT_HYBRID='front=qwen_edit_seq:raw,right=qwen_edit_seq:raw,left=qwen_edit_seq:raw,back=mvadapter:view,top=mvadapter:view,bottom=mvadapter:view'
 BACKENDS=('mvadapter','qwen_seq','qwen_grid','qwen_edit_seq')
 RES=768
 
@@ -93,6 +94,33 @@ def generate(work, backend, **options):
     for v,im in zip(views,images):Image.fromarray(im).save(out/f"view_{v['name']}.png")
     info.update(synthetic=True,geometry_evidence=False,
         views={f"view_{v['name']}.png":sha256(out/f"view_{v['name']}.png") for v in views})
+    skin.write_json(out/'generation.json',info)
+    return info
+
+
+def compose(work, spec, name='hybrid'):
+    """Assemble a per-view hybrid generation (e.g. Edit-2511 for face-seeing views, MV-Adapter elsewhere).
+
+    spec: 'view=<backend dir>:<raw|view>,...'. 'raw' takes <dir>/<view>/edited.png (full editor output),
+    'view' takes <dir>/view_<view>.png. Writes <work>/<name>/view_*.png and a generation.json whose licence
+    is the union of the sources (MV-Adapter's SDXL base makes the result evaluation-only).
+    """
+    record=check(work);work=Path(work);out=work/name;out.mkdir(exist_ok=True)
+    res=record['resolution'];sources={};licences=set();generators={}
+    for item in spec.split(','):
+        view,src=item.split('=');backend,kind=src.split(':')
+        path=work/backend/view/'edited.png' if kind=='raw' else work/backend/f'view_{view}.png'
+        im=Image.open(path).convert('RGB')
+        if im.size!=(res,res):im=im.resize((res,res),Image.Resampling.LANCZOS)
+        im.save(out/f'view_{view}.png')
+        info=json.loads((work/backend/'generation.json').read_text())
+        licences.add(info.get('license','unknown'));generators[view]=f"{info.get('generator',backend)} [{kind}]"
+        sources[view]=dict(backend=backend,kind=kind,sha256=sha256(path))
+    names=[v['name'] for v in record['views']]
+    if set(sources)!=set(names):raise ValueError('hybrid spec must cover every view: '+','.join(names))
+    info=dict(generator='hybrid: '+'; '.join(f'{v}={generators[v]}' for v in names),
+              license=' + '.join(sorted(licences)),sources=sources,synthetic=True,geometry_evidence=False,
+              views={f'view_{v}.png':sha256(out/f'view_{v}.png') for v in names})
     skin.write_json(out/'generation.json',info)
     return info
 
@@ -380,10 +408,10 @@ def evaluate(work, outs):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('stage',choices=('prepare','generate','regen-polar','bake','eval'))
+    p.add_argument('stage',choices=('prepare','generate','compose','regen-polar','bake','eval'))
     p.add_argument('--candidate');p.add_argument('--work',required=True)
-    p.add_argument('--backend',choices=BACKENDS,default='mvadapter');p.add_argument('--out',nargs='*')
-    p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--one-band',action='store_true');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
+    p.add_argument('--backend',default='mvadapter',help=f'{BACKENDS} for generate; any work subdir for bake');p.add_argument('--out',nargs='*')
+    p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--one-band',action='store_true');p.add_argument('--spec',default=DEFAULT_HYBRID);p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
     if a.stage=='generate':
@@ -395,6 +423,7 @@ def main():
         record=check(a.work);frame,views=conditions(Path(record['candidate']),record['resolution'])
         print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,make_editor(),
             **({'steps':a.steps} if a.steps else {})),indent=1))
+    if a.stage=='compose':print(json.dumps(compose(a.work,a.spec,a.backend if a.backend.startswith('hybrid') else 'hybrid'),indent=1))
     if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
