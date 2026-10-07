@@ -65,6 +65,27 @@ struct LdInt4G64 {
 
 /* One K range of the tiled WMMA loop, accumulating into acc.  X rows have stride ldx elements; W rows
  * are LB-encoded with K = ldw columns (for row_bytes / scale groups). */
+/* INT8 g64 weights (Q4_K_M-style 8-bit for sensitive linears): [N, K] int8, BF16 scale per (row, 64-group). */
+struct LdInt8G64 {
+    __device__ static size_t row_bytes(int K) { return (size_t)K; }
+    __device__ static Raw load(const unsigned char *row, int k, const unsigned short *srow) {
+        Raw r;
+        const uint2 v = *(const uint2 *)(row + k);
+        r.w[0] = v.x; r.w[1] = v.y; r.w[2] = (unsigned int)srow[k >> 6] << 16; r.w[3] = 0;
+        return r;
+    }
+    __device__ static u16x8 decode(const Raw &r, int, const unsigned short *) {
+        const float s = __uint_as_float(r.w[2]);
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) v[i] = (float)(signed char)((r.w[i >> 2] >> (8 * (i & 3))) & 0xFF) * s;
+        u32x4 w;
+        w[0] = pack2(bf16_rne_hi(v[0]), bf16_rne_hi(v[1])); w[1] = pack2(bf16_rne_hi(v[2]), bf16_rne_hi(v[3]));
+        w[2] = pack2(bf16_rne_hi(v[4]), bf16_rne_hi(v[5])); w[3] = pack2(bf16_rne_hi(v[6]), bf16_rne_hi(v[7]));
+        return __builtin_bit_cast(u16x8, w);
+    }
+};
+
 /* Wide int4 loader: one thread stages a whole K32 slice of one weight row (16 bytes = 32 nibbles) plus its
  * g64 scale, decoding all four kslot vectors; replaces 4 narrow 4-byte loads + 4 scale loads per row. */
 struct Int4Wide { uint4 q; float s; };
@@ -311,6 +332,8 @@ QGEMM_INST(qgemm_bf16_64x128,  LdDense,    64, 128, 1, 4)
 QGEMM_INST(qgemm_bf16_128x64,  LdDense,   128,  64, 2, 2)
 QGEMM_INST(qgemm_i4_128x128,   LdInt4G64, 128, 128, 2, 2)
 QGEMM_INST(qgemm_i4_64x128,    LdInt4G64,  64, 128, 1, 4)
+QGEMM_INST(qgemm_i8_128x128w8, LdInt8G64, 128, 128, 2, 4)
+QGEMM_INST(qgemm_i8_64x128,   LdInt8G64,  64, 128, 1, 4)
 QGEMM_INST(qgemm_bf16_64x64,   LdDense,    64,  64, 2, 2)
 QGEMM_INST(qgemm_i4_128x128w8, LdInt4G64, 128, 128, 2, 4)
 QGEMM_INST(qgemm_i4_128x256,   LdInt4G64, 128, 256, 2, 4)

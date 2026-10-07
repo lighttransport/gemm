@@ -131,6 +131,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--blocks", default="all", help="'all' or comma-separated indices (dev subset)")
     ap.add_argument("--rank", type=int, default=128)
+    ap.add_argument("--int8", default="", help="comma-separated MAIN suffixes packed as INT8-g64 (e.g. attn.to_v,img_mlp.net.2)")
+    ap.add_argument("--no-mod", action="store_true", help="omit img_mod/txt_mod (computed on the host, QIMG_HOST_MOD=1)")
     ap.add_argument("--group", type=int, default=64)
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--clip", type=float, default=1e3, help="clamp range for smoothing lambda")
@@ -154,6 +156,7 @@ def main():
     print(f"quantizing {len(blocks)} block(s), rank={a.rank} group={a.group} "
           f"smooth={'off' if a.no_smooth else ('calib' if calib else 'lambda=1')}", file=sys.stderr)
 
+    int8_set = {x for x in a.int8.split(',') if x}
     out_t = {}
     t0 = time.time()
     cos_acc = []
@@ -161,6 +164,16 @@ def main():
         p = f"transformer_blocks.{b}."
         for suf in MAIN:
             W = src.get_tensor(p + suf + ".weight").float()                    # [out,in]
+            if suf in int8_set:                                                # Q4_K_M-style: sensitive tensors at 8 bit
+                g = W.reshape(W.shape[0], -1, a.group)
+                scale = (g.abs().amax(dim=2, keepdim=True) / 127.0).clamp(min=1e-12)
+                scale = scale.to(torch.bfloat16).float()                       # stored bf16: quantize against it
+                q = torch.clamp(torch.round(g / scale), -127, 127).to(torch.int8).reshape(W.shape)
+                k = p + suf
+                out_t[k + ".qint8"] = q.contiguous()
+                out_t[k + ".wscale"] = scale.squeeze(2).to(torch.bfloat16).contiguous()
+                out_t[k + ".bias"] = src.get_tensor(p + suf + ".bias").float()
+                continue
             amax = calib.get(p + suf + ".amax")
             lam = torch.ones(W.shape[1]) if a.no_smooth else smoothing_lambda(W, amax, a.alpha, a.clip)
             What = W * lam.unsqueeze(0)
@@ -182,7 +195,7 @@ def main():
                 cos, rel = reconstruct_and_check(W, lam, lora_up, lora_down_emit, qint4, wscale, a.group)
                 cos_acc.append(cos)
                 print(f"  b{b:02d} {suf:18s} out={W.shape[0]:5d} in={W.shape[1]:5d} r={r} cos={cos:.5f} rel={rel:.4f}", file=sys.stderr)
-        for suf in MOD:                                                        # SVDQuant rank-r (weight-only) — was RTN
+        for suf in ([] if a.no_mod else MOD):                                  # SVDQuant rank-r (weight-only) — was RTN
             W = src.get_tensor(p + suf + ".weight").float()                    # [6*hidden, hidden]
             if a.mod_rtn:
                 qint4, wscale = quant_int4_g64(W, a.group)

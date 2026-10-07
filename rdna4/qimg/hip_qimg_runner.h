@@ -59,6 +59,10 @@ void hip_qimg_free(hip_qimg_runner *r);
  * Callers use only the first f*h*w output rows. n_seg = 0 restores plain text-to-image. */
 int hip_qimg_set_edit_layout(hip_qimg_runner *r, int n_seg, const int *fhw, int zero_cond_t);
 
+/* Host-computed per-block modulation ([n_blocks][6*3072] floats): img/txt at the step's t, img0 at t=0
+ * (zero_cond_t refs, may be NULL). With QIMG_HOST_MOD=1 at load the INT4 mod weights are not loaded. */
+int hip_qimg_set_mod_vectors(hip_qimg_runner *r, const float *img, const float *txt, const float *img0);
+
 int hip_qimg_dit_step(hip_qimg_runner *r,
                       const float *img_tokens, int n_img,
                       const float *txt_tokens, int n_txt,

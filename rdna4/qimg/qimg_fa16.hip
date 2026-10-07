@@ -12,7 +12,13 @@ typedef float float8 __attribute__((ext_vector_type(8)));
 #endif
 #define K_NB (HD/16)
 #define LOG2E 1.4426950408889634f
+/* Hardware v_exp_f32 (exact to ~1 ulp). The fa2 bench's Schraudolph bit-trick exp2 (up to ~6% error per
+ * softmax weight) added ~1.4% rel_l2 to Edit-2511 DiT outputs; QIMG_FA_FAST_EXP restores it for A/B. */
+#ifdef QIMG_FA_FAST_EXP
 __device__ __forceinline__ float exp2_fast(float x){if(x<=-24.0f)return 0.0f;if(x>8.0f)x=8.0f;union{int i;float f;}u;u.i=(int)((x+127.0f)*8388608.0f);return u.f;}
+#else
+__device__ __forceinline__ float exp2_fast(float x){return __builtin_amdgcn_exp2f(fminf(x,8.0f));}
+#endif
 /* blog XOR swizzle: spread BKV rows of HD-stride K across LDS banks, 8-elem aligned */
 #ifdef SWZ
 #define SW(r) (((r)&7)<<4)
@@ -73,7 +79,7 @@ void fa_db(float*out,const wt*Q,const wt*Kt,const wt*Vt,int N,int H,float isd){
 }
 
 /* branchless exp2 for fa_db_vt: clamps instead of branching (masked keys are zeroed explicitly). */
-__device__ __forceinline__ float exp2_bl(float x){x=fminf(fmaxf(x,-126.0f),8.0f);union{int i;float f;}u;u.i=(int)((x+127.0f)*8388608.0f);return u.f;}
+__device__ __forceinline__ float exp2_bl(float x){return exp2_fast(x);}
 /* fa_db_vt: V pre-transposed by the pack kernel to [H][HD][Np] (Np = N rounded up to 32, zero tail), so the
  * V tile is copied with 16-byte vectors like K instead of 16 strided 2-byte LDS stores per thread. */
 #define LDVT(KK,VV,KV0) { for(int o=tid*16;o<tot;o+=st){int r=o/HD,d=o%HD,kv=(KV0)+r;size_t b=((size_t)h*N+kv)*HD+d; \

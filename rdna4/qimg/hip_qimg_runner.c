@@ -116,6 +116,7 @@ typedef struct {
     void  *lora_up;    /* device bf16  [n_out, rank] */
     float *bias;       /* device f32   [n_out] */
     int lora_folded;   /* lora_down pre-multiplied by smooth (tiled path) */
+    int bits;          /* 4 (qint4 nibbles) or 8 (qint8 bytes, tiled path only) */
     int n_out, n_in, rank, group_size;
 } qimg_int4_linear;
 
@@ -216,6 +217,9 @@ struct hip_qimg_runner {
     /* INT4 (Nunchaku/SVDQuant, W4A16 logical layout) path — all blocks resident (no streaming). */
     qimg_int4_linear *int4_linears;  /* [n_blocks * QIMG_INT4_PER_BLOCK] per-block logical-linear descriptors */
     void *int4_arena; size_t int4_arena_cap;
+    /* Host-computed modulation (hip_qimg_set_mod_vectors): [n_blocks][6*dim] for img (t), txt (t) and img (t=0,
+     * zero_cond_t). QIMG_HOST_MOD=1 at load skips the INT4 mod weights (RTN int4 mods dominated edit error). */
+    float *d_hmod_img, *d_hmod_txt, *d_hmod_img0; int host_mod, host_mod_img0, skip_mod_load;
     qimg_int4_linear *int4_mod;      /* [n_blocks * 2] img_mod/txt_mod RTN-int4 (rank0, no smooth) */
     float *i4_ldf, *i4_luf, *i4_dt, *i4_dly; size_t i4_dt_cap, i4_dly_cap;  /* persistent lora scratch */
     void *d_edit_pos; int edit_n_seg, edit_n_tok, edit_txt_start, edit_n_cond, edit_zero_cond;  /* edit layout */
@@ -224,7 +228,7 @@ struct hip_qimg_runner {
     /* Tiled WMMA module (qimg_gemm_wmma.hip); QIMG_INT4_GEMM=legacy keeps the old kernels. */
     hipModule_t mod_tiled; int use_tiled, tiled_oom, step_error, pending_gelu, gelu_fused;
     hipModule_t mod_fa16; hipFunction_t fn_fa16, fn_fa16_pack, fn_fa16_nrp, fn_fa16_vt, fn_fa16_dbvt; void *fa16_buf; size_t fa16_cap; void *fa16_vt_buf; size_t fa16_vt_cap;  /* QIMG_ATTN=fa16 */
-    hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4w_w8, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
+    hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4w_w8, fn_qg_i8_w8, fn_qg_i8_64, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
     unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
     /* INT8 SmoothQuant (W8A8) path: int8 weights stream via the fp8 byte path (same 1 B/param);
@@ -683,11 +687,14 @@ static void *qimg_st_upload_raw(st_context *st, const char *name) {
  * Used by the Nunchaku-format DiT loader — all blocks preloaded (the INT4 model fits VRAM; no streaming). */
 static int qimg_upload_int4_linear(st_context *st, const char *key, qimg_int4_linear *L) {
     char nm[256]; int idx;
-    memset(L, 0, sizeof(*L)); L->group_size = 64;
+    memset(L, 0, sizeof(*L)); L->group_size = 64; L->bits = 4;
+    const char *qsuf = ".qint4";
     snprintf(nm, sizeof(nm), "%s.qint4", key);
-    idx = safetensors_find(st, nm); if (idx < 0) return -1;
-    const uint64_t *qs = safetensors_shape(st, idx);          /* [n_out, n_in/2] */
-    L->n_out = (int)qs[0]; L->n_in = (int)(qs[1] * 2);
+    idx = safetensors_find(st, nm);
+    if (idx < 0) { snprintf(nm, sizeof(nm), "%s.qint8", key); idx = safetensors_find(st, nm); L->bits = 8; qsuf = ".qint8"; }
+    if (idx < 0) return -1;
+    const uint64_t *qs = safetensors_shape(st, idx);          /* [n_out, n_in/2] int4 or [n_out, n_in] int8 */
+    L->n_out = (int)qs[0]; L->n_in = (int)(L->bits == 8 ? qs[1] : qs[1] * 2);
     /* Group size from wscale columns: Nunchaku g64 -> n_in/64 cols; simple g16 -> n_in/16. */
     snprintf(nm, sizeof(nm), "%s.wscale", key);
     { int widx = safetensors_find(st, nm);
@@ -696,7 +703,7 @@ static int qimg_upload_int4_linear(st_context *st, const char *key, qimg_int4_li
         if (wcols > 0) L->group_size = L->n_in / wcols; } }
     snprintf(nm, sizeof(nm), "%s.lora_up", key);
     idx = safetensors_find(st, nm); if (idx >= 0) L->rank = (int)safetensors_shape(st, idx)[1];
-    snprintf(nm, sizeof(nm), "%s.qint4", key);     L->qint4     = qimg_st_upload_raw(st, nm);
+    snprintf(nm, sizeof(nm), "%s%s", key, qsuf);   L->qint4     = qimg_st_upload_raw(st, nm);
     snprintf(nm, sizeof(nm), "%s.wscale", key);    L->wscale    = (float *)qimg_st_upload_raw(st, nm);   /* bf16, kernel expands */
     snprintf(nm, sizeof(nm), "%s.smooth", key);    L->smooth    = (float *)qimg_st_upload_f32(st, nm);
     snprintf(nm, sizeof(nm), "%s.lora_down", key); L->lora_down = qimg_st_upload_raw(st, nm);
@@ -1190,6 +1197,10 @@ static void qimg_tl_gemm_full(hip_qimg_runner *r, int int4, void *Y, const void 
     /* Tile choice: narrow N (LoRA rank) -> 64x64 for CTA count; small M -> 64x128;
      * else variant (QIMG_TILED_VARIANT): 0 = 128x128/128thr, 1 = 128x128/256thr, 2 = 128x256/256thr. */
     hipFunction_t f; int bm, bn, thr;
+    if (int4 == 2) {   /* int8 weights */
+        if (M <= 64) { f = r->fn_qg_i8_64; bm = 64; bn = 128; thr = 128; }
+        else         { f = r->fn_qg_i8_w8; bm = 128; bn = 128; thr = 256; }
+    } else
     if (!int4 && N <= 128)      { f = r->fn_qg_bf16_64x64; bm = 64; bn = 64; thr = 128; }
     else if (M <= 64)           { f = int4 ? r->fn_qg_i4_64 : r->fn_qg_bf16_64; bm = 64; bn = 128; thr = 128; }
     else if (r->tl_variant == 2 && int4) { f = r->fn_qg_i4_256; bm = 128; bn = 256; thr = 256; }
@@ -1236,6 +1247,11 @@ static void qimg_tiled_int4_linear(hip_qimg_runner *r, void *Y, void *X, const q
     int act = r->pending_gelu ? 2 : 0;   /* caller asked for GELU fused into this linear's epilogue */
     if (qimg_tl_reserve(r, (size_t)nx, (size_t)(rk > 0 ? rk : 1) * n_tok, need_xb) != 0) { r->tiled_oom = 1; return; }
     qimg_tl_cast(r, r->tl_xs, X, L->smooth, n_in, nx);                       /* bf16(X / smooth) */
+    if (L->bits == 8) {   /* plain int8-g64 weight, no low-rank branch */
+        qimg_tl_gemm(r, 2, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, act);
+        if (act) r->gelu_fused = 1;
+        return;
+    }
     if (rk > 0 && L->lora_down) {
         /* dt = X @ ld^T first (split-K), then one GEMM: Y = [X/s | dt] @ [Wq | lora_up]^T + bias. */
         const unsigned short *xa = L->smooth && !L->lora_folded ? NULL : r->tl_xs;
@@ -1266,6 +1282,7 @@ static void qimg_fold_smooth_into_lora(qimg_int4_linear *L) {
 
 static void op_int4_linear(hip_qimg_runner *r, void *Y, void *X, const qimg_int4_linear *L, int n_tok) {
     int n_out = L->n_out, n_in = L->n_in, gs = L->group_size, rk = L->rank;
+    if (L->bits == 8 && !(r->use_tiled && r->fn_qg_i8_w8)) { fprintf(stderr, "hip_qimg: int8 linear needs the tiled GEMM\n"); r->step_error = 1; return; }
     if (r->use_tiled && gs == 64 && (n_in % 64) == 0 && (rk % 32) == 0) {
         qimg_tiled_int4_linear(r, Y, X, L, n_tok);
         if (!r->tiled_oom) return;
@@ -1954,6 +1971,8 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
           }
           hipModuleGetFunction(&r->fn_qg_i4_w8, r->mod_tiled, "qgemm_i4_128x128w8");
           if (!getenv("QIMG_I4_NARROW")) hipModuleGetFunction(&r->fn_qg_i4w_w8, r->mod_tiled, "qgemm_i4w_128x128w8");
+          hipModuleGetFunction(&r->fn_qg_i8_w8, r->mod_tiled, "qgemm_i8_128x128w8");
+          hipModuleGetFunction(&r->fn_qg_i8_64, r->mod_tiled, "qgemm_i8_64x128");
           hipModuleGetFunction(&r->fn_qg_i4_256, r->mod_tiled, "qgemm_i4_128x256");
           hipModuleGetFunction(&r->fn_qg_bf16_w8, r->mod_tiled, "qgemm_bf16_128x128w8");
           { const char *v = getenv("QIMG_TILED_VARIANT"); r->tl_variant = v ? atoi(v) : 1; }
@@ -2330,12 +2349,14 @@ int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
     }
     r->int4_linears = (qimg_int4_linear *)calloc((size_t)r->n_blocks * QIMG_INT4_PER_BLOCK, sizeof(qimg_int4_linear));
     if (!r->int4_linears) return -1;
+    { const char *hm = getenv("QIMG_HOST_MOD"); r->skip_mod_load = hm && atoi(hm); }
     {   /* arena sized from the file: f32-expanded tensors (smooth/bias/norms) take 4 B/elem */
         size_t need = 0;
         for (int i = 0; i < st->n_tensors; i++) {
             const char *nm = safetensors_name(st, i);
             if (!strstr(nm, "transformer_blocks.")) continue;
-            int raw = strstr(nm, ".qint4") || strstr(nm, ".wscale") || strstr(nm, ".lora_down") || strstr(nm, ".lora_up");
+            if (r->skip_mod_load && strstr(nm, "_mod.1.")) continue;
+            int raw = strstr(nm, ".qint4") || strstr(nm, ".qint8") || strstr(nm, ".wscale") || strstr(nm, ".lora_down") || strstr(nm, ".lora_up");
             size_t nb = safetensors_nbytes(st, i), el = 1; const uint64_t *sh = safetensors_shape(st, i);
             for (int d = 0; d < safetensors_ndims(st, i); d++) el *= sh[d];
             need += (raw ? nb : el * 4) + 256;
@@ -2387,8 +2408,11 @@ int hip_qimg_load_dit_int4(hip_qimg_runner *r, const char *path) {
         MW(norm_q_w,"attn.norm_q.weight"); MW(norm_k_w,"attn.norm_k.weight");
         MW(norm_added_q_w,"attn.norm_added_q.weight"); MW(norm_added_k_w,"attn.norm_added_k.weight");
         #undef MW
-        snprintf(nm,sizeof nm,"transformer_blocks.%d.img_mod.1",b); int e1=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b]);
-        snprintf(nm,sizeof nm,"transformer_blocks.%d.txt_mod.1",b); int e2=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b+1]);
+        int e1 = 0, e2 = 0;
+        if (!r->skip_mod_load) {
+            snprintf(nm,sizeof nm,"transformer_blocks.%d.img_mod.1",b); e1=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b]);
+            snprintf(nm,sizeof nm,"transformer_blocks.%d.txt_mod.1",b); e2=qimg_upload_int4_linear(st,nm,&r->int4_mod[2*b+1]);
+        }
         if (e1||e2) fprintf(stderr, "hip_qimg: int4 block %d mod/norm incomplete\n", b);
     }
     if (r->verbose) {
@@ -2945,10 +2969,27 @@ int hip_qimg_set_edit_layout(hip_qimg_runner *r, int n_seg, const int *fhw, int 
     return 0;
 }
 
+/* Host-computed modulation: img/txt [n_blocks][6*dim] at timestep t, img0 (may be NULL) at t=0 for zero_cond_t
+ * reference tokens. Replaces the on-GPU mod linears until called with img == NULL. */
+int hip_qimg_set_mod_vectors(hip_qimg_runner *r, const float *img, const float *txt, const float *img0) {
+    size_t n = (size_t)r->n_blocks * 6 * r->dim * sizeof(float);
+    if (!img) { r->host_mod = 0; return 0; }
+    if (!r->d_hmod_img) {
+        if (hipMalloc((void **)&r->d_hmod_img, n) != hipSuccess || hipMalloc((void **)&r->d_hmod_txt, n) != hipSuccess ||
+            hipMalloc((void **)&r->d_hmod_img0, n) != hipSuccess) return -1;
+    }
+    hipMemcpy(r->d_hmod_img, img, n, hipMemcpyHostToDevice);
+    hipMemcpy(r->d_hmod_txt, txt, n, hipMemcpyHostToDevice);
+    if (img0) hipMemcpy(r->d_hmod_img0, img0, n, hipMemcpyHostToDevice);
+    r->host_mod = 1; r->host_mod_img0 = img0 != NULL;
+    return 0;
+}
+
 int hip_qimg_dit_step(hip_qimg_runner *r,
                       const float *img_tokens, int n_img,
                       const float *txt_tokens, int n_txt,
                       float timestep, float *out) {
+    if (r->skip_mod_load && !r->host_mod) { fprintf(stderr, "hip_qimg: QIMG_HOST_MOD set but no modulation vectors\n"); return -1; }
     r->step_error = 0;
     int dim = r->dim;
     int nh = r->n_heads, hd = r->head_dim;
@@ -3115,6 +3156,14 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
             }
         }
 
+        if (r->host_mod) {   /* host-computed modulation vectors for this block */
+            size_t o = (size_t)L * 6 * dim;
+            hipMemcpyAsync(d_img_mod, r->d_hmod_img + o, (size_t)6 * dim * sizeof(float), hipMemcpyDeviceToDevice, NULL);
+            hipMemcpyAsync(d_txt_mod, r->d_hmod_txt + o, (size_t)6 * dim * sizeof(float), hipMemcpyDeviceToDevice, NULL);
+            if (d_img_mod0)
+                hipMemcpyAsync(d_img_mod0, (r->host_mod_img0 ? r->d_hmod_img0 : r->d_hmod_img) + o,
+                               (size_t)6 * dim * sizeof(float), hipMemcpyDeviceToDevice, NULL);
+        } else {
         qimg_set_gemm_context(r, L, "img_mod");
         if (r->use_int4) op_int4_linear(r, d_img_mod, d_t_silu, &r->int4_mod[2*L], 1);
         else if (r->use_int8 && r->i8_ws) op_gemm_int8(r, d_img_mod, blk.img_mod_w,
@@ -3136,6 +3185,7 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
             r->i8_ws[(size_t)L*QIMG_I8_PER_BLOCK+13], r->use_int8_smooth ? r->i8_sm[(size_t)L*QIMG_I8_PER_BLOCK+13] : NULL,
             d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
         else op_wgemm_bf16(r, d_txt_mod, blk.txt_mod_w, d_t_silu, blk.txt_mod_b, 6 * dim, dim, 1);
+        }
 
         /* Modulation offsets */
         #define MOD_OFF(base, idx) ((void *)((char *)(base) + (size_t)(idx) * dim * sizeof(float)))
