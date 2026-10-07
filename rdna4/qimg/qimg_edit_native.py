@@ -133,16 +133,18 @@ def load_pipeline(base, int4_path, *, zero_cond_t=None):
     vis_forward, vis_cache = visual.forward, {}
 
     def cached_visual(pixel_values, grid_thw=None, **kwargs):
-        import hashlib
+        import copy, hashlib
         key = (hashlib.sha1(pixel_values.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
                None if grid_thw is None else tuple(grid_thw.flatten().tolist()), tuple(sorted(kwargs)))
         if key not in vis_cache:
             if len(vis_cache) >= 4:
                 vis_cache.pop(next(iter(vis_cache)))
-            vis_cache[key] = vis_forward(pixel_values, grid_thw=grid_thw, **kwargs)
+            vis_cache[key] = copy.copy(vis_forward(pixel_values, grid_thw=grid_thw, **kwargs))
         else:
             pipe.vision_cache_hits += 1
-        return vis_cache[key]
+        # get_image_features mutates the output in place (pooler_output -> tuple of splits): hand out copies.
+        import copy
+        return copy.copy(vis_cache[key])
 
     visual.forward = cached_visual
     pipe.vision_cache_hits = 0

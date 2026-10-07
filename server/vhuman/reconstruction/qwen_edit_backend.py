@@ -23,6 +23,13 @@ NATIVE_GENERATOR='Qwen-Image-Edit-2511 SVDQuant INT4 r128 (native RDNA4 DiT)'
 REPO=Path(__file__).resolve().parents[3]
 
 
+def condition_size(size):
+    """Edit-Plus resizes every reference to VAE_IMAGE_SIZE (module constant, 1024^2): keep it equal to the
+    output size or the output reproduces only part of the condition grid (the 512^2 quarter-zoom)."""
+    import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus as plus
+    plus.VAE_IMAGE_SIZE=size*size
+
+
 def make_editor():
     """Native INT4 DiT when packed (QWEN_EDIT_BACKEND=gguf forces the diffusers GGUF fallback)."""
     import os
@@ -43,6 +50,7 @@ class NativeEditor:
 
     def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
                  negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
+        condition_size(size)
         started=time.time();dit0=self.pipe.native.seconds;hits0=self.pipe.vision_cache_hits
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
         out=self.pipe(image=images,prompt=prompt,negative_prompt=negative,true_cfg_scale=cfg,height=size,width=size,
@@ -69,7 +77,7 @@ class Editor:
 
     def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
                  negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
-        torch=self.torch;started=time.time()
+        torch=self.torch;started=time.time();condition_size(size)
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
         with torch.no_grad():
             # Encode on CPU (encoder too large to share the GPU with the transformer).

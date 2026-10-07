@@ -39,6 +39,9 @@ class Editor21:
                  negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
         torch=self.torch;started=time.time()
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
+        # output_resolution sizes the references too (same grid as the output, so alignment holds at any size).
+        # Prefix KV cache: ~4-5 GB at 1024^2 + 2 refs (does not fit 16 GB); ~0.56x that at 768^2.
         out=self.pipe(image=images,prompt=prompt,negative_prompt=negative,true_cfg_scale=cfg,height=size,width=size,
-            num_inference_steps=steps,generator=torch.Generator(device='cuda').manual_seed(seed)).images[0]
+            output_resolution=size,num_inference_steps=steps,generator=torch.Generator(device='cuda').manual_seed(seed),
+            use_kv_cache=size<=768).images[0]
         return np.asarray(out.convert('RGB')),time.time()-started

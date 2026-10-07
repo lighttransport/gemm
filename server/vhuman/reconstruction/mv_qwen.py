@@ -9,6 +9,7 @@ grid: the four horizontal views tiled 2x2 and edited in one 1024px call, so the
   generator sees all of them jointly; top and bottom keep the projected state.
 """
 from pathlib import Path
+import json
 import time
 
 import numpy as np
@@ -122,3 +123,33 @@ def grid(candidate, frame, views, out, *, steps=12, seed=317, strength=.9):
         m=_mask(v)>0;images[v['name']]=np.where(m[...,None],tile,v['rgb'])
     return [images.get(v['name'],v['rgb']) for v in views],dict(generator='Qwen-Image-2.1 2x2 grid',
         license='qwen-research',steps=steps,seed=seed,strength=strength,seconds=receipt['seconds'])
+
+
+POLAR_PROMPT=('The LAST picture is a 3D render of the {where} of a bald human head, partly untextured (flat uniform '
+    'beige). The other pictures are already-completed views of the same head. Edit only the last picture: fill the '
+    'flat beige areas with {what}, matching the skin tone and texture of the other pictures. There is NO face in this '
+    'view: no eyes, nose, mouth or lips. Do not move, zoom, crop or change the camera; keep the silhouette and gray '
+    'background identical. Even diffuse light, no shadows, no highlights.')
+POLAR_WHAT={'top':('top of the scalp seen from directly above','very short dark hair stubble over the whole scalp'),
+            'bottom':('underside (chin, jaw and neck) seen from directly below','plain neck and under-chin skin')}
+
+
+def regen_polar(candidate, frame, views, out, editor, *, steps=12, seed=917):
+    """Re-edit top/bottom without the portrait (portrait-conditioned edits put faces on the crown/chin).
+
+    References: the finished front and back raw edits; target render last (1024^2 alignment rule).
+    Writes <view>/edited.png and polar_regen.json so the bake may fuse these raw outputs too.
+    """
+    out=Path(out);res=views[0]['depth'].shape[0];by_name={v['name']:v for v in views};report={}
+    refs=[np.asarray(Image.open(out/n/'edited.png').convert('RGB').resize((1024,1024))) for n in ('front','back')]
+    for index,name in enumerate(('top','bottom')):
+        view=by_name[name]
+        big=np.asarray(Image.fromarray(np.asarray(Image.open(out/f'view_{name}.png').convert('RGB'))).resize((1024,1024),Image.Resampling.LANCZOS))
+        where,what=POLAR_WHAT[name]
+        edited,took=editor(refs+[big],POLAR_PROMPT.format(where=where,what=what),steps=steps,seed=seed+index,
+                           negative='face, eyes, nose, mouth, lips, teeth, ears on top, text, blurry, shadows, highlights')
+        Image.fromarray(edited).save(out/name/'edited.png');report[name]=dict(seconds=took)
+        print(f'[mv_qwen] regen {name}: {took:.1f}s',flush=True)
+    (out/'polar_regen.json').write_text(json.dumps(dict(prompt=POLAR_PROMPT,references=['front','back'],steps=steps,
+        seed=seed,views=report,generator=editor.generator),indent=2))
+    return report

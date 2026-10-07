@@ -103,7 +103,7 @@ def fuse(colors, weights):
     return mean,w,spread,(weights>.01).sum(0)
 
 
-def bake(work, backend, out, *, delight=True, source='auto'):
+def bake(work, backend, out, *, delight=True, source='auto', polar='auto'):
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
     info=json.loads((work/backend/'generation.json').read_text())
     for name,digest in info['views'].items():
@@ -119,10 +119,11 @@ def bake(work, backend, out, *, delight=True, source='auto'):
         raw=work/backend/v['name']/'edited.png'
         # Top/bottom raw edits hallucinate faces (portrait-conditioned editor on a top-down head): keep
         # their sequential composite, which only adds the hole no earlier view covered.
-        path=raw if use_raw and raw.exists() and v['name'] not in POLAR_VIEWS else work/backend/f"view_{v['name']}.png"
+        path=raw if use_raw and raw.exists() and (v['name'] not in POLAR_VIEWS or polar=='raw') else work/backend/f"view_{v['name']}.png"
         im=Image.open(path).convert('RGB')
         return np.asarray(im.resize((record['resolution'],)*2,Image.Resampling.LANCZOS) if im.size[0]!=record['resolution'] else im)
     raw_all=all((work/backend/v['name']/'edited.png').exists() for v in views)
+    polar_ok=(work/backend/'polar_regen.json').exists()   # top/bottom re-edited without the portrait
     use_raw=source=='raw' or (source=='auto' and raw_all)
     images=[load_view(v) for v in views]
     delight_report=None
@@ -131,11 +132,22 @@ def bake(work, backend, out, *, delight=True, source='auto'):
         delight_report={}
         for i,v in enumerate(views):
             images[i],delight_report[v['name']]=remove_light(images[i],v['normal'],v['valid'])
+    # polar='skip': top/bottom generations are unreliable (portrait-conditioned edits paint faces on the crown;
+    # portrait-free ones ignore the top-down camera). Use only horizontal views, accepting grazing angles
+    # (facing >= 0.05, still weighted by facing^2) for texels no view sees head-on; fill_unsupported covers the rest.
+    polar_mode=('skip' if use_raw else 'composite') if polar=='auto' else polar
+    is_polar=np.array([v['name'] in POLAR_VIEWS for v in views])
     colors,weights=cond.project_views(frame,views,images,points,normals)
-    if use_raw:   # polar views only fill texels the horizontal (raw) views do not see
-        polar=np.array([v['name'] in POLAR_VIEWS for v in views])
-        side=weights[~polar].sum(0)>.01
-        weights[polar]*=np.where(side,.05,1.)[None]
+    if polar_mode=='skip':
+        side=[i for i,p in enumerate(is_polar) if not p]
+        gc,gw=cond.project_views(frame,[views[i] for i in side],[images[i] for i in side],points,normals,min_facing=.05)
+        weights[is_polar]=0
+        unseen=weights[~is_polar].sum(0)<=.01        # no horizontal view sees these head-on
+        for k,i in enumerate(side):
+            colors[i]=np.where(unseen[:,None],gc[k],colors[i]);weights[i]=np.where(unseen,gw[k],weights[i])
+    elif use_raw and not polar_ok:   # polar composites only fill texels the horizontal (raw) views do not see
+        side=weights[~is_polar].sum(0)>.01
+        weights[is_polar]*=np.where(side,.05,1.)[None]
     linear=srgb_to_linear(base[valid]/255);seen=observed[valid]
     weights*=neck_cut_weight(geometry,points)[None]
     # Reject per-view outliers (cast shadows, collars) against the cross-view
@@ -170,7 +182,7 @@ def bake(work, backend, out, *, delight=True, source='auto'):
         source_geometry_sha256=record['geometry_sha256'],work=str(work.resolve()),
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
         basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
-        view_source='raw edits (horizontal) + composite polar views' if use_raw else 'composites',
+        view_source=('raw edits' if use_raw else 'composites')+f', polar={polar_mode}',
         photographed_texels_changed=int(np.any(result[observed]!=base[observed],axis=-1).sum()),
         generated_texels=int((blend>.01).sum()),
         unseen_texels=int((~seen).sum()),unseen_covered=float((support[~seen]>.05).mean()),
@@ -268,16 +280,22 @@ def evaluate(work, outs):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('stage',choices=('prepare','generate','bake','eval'))
+    p.add_argument('stage',choices=('prepare','generate','regen-polar','bake','eval'))
     p.add_argument('--candidate');p.add_argument('--work',required=True)
     p.add_argument('--backend',choices=BACKENDS,default='mvadapter');p.add_argument('--out',nargs='*')
-    p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
+    p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
     if a.stage=='generate':
         opts=dict(seed=a.seed);opts.update(steps=a.steps) if a.steps else None
         print(json.dumps(generate(a.work,a.backend,**opts),indent=1))
-    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source),indent=1))
+    if a.stage=='regen-polar':
+        from . import mv_qwen
+        from .qwen_edit_backend import make_editor
+        record=check(a.work);frame,views=conditions(Path(record['candidate']),record['resolution'])
+        print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,make_editor(),
+            **({'steps':a.steps} if a.steps else {})),indent=1))
+    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
 
