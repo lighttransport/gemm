@@ -65,6 +65,93 @@ struct LdInt4G64 {
 
 /* One K range of the tiled WMMA loop, accumulating into acc.  X rows have stride ldx elements; W rows
  * are LB-encoded with K = ldw columns (for row_bytes / scale groups). */
+/* Wide int4 loader: one thread stages a whole K32 slice of one weight row (16 bytes = 32 nibbles) plus its
+ * g64 scale, decoding all four kslot vectors; replaces 4 narrow 4-byte loads + 4 scale loads per row. */
+struct Int4Wide { uint4 q; float s; };
+__device__ __forceinline__ Int4Wide i4w_load(const unsigned char *row, int k, const unsigned short *srow) {
+    Int4Wide w; w.q = *(const uint4 *)(row + (k >> 1)); w.s = __uint_as_float((unsigned)srow[k >> 6] << 16); return w;
+}
+__device__ __forceinline__ u16x8 i4w_decode(unsigned word, float s) {
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) { int nb = (word >> (4 * i)) & 0xF; v[i] = (float)(nb >= 8 ? nb - 16 : nb) * s; }
+    u32x4 o;
+    o[0] = pack2(bf16_rne_hi(v[0]), bf16_rne_hi(v[1])); o[1] = pack2(bf16_rne_hi(v[2]), bf16_rne_hi(v[3]));
+    o[2] = pack2(bf16_rne_hi(v[4]), bf16_rne_hi(v[5])); o[3] = pack2(bf16_rne_hi(v[6]), bf16_rne_hi(v[7]));
+    return __builtin_bit_cast(u16x8, o);
+}
+
+/* K loop with int4 W staged by the wide loader (threads [0,BN) load B rows; all threads load A). */
+template <int BM, int BN, int WAVES_M, int WAVES_N>
+__device__ __forceinline__ void qgemm_kloop_i4w(
+        float8 (&acc)[BM / WAVES_M / 16][BN / WAVES_N / 16], u16x8 *smA, u16x8 *smB,
+        const unsigned short *__restrict__ X, int ldx, const unsigned char *__restrict__ W, int K,
+        const unsigned short *__restrict__ S, int m0, int n0, int M, int N, int kbeg, int kend) {
+    constexpr int NT = WAVES_M * WAVES_N * 32;
+    constexpr int WTM = BM / WAVES_M, WTN = BN / WAVES_N;
+    constexpr int FM = WTM / 16, FN = WTN / 16;
+    constexpr int AV = BM * 4 / NT;
+    static_assert(BN <= NT && AV >= 1, "wide int4 loader needs BN <= threads");
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const int wm = wave % WAVES_M, wn = wave / WAVES_M, half = lane >> 4, idx = lane & 15;
+    const u16x8 *pa[AV]; int sa[AV];
+#pragma unroll
+    for (int i = 0; i < AV; i++) {
+        int e = tid + i * NT, r = e >> 2, ks = e & 3;
+        int gr = m0 + r; if (gr > M - 1) gr = M - 1;
+        pa[i] = (const u16x8 *)(X + (size_t)gr * ldx + kbeg + ks * 8);
+        sa[i] = ks * BM + r;
+    }
+    const bool bth = tid < BN;
+    int br = n0 + tid; if (br > N - 1) br = N - 1;
+    const unsigned char *pb = W + (size_t)br * (K / 2);
+    const unsigned short *ps = S + (size_t)br * (K / 64);
+    const int nk = (kend - kbeg) / 32;
+    if (nk <= 0) return;
+    u16x8 ra[AV]; Int4Wide rb;
+#pragma unroll
+    for (int i = 0; i < AV; i++) smA[sa[i]] = pa[i][0];
+    if (bth) { Int4Wide w = i4w_load(pb, kbeg, ps);
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) smB[ks * BN + tid] = i4w_decode(((const unsigned *)&w.q)[ks], w.s); }
+    __syncthreads();
+    int buf = 0;
+    for (int kt = 0; kt < nk; kt++) {
+        const int has_next = kt + 1 < nk, kn = kbeg + (kt + 1) * 32;
+        if (has_next) {
+#pragma unroll
+            for (int i = 0; i < AV; i++) ra[i] = pa[i][(kt + 1) * 4];
+            if (bth) rb = i4w_load(pb, kn, ps);
+        }
+        const u16x8 *cA = smA + buf * 4 * BM, *cB = smB + buf * 4 * BN;
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            const int ks = kk * 2 + half;
+            u16x8 fa[FM], fb[FN];
+#pragma unroll
+            for (int i = 0; i < FM; i++) fa[i] = cA[ks * BM + wm * WTM + i * 16 + idx];
+#pragma unroll
+            for (int j = 0; j < FN; j++) fb[j] = cB[ks * BN + wn * WTN + j * 16 + idx];
+#pragma unroll
+            for (int i = 0; i < FM; i++)
+#pragma unroll
+                for (int j = 0; j < FN; j++)
+                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(fa[i], fb[j], acc[i][j]);
+        }
+        if (has_next) {
+            u16x8 *nA = smA + (buf ^ 1) * 4 * BM, *nB = smB + (buf ^ 1) * 4 * BN;
+#pragma unroll
+            for (int i = 0; i < AV; i++) nA[sa[i]] = ra[i];
+            if (bth) {
+#pragma unroll
+                for (int ks = 0; ks < 4; ks++) nB[ks * BN + tid] = i4w_decode(((const unsigned *)&rb.q)[ks], rb.s);
+            }
+            buf ^= 1;
+        }
+        __syncthreads();
+    }
+}
+
 template <typename LB, int BM, int BN, int WAVES_M, int WAVES_N>
 __device__ __forceinline__ void qgemm_kloop(
         float8 (&acc)[BM / WAVES_M / 16][BN / WAVES_N / 16], u16x8 *smA, u16x8 *smB,
@@ -151,7 +238,7 @@ __device__ __forceinline__ void qgemm_kloop(
 /* Y[M,N] (+)= X[M,K] W^T (+ X2[M,K2] W2^T, dense bf16: the fused SVDQuant lora_up phase) + bias.
  * accum: bit0 = add into Y, bit1 = tanh-GELU epilogue.
  * gridDim.y > 1: split-K partials of the main phase to Y + z*M*N (no X2, no accum). */
-template <typename LB, int BM, int BN, int WAVES_M, int WAVES_N>
+template <typename LB, int BM, int BN, int WAVES_M, int WAVES_N, bool WIDE = false>
 __device__ __forceinline__ void qgemm_body(
         float *__restrict__ Y, const unsigned char *__restrict__ W,
         const unsigned short *__restrict__ S, const unsigned short *__restrict__ X,
@@ -183,7 +270,8 @@ __device__ __forceinline__ void qgemm_body(
     for (int i = 0; i < FM; i++)
 #pragma unroll
         for (int j = 0; j < FN; j++) acc[i][j] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
-    qgemm_kloop<LB, BM, BN, WAVES_M, WAVES_N>(acc, smA, smB, X, K, W, K, S, m0, n0, M, N, kbeg, kend);
+    if constexpr (WIDE) qgemm_kloop_i4w<BM, BN, WAVES_M, WAVES_N>(acc, smA, smB, X, K, W, K, S, m0, n0, M, N, kbeg, kend);
+    else qgemm_kloop<LB, BM, BN, WAVES_M, WAVES_N>(acc, smA, smB, X, K, W, K, S, m0, n0, M, N, kbeg, kend);
     if (X2) qgemm_kloop<LdDense, BM, BN, WAVES_M, WAVES_N>(acc, smA, smB, X2, K2, W2, K2, 0, m0, n0, M, N, 0, K2);
 
 #pragma unroll
@@ -227,6 +315,12 @@ QGEMM_INST(qgemm_bf16_64x64,   LdDense,    64,  64, 2, 2)
 QGEMM_INST(qgemm_i4_128x128w8, LdInt4G64, 128, 128, 2, 4)
 QGEMM_INST(qgemm_i4_128x256,   LdInt4G64, 128, 256, 2, 4)
 QGEMM_INST(qgemm_bf16_128x128w8, LdDense, 128, 128, 2, 4)
+extern "C" __global__ __launch_bounds__(256) void qgemm_i4w_128x128w8(
+        float *Y, const unsigned char *W, const unsigned short *S,
+        const unsigned short *X, const float *bias, int N, int K, int M, int accum,
+        const unsigned short *X2, const unsigned char *W2, int K2) {
+    qgemm_body<LdInt4G64, 128, 128, 2, 4, true>(Y, W, S, X, bias, N, K, M, accum, X2, W2, K2);
+}
 
 /* Xb[t,k] = bf16_rne(X[t,k] / smooth[k]) (smooth may be NULL). 8 elements per thread, K % 8 == 0. */
 extern "C" __global__ void cast_f32_bf16_smooth(unsigned short *Xb, const float *X,

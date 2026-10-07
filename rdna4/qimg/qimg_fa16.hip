@@ -72,6 +72,8 @@ void fa_db(float*out,const wt*Q,const wt*Kt,const wt*Vt,int N,int H,float isd){
   for(int kb=0;kb<K_NB;kb++)for(int i=0;i<8;i++){int r=q0+wid*16+hf*8+i,d=kb*16+id;if(r<N)out[(size_t)r*dim+h*HD+d]=O[kb][i]*li[i];}
 }
 
+/* branchless exp2 for fa_db_vt: clamps instead of branching (masked keys are zeroed explicitly). */
+__device__ __forceinline__ float exp2_bl(float x){x=fminf(fmaxf(x,-126.0f),8.0f);union{int i;float f;}u;u.i=(int)((x+127.0f)*8388608.0f);return u.f;}
 /* fa_db_vt: V pre-transposed by the pack kernel to [H][HD][Np] (Np = N rounded up to 32, zero tail), so the
  * V tile is copied with 16-byte vectors like K instead of 16 strided 2-byte LDS stores per thread. */
 #define LDVT(KK,VV,KV0) { for(int o=tid*16;o<tot;o+=st){int r=o/HD,d=o%HD,kv=(KV0)+r;size_t b=((size_t)h*N+kv)*HD+d; \
@@ -91,9 +93,9 @@ void fa_db_vt(float*out,const wt*Q,const wt*Kt,const wt*Vt,int N,int H,float isd
     float8 S[CH]; for(int c=0;c<CH;c++)for(int i=0;i<8;i++)S[c][i]=0;
     for(int g=0;g<K_NB/4;g++)for(int c=0;c<CH;c++){v8 kr[4];for(int i=0;i<4;i++){int kb=g*4+i,r=c*16+id,d=kb*16+hf*8;kr[i]=*(const v8*)(cK+r*HD+(d^SW(r)));}for(int i=0;i<4;i++)MMA(qr[g][i],kr[i],S[c]);}
     float rm[8];for(int i=0;i<8;i++){float mx=-1e30f;for(int c=0;c<CH;c++){int kv=kv0+c*16+id;float s=S[c][i]*isd*LOG2E;if(kv>=N)s=-1e30f;S[c][i]=s;mx=fmaxf(mx,s);}mx=fmaxf(mx,__shfl_xor(mx,1,32));mx=fmaxf(mx,__shfl_xor(mx,2,32));mx=fmaxf(mx,__shfl_xor(mx,4,32));mx=fmaxf(mx,__shfl_xor(mx,8,32));rm[i]=mx;}
-    float al[8];for(int i=0;i<8;i++){float nm=fmaxf(mi[i],rm[i]);al[i]=exp2_fast(mi[i]-nm);float lo=0;for(int c=0;c<CH;c++){int kv=kv0+c*16+id;float p=exp2_fast(S[c][i]-nm+8.0f);if(kv>=N)p=0;S[c][i]=p;lo+=p;}li[i]=li[i]*al[i]+lo;mi[i]=nm;}
+    float al[8];for(int i=0;i<8;i++){float nm=fmaxf(mi[i],rm[i]);al[i]=exp2_bl(mi[i]-nm);float lo=0;for(int c=0;c<CH;c++){int kv=kv0+c*16+id;float p=exp2_bl(S[c][i]-nm+8.0f);if(kv>=N)p=0;S[c][i]=p;lo+=p;}li[i]=li[i]*al[i]+lo;mi[i]=nm;}
     for(int kb=0;kb<K_NB;kb++)for(int i=0;i<8;i++)O[kb][i]*=al[i];
-    for(int c=0;c<CH;c++){wt*pc=sP+c*256;for(int i=0;i<8;i++)pc[(hf*8+i)*16+id]=CVT(S[c][i]);}__builtin_amdgcn_s_waitcnt(0);__syncthreads();
+    for(int c=0;c<CH;c++){wt*pc=sP+c*256;for(int i=0;i<8;i++)pc[(hf*8+i)*16+id]=CVT(S[c][i]);}__builtin_amdgcn_s_waitcnt(0);__builtin_amdgcn_wave_barrier();/* sP is per-wave: no CTA barrier */
     for(int c=0;c<CH;c++){wt*pc=sP+c*256;v8 ap=*(const v8*)(pc+id*16+hf*8);for(int kb=0;kb<K_NB;kb++){int d=kb*16+id;MMA(ap,*(const v8*)(cV+d*BKV+c*16+hf*8),O[kb]);}}
     __syncthreads();
   }

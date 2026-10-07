@@ -224,7 +224,7 @@ struct hip_qimg_runner {
     /* Tiled WMMA module (qimg_gemm_wmma.hip); QIMG_INT4_GEMM=legacy keeps the old kernels. */
     hipModule_t mod_tiled; int use_tiled, tiled_oom, step_error, pending_gelu, gelu_fused;
     hipModule_t mod_fa16; hipFunction_t fn_fa16, fn_fa16_pack, fn_fa16_nrp, fn_fa16_vt, fn_fa16_dbvt; void *fa16_buf; size_t fa16_cap; void *fa16_vt_buf; size_t fa16_vt_cap;  /* QIMG_ATTN=fa16 */
-    hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
+    hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4w_w8, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
     unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
     /* INT8 SmoothQuant (W8A8) path: int8 weights stream via the fp8 byte path (same 1 B/param);
@@ -1193,7 +1193,7 @@ static void qimg_tl_gemm_full(hip_qimg_runner *r, int int4, void *Y, const void 
     if (!int4 && N <= 128)      { f = r->fn_qg_bf16_64x64; bm = 64; bn = 64; thr = 128; }
     else if (M <= 64)           { f = int4 ? r->fn_qg_i4_64 : r->fn_qg_bf16_64; bm = 64; bn = 128; thr = 128; }
     else if (r->tl_variant == 2 && int4) { f = r->fn_qg_i4_256; bm = 128; bn = 256; thr = 256; }
-    else if (r->tl_variant >= 1) { f = int4 ? r->fn_qg_i4_w8 : r->fn_qg_bf16_w8; bm = 128; bn = 128; thr = 256; }
+    else if (r->tl_variant >= 1) { f = int4 ? (r->fn_qg_i4w_w8 ? r->fn_qg_i4w_w8 : r->fn_qg_i4_w8) : r->fn_qg_bf16_w8; bm = 128; bn = 128; thr = 256; }
     else                        { f = int4 ? r->fn_qg_i4_128 : r->fn_qg_bf16_128; bm = 128; bn = 128; thr = 128; }
     void *a[] = {&Y, (void*)&W, (void*)&S, (void*)&X, (void*)&bias, &N, &K, &M, &accum, (void*)&X2, (void*)&W2, &K2};
     unsigned tiles = (unsigned)(((M + bm - 1) / bm) * ((N + bn - 1) / bn));  /* 1-D grouped grid */
@@ -1953,6 +1953,7 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
               hipModuleGetFunction(&r->fn_ew_adaln, r->mod_tiled, "ew_adaln");
           }
           hipModuleGetFunction(&r->fn_qg_i4_w8, r->mod_tiled, "qgemm_i4_128x128w8");
+          if (!getenv("QIMG_I4_NARROW")) hipModuleGetFunction(&r->fn_qg_i4w_w8, r->mod_tiled, "qgemm_i4w_128x128w8");
           hipModuleGetFunction(&r->fn_qg_i4_256, r->mod_tiled, "qgemm_i4_128x256");
           hipModuleGetFunction(&r->fn_qg_bf16_w8, r->mod_tiled, "qgemm_bf16_128x128w8");
           { const char *v = getenv("QIMG_TILED_VARIANT"); r->tl_variant = v ? atoi(v) : 1; }
