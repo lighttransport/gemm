@@ -2936,7 +2936,11 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     size_t max_scratch = (size_t)n_total * dim * sizeof(float);
     hipMalloc(&d_scratch1, max_scratch);
     hipMalloc(&d_scratch2, max_scratch);
-    size_t ffn_scratch = (size_t)(n_img > n_txt ? n_img : n_txt) * mlp_h * sizeof(float);
+    int mlp_chunk = 4096;
+    { const char *e = getenv("QIMG_MLP_CHUNK"); if (e && atoi(e) > 0) mlp_chunk = atoi(e); }
+    int ffn_rows = n_img < mlp_chunk ? n_img : mlp_chunk;
+    if (n_txt > ffn_rows) ffn_rows = n_txt;
+    size_t ffn_scratch = (size_t)ffn_rows * mlp_h * sizeof(float);
     hipMalloc(&d_scratch3, ffn_scratch);
 
     /* Joint Q/K/V buffers */
@@ -2958,8 +2962,10 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
     if (r->use_int4 && r->use_tiled) {
         /* tiled path: only the bf16 activation (largest n_in = mlp_h) and rank scratch; the legacy
          * n_out*n_tok f32 LoRA buffer (~600 MB at edit sizes) is never touched. */
+        /* largest bf16 activation: fc2 input of one MLP chunk, or a full-length dim-wide projection */
         int mt = n_img > n_txt ? n_img : n_txt;
-        if (qimg_tl_reserve(r, (size_t)mt * mlp_h, (size_t)128 * mt, 0) != 0) r->step_error = 1;
+        size_t xmax = (size_t)ffn_rows * mlp_h; if ((size_t)mt * dim > xmax) xmax = (size_t)mt * dim;
+        if (qimg_tl_reserve(r, xmax, (size_t)128 * mt, 0) != 0) r->step_error = 1;
     } else if (r->use_int4) {
         int mt = n_img > n_txt ? n_img : n_txt;
         if (!r->i4_ldf) { hipMalloc(&r->i4_ldf,(size_t)128*12288*4); hipMalloc(&r->i4_luf,(size_t)18432*128*4); }
@@ -3151,11 +3157,17 @@ int hip_qimg_dit_step(hip_qimg_runner *r,
 
         /* MLP: Image (GELU) */
         qimg_img_adaln(r, d_scratch1, d_img, d_img_mod, d_img_mod0, 3, n_img, n_cond, dim);
-        qimg_set_gemm_context(r, L, "img_mlp_fc1");
-        op_proj(r, d_scratch3, blk.img_mlp_fc1_w, d_scratch1, blk.img_mlp_fc1_b, mlp_h, dim, n_img, L, 8);
-        op_gelu(r, d_scratch3, n_img * mlp_h);
-        qimg_set_gemm_context(r, L, "img_mlp_fc2");
-        op_proj(r, d_scratch1, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b, dim, mlp_h, n_img, L, 9);
+        /* Image MLP in token chunks: the fc1 scratch is chunk*mlp_h instead of n_img*mlp_h (multi-reference
+         * edit steps reach 16k+ tokens). fc2 writes back into the chunk's own rows of d_scratch1. */
+        for (int c0 = 0; c0 < n_img; c0 += mlp_chunk) {
+            int cn = n_img - c0 < mlp_chunk ? n_img - c0 : mlp_chunk;
+            void *rows = (char *)d_scratch1 + (size_t)c0 * dim * sizeof(float);
+            qimg_set_gemm_context(r, L, "img_mlp_fc1");
+            op_proj(r, d_scratch3, blk.img_mlp_fc1_w, rows, blk.img_mlp_fc1_b, mlp_h, dim, cn, L, 8);
+            op_gelu(r, d_scratch3, cn * mlp_h);
+            qimg_set_gemm_context(r, L, "img_mlp_fc2");
+            op_proj(r, rows, blk.img_mlp_fc2_w, d_scratch3, blk.img_mlp_fc2_b, dim, mlp_h, cn, L, 9);
+        }
         qimg_img_gated_add(r, d_img, d_scratch1, d_img_mod, d_img_mod0, 5, n_img, n_cond, dim);
 
         /* MLP: Text (GELU) */
