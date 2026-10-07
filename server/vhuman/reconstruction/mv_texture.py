@@ -28,6 +28,7 @@ from .provenance import validate_candidate
 from .reference import srgb_to_linear, linear_to_srgb
 
 POLAR_VIEWS=('top','bottom')
+FACELESS_VIEWS=('back','top','bottom')
 BACKENDS=('mvadapter','qwen_seq','qwen_grid','qwen_edit_seq')
 RES=768
 
@@ -135,10 +136,17 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         from scipy.ndimage import binary_dilation
         from ..face_parsing import FaceParser, LABELS
         parser=FaceParser();drop=[LABELS.index(n) for n in ('glasses','earring','necklace','clothes','hat')]
+        # Views that cannot see the face: portrait-conditioned edits paint one anyway (a face on the back of the head).
+        face_parts=[LABELS.index(n) for n in ('left_brow','right_brow','left_eye','right_eye','nose','mouth','upper_lip','lower_lip')]
         exclusion_report={};views=[dict(v) for v in views]
         for v,im in zip(views,images):
             labels,conf=parser.predict(im)
-            bad=binary_dilation(np.isin(labels,drop)&(conf>=.5),iterations=4)
+            bad=np.isin(labels,drop)&(conf>=.5)
+            if v['name'] in FACELESS_VIEWS:
+                feats=np.isin(labels,face_parts)&(conf>=.4)
+                if feats.sum()>.002*v['valid'].sum():      # a hallucinated face: drop its whole skin region too
+                    bad|=binary_dilation(feats,iterations=40)
+            bad=binary_dilation(bad,iterations=4)
             exclusion_report[v['name']]=float((bad&v['valid']).sum()/max(v['valid'].sum(),1))
             v['valid']=v['valid']&~bad
     delight_report=None
