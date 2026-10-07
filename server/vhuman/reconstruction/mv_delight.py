@@ -24,8 +24,12 @@ def masked_blur(values, mask, sigma):
     return gaussian_filter(values*m,sigma)/np.maximum(gaussian_filter(m,sigma),1e-6)
 
 
-def delight(image, normal_map, valid, *, blob_sigma=None, blob_strength=1.):
-    """image uint8 sRGB view; normal_map [0,1] world normals; valid bool mask."""
+def delight(image, normal_map, valid, *, blob_sigma=None, blob_strength=1., chroma=False):
+    """image uint8 sRGB view; normal_map [0,1] world normals; valid bool mask.
+
+    chroma=True additionally flattens each channel's broad log variation toward the channel median, removing
+    low-frequency hue blotches (e.g. MV-Adapter's pink back of head); fine detail and the mean colour remain.
+    """
     rgb=srgb_to_linear(np.asarray(image,float)/255)
     interior=valid&(rgb.mean(-1)>.01)
     luma=np.maximum(rgb@LUMA,1e-4);log=np.log(luma)
@@ -42,5 +46,12 @@ def delight(image, normal_map, valid, *, blob_sigma=None, blob_strength=1.):
     log2-=blob_strength*(low-np.median(low[interior]))
     scale=np.where(valid,np.exp(log2-log),1.)[...,None]
     out=np.clip(rgb*scale,0,1)
+    if chroma:
+        # per-channel broad variation relative to luminance (hue blotches), flattened to the median hue
+        lo=np.log(np.maximum(out,1e-4))-np.log(np.maximum(out@LUMA,1e-4))[...,None]
+        for c in range(3):
+            band=masked_blur(lo[...,c],interior,sigma)
+            out[...,c]*=np.where(valid,np.exp(-(band-np.median(band[interior]))),1.)
+        out=np.clip(out,0,1)
     return np.uint8(np.clip(linear_to_srgb(out)*255+.5,0,255)),dict(sh=coef.tolist(),
         shading_range=float(np.ptp(shading[interior])),blob_range=float(np.ptp(low[interior])))

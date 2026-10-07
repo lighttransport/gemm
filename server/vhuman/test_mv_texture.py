@@ -65,4 +65,17 @@ class MultiviewTextureTests(unittest.TestCase):
         # checker contrast survives
         a=srgb_to_linear(out[...,0]/255);self.assertGreater(abs(a[32,30]-a[32,34]),.01)
 
+    def test_chroma_delight_removes_hue_blotch_but_keeps_detail(self):
+        from .reconstruction.mv_delight import delight
+        from .reconstruction.reference import srgb_to_linear,linear_to_srgb
+        r=96;yy,xx=np.mgrid[:r,:r];valid=np.ones((r,r),bool);n=np.zeros((r,r,3));n[...,2]=1
+        base=np.stack([np.full((r,r),.40),np.full((r,r),.30),np.full((r,r),.22)],-1)
+        blob=np.exp(-((xx-30)**2+(yy-40)**2)/(2*12.**2))
+        lin=base*np.stack([1+.5*blob,1-.1*blob,1-.1*blob],-1)*(1+.08*((xx//3+yy//3)%2))[...,None]
+        img=np.uint8(np.clip(linear_to_srgb(lin)*255+.5,0,255))
+        hue=lambda im:(lambda l:np.log(l[...,0]/np.maximum(l[...,1],1e-4)))(srgb_to_linear(im/255))
+        out,_=delight(img,n/2+.5,valid,blob_strength=1.,chroma=True)
+        self.assertLess(abs(hue(out)[40,30]-hue(out)[40,85]),.5*abs(hue(img)[40,30]-hue(img)[40,85]))
+        o=srgb_to_linear(out[...,1]/255);self.assertGreater(abs(o[60,60]-o[60,63]),.005)   # checker survives
+
 if __name__=='__main__':unittest.main()

@@ -182,7 +182,9 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         from .mv_delight import delight as remove_light
         delight_report={}
         for i,v in enumerate(views):
-            images[i],delight_report[v['name']]=remove_light(images[i],v['normal'],v['valid'])
+            # structure views of a hybrid (MV-Adapter) also get hue-blotch flattening
+            structure=bool(info.get('sources')) and info['sources'].get(v['name'],{}).get('kind')!='raw'
+            images[i],delight_report[v['name']]=remove_light(images[i],v['normal'],v['valid'],chroma=structure)
     # polar='skip': top/bottom generations are unreliable (portrait-conditioned edits paint faces on the crown;
     # portrait-free ones ignore the top-down camera). Use only horizontal views, accepting grazing angles
     # (facing >= 0.05, still weighted by facing^2) for texels no view sees head-on; fill_unsupported covers the rest.

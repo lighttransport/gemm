@@ -366,7 +366,7 @@ Edit-2511 cannot refine the back of the head. Both the native and the GGUF refer
 doll or an unrelated scene, even as a single-image "add stubble" edit. So refinement there has to be non-generative.
 
 Next:
-- stronger blob de-light for the structure views only (the pink blotch is spatial)
+- DONE: per-channel (hue) blob flattening on the structure views removes the pink blotch (`delight(chroma=True)`; seam 0.0468, 0 photographed texels changed)
 - stronger synthesized stubble amplitude on the back
 - regenerate the Edit-2511 sides with the recipe the 2×2 A/B selects
 - the hybrid is evaluation-only (SDXL OpenRAIL++)
