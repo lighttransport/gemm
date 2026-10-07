@@ -1,7 +1,8 @@
-"""Qwen-Image-Edit-2511 (Apache-2.0) through diffusers with a GGUF Q4_K_M transformer.
+"""Qwen-Image-Edit-2511 (Apache-2.0) editors: native RDNA4 DiT (default) or diffusers GGUF Q4_K_M fallback.
 
-The 13 GB transformer is resident on the 16 GB GPU; the Qwen2.5-VL text/vision
-encoder (16.6 GB bf16) runs on the CPU and only its embeddings move to the GPU.
+Native: mixed INT4/INT8 DiT resident (~11.3 GB), modulation computed exactly on the host, FP32 Qwen2.5-VL
+encoder on the CPU (Zen 2 has no native BF16). GGUF: the 13 GB transformer is resident and the BF16 encoder
+runs on the CPU. Both use the same identity-verified flow (CPU prompt encode, cuda pipeline + generator).
 Edit outputs whole images: callers composite photographed pixels back.
 
 Alignment: the pipeline sizes condition latents to ~1 MP, so the output must be 1024^2 and the
@@ -19,7 +20,7 @@ GGUF=ROOT/'qwen-image-edit-2511-Q4_K_M.gguf'
 LICENSE='apache-2.0'
 GENERATOR='Qwen-Image-Edit-2511 Q4_K_M (diffusers GGUF)'
 INT4=ROOT/'edit2511-int4mix-r128.safetensors'   # mixed: INT8 v-proj/MLP-down, INT4 rest, mods on host
-NATIVE_GENERATOR='Qwen-Image-Edit-2511 SVDQuant INT4 r128 (native RDNA4 DiT)'
+NATIVE_GENERATOR='Qwen-Image-Edit-2511 SVDQuant INT4/INT8 mixed r128 + host BF16 modulation (native RDNA4 DiT)'
 REPO=Path(__file__).resolve().parents[3]
 
 

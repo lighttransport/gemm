@@ -79,3 +79,13 @@ CAP4D (https://github.com/felixtaubner/cap4d) is CC BY-NC 4.0 and its MMDM
 weights depend on FLAME. No CAP4D code or weights are used. `mv_qwen.sequential`
 is an independent implementation of the published idea (views generated in
 sequence, conditioned on mesh renders and on earlier views), using GNM.
+
+# Qwen-Image-Edit-2511 and BiRefNet (multiview texture completion)
+
+`reconstruction/qwen_edit_backend.py` uses Qwen-Image-Edit-2511 (https://huggingface.co/Qwen/Qwen-Image-Edit-2511,
+Apache-2.0). It runs either as the GGUF Q4_K_M build (https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF,
+same licence) or as a local SVDQuant INT4/INT8 repack made by `rdna4/qimg/tools/svdquant_from_bf16.py`. Its text
+encoder is the stock Qwen2.5-VL-7B-Instruct (Apache-2.0). No weights are shipped.
+
+`reconstruction/mv_qwen.py` mattes the portrait reference with BiRefNet (https://github.com/ZhengPeng7/BiRefNet,
+MIT), loaded from a local copy at run time.

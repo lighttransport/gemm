@@ -311,3 +311,35 @@ of the observed boundary.
 - **Qwen-Image-2.1** supports up to 10 reference images, but our native qimg21 backend allows 1. The earlier flat result
   came from a contact sheet plus masked inpaint, not from 2.1's multi-reference edit. `qwen21_edit_backend.py` re-tests it
   through diffusers with fp8-stored weights.
+
+### Native Edit-2511 per-view policies (2026-10-08) and next task
+
+The native INT4/INT8 Edit-2511 now preserves identity on side views (see `rdna4/qimg/EDIT_PORT_PLAN.md`). Running
+six views exposed policy failures that the bake cannot fully repair. All bakes changed 0 photographed texels.
+
+| six-view policy | bake seam | unseen covered | result |
+|---|---|---|---|
+| chained (previous view as 3rd ref), older run | **0.0456** | 90.6% | best so far: consistent stubble, faint crown X |
+| two refs (portrait + target), no chain | 0.0506 | 77.5% | back view painted a face, collar patches |
+| same + faceless-view filter | 0.0504 | 72.5% | face only partly removed |
+
+- **Chaining** propagated the front view's painted suit/tie (the model's prior for this subject, which survived a
+  matted portrait, a bare-skin prompt and clothing negatives).
+- **Dropping the chain** made the portrait-conditioned back edit draw the face on the back of the head.
+- **Bake guards that stay** (`mv_texture.bake`):
+  - BiSeNet parsing drops clothing, hat, glasses and jewellery in every view, and facial features in back/top/bottom
+  - two-band fusion
+  - polar views skipped, with a grazing-detail fallback
+- **Polar regeneration without a portrait** ignored the top-down camera and drew a frontal face. It is kept as
+  `regen-polar` (opt-in `--polar raw`).
+
+**Next task: MV-Adapter + Edit-2511 hybrid.**
+- The portrait reference helps the views that see the face (front, sides) and hurts the ones that do not.
+- Plan:
+  - MV-Adapter (geometry-conditioned, multiview-consistent) for the back, crown and under-chin
+  - Edit-2511 (portrait + target, two refs) for front and sides
+  - optionally a light Edit-2511 refine of the MV-Adapter back with a side view as reference, not the portrait
+  - fuse in `mv_texture.bake` with the parser guards
+- Still open:
+  - a 2×2 recipe A/B on the right view (raw vs matted portrait × original vs bare-skin prompt). Queued, not run.
+  - MV-Adapter's SDXL base is OpenRAIL++ (evaluation only).

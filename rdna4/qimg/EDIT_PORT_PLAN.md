@@ -122,3 +122,39 @@ Checked by sampled tensor byte equality over HTTP range reads.
 So the official quantized releases are valid drop-ins, for example `Qwen/Qwen3-VL-8B-Instruct-FP8` (block-128 FP8).
 That cuts the CPU-bound prompt encode (currently bf16 on the CPU), or lets the encoder be paged onto the GPU between
 DiT runs.
+
+## Status (2026-10-08)
+
+Done:
+- Steps 1–5: own SVDQuant pack, tiled WMMA INT4/INT8 GEMM, edit layout (multi-segment RoPE, `zero_cond_t`),
+  ctypes driver.
+
+Step time at 12.8k tokens (normal clocks): 45 s, then 5.85 s.
+- tiled WMMA GEMM with grouped rasterization and fused LoRA
+- fa16 attention (rdna4/fa2 port, exact exp2)
+- fused QKV norm/RoPE/pack
+- wide INT4 loader
+- chunked image MLP
+- int4 arena
+
+Parity investigation. Native edits lost the subject's identity, and three distinct causes were found:
+1. **INT4 modulation linears** (img_mod/txt_mod).
+   - Ground truths: BF16 diffusers via group offload (`tools/edit_parity_bf16.py`), and diffusers math with our
+     weights (`tools/edit_parity_fakequant.py`, `FQ_KEEP_BF16`).
+   - These showed the mods dominate. At the late step, rel_l2 was 21% with INT4 mods and 2% with BF16 mods.
+   - Fix: `hip_qimg_set_mod_vectors` with `QIMG_HOST_MOD=1`. Mods are computed exactly from host BF16 weights,
+     once per view, which also frees 4.3 GB of VRAM.
+2. **Sensitive linears.** Q4_K_M keeps v-proj and MLP-down at Q6_K. `svdquant_from_bf16 --int8` (`LdInt8G64`) does
+   the same at 8 bit. The mixed pack is 11.3 GB resident.
+3. **Pipeline flow.** A CPU-device diffusers flow with VAE and vision wrappers lost identity even with a correct
+   DiT. The driver now uses the GGUF editor's cuda flow.
+
+Calibrated smoothing (`tools/edit_calib_bf16.py`) did not help: it stayed at rel_l2 about 20% while the mods were
+INT4. Final per-step error vs BF16 is 1.8% at t = 0.31 and 4.2% at t = 1. GGUF is 1.3% and 2.8%.
+
+Per view at 1024² with 2 references: DiT 161 s, FP32 CPU prompt encode 123 s, other about 40 s.
+
+Open:
+- the speed A/B was queued but not run: `QIMG_REF_SIDE` (smaller references), `QIMG_VISION_CACHE`, 32 encoder
+  threads
+- an FP8 GPU encoder

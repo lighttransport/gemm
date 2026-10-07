@@ -1,12 +1,10 @@
-"""Qwen-Image-Edit-2511 with the native RDNA4 INT4 W4A16 DiT (libhip_qimg.so) under diffusers.
+"""Qwen-Image-Edit-2511 with the native RDNA4 mixed INT4/INT8 DiT (libhip_qimg.so) under diffusers.
 
-diffusers' QwenImageEditPlusPipeline keeps prompt/vision encoding (Qwen2.5-VL), VAE and the
-scheduler on the CPU; only the 60-block DiT runs natively on the GPU, fully resident in INT4.
-The diffusers transformer is an empty meta-device shell whose forward() calls
-hip_qimg_set_edit_layout + hip_qimg_dit_step (see EDIT_PORT_PLAN.md).
-
-    pipe = load_pipeline('/mnt/disk01/models/qwen-image-edit-2511/base', 'edit2511-int4.safetensors')
-    image = pipe(image=[portrait, target], prompt=..., height=1024, width=1024, ...).images[0]
+diffusers' QwenImageEditPlusPipeline runs on cuda with a tiled VAE; the Qwen2.5-VL prompt/vision encoder
+stays on the CPU and the caller passes embeddings (server/vhuman/reconstruction/qwen_edit_backend.NativeEditor).
+The transformer is an empty meta-device shell whose forward() calls hip_qimg_set_edit_layout +
+hip_qimg_dit_step; per-block modulation is computed exactly from host BF16 weights (HostModulation).
+See EDIT_PORT_PLAN.md for the parity investigation behind this layout.
 """
 import ctypes
 import os
@@ -25,7 +23,10 @@ os.environ.setdefault('MIOPEN_USER_DB_PATH', str(_MIOPEN_CACHE / 'db'))
 os.environ.setdefault('MIOPEN_CUSTOM_CACHE_DIR', str(_MIOPEN_CACHE / 'kernels'))
 os.environ.setdefault('MIOPEN_FIND_MODE', 'FAST')
 for _d in ('db', 'kernels'):
-    (_MIOPEN_CACHE / _d).mkdir(parents=True, exist_ok=True)
+    try:
+        (_MIOPEN_CACHE / _d).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
 
 class NativeDiT:
@@ -139,7 +140,11 @@ class HostModulation:
 
 
 def load_pipeline(base, int4_path, *, zero_cond_t=None):
-    """diffusers Edit-Plus pipeline on CPU with the transformer forward replaced by NativeDiT."""
+    """Edit-Plus pipeline (cuda device, tiled cuda VAE, CPU text encoder) whose transformer forward is NativeDiT.
+
+    This is the GGUF editor's flow, which preserved identity; an earlier CPU-device flow with VAE/vision
+    wrappers lost it even with a correct DiT. Prompts must be encoded by the caller on the CPU.
+    """
     from accelerate import init_empty_weights
     from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel
     from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -179,104 +184,8 @@ def load_pipeline(base, int4_path, *, zero_cond_t=None):
 
     shell.forward = forward
     pipe = QwenImageEditPlusPipeline.from_pretrained(str(base), transformer=shell, torch_dtype=torch.bfloat16)
-    if os.environ.get('QIMG_ENCODER_DTYPE', 'fp32') == 'fp32':
-        # No native BF16 GEMM on this CPU: the Qwen2.5-VL encoder runs several times faster in FP32 (~30 GB RAM).
-        pipe.text_encoder.to(torch.float32)
-    if os.environ.get('QIMG_PIPE_FLOW', 'cuda') == 'cpu':
-        # Legacy CPU-device flow with VAE/vision/encode wrappers. Kept for A/B: it lost the subject's identity on
-        # side views (the same native DiT kept it under the cuda flow), so it is not the default.
-        type(pipe)._execution_device = property(lambda self: torch.device('cpu'))
-        # bf16 conv3d on the CPU is single-threaded and takes >1 h at 1024^2: run the VAE on the GPU next to the
-        # resident INT4 DiT (tiled), moving tensors across so the rest of the pipeline stays on the CPU.
-        pipe.vae.to('cuda'); pipe.vae.enable_tiling()
-        enc, dec = pipe.vae.encode, pipe.vae.decode
-
-        def to_cpu(x):
-            if torch.is_tensor(x):
-                return x.cpu()
-            if hasattr(x, 'latent_dist'):
-                d = x.latent_dist
-                for k in ('parameters', 'mean', 'logvar', 'std', 'var'):
-                    setattr(d, k, getattr(d, k).cpu())
-                return x
-            if hasattr(x, 'sample') and torch.is_tensor(x.sample):
-                x.sample = x.sample.cpu()
-                return x
-            if isinstance(x, tuple):
-                return tuple(to_cpu(v) for v in x)
-            return x
-
-        phase = {}
-
-        def timed(name, fn):
-            def run(*a, **k):
-                t = time.time()
-                try:
-                    return fn(*a, **k)
-                finally:
-                    phase[name] = phase.get(name, 0.) + time.time() - t
-            return run
-
-        pipe.phase_seconds = phase
-
-        def released(fn):
-            # torch's caching allocator would otherwise keep VAE activations the native DiT needs.
-            def run(x, *a, **k):
-                try:
-                    return to_cpu(fn(x.to('cuda', pipe.vae.dtype), *a, **k))   # FP32 encoder makes inputs float32
-                finally:
-                    torch.cuda.empty_cache()
-            return run
-
-        enc_cache = {}
-
-        def cached_encode(x, *a, **k):
-            # Reference latents use the distribution mode (deterministic), and the portrait recurs every view.
-            import hashlib, copy
-            key = (hashlib.sha1(x.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
-                   tuple(x.shape), str(x.dtype))
-            if key not in enc_cache:
-                if len(enc_cache) >= 8:
-                    enc_cache.pop(next(iter(enc_cache)))
-                enc_cache[key] = released(enc)(x, *a, **k)
-            else:
-                pipe.vae_cache_hits += 1
-            return copy.copy(enc_cache[key])
-
-        pipe.vae_cache_hits = 0
-        pipe.vae.encode = timed('vae_encode', cached_encode if not os.environ.get('QIMG_NO_VAE_CACHE') else released(enc))
-        pipe.vae.decode = timed('vae_decode', released(dec))
-        pipe.encode_prompt = timed('prompt_encode', pipe.encode_prompt)
-
-        # The negative-prompt encode re-runs the Qwen2.5-VL vision tower on the same reference images
-        # (~16k patches per view on the CPU). Its output depends only on pixels and grid, so memoize it.
-        visual = pipe.text_encoder.model.visual
-        vis_forward, vis_cache = visual.forward, {}
-
-        def cached_visual(pixel_values, grid_thw=None, **kwargs):
-            import copy, hashlib
-            key = (hashlib.sha1(pixel_values.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
-                   None if grid_thw is None else tuple(grid_thw.flatten().tolist()), tuple(sorted(kwargs)))
-            if key not in vis_cache:
-                if len(vis_cache) >= 4:
-                    vis_cache.pop(next(iter(vis_cache)))
-                vis_cache[key] = copy.copy(vis_forward(pixel_values, grid_thw=grid_thw, **kwargs))
-            else:
-                pipe.vision_cache_hits += 1
-            # get_image_features mutates the output in place (pooler_output -> tuple of splits): hand out copies.
-            import copy
-            return copy.copy(vis_cache[key])
-
-        if not os.environ.get('QIMG_NO_VISION_CACHE'):
-            visual.forward = cached_visual
-        pipe.vision_cache_hits = 0
-    else:
-        # Same flow as the GGUF editor (identity verified): pipeline on cuda, tiled VAE on cuda, prompts
-        # encoded on the CPU by the caller (NativeEditor) and passed as embeddings.
-        pipe.text_encoder.to(torch.bfloat16)
-        pipe.vae.to('cuda'); pipe.vae.enable_tiling()
-        type(pipe)._execution_device = property(lambda self: torch.device('cuda'))
-        pipe.phase_seconds = {}; pipe.vision_cache_hits = 0
+    pipe.vae.to('cuda'); pipe.vae.enable_tiling()
+    type(pipe)._execution_device = property(lambda self: torch.device('cuda'))
     pipe.native = native
     holder['pipe'] = pipe
     return pipe
