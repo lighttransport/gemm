@@ -1,7 +1,7 @@
 # Vulkan GEMM benchmark
 
 Small C11 Vulkan 1.3 compute benchmark for row-major `C = A * B`. FP32 defaults
-to a 128x128 output tile with 8x8 register tiles per invocation. Other types
+to adaptive output tiles up to 128x128, with up to 8x8 outputs per invocation. Other types
 use the original 16x16 shared-memory kernel. Both FP32 kernels remain selectable.
 Both the program and vkew loader compile as C. vkew resolves `vulkan-1.dll` at runtime,
 so no Vulkan import library or SDK is needed to run the built benchmark.
@@ -181,7 +181,7 @@ A 128 MiB-reserve LLVM-MinGW run fully verified 13.884 GiB and correctly returne
 
 ## FP32 optimization results
 
-The default register kernel uses 128x128 workgroup tiles, 8x8 outputs per invocation,
+For large matrices, the register kernel uses 128x128 workgroup tiles, 8x8 outputs per invocation,
 K steps of 16, vector global loads/stores for aligned shapes, and an unrolled load
 loop that keeps the next tile's global reads in flight during arithmetic. It uses
 128 VGPRs, 16 KiB LDS, and zero scratch bytes on this driver. Ragged dimensions use
@@ -212,10 +212,11 @@ benchmark/vulkan-gemm/build-mingw/bench_vulkan_gemm.exe --type fp32 `
   --m 2048 --n 2048 --k 2048 --warmup 20 --iterations 100 --fp32-kernel baseline
 ```
 
-Optional tuning controls: `--fp32-tile 64|128`, `--fp32-rows 64|128`,
+Optional tuning controls: `--fp32-tile auto|64|128`, `--fp32-rows auto|64|128`,
 `--fp32-kstep 8|16|32`, `--fp32-pad 0|1`, `--fp32-prefetch 0|1`,
-`--fp32-lds-prefetch 0|1`, and `--fp32-pack-a 0|1`. Defaults are 128x128,
+`--fp32-lds-prefetch 0|1`, and `--fp32-pack-a 0|1`. Large-matrix defaults are 128x128,
 Kstep=16, pad=0, global prefetch=1, LDS prefetch=0, packing=0.
+Tile dimensions now default to `auto`; the rules below describe the selected shapes.
 The packing experiment transposes A on the GPU and reports its cost separately,
 as well as packing plus one GEMM. A trial reached 3.75 TFLOP/s for the packed kernel,
 excluding packing, with no consistent advantage at larger sizes. LDS prefetch and
@@ -226,6 +227,75 @@ and grouping workgroups for cache reuse did not improve the sustained rate.
 `VK_AMD_shader_info` is available. Logs and full commands are in ignored
 `logs/optimized-performance.json` and `logs/optimized-validation.log`.
 
+### Further tuning on 2026-10-08
+
+Vector loads, stores, and prefetching now support partial output tiles and partial
+K tiles. For row-major A, N and K must be divisible by four. For packed A, M and N
+must be divisible by four, while K can be arbitrary. Every partial-tile read is
+masked to zero and output stores are bounded. A separate specialization removes
+these predicates for full tiles, preserving the original fast path. All other
+shapes retain scalar loads and stores with bounds checks.
+
+Default tile selection uses 64 output columns when M*N <= 262144 or N <= 64,
+otherwise 128. Default row tiles are 64 when M*N <= 131072 or M <= 64, otherwise
+128. This supplies more workgroups for small matrices. An explicit `--fp32-tile`
+uses that dimension for rows too unless `--fp32-rows` is supplied. Explicit numeric
+settings remain reproducible; `auto` resets selection to the default rules.
+
+Paired LLVM-MinGW runs compared the committed `876fa234` kernel against the new
+code. Each pair used 20 warmups and 100 timed iterations; the table reports the
+median of three run averages. Inputs, timestamps, compiler, and GPU were shared,
+and packing was disabled. The committed code and shader were built separately in
+ignored `logs/before-build/` so shader replacement could not change the reference.
+
+| M x N x K | Before TFLOP/s | After TFLOP/s | Ratio |
+|---|---:|---:|---:|
+| 512 x 512 x 512 | 0.834 | 0.928 | 1.11x |
+| 1024 x 1024 x 1024 | 1.864 | 1.823 | 0.98x |
+| 2048 x 2048 x 2048 | 3.634 | 3.647 | 1.00x |
+| 2049 x 2048 x 2048 | 2.478 | 3.217 | 1.30x |
+| 2048 x 2052 x 2048 | 2.498 | 3.216 | 1.29x |
+| 2048 x 2048 x 2052 | 2.665 | 3.504 | 1.31x |
+
+The near-2048 shapes gain 29-32%. The aligned 2048 kernel remains around
+3.65 TFLOP/s; **sustained 4+ TFLOP/s is still not achieved**. Small-shape rates vary
+substantially between short runs: a separate warm-state 512-cubed trial reached
+2.09 TFLOP/s with the new 128x64 tile, but this was not sustained in the paired
+short-run comparison. The 1024-cubed kernel is unchanged and its small difference
+in this table should not be interpreted as a consistent regression. The generated AMD
+ISA for the full 128x128-tile path is byte-identical to the committed kernel.
+
+Fresh MSVC2022 runs (20 warmups, 100 iterations each) measured 3.625 TFLOP/s
+for 2048 cubed, and 3.231 / 3.224 / 3.517 TFLOP/s for the M / N / K partial-tile
+shapes respectively. These agree with the LLVM-MinGW results.
+
+Further experiments with alternating LDS buffers, component-major LDS layouts,
+row-major A in LDS, and shape constants did not improve aligned 2048-cubed
+throughput and were discarded. Only the measured edge-path and tile-selection
+improvements were retained.
+
+Optional `--batch N` (1..1024, default 1) records several sequential GEMMs per
+submission and timestamps the whole batch. GPU write-after-write barriers separate
+the dispatches. Mean time is total measured GPU time divided by the iteration
+count; min/max are per-GEMM batch averages. Inter-dispatch barriers are included,
+so batched rates must be reported separately from the default per-submit rates.
+Warmups and timed iterations never share a batch, and partial final batches are
+counted correctly. Work is capped at 137438953472 operations per submission,
+with at least one GEMM, to bound submission size. The actual batch limit is printed.
+Batching did not raise the aligned 2048 rate above 4 TFLOP/s and is not the default.
+
+```powershell
+benchmark/vulkan-gemm/build-mingw/bench_vulkan_gemm.exe --type fp32 `
+  --m 2049 --n 2048 --k 2048 --warmup 20 --iterations 100
+benchmark/vulkan-gemm/build-mingw/bench_vulkan_gemm.exe --type fp32 `
+  --m 512 --n 512 --k 512 --fp32-tile auto --fp32-rows auto
+benchmark/vulkan-gemm/build-mingw/bench_vulkan_gemm.exe --type fp32 `
+  --m 1024 --n 1024 --k 1024 --warmup 256 --iterations 512 --batch 8
+```
+
+Paired measurements and exact arguments are in `logs/edge-performance.json`;
+correctness and argument-check output is in `logs/edge-validation.log`.
+
 ## Validation commands
 
 ```powershell
@@ -234,7 +304,7 @@ python benchmark/vulkan-gemm/validate.py `
   benchmark/vulkan-gemm/build-msvc/Release/bench_vulkan_gemm.exe
 ```
 
-Result: **31 cases per compiler, 62 total PASS**. Covers non-tile-aligned and
+Result: **56 cases per compiler, 112 total PASS**. Covers non-tile-aligned and
 rectangular shapes, 1x1x1, all supported types, malformed/overflowing arguments,
 invalid device selection, oversized buffers/indexing, integer overflow prevention,
 a 32 MiB capacity test, and insufficient VRAM budget. Full 14 GiB checks are the

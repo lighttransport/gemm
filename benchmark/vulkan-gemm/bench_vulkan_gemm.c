@@ -67,6 +67,7 @@ typedef struct Options {
     uint32_t fp32_rows;
     uint32_t fp32_lds_prefetch;
     uint32_t fp32_pack_a;
+    uint32_t batch;
     const char *fp32_isa;
 } Options;
 
@@ -166,6 +167,16 @@ static void barrier(Context *ctx) {
     vkCmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          0, 1, &memory, 0, NULL, 0, NULL);
+}
+
+// Repeated GEMMs only overwrite C; A and B remain read-only.
+static void gemm_write_barrier(Context *ctx) {
+    VkMemoryBarrier memory = {0};
+    memory.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    memory.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 0, NULL, 0, NULL);
 }
 
 static int begin_commands(Context *ctx) {
@@ -666,7 +677,7 @@ cleanup:
 }
 
 static int gemm(Context *ctx, Pipeline *pipeline, int type, uint32_t m, uint32_t n, uint32_t k,
-                uint32_t warmup, uint32_t iterations) {
+                uint32_t warmup, uint32_t iterations, uint32_t batch) {
     Buffer a = {0}, b = {0}, c = {0}, packed_a = {0};
     Buffer *buffers[] = {&a, &b, &c};
     uint32_t params[] = {m, n, k};
@@ -718,12 +729,24 @@ static int gemm(Context *ctx, Pipeline *pipeline, int type, uint32_t m, uint32_t
         printf("  GPU A packing=%.4f ms (once, excluded from GEMM-only timing)\n", packing_ms);
     }
     bind_buffers(ctx, pipeline, buffers, 3);
-    for (uint32_t i = 0; i < warmup + iterations; ++i) {
+    uint32_t max_batch = batch;
+    // Bound work per submission; large GEMMs still execute individually.
+    double operations = 2.0*m*n*k;
+    if (operations*max_batch > 137438953472.0) {
+        max_batch = (uint32_t)(137438953472.0/operations);
+        if (!max_batch) max_batch = 1;
+    }
+    for (uint32_t i = 0; i < warmup + iterations;) {
+        uint32_t count = i < warmup ? warmup-i : warmup+iterations-i;
         uint64_t timestamps[2];
+        if (count > max_batch) count = max_batch;
         if (!begin_commands(ctx)) goto cleanup;
         vkCmdResetQueryPool(ctx->cmd, ctx->queries, 0, 2);
         vkCmdWriteTimestamp(ctx->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx->queries, 0);
-        dispatch(ctx, pipeline, params, sizeof(params), groups_x, groups_y);
+        for (uint32_t j = 0; j < count; ++j) {
+            dispatch(ctx, pipeline, params, sizeof(params), groups_x, groups_y);
+            if (j+1 < count) gemm_write_barrier(ctx);
+        }
         vkCmdWriteTimestamp(ctx->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->queries, 1);
         barrier(ctx);
         if (!submit_commands(ctx)) goto cleanup;
@@ -734,15 +757,18 @@ static int gemm(Context *ctx, Pipeline *pipeline, int type, uint32_t m, uint32_t
         double ms = (double)delta * ctx->props.limits.timestampPeriod / 1e6;
         if (i >= warmup) {
             sum_ms += ms;
-            if (ms < min_ms) min_ms = ms;
-            if (ms > max_ms) max_ms = ms;
+            double per_gemm_ms = ms/count;
+            if (per_gemm_ms < min_ms) min_ms = per_gemm_ms;
+            if (per_gemm_ms > max_ms) max_ms = per_gemm_ms;
         }
+        i += count;
     }
     if (!check_output(ctx, &c, type, m, n, k)) goto cleanup;
     if (!(sum_ms > 0)) { fprintf(stderr, "Zero GPU timestamp duration\n"); goto cleanup; }
     printf("  GPU mean=%.4f ms min=%.4f max=%.4f; %.3f %s (%u iterations, %u warmups)\n",
            sum_ms/iterations, min_ms, max_ms,
            2.0*m*n*k / ((sum_ms/iterations)*1e6), type < 3 ? "GOP/s" : "GFLOP/s", iterations, warmup);
+    if (batch > 1) printf("  Batch limit=%u dispatches; timing includes inter-dispatch barriers; min/max are batch averages\n", max_batch);
     if (pipeline->pack_a) printf("  GPU pack + one GEMM=%.4f ms; %.3f GFLOP/s\n",
         packing_ms+sum_ms/iterations, 2.0*m*n*k / ((packing_ms+sum_ms/iterations)*1e6));
     success = 1;
@@ -798,9 +824,9 @@ static int benchmark(Context *ctx, const Options *options) {
         snprintf(shader, sizeof(shader), "gemm_%d.spv", type);
         uint32_t config[] = { options->fp32_rows/16, options->fp32_kstep, options->fp32_pad, 0,
                              options->fp32_prefetch, options->fp32_tile/16, options->fp32_lds_prefetch,
-                             options->fp32_pack_a };
-        VkSpecializationMapEntry entries[] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}, {7, 28, 4}};
-        VkSpecializationInfo spec = {8, entries, sizeof(config), config};
+                             options->fp32_pack_a, 0 };
+        VkSpecializationMapEntry entries[] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}, {7, 28, 4}, {8, 32, 4}};
+        VkSpecializationInfo spec = {9, entries, sizeof(config), config};
         int register_kernel = type == 4 && options->fp32_register;
         if (register_kernel) {
             uint32_t shared_bytes = config[1]*(options->fp32_rows+options->fp32_tile+4*config[2])*4;
@@ -818,20 +844,23 @@ static int benchmark(Context *ctx, const Options *options) {
             register_kernel ? "register" : "baseline", pipeline.tile_m, pipeline.tile,
             register_kernel ? config[1] : 16, register_kernel ? config[2] : 0,
             register_kernel ? config[4] : 0);
-        int ok = gemm(ctx, &pipeline, type, 19, 23, 29, 0, 1);
-        if (ok && register_kernel && options->m % pipeline.tile_m == 0 &&
-            options->n % pipeline.tile == 0 && options->k % config[1] == 0) {
+        int ok = gemm(ctx, &pipeline, type, 19, 23, 29, 0, 1, 1);
+        if (ok && register_kernel && options->n % 4 == 0 &&
+            (pipeline.pack_a ? options->m % 4 == 0 : options->k % 4 == 0)) {
             destroy_pipeline(ctx, &pipeline);
             config[3] = 1;
+            config[8] = options->m % options->fp32_rows == 0 &&
+                        options->n % options->fp32_tile == 0 && options->k % config[1] == 0;
             ok = create_pipeline(ctx, &pipeline, "gemm_fp32_register.spv", 3, 12, &spec);
             pipeline.tile = options->fp32_tile;
             pipeline.tile_m = options->fp32_rows;
             pipeline.pack_a = options->fp32_pack_a;
-            printf("  FP32 aligned vector-load/store specialization\n");
+            printf("  FP32 vector-load/store specialization (%s)\n",
+                   config[8] ? "full tiles" : "guarded edges");
         }
         if (ok && type == 4) ok = shader_info(ctx, &pipeline, options->fp32_isa);
         if (ok) ok = gemm(ctx, &pipeline, type, options->m, options->n, options->k,
-                          options->warmup, options->iterations);
+                          options->warmup, options->iterations, options->batch);
         destroy_pipeline(ctx, &pipeline);
         if (!ok) return 0;
     }
@@ -938,11 +967,11 @@ cleanup:
 
 static void usage(const char *program) {
     printf("Usage: %s [--info] [--device INDEX] [--type all|int8|int16|int32|fp16|fp32|fp64]\n"
-           "  [--m M] [--n N] [--k K] [--warmup W] [--iterations I]\n"
-           "  [--fp32-kernel baseline|register] [--fp32-tile 64|128]\n"
+           "  [--m M] [--n N] [--k K] [--warmup W] [--iterations I] [--batch 1..1024]\n"
+           "  [--fp32-kernel baseline|register] [--fp32-tile auto|64|128]\n"
            "  [--fp32-kstep 8|16|32] [--fp32-pad 0|1]\n"
            "  [--fp32-prefetch 0|1]\n"
-           "  [--fp32-rows 64|128] (default matches --fp32-tile)\n"
+           "  [--fp32-rows auto|64|128] (default adaptive; matches an explicit tile)\n"
            "  [--fp32-lds-prefetch 0|1]\n"
            "  [--fp32-pack-a 0|1] (GPU packing cost reported separately)\n"
            "  [--fp32-isa FILE] (AMD shader disassembly)\n"
@@ -964,7 +993,7 @@ static int parse_uint(const char *text, uint32_t *out, int allow_zero) {
 }
 
 int main(int argc, char **argv) {
-    Options options = {0, 1024, 1024, 1024, 2, 10, -1, 0, 0, 14*GIB, 512, 1, 128, 16, 0, 1, 0, 0, 0, NULL};
+    Options options = {0, 1024, 1024, 1024, 2, 10, -1, 0, 0, 14*GIB, 512, 1, 0, 16, 0, 1, 0, 0, 0, 1, NULL};
     Context ctx = {0};
     int result = EXIT_FAILURE;
     // UCRT rejects a zero-sized line buffer; unbuffered output works for both builds.
@@ -989,6 +1018,10 @@ int main(int argc, char **argv) {
         const char *value = argv[++i];
         if (!strcmp(arg, "--fp32-isa")) {
             options.fp32_isa = value;
+        } else if (!strcmp(arg, "--fp32-tile") && !strcmp(value, "auto")) {
+            options.fp32_tile = 0;
+        } else if (!strcmp(arg, "--fp32-rows") && !strcmp(value, "auto")) {
+            options.fp32_rows = 0;
         } else if (!strcmp(arg, "--type")) {
             options.type = -1;
             if (!strcmp(value, "all")) continue;
@@ -1007,6 +1040,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(arg, "--k")) out = &options.k;
             else if (!strcmp(arg, "--warmup")) { out = &options.warmup; allow_zero = 1; }
             else if (!strcmp(arg, "--iterations")) out = &options.iterations;
+            else if (!strcmp(arg, "--batch")) out = &options.batch;
             else if (!strcmp(arg, "--vram-reserve-mib")) { out = &options.vram_reserve_mib; allow_zero = 1; }
             else if (!strcmp(arg, "--fp32-tile")) out = &options.fp32_tile;
             else if (!strcmp(arg, "--fp32-kstep")) out = &options.fp32_kstep;
@@ -1019,8 +1053,14 @@ int main(int argc, char **argv) {
             if (!parse_uint(value, out, allow_zero)) goto invalid;
         }
     }
-    if (options.iterations > 100000 || options.warmup > 100000 || options.vram_reserve_mib > 65536 ||
+    if (options.iterations > 100000 || options.warmup > 100000 || options.batch > 1024 || options.vram_reserve_mib > 65536 ||
         (options.info && options.vram)) goto invalid;
+    if (!options.fp32_tile) {
+        uint64_t area = (uint64_t)options.m * options.n;
+        // Smaller output tiles expose more workgroups for small or narrow matrices.
+        options.fp32_tile = area <= 262144 || options.n <= 64 ? 64 : 128;
+        if (!options.fp32_rows) options.fp32_rows = area <= 131072 || options.m <= 64 ? 64 : 128;
+    }
     if ((options.fp32_tile != 64 && options.fp32_tile != 128) ||
         (options.fp32_kstep != 8 && options.fp32_kstep != 16 && options.fp32_kstep != 32) ||
         options.fp32_pad > 1 || options.fp32_prefetch > 1 || options.fp32_lds_prefetch > 1 || options.fp32_pack_a > 1) goto invalid;
