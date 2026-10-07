@@ -103,7 +103,8 @@ def fuse(colors, weights):
     return mean,w,spread,(weights>.01).sum(0)
 
 
-def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_band=True, band_sigma=4.):
+def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_band=True, band_sigma=4.,
+         exclude_clothing=True):
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
     info=json.loads((work/backend/'generation.json').read_text())
     for name,digest in info['views'].items():
@@ -126,6 +127,20 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
     polar_ok=(work/backend/'polar_regen.json').exists()   # top/bottom re-edited without the portrait
     use_raw=source=='raw' or (source=='auto' and raw_all)
     images=[load_view(v) for v in views]
+    exclusion_report=None
+    if exclude_clothing:
+        # Editors paint the subject's 'usual' clothing (suit/shirt/tie) on the untextured neck/shoulders even when
+        # told not to; parse every view and treat clothing/accessory pixels as not visible, so those texels come
+        # from skin seen elsewhere or nearest-fill.
+        from scipy.ndimage import binary_dilation
+        from ..face_parsing import FaceParser, LABELS
+        parser=FaceParser();drop=[LABELS.index(n) for n in ('glasses','earring','necklace','clothes','hat')]
+        exclusion_report={};views=[dict(v) for v in views]
+        for v,im in zip(views,images):
+            labels,conf=parser.predict(im)
+            bad=binary_dilation(np.isin(labels,drop)&(conf>=.5),iterations=4)
+            exclusion_report[v['name']]=float((bad&v['valid']).sum()/max(v['valid'].sum(),1))
+            v['valid']=v['valid']&~bad
     delight_report=None
     if delight:
         from .mv_delight import delight as remove_light
@@ -211,6 +226,7 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
         basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
         view_source=('raw edits' if use_raw else 'composites')+f', polar={polar_mode}'+(f', two-band sigma {band_sigma}' if two_band else ''),
+        clothing_excluded_fraction=exclusion_report,
         photographed_texels_changed=int(np.any(result[observed]!=base[observed],axis=-1).sum()),
         generated_texels=int((blend>.01).sum()),
         unseen_texels=int((~seen).sum()),unseen_covered=float((support[~seen]>.05).mean()),

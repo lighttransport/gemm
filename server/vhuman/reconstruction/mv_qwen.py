@@ -29,11 +29,13 @@ PROMPT=('Photorealistic texture render of this exact bald human head on a plain 
 EDIT_PROMPT=('Picture 1 is a photo of a person. The LAST picture is a 3D render of the same bald head, partly '
     'untextured (flat uniform beige). Edit only the last picture: replace the flat beige areas with realistic skin of '
     'the person in Picture 1, matching the skin tone of the already-textured face, natural ear anatomy, and very short '
-    'dark hair stubble on the scalp where hair grows. Do not move, zoom, crop or change the camera; keep the silhouette, '
-    'all textured regions and the gray background identical. Even diffuse light, no shadows, no highlights.')
+    'dark hair stubble on the scalp where hair grows. The neck and shoulders are bare skin: the person wears no '
+    'clothing in this render (no suit, shirt, collar or tie). Do not move, zoom, crop or change the camera; keep the '
+    'silhouette, all textured regions and the plain gray background identical. Even diffuse light, no shadows, no '
+    'highlights.')
 
-SEQ_NEGATIVE=('blurry, hat, glasses, text, extra ears, shadows, highlights, clothing, shirt, collar, background, '
-              'scenery, window, room, long hair, hair on the neck')
+SEQ_NEGATIVE=('blurry, hat, glasses, text, extra ears, shadows, highlights, clothing, suit, jacket, shirt, collar, '
+              'tie, background, scenery, window, room, long hair, hair on the neck')
 
 
 def matted_portrait(candidate):
@@ -102,7 +104,7 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
     known=(np.asarray(Image.open(candidate/'skin_coverage.png'))>0).astype(float)
     valid,points,normals=skin.atlas_surface(geometry,len(base))
     portrait=matted_portrait(candidate)
-    res=views[0]['depth'].shape[0];by_name={v['name']:v for v in views};results={};seconds=0.;previous=None
+    res=views[0]['depth'].shape[0];by_name={v['name']:v for v in views};results={};seconds=0.;previous=None;previous_ref=None
     for index,name in enumerate(ORDER):
         t_render=time.time()
         _,current=cond.render_conditions(geometry,atlas,known,res,only=(name,))   # only the view being edited
@@ -110,7 +112,7 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
         t_render=time.time()-t_render
         mask=_mask(view)
         if (mask>0).sum()<.02*view['valid'].sum():
-            results[name]=view['rgb'];previous=view['rgb'];continue
+            results[name]=view['rgb'];previous=previous_ref=view['rgb'];continue
         folder=out/name;folder.mkdir(parents=True,exist_ok=True)
         small=lambda a,mode=Image.Resampling.LANCZOS:Image.fromarray(a).resize((512,512),mode)
         small(view['rgb']).save(folder/'input.png');small(mask,Image.Resampling.NEAREST).save(folder/'mask.png')
@@ -124,7 +126,7 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
             seconds+=receipt['seconds']
         else:
             big=np.asarray(Image.fromarray(view['rgb']).resize((1024,1024),Image.Resampling.LANCZOS))
-            inputs=[portrait]+([np.asarray(Image.fromarray(previous).resize((1024,1024)))] if previous is not None else [])+[big]
+            inputs=[portrait]+([np.asarray(Image.fromarray(previous_ref).resize((1024,1024)))] if previous is not None else [])+[big]
             edited,took=editor(inputs,EDIT_PROMPT+(' Picture 2 is the previously completed neighbouring view; keep skin '
                 'tone and texture consistent with it.' if len(inputs)==3 else ''),steps=steps,seed=seed+index,
                 negative=SEQ_NEGATIVE)
@@ -133,6 +135,10 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
         # Keep known pixels exact at full resolution; only masked pixels are new.
         m=mask>0;image=np.where(m[...,None],image,view['rgb'])
         results[name]=image;previous=image
+        # The next view's 'previous' reference: this view inside the mesh silhouette only, on gray, so clothing or
+        # scenery the editor painted outside/around the head cannot propagate along the chain.
+        sil=by_name[name]['valid'][...,None]
+        previous_ref=np.uint8(np.where(sil,image,127))
         t_commit=time.time()
         _commit(atlas,known,geometry,frame,by_name[name],image,valid,points,normals)
         print(f'[mv_qwen] {name}: render {t_render:.1f}s edit {took if editor is not None else receipt["seconds"]:.1f}s '
