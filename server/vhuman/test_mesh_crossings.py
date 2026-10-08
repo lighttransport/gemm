@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from .reconstruction.mesh_crossings import strict_crossings, crossing_pairs
+from .reconstruction.mesh_crossings import strict_crossings, crossing_pairs, crossing_points
 
 
 class MeshCrossingTests(unittest.TestCase):
@@ -37,6 +37,14 @@ class MeshCrossingTests(unittest.TestCase):
     def test_degenerate_segment_is_not_a_surface_crossing(self):
         line = np.array([[.5,.5,-1], [.5,.5,0], [.5,.5,1]])*.001
         self.assertFalse(strict_crossings(self.flat[None],line[None])[0])
+
+    def test_intersection_points_lie_on_both_planes(self):
+        through=self.through.copy();through[2]=[.0012,.0005,.0003]
+        points,mask=crossing_points(self.flat[None],through[None])
+        selected=points[mask]
+        self.assertGreaterEqual(len(selected),2)
+        np.testing.assert_allclose(selected[:,2],0,atol=1e-12)
+        np.testing.assert_allclose(selected[:,1],.0005,atol=1e-12)
 
 
 if __name__ == '__main__':

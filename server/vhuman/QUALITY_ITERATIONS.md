@@ -306,10 +306,64 @@ work. Receipts are in `oral_contacts/`, `oral_contacts_aligned/`,
 Regression: 47 tests pass with `server.vhuman.test_mesh_crossings` added to the
 previous test command.
 
+## Cavity experiments, visible contacts and individual tooth spacing
+
+Terminology correction: earlier "crown" counts refer to triangles assigned to
+the tooth material rather than gums. The asset does not separately label crowns
+and roots. Crossing counts alone therefore do not establish visible defects.
+
+Nine graph-smoothed cavity corrections keep exterior skin vertices fixed.
+The selected stiffness-1, strength-1 trial moves only mouth-sock vertices, by at
+most 4.624 mm, and has minimum area ratio 0.98439 across 21 poses. Cavity crossing
+pairs fall from 867 to 717, and the complete audited oral subset falls from 1123
+to 973. Alternative radial corrections around a convex envelope of the oral
+geometry reduce crossings further but require roughly 30 mm displacement and
+reverse faces; all are rejected. No exterior face texture needs rebaking for
+the selected cavity-only change.
+
+`crossing_points` now exposes segment endpoints for visibility checks. Blender
+BVH rays sample five points per crossing segment from the fitted source camera,
+using a 0.05 mm depth tolerance. This finds 14 source-visible crossing pairs in
+the baseline, 10 after dental alignment, and 10 after cavity smoothing. None of
+the sampled cavity crossings is source-visible; the remaining 10 are three
+lower-lip pairs and seven upper-tooth pairs. This is a sampled source-view
+diagnostic, not proof for all viewpoints or boundary/coplanar contacts.
+
+The seven visible upper-tooth pairs all involve the two central incisors. The
+upper and lower tooth surfaces each have 16 disconnected components. New
+`component_spacing` projects bounded rigid component translations onto
+separating-plane constraints, preserving each selected tooth's shape. Cascaded
+neighbor contacts are rechecked. Upper translations are at most 0.162 mm and
+lower translations at most 0.364 mm, under the 0.5 mm limit with 0.02 mm target
+clearance. Captured-pose tooth intersections fall from 11/42 (upper/lower) to
+zero, but that initial proposal folds adjoining shared-vertex gum triangles
+and is rejected as a complete-mesh candidate.
+
+Screened harmonic extension into the gums preserves the rigid tooth offsets.
+A bounded area-gradient repair then adjusts only free gum vertices, by at most
+0.010798 mm, to meet a 0.15 oriented-area floor. It converges in five steps; a
+101-pose check has no reversals and minimum ratio 0.15000001. Production helpers
+reproduce the prototype delta exactly. Every tooth remains rigidly translated
+within each evaluated pose. These helpers explicitly return rejection when
+their displacement or iteration limits are exceeded.
+
+The combined `lip_candidate_teeth_spaced` has zero detected crossings within
+either tooth arch or between them in all 21 sampled expression poses. Blender
+source-view ray auditing finds only three remaining visible pairs, all in the
+lower lip. Total strict crossings in the audited oral subset are 913, mostly
+hidden contacts; zero tooth crossings does not imply zero gum/cavity contacts.
+The final OptiX render and packed-asset reload pass (20.5 seconds, 2709 MiB peak
+device memory). This is the working anatomy candidate, still unpromoted pending
+lip repair, broader motion/side-view checks and completed-material transfer.
+
+Receipts: `cavity_sweep/`, `cavity_envelope/`, `contact_visibility/`,
+`tooth_spacing/`, and `lip_candidate_teeth_spaced/` under the study root.
+Regression: 53 tests pass, adding `server.vhuman.test_component_spacing`.
+
 ## Next experiments
 
-- Coordinate lower-arch/tongue placement with mouth-cavity contact correction;
-  inspect side views and remaining within-arch crossings before promotion.
+- Repair the three remaining source-visible lower-lip crossings while preserving
+  the observed face attachments; validate side views and broader oral motion.
 - Inspect tongue/cavity, lip contact and eye-lid contact during jaw opening,
   gaze changes and side views.
 - Evaluate the passing geometry candidates before transferring completed skin
