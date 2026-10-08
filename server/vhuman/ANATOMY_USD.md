@@ -94,3 +94,17 @@ wrinkle activation, are captured at the first frame. The report lists affected
 materials and driver counts. Geometry animation and texture pixels survive the
 roundtrip; exact animated shading is not claimed. The export gate also does not
 prove fit accuracy, collision freedom, or behavior at unsampled times.
+
+## Fitted optical centers in the Blender scene
+
+An optical part attached to GNM eye joint 2 or 3 may specify
+`rotation_center_offset: [x, y, z]` in `scene.json`, in metres in the aligned
+rest coordinate frame. Its stored mesh positions must already include that
+placement offset. The renderer rotates surface points around the shifted rest
+center, then carries the offset with head joint 1. This prevents eye gaze from
+orbiting a translated globe around the old native joint. Parts without the
+field retain the original joint transform.
+
+`joint_motion.shifted_joint_positions` validates the arrays and proper rotations.
+It does not validate anatomical placement or contacts. Sampled USD bakes the
+resulting positions; it does not preserve this editable joint-center control.

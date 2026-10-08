@@ -1070,3 +1070,54 @@ Receipts under `tmp/vhuman-quality8h/`: `source_illumination_trial.json`,
 `source_illumination_validation.json`, `illumination_comparison/{report.json,
 appearance_metrics.json,comparison.png}`, `illumination_opposite/comparison.png`,
 and `illumination_receipt_tests.log`.
+
+## Combined blink, shifted optical centers and revised appearance
+
+`joint_motion.shifted_joint_positions` implements a fitted center whose offset
+follows the head while the globe rotates around it. `cycles_scene.animate`
+uses this for optical parts declaring `rotation_center_offset`; legacy scenes
+retain their previous transform. Four tests cover fixed-center gaze, head
+transport with independent gaze, exact zero-offset equivalence, and invalid
+arrays/rotations. The offset is in aligned rest coordinates, in metres.
+
+The integrated experimental preview has 41 frames at 48 fps, opening and
+closing through the validated 0.025-aperture blink, with authored rigid head
+yaw +/-8 degrees and gaze +/-10 degrees. It uses `completed_illumination_0.5`
+and the dense-gaze optical placement. The original detail maps are retained
+as separate appearance priors. This is not observed target-subject motion or
+a fitted neck deformation, and the motion metadata keeps contact acceptance
+false.
+
+Fresh Blender evaluation verifies all eight optical meshes at all 41 frames
+(328 checks) against independent explicit Y-axis head/gaze transforms. Maximum
+coordinate discrepancy is 2.576e-9 m. Packed signed detail maps and native-motion
+reload checks pass. Five matched key-pose renders include open, both turning
+half-blinks and full closure. The radial lid contour audit across 41 frames
+has no missing optical-shell ray hits; its worst clearance is -0.123198 mm.
+Small lower-lid penetration and the earlier finite-view corner-gap limitations
+remain; this is not a continuous collision-free result.
+
+All saved full-anatomy frames pass the 0.1 oriented-area gate (minimum 0.100997).
+A fixed start-frame reference normal during head rotation gives 0.090699,
+which mixes rigid turning into the deformation measurement. Using linearly
+interpolated, rotated reference normals instead gives a conservative interval
+bound of 0.100625. The numerator is cubic in interval time, so its extrema use
+quadratic derivative roots. Dividing by the original squared reference-normal
+length is conservative for the normalized interpolated reference because
+interpolating equal-length normals cannot increase their length. This supports
+orientation preservation along the stored linear path, not injectivity.
+
+Receipts under `tmp/vhuman-quality8h/`: `combined_blink_motion/{motion.json,
+geometry_validation.json,optical_clearance.json}` and
+`combined_blink_render/{joint_validation.json,asset_validation.json,key_poses.png}`.
+
+The combined preview also exports 18 meshes x 81 samples at 96 fps through
+`usd_motion_worker.py`. All 1458 geometry/topology/UV checks pass with measured
+coordinate and UV error zero. Fresh import verifies all sample hashes,
+11 materials, 67 nodes and 18 packed images, saving `portable.blend` with
+`//head.usdc` as its animation-cache path. The matched closed-blink native/USD
+render has foreground RGB MAE 0.389972/255, p99 4/255 and unchanged alpha.
+Shader-driver serialization remains generally static; this specific preview
+holds expression coefficients constant. Nine joint-motion/blink tests pass.
+Additional receipts: `combined_blink_usd/{report.json,portable.validation.json}`
+and `combined_blink_usd_comparison/{metrics.json,comparison.png}`.

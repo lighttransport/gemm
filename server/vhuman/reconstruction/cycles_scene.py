@@ -50,6 +50,17 @@ def animate(scene, request, config, data, objects):
         elif part.get('joint') is not None:
             joint=part['joint'];p=data[part['name']+'_positions']-rest_joints[joint]
             positions=np.einsum('fij,vj->fvi',world[:,joint],p)+motion['joints'][:,joint,None]
+            if 'rotation_center_offset' in part:
+                if joint not in (2,3):
+                    raise ValueError('shifted optical centers require a GNM eye joint')
+                if __package__:
+                    from .joint_motion import shifted_joint_positions
+                else:
+                    sys.path.insert(0,str(Path(__file__).parent))
+                    from joint_motion import shifted_joint_positions
+                positions=shifted_joint_positions(data[part['name']+'_positions'],
+                    rest_joints[joint],motion['joints'][:,joint],world[:,joint],
+                    part['rotation_center_offset'],world[:,1])
         else:
             positions=None
         if positions is not None:
