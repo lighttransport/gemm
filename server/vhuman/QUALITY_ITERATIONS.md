@@ -1152,3 +1152,34 @@ hidden dental contacts are not solved by this study.
 Receipts under `tmp/vhuman-quality8h/`: `tongue_contact_sweep/{report,visibility,
 ranked}.json`, `tongue_surprise_sweep/{report,visibility,ranked}.json`, and
 `tongue_placement_render/{report.json,metrics.json,mouth_comparison.png}`.
+
+## Local cavity back-wall trials
+
+Five depth-weighted back-wall offsets (0,1,2,3,4 mm) keep exterior skin, lip
+margins, teeth and tongue fixed. The offset ramps from zero at Z=-10 mm to
+full weight at Z=-35 mm. All triangles retain orientation relative to the
+same unmodified surprise pose; the weakest projected-area ratio is 0.999239.
+The static-neutral reference contains pre-existing unrelated interior negative
+ratios at this stress pose, so its -2.235386 minimum is recorded as a diagnostic,
+not used to claim that the cavity change introduced or repaired those triangles.
+
+Across five views, baseline visible oral pairs total 27, including four frontal
+tongue/cavity pairs. Offsets 1/2/3/4 mm give totals 26/26/28/28 and frontal
+tongue pairs 3/2/4/4. The 2 mm and larger trials add a lower-dental/cavity pair
+at +30 degrees. Thus no candidate both resolves the targeted contact and
+avoids introducing another visible contact.
+
+A more localized variant displaces around the two contact-triangle centroids
+opposite their normals, using compact 20 mm radial support and keeping the
+same protected vertices fixed. Nominal 2/4 mm strengths produce maximum actual
+movement 1.686/3.372 mm, with relative orientation minima 0.998940/0.997880.
+Visible tongue/cavity pairs become three and five; total visible pairs are
+26 and 28. Contact migrates across neighboring back-wall facets rather than
+being eliminated. Neither trial changes the working geometry or motion.
+A future anatomical attachment/remeshing study would need a different model
+of the tongue root and cavity junction, not simply larger displacements.
+
+Receipts under `tmp/vhuman-quality8h/`: `cavity_backwall_sweep/{report,visibility}.json`
+and `cavity_local_sweep/{report,visibility}.json`. These are static bounded
+geometry studies with finite segment/visibility sampling; no dynamic contact
+acceptance is asserted.
