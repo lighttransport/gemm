@@ -1026,3 +1026,47 @@ Receipts under `tmp/vhuman-quality8h/`: `skin_ablation/{report.json,comparison.p
 `skin_coverage_diagnostic/albedo.png`, `unseen_tone_normalization.json`,
 `unseen_tone_validation.json`, and
 `unseen_tone_comparison/{report.json,appearance_metrics.json,comparison.png}`.
+
+## Partial source-illumination compensation
+
+Re-sampling the original masked portrait on the current atlas closely
+reconstructs the stored lighting fit: direction [-0.24537,0.68101,0.39170]
+versus stored [-0.24401,0.68039,0.38430]. Median absolute linear-albedo error
+is 0.001765, with 90th/99th percentiles 0.008381/0.029040. Differences include
+quantized confidence and earlier completion/feathering. The source estimator
+permits up to 2x brightening, making partial reversal a targeted hypothesis.
+
+Two candidates reverse 0.5 or 1.0 of the stored first-order log illumination,
+using its clipping order and a reconstructed median gauge of 1.4552243. Adjacent
+unseen skin receives a normal-compatible 15 mm feather. Because the old receipt
+omitted its exact gauge, this experiment is approximate, not an exact inversion
+of the original bake. Both retain geometry and all auxiliary/support maps.
+The 0.5 candidate changes 169009 photographed texels; 1.0 changes 172138, with
+zero photographic edits outside the declared `skin_illumination_repair.png`.
+These are revised albedo estimates, not preserved source pixels or new views.
+
+Seam energy falls from 0.0366182 to 0.0288962 (21.1%) and 0.0269910 (26.3%).
+Twelve matched renders cover front, both 60-degree sides and alternate key
+lighting. The half-strength foreground RGB MAE is 2.874/255 frontally,
+4.123/255 on the +60-degree side and 2.705/255 under the alternate key; alpha
+is unchanged in those three comparisons. Visual review selects half strength
+for continued rendering because the transition is less abrupt while full
+strength darkens the jaw/neck more. Broad scalp mottling remains. This is a
+working appearance preference, not proof of recovered physical reflectance.
+
+Working material becomes `completed_illumination_0.5`; the previous
+`completed_tone_balanced` stays intact as the photo-preserving alternative.
+Existing motion geometry and USD exports are unchanged; subsequent combined
+renders/exports must deliberately select the new material rather than assume
+older packed scenes have updated textures or regenerated detail maps.
+
+`materials.estimate` now records `irradiance_median`, `log_irradiance_clip`,
+and `normalized_irradiance_clip`. Future receipts replay the illumination
+without reconstructing the source fit mask. The 29 reconstruction tests pass,
+including a varying-normal synthetic illumination replay at 1e-14 tolerance.
+Default estimated albedo behavior is unchanged.
+
+Receipts under `tmp/vhuman-quality8h/`: `source_illumination_trial.json`,
+`source_illumination_validation.json`, `illumination_comparison/{report.json,
+appearance_metrics.json,comparison.png}`, `illumination_opposite/comparison.png`,
+and `illumination_receipt_tests.log`.

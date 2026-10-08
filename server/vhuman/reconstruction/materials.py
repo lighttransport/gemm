@@ -55,12 +55,14 @@ def estimate(rgb, normals, confidence):
             w = np.minimum(1., .15/np.maximum(abs(err), 1e-6))
             light = np.linalg.solve(a.T@(w[:, None]*a)+np.diag([1e-6, 20, 20, 20]), a.T@(w*y))
     illum = np.exp(np.clip(n @ light[1:], -.5, .5))
-    if keep.any():
-        illum /= np.median(illum[keep])
+    irradiance_median = float(np.median(illum[keep])) if keep.any() else 1.
+    illum /= irradiance_median
     illum = np.clip(illum,.5,2.)
     albedo = np.clip(rgb / illum[..., None], 0, 1)
     return albedo, dict(log_direction=light[1:].tolist(), gauge='median visible diffuse irradiance = 1',
-                         fitted_pixels=int(keep.sum()), max_gain=float((1/illum).max()))
+                         fitted_pixels=int(keep.sum()), max_gain=float((1/illum).max()),
+                         irradiance_median=irradiance_median, log_irradiance_clip=[-.5,.5],
+                         normalized_irradiance_clip=[.5,2.])
 
 
 def complete_surface(points, normals, colors, measured, max_distance=.02):

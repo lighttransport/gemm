@@ -465,4 +465,18 @@ class ReconstructionTests(unittest.TestCase):
         self.assertIn('median',report['gauge'])
 
 
+    def test_material_lighting_receipt_replays_without_source_fit_mask(self):
+        from .reconstruction.materials import estimate
+        rng=np.random.default_rng(73)
+        normals=rng.normal(size=(256,3))
+        normals/=np.linalg.norm(normals,axis=1,keepdims=True)
+        illumination=np.exp(normals@np.array([.2,.4,.1]))
+        rgb=r.linear_to_srgb(np.clip(illumination[:,None]*[.3,.2,.12],0,1))*255
+        albedo,report=estimate(rgb,normals,np.ones(256))
+        replay=np.exp(np.clip(normals@report['log_direction'],*report['log_irradiance_clip']))
+        replay=np.clip(replay/report['irradiance_median'],*report['normalized_irradiance_clip'])
+        np.testing.assert_allclose(albedo,np.clip(r.srgb_to_linear(rgb/255)/replay[:,None],0,1),atol=1e-14)
+        self.assertGreater(report['irradiance_median'],0)
+
+
 if __name__=='__main__':unittest.main()
