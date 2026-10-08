@@ -1683,3 +1683,12 @@ USD import: 18 meshes across 81 samples, 1,458 mesh checks and 972 shader
 checks, zero measured shader error and a relative USD cache. Interchange success
 does not remove the inherited eyelid/tongue contact limitations. The selected
 ear basecolor is packed and remains explicit authored appearance.
+
+The reusable `reconstruction.local_skin_color` tool reproduces the selected
+ear PNG byte for byte from explicit region JSON (`ear_color_reproduced/`). Its
+CLI protects photo-supported texels unless `--edit-observed` is supplied,
+validates surface/reference hashes, rejects overlapping regions and writes a
+provenance record and edit mask. Five numerical tests cover outlier reduction,
+exact exterior/protected pixels, zero strength, uniform/empty regions, a single
+trusted reference, and invalid/overlapping input. The actual reproduced mask
+contains every changed texel. See `BLENDER_TEXTURE.md` for usage and limitations.

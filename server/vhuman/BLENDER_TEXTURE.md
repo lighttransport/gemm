@@ -169,6 +169,36 @@ Backgrounding or context loss invalidates the run. Speech requires a secure
 context and is outside this local rendering test; HTTPS is needed for speech
 on a LAN device. Actual mobile performance remains pending a device receipt.
 
+## Local skin color cleanup
+
+For spatially localized pale/cyan texture artifacts, use explicit ellipsoidal
+regions in the fitted geometry's metre coordinate system. Each JSON region has
+`name`, `center: [x,y,z]` and positive `radii: [rx,ry,rz]`; regions must not
+overlap on the sampled surface. The tool verifies the candidate, surface audit,
+and original photographic reference hashes before editing.
+
+```sh
+TMPDIR="$PWD/tmp" PYTHONPATH="$PWD" tmp/vhuman-texture-venv/bin/python \
+  -m server.vhuman.reconstruction.local_skin_color \
+  --candidate tmp/vhuman-quality8h/completed_illumination_0.5 \
+  --audit tmp/vhuman-quality8h/completed_surface_audit \
+  --regions tmp/vhuman-quality4h/ear_color_regions.json \
+  --out tmp/vhuman-quality4h/ear_cleanup_new --edit-observed
+```
+
+Choose a new output directory. Photographed texels are protected by default;
+`--edit-observed` explicitly allows their alteration and records the count.
+The selected ear trial uses that flag. Region coordinates are fitted-subject
+specific and must be reviewed before reuse on a different head. A local median
+prior suppresses color outliers; it does not recover reflectance, geometry or
+unseen evidence. Euclidean neighborhoods can mix nearby folds, and real
+pigmentation can be removed. Inspect matched rendered views under more than
+one light before selecting a result. Geometry and support maps are copied
+unchanged; the output includes a weighted edit mask and source provenance.
+
+Run numerical protection and edge-case checks with
+`python -m unittest server.vhuman.test_local_skin_color`.
+
 ## Validation
 
 114 reconstruction/mobile tests passed, with one optional Torch/OpenEXR test
