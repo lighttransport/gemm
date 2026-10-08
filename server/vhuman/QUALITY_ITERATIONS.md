@@ -1396,3 +1396,79 @@ study above remains the dynamic-shader evidence. A matched half-blink render
 and unchanged alpha. Receipts are in `combined_lid_fit_usd_materials/` and
 `combined_lid_fit_usd_comparison/`. The improved fit remains a separate review
 candidate with residual optical contacts, not a globally accepted replacement.
+
+## Native tongue articulation and UV-bound shading trials
+
+The 32 native tongue coefficients affect exactly the 933 tongue vertices and
+no other component. Those vertices are fully weighted to the head joint.
+A posed linear basis delta was checked against two full GNM evaluations;
+maximum difference is 1.17e-16 metres. The zero tongue coefficients in the
+previous stress tracks therefore left a useful articulation space untested.
+Coefficient labels are PCA/control identifiers, not inferred speech gestures.
+
+A 31-pose sweep tests the five leading controls at +/-0.25, +/-0.5 and +/-1,
+plus the original peak surprise pose. Baseline has 37 hidden tongue self-pairs
+and four visible tongue/cavity pairs across five views. The `tongue_mean`
+control at +1 removes the self-pairs, but creates 55 visible pairs, moves some
+vertices 9.58 mm and produces a visibly detached-looking tongue. Its linear
+path nearly collapses a triangle: exact unsigned area magnitude falls to
+0.00207 of baseline around 59.5% of the path, and an endpoint edge stretches
+5.99 times. This candidate is rejected. Projected-normal reversal alone is
+not treated as collapse: at +0.25 the same control has negative projected
+area but an unsigned continuous minimum of 0.544, illustrating that bending
+and degeneracy need separate checks.
+
+A 13-pose coupled sweep combines controls 351 and 352. At values 0.25/0.125,
+peak-pose visible pairs fall from four to one and self-pairs from 37 to 18,
+with minimum relative oriented area 0.738 and maximum movement 3.082 mm.
+The first aperture-scaled animation reduces summed visible pairs across 215
+views from 116 to 73, but worsens three views (frames 5, 5.5 and 22); it is
+not selected. A later smoothstep activation over lip-landmark aperture
+30--35 mm removes those regressions in the sampled view set:
+
+- 43 saved/half-frame poses, five yaws each: summed visible pairs 116 to 70,
+  24 views improve and none worsens;
+- summed tongue self-pairs 1,591 to 985, but frames 5.5 and 6 each increase
+  from 37 to 38, so full contact acceptance remains false;
+- minimum relative oriented tongue area 0.736655 over sampled poses;
+- first frame and all non-tongue vertices remain exactly unchanged;
+- the skin wrinkle mapping has zero weights for these tongue coefficients.
+
+This is an authored wide-mouth prior on a cross-subject surprise stress track,
+not recovered target-subject tongue motion. Relative areas compare against
+matching baseline poses, which already contain anatomy defects. Visibility
+uses five points per strict crossing segment, opaque base geometry and five
+finite camera yaws; it does not prove contact freedom at arbitrary times or
+views. A separate scene `native_tongue_motion_render/head.blend` preserves the
+candidate. Fresh-load verification checks all 18 parts at 22 frames (396
+checks), with maximum coordinate error 4.93e-9 metres. Matched CPU mouth crops
+at frames 6/11/22 have RGB MAE 0.3794/0.7965/0.6217 per 255 and unchanged alpha.
+The existing default motion remains intact.
+
+Separately, six matched mouth crops compare the original tongue material,
+UV-bound fine bump, and bump plus mild color/coat variation at 0/30 degrees.
+The authored bump uses distance 0.04 mm and strength 0.35. The color prior
+varies linear RGB between (0.36,0.078,0.07) and (0.44,0.105,0.09), roughness
+0.38 and coat weight 0.08. Existing scattering parameters are retained.
+Changes are small: bump-only MAE 0.0430/0.0275 per 255 and color-prior MAE
+0.0814/0.0633; these remain optional, not recovered surface detail or default
+materials. A static USD roundtrip preserves all 933 vertices, 1,824 triangles
+and UVs exactly and verifies the seven-node shader.
+
+The first shading render ran out of GPU memory while a separate model process
+held about 12.9 GiB. That process was left untouched. Re-running only the
+380x240 mouth crop on CPU completed all six comparisons at 64 samples.
+This is resource contention, not a successful 16 GiB GPU run of that trial.
+
+Recipes/receipts under `tmp/vhuman-quality8h/`: `tongue_basis_probe.json`,
+`native_tongue_sweep/`, `native_tongue_coupled_sweep/`,
+`native_tongue_shape_paths.json`, `native_tongue_motion_late/`,
+`native_tongue_motion_late_contacts/{report,visibility_comparison}.json`,
+`native_tongue_motion_render/{motion_validation,metrics}.json`,
+`tongue_material_trial/{report,metrics}.json`, and `tongue_material_usd/report.json`.
+
+`native_tongue_motion_usd/portable.blend` completes a fresh-process USD check
+for this review candidate: 18 meshes / 43 samples, all 774 mesh checks and
+516 shader checks pass, with zero measured shader-value error and a relative
+`//head.usdc` cache. The package retains the authored-motion and residual-contact
+limitations; interchange success does not promote the anatomy.
