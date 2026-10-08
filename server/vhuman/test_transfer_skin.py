@@ -147,6 +147,34 @@ class LocalizedRebakeProvenanceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'invalid localized rebake'):
                 validate_candidate(path)
 
+    def test_local_cleanup_mask_and_evidence_claim_are_guarded(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from PIL import Image
+        from .reconstruction.observations import sha256
+        from .reconstruction.provenance import validate_candidate
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.fixture(Path(directory))
+            mask = path/'local_color_edit_mask.png'
+            Image.new('L', (8, 8), 64).save(mask)
+            manifest = json.loads((path/'manifest.json').read_text())
+            report = manifest['material']['synthetic_completion']
+            report['local_color_cleanup'] = [dict(new_view_evidence=False,mask_sha256=sha256(mask))]
+            def write():
+                (path/'manifest.json').write_text(json.dumps(manifest))
+                (path/'generated_skin.json').write_text(json.dumps(report))
+            write(); validate_candidate(path)
+            original = mask.read_bytes()
+            Image.new('L', (8, 8), 0).save(mask)
+            with self.assertRaisesRegex(ValueError, 'cleanup mask hash'):
+                validate_candidate(path)
+            mask.write_bytes(original)
+            report['local_color_cleanup'][-1]['new_view_evidence'] = True
+            write()
+            with self.assertRaisesRegex(ValueError, 'cleanup provenance'):
+                validate_candidate(path)
+
 
 if __name__ == '__main__':
     unittest.main()

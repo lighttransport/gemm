@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import tempfile
 import queue
 import time
 from urllib.request import urlopen,Request
@@ -50,11 +51,13 @@ def verify(player,out,hardware=False,device_test=False):
         def log_message(self,*args):pass
     server=ThreadingHTTPServer(('127.0.0.1',0),partial(Quiet,directory=str(player)))
     thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-    chrome=cdp=None
+    chrome=cdp=runtime=None
     try:
         profile=out/'chrome-profile';profile.mkdir(exist_ok=True)
         gpu=['--use-gl=angle','--use-angle=vulkan','--enable-features=Vulkan','--disable-vulkan-surface'] if hardware else ['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']
-        environment=dict(os.environ,TMPDIR=str(out));environment.pop('DISPLAY',None)
+        # Chromium's singleton Unix socket must fit the platform path limit.
+        runtime=tempfile.TemporaryDirectory(prefix='brv-',dir=player.parent)
+        environment=dict(os.environ,TMPDIR=runtime.name);environment.pop('DISPLAY',None)
         with (out/'chrome.log').open('w') as log:
             chrome=subprocess.Popen([find_chrome(),'--headless=new','--ozone-platform=headless','--no-sandbox','--no-first-run','--no-default-browser-check','--autoplay-policy=no-user-gesture-required',
                 '--ignore-gpu-blocklist','--window-size=1100,900','--remote-debugging-port=0',f'--user-data-dir={profile}',*gpu,'about:blank'],
@@ -81,9 +84,11 @@ def verify(player,out,hardware=False,device_test=False):
                 for index,yaw in enumerate((0,.35,-.35)):
                     expression=np.asarray(reference).copy()
                     expression[:24]=np.clip(expression[:24]+.1*np.sin(np.arange(24)+index),-3,3)
-                    times=cdp.evaluate(f'vhuman.setPose({json.dumps(expression.tolist())},{yaw})')
-                    actual=np.asarray(cdp.evaluate('vhuman.nativeVertices()')).reshape(-1,3)
                     rotations=np.zeros((4,3));rotations[0,1]=yaw
+                    rotations[1,0]=.07*index
+                    rotations[2,1]=.18*(index-1);rotations[3,1]=-.13*(index-1)
+                    times=cdp.evaluate(f'vhuman.setPose({json.dumps(expression.tolist())},{yaw},{json.dumps(rotations.ravel().tolist())})')
+                    actual=np.asarray(cdp.evaluate('vhuman.nativeVertices()')).reshape(-1,3)
                     expected=native.evaluate(expression,rotations)
                     errors.append(np.linalg.norm(actual-expected,axis=1)*1000);timings.append(times)
                     for part in manifest['parts']:
@@ -92,7 +97,9 @@ def verify(player,out,hardware=False,device_test=False):
                         elif part['joint']>=0:
                             primitive=glb.doc['meshes'][part['mesh']]['primitives'][0]
                             rest=glb.accessor(primitive['attributes']['POSITION']);matrix,translation=native.joint_transform(part['joint'])
-                            want=rest@matrix.T+translation
+                            center=np.asarray(part.get('rotation_center_offset',[0,0,0]))
+                            parent,_=native.joint_transform(1)
+                            want=(rest-center)@matrix.T+translation+parent@center
                         else:
                             root=(expected[ids]*weights[:,:,None]).sum(1)
                             want=root+np.einsum('vij,vj->vi',attachment_frames(expected[ids[:,:3]]),offset)
@@ -188,6 +195,7 @@ def verify(player,out,hardware=False,device_test=False):
             chrome.terminate()
             try:chrome.wait(timeout=5)
             except subprocess.TimeoutExpired:chrome.kill();chrome.wait()
+        if runtime:runtime.cleanup()
         server.shutdown();server.server_close();thread.join(timeout=2)
 
 

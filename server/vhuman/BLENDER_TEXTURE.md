@@ -139,11 +139,22 @@ The current artifacts are under `tmp/vhuman-blender/`:
 - `decision.json`: numeric gates and explicit limitations.
 - `out_balanced/`: promoted candidate; original baseline remains unchanged.
 
-The browser package uses the previous `texture_scene` with older hair overlays
+The original browser package uses the previous `texture_scene` with older hair overlays
 disabled, retaining native anatomy and bindings. Build it through the existing
 mobile export/preprocess/browser commands, using the repository-local
 Emscripten cache as documented in TEXTURE_CUDA.md. The browser builder now
 includes a standalone device test page.
+
+The later candidate-first ear/skin continuation is documented in
+[QUALITY_ITERATIONS.md](QUALITY_ITERATIONS.md#native-tongue-rest-lift-and-current-candidate-delivery).
+Its current pointers are `tmp/vhuman-quality4h/session.json`: preferred scene
+`preferred_tongue_candidate/head.blend`, complete portable default/stress bundles
+`preferred_tongue_usd/` and `preferred_tongue_stress_usd/`, comparison gallery
+`review/`, and updated live browser `player/`. The browser includes new ear and
+tongue rest geometry and preserves fitted optical centers under gaze; the
+offline eyelid correction and authored stress gate remain in Blender/USD.
+Earlier candidates and baseline artifacts remain available. Physical mobile
+validation and residual contact acceptance remain pending.
 
 ```sh
 $PY -m server.vhuman.mobile.browser_verify --player "$WORK/player" \

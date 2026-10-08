@@ -128,7 +128,10 @@ def export(candidate,out, *, scene,profile='iphone12'):
             joint=part.get('joint') if part.get('joint') is not None else 1
             offset=pos[mapping]-g['gnm_joint_positions'][joint]
         bindings[name+'_ids']=ids;bindings[name+'_weights']=weights;bindings[name+'_offset']=offset
-        records.append(dict(name=name,mesh=mi,vertices=n,triangles=len(tri),joint=joint,native=part['native']))
+        center=np.asarray(part.get('rotation_center_offset',[0,0,0]),dtype=np.float32)
+        if center.shape!=(3,) or not np.isfinite(center).all():raise ValueError('invalid fitted joint center')
+        records.append(dict(name=name,mesh=mi,vertices=n,triangles=len(tri),joint=joint,native=part['native'],
+            rotation_center_offset=center.tolist()))
         triangles+=len(tri)
     if triangles>IPHONE12['triangle_budgets'][0]:raise ValueError(f'mobile mesh exceeds triangle budget: {triangles}')
     b.write(out/'avatar.glb');np.savez_compressed(out/'bindings.npz',**bindings)
@@ -142,9 +145,10 @@ def export(candidate,out, *, scene,profile='iphone12'):
     # Flat binary avoids a Python/NPZ dependency on device. Each record follows
     # glTF mesh order and shares its indexed vertex ordering.
     with (out/'bindings.bin').open('wb') as f:
-        f.write(struct.pack('<8sI',b'VHBND001',len(records)))
+        f.write(struct.pack('<8sI',b'VHBND002',len(records)))
         for p in records:
             name=p['name'];f.write(struct.pack('<Iii',p['vertices'],p['joint'],int(p['native'])))
+            f.write(np.asarray(p['rotation_center_offset'],dtype='<f4').tobytes())
             for suffix,dtype in (('_ids','<u4'),('_weights','<f4'),('_offset','<f4')):
                 f.write(np.asarray(bindings[name+suffix],dtype=dtype).tobytes())
     controls=dict(schema='vhuman.gnm_controls.v1',names=model.data['expression_names'].tolist(),
@@ -166,11 +170,19 @@ def export(candidate,out, *, scene,profile='iphone12'):
     completion=manifest['material'].get('synthetic_completion')
     if completion:
         result['licenses'].append(dict(component='Generated skin appearance',license=completion['license'],
-            generator=completion['generator'],source=('generated_skin.json' if completion.get('method')=='mv_texture'
-                else 'https://github.com/QwenLM/Qwen-Image-2.1')))
+            generator=completion['generator'],source='generated_skin.json'))
         result['validation']['research_generated_skin']=True
         for name in ('skin_generated_support.png','generated_skin.json'):
             shutil.copyfile(candidate/name,out/name)
+        # Retain evidence masks at their original resolution, independently of
+        # the resized GLB texture. These are provenance assets, not shader maps.
+        evidence=('ear_rebake_mask.png','local_color_edit_mask.png','skin_source_core_mask_0.png',
+            'skin_strict_exclusion_0.png','skin_coverage.png','skin_confidence.png','skin_prior_transfer.png')
+        result['appearance_evidence']={}
+        for name in evidence:
+            if (candidate/name).is_file():
+                shutil.copyfile(candidate/name,out/name)
+                result['appearance_evidence'][name]=sha256(candidate/name)
         refinement=completion.get('surface_refinement')
         if refinement:
             name='skin_projection_repair.png'

@@ -35,6 +35,16 @@ def validate_candidate(candidate):
         if ('source_geometry_sha256' in completion
                 and completion['source_geometry_sha256'] != manifest['geometry_sha256']):
             raise ValueError('synthetic completion geometry hash mismatch')
+        cleanup = completion.get('local_color_cleanup')
+        if cleanup is not None:
+            if (not isinstance(cleanup, list) or not cleanup
+                    or any(not isinstance(row, dict) or row.get('new_view_evidence') is not False
+                           for row in cleanup)):
+                raise ValueError('invalid local color cleanup provenance')
+            mask = candidate/'local_color_edit_mask.png'
+            expected = cleanup[-1].get('mask_sha256')
+            if not expected or not mask.is_file() or sha256(mask) != expected:
+                raise ValueError('local color cleanup mask hash mismatch')
         if completion.get('method') == 'same_uv_prior_transfer':
             transfer = completion.get('prior_transfer')
             if not isinstance(transfer, dict) or transfer.get('new_view_evidence') is not False:

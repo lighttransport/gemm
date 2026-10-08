@@ -1822,3 +1822,108 @@ bakes and comparisons are in `tmp/vhuman-quality4h/`: `bake_ear_geometry.py`,
 `compose_ear_rebake_strict.py`, `ear_geometry_strict_reference/`,
 `ear_rebake_strict_render/`, `ear_rebake_clean_render/`, `ear_rebake_motion/`,
 and `preferred_rebaked_candidate/`.
+
+## Native tongue rest lift and current candidate delivery
+
+The preferred reconstruction is now `tmp/vhuman-quality4h/tongue_reconstruction/`,
+geometry hash `92c7ec5013aafbbe7c57b17ee8689961a7b4824a2c0d3f44d87957e344d88275`.
+It retains the corrected ears and selected geometry-specific skin appearance.
+A native control-352 bias of 0.125 is incorporated into the tongue rest mesh;
+its maximum displacement is 0.5164 mm. Exterior skin vertices and all skin maps
+remain byte-identical to `ear_rebake_clean`. This is an authored anatomy prior,
+not new target-subject observation. Control 351 advances the tongue up to 0.25
+with a smooth 30–35 mm lip-aperture gate in the separate stress motion.
+
+Opening/closing hysteresis and a fixed lift-and-advance rest prior were tried
+first. They introduced worse samples, so neither is selected. With the selected
+rest lift and gated advance, 43 saved/half stress poses reduce summed tongue
+self-intersection pairs from 1,591 to 764, with no pose worsening. Minimum
+tongue relative area is 0.736655. Across 215 finite camera views, exposed
+crossings decrease from 116 to 70: 24 views improve and none worsens. The final
+audit uses the stored, repaired float32 vertices and a shared baseline camera
+pivot per pose. Residual self, cavity and dental/gum contacts remain;
+contact acceptance is explicitly false. Five-point opaque crossing visibility
+is not an all-view or continuous-animation guarantee.
+
+Matched CPU mouth crops at frames 1, 6, 11 and 22 show the placement change
+without changing alpha. The neutral difference is small. The stress track uses
+cross-subject source expressions and pose correctives; it is not target-subject
+ground-truth articulation. A final skin/gum area repair against the updated
+native rest reference moves vertices by at most 0.0000889 mm. Revalidation of
+the saved float32 stress frames passes minimum relative area 0.1008625;
+continuous stress orientation is not claimed. The default track retains its
+continuous linear-interval minimum of 0.1005171.
+
+The preferred default scene is `preferred_tongue_candidate/head.blend`; the
+stress scene is `preferred_tongue_stress/head.blend`. Fresh scene verification
+passes 738 and 396 part/frame checks respectively, with maximum position errors
+2.06e-9 and 4.74e-9 metres. Both portable sampled USD bundles pass export and
+fresh-process import:
+
+| Bundle | Samples | Mesh checks | Shader checks |
+| --- | ---: | ---: | ---: |
+| `preferred_tongue_usd/` | 81 | 1,458 | 972 |
+| `preferred_tongue_stress_usd/` | 43 | 774 | 516 |
+
+Both include `portable.blend`, relative `//head.usdc` cache paths, packed images,
+restored shader settings and baked shader animation. Shader error is zero.
+Generic USD viewers may show static shader values; use the Blender sidecar for
+the verified shader animation. Interchange acceptance does not imply contact
+acceptance. The previous candidate and baseline artifacts remain available.
+
+### Browser optical binding and appearance evidence
+
+`mobile_tongue/`, `mobile_tongue_detail/` and `player/` now contain the corrected
+ear and tongue rest geometry and the selected skin. The 75,620-triangle reference
+retains native PCA controls and excludes hair cards. Export previously dropped
+the fitted optical rotation-center offsets, causing fitted eye centers to orbit
+under gaze. Binding format `VHBND002` adds three float32 center-offset values
+after each part header. Browser and Filament readers still accept `VHBND001`,
+which implies zero offset. The rest position transforms as
+`R_joint * (position - offset) + translation_joint + R_head * offset`, so
+the fitted center follows the head while the optical surface follows gaze.
+
+Two JavaScript checks exercise both binding versions, invalid centers, and
+center invariance under independent head/eye turns. The Filament player compiles
+warning-clean with the existing 1.77.2 SDK headers copied from b550. The final
+Chromium verification adds independent head and eye rotations: native/WASM
+vertex error is zero, binding p95 error is 2.95e-6 mm, and detail activation
+error is below 1.57e-9. Relighting, detail toggles, inspection views, audio sample
+clock, cancellation and the downloadable device-test receipt all pass.
+The browser test uses SwiftShader and fails the device timing target; this is
+neither GPU performance evidence nor physical phone/tablet validation.
+
+Original-resolution coverage, confidence and localized/source edit masks are
+included as hashed appearance evidence, independently of the resized shader
+texture. Generated-skin attribution now points to its actual completion record
+rather than assigning a Qwen source to a localized rebake. Local cleanup
+validation additionally guards the latest edit-mask hash and rejects new-view
+claims. Twelve skin/provenance tests and two browser binding tests pass;
+the mobile suite passed with authorized loopback networking. Chromium temp
+sockets use a short repository-local directory to avoid Unix path limits.
+
+The live browser includes these rest changes, but does not apply the offline
+local eyelid correction or authored aperture-gated stress track. The latter
+remain in the checked Blender/USD scenes. Low-frequency scalp/neck tone patches,
+residual eyelid contacts and the known frame-19.5 exposed-crossing regression
+remain visible limitations. Current pointers and provenance are in
+`tmp/vhuman-quality4h/session.json`. `review/` provides 11 matched image pairs,
+two complete USD/Blender ZIPs, measurement links and the updated device page;
+its responsive controls, image loading, links and ZIP integrity are checked.
+
+GPU memory became available later in the session. The final hardware browser
+check reports the RTX 5060 Ti through NVIDIA ANGLE/Vulkan, approximately 29.87
+static display FPS and 30.04 animated display/pose FPS. All binding, rendering
+and audio checks pass, and the desktop device-test timing target passes.
+`browser_gpu_checks/verification.json` and its downloaded receipt distinguish
+this desktop measurement from physical mobile validation. The software receipt
+is retained separately. The full final Python suite passes 21 tests; the
+JavaScript binding, hash and audio test files also pass.
+
+A targeted frame-19.5 eyelid strength sweep finds that 25–50% of the local
+extension retains the earlier frontal exposed count of 30, while 75–100%
+produces 31. The 50% trial increases total crossing pairs at that pose from 98
+to 109. This is not a full-track comparison and is not substituted for the
+preferred candidate; its tradeoff requires broader saved/fractional pose and
+gaze checks. Receipts are in `lid_strength_probe/`. The known regression remains
+explicit rather than being declared resolved by a one-frame trial.

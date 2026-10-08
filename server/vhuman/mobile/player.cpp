@@ -46,6 +46,7 @@ backend::BufferDescriptor upload(const void* source,size_t size) {
 struct Vertex {float3 position;quatf tangent;float2 uv;float4 color{1};};
 struct Part {
     std::string name;int joint=-1;bool native=false;
+    float3 center{0};
     std::vector<float3> rest,position,normal,offset;
     std::vector<float2> uv;
     std::vector<uint32_t> triangles,ids;
@@ -80,7 +81,8 @@ struct Player::Impl {
         char magic[8];uint32_t count,count2;read(f,magic,8);
         if(memcmp(magic,"VHMES001",8))throw std::runtime_error("bad mesh format");
         read(f,&count,1);read(bind,magic,8);read(bind,&count2,1);
-        if(memcmp(magic,"VHBND001",8)||count!=count2||count>128)throw std::runtime_error("bad binding format");
+        bool fitted=!memcmp(magic,"VHBND002",8);
+        if((!fitted&&memcmp(magic,"VHBND001",8))||count!=count2||count>128)throw std::runtime_error("bad binding format");
         parts.resize(count);size_t total=0,total_vertices=0;
         for(auto& part:parts) {
             uint32_t dims[3];read(f,dims,3);
@@ -98,6 +100,8 @@ struct Player::Impl {
             for(auto i:part.triangles)if(i>=n)throw std::runtime_error("mesh index out of bounds");
             int32_t info[3];read(bind,info,3);part.joint=info[1];part.native=info[2]!=0;
             if(info[0]!=int(n)||part.joint < -1||part.joint>3||(info[2]!=0&&info[2]!=1))throw std::runtime_error("invalid bindings");
+            if(fitted)read(bind,&part.center,1);
+            for(int k=0;k<3;k++)if(!std::isfinite(part.center[k]))throw std::runtime_error("invalid fitted center");
             part.ids.resize(n*6);part.weights.resize(n*6);part.offset.resize(n);
             read(bind,part.ids.data(),n*6);read(bind,part.weights.data(),n*6);read(bind,part.offset.data(),n);
             for(auto i:part.ids)if(i>=native.size())throw std::runtime_error("binding index out of bounds");
@@ -211,11 +215,14 @@ void Player::resize(uint32_t w,uint32_t h) {
 void Player::pose(const float* expressions,const float* rotations,const float* translation) {
     if(vh_mobile_eval(p->model,expressions,rotations,translation,reinterpret_cast<float*>(p->native.data())))throw std::runtime_error("invalid pose");
     for(auto& part:p->parts) {
-        float affine[12]{};
+        float affine[12]{},parent[12]{};
         if(part.joint>=0 && vh_mobile_joint_transform(p->model,unsigned(part.joint),affine))throw std::runtime_error("invalid joint");
+        if(part.joint>=0 && vh_mobile_joint_transform(p->model,1,parent))throw std::runtime_error("invalid head joint");
         for(size_t i=0;i<part.position.size();i++) {
             if(part.joint>=0) {
-                auto x=part.rest[i];for(int k=0;k<3;k++)part.position[i][k]=affine[k*3]*x.x+affine[k*3+1]*x.y+affine[k*3+2]*x.z+affine[9+k];
+                auto d=part.center,x=part.rest[i]-d;
+                for(int k=0;k<3;k++)part.position[i][k]=affine[k*3]*x.x+affine[k*3+1]*x.y+affine[k*3+2]*x.z+affine[9+k]
+                    +parent[k*3]*d.x+parent[k*3+1]*d.y+parent[k*3+2]*d.z;
             } else if(part.native)part.position[i]=p->native[part.ids[i*6]];
             else {
                 float3 root{0};for(int k=0;k<6;k++)root+=p->native[part.ids[i*6+k]]*part.weights[i*6+k];

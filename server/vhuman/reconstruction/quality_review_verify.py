@@ -96,20 +96,21 @@ def verify(work, out):
                 with urlopen(Request(urljoin(url, href), method='HEAD')) as response:
                     if response.status != 200:
                         raise ValueError('broken review link: ' + href)
-            cdp.evaluate('document.getElementById("eyes").scrollIntoView({block:"center"})')
+            selected=json.dumps(data['cards'][0]['id'])
+            cdp.evaluate(f'document.getElementById({selected}).scrollIntoView({{block:"center"}})')
             screenshots = []
             for button, label in ((0, 'earlier'), (2, 'candidate')):
-                cdp.evaluate(f'document.getElementById("eyes").querySelectorAll("button")[{button}].click()')
+                cdp.evaluate(f'document.getElementById({selected}).querySelectorAll("button")[{button}].click()')
                 cdp.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))')
-                value = cdp.evaluate('document.getElementById("eyes").dataset.split')
+                value = cdp.evaluate(f'document.getElementById({selected}).dataset.split')
                 if value != ('100' if button == 0 else '0'):
                     raise ValueError('comparison control did not change split')
                 shot = base64.b64decode(cdp.call('Page.captureScreenshot', {'format': 'png'})['data'])
-                (out / f'eyes_{label}.png').write_bytes(shot)
+                (out / f'comparison_{label}.png').write_bytes(shot)
                 screenshots.append(shot)
             if screenshots[0] == screenshots[1]:
                 raise ValueError('comparison controls did not change visible output')
-            cdp.evaluate('document.getElementById("eyes").querySelectorAll("button")[1].click();scrollTo(0,0)')
+            cdp.evaluate(f'document.getElementById({selected}).querySelectorAll("button")[1].click();scrollTo(0,0)')
             desktop = cdp.call('Page.captureScreenshot', {'format': 'png'})
             (out / 'desktop.png').write_bytes(base64.b64decode(desktop['data']))
             cdp.call('Emulation.setDeviceMetricsOverride', dict(width=390, height=844,

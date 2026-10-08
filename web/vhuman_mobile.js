@@ -22,15 +22,18 @@ function readBindings(buffer,records){
     const view=new DataView(buffer);let cursor=0;
     const u32=()=>{const value=view.getUint32(cursor,true);cursor+=4;return value;};
     const i32=()=>{const value=view.getInt32(cursor,true);cursor+=4;return value;};
-    if(new TextDecoder().decode(new Uint8Array(buffer,0,8))!=='VHBND001')throw Error('Invalid bindings');cursor=8;
+    const version=new TextDecoder().decode(new Uint8Array(buffer,0,8));
+    if(!['VHBND001','VHBND002'].includes(version))throw Error('Invalid bindings');cursor=8;
     if(u32()!==records.length)throw Error('Binding count mismatch');
     const array=(Type,count)=>{if(cursor+count*4>buffer.byteLength)throw Error('Truncated bindings');const result=new Type(buffer,cursor,count);cursor+=count*4;return result;};
     const result=records.map(record=>{
         const count=u32(),joint=i32(),native=i32();
         if(count!==record.vertices||joint!==record.joint||Boolean(native)!==record.native)throw Error('Binding metadata mismatch');
+        const center=version==='VHBND002'?array(Float32Array,3):new Float32Array(3);
+        if(center.some(v=>!Number.isFinite(v)))throw Error('Invalid fitted center');
         const ids=array(Uint32Array,count*6),weights=array(Float32Array,count*6),offset=array(Float32Array,count*3);
         if(ids.some(v=>v>=17821)||weights.some(v=>!Number.isFinite(v)||v<0||v>1.0001)||offset.some(v=>!Number.isFinite(v)))throw Error('Invalid binding value');
-        return {...record,ids,weights,offset};
+        return {...record,ids,weights,offset,center};
     });
     if(cursor!==buffer.byteLength)throw Error('Trailing binding data');return result;
 }
@@ -40,7 +43,9 @@ function attach(positions,joints,part){
         const p=i*3,b=i*6;
         if(part.joint>=0){
             const a=part.joint*12,x=part.rest[p],y=part.rest[p+1],z=part.rest[p+2];
-            for(let k=0;k<3;k++)destination[p+k]=joints[a+k*3]*x+joints[a+k*3+1]*y+joints[a+k*3+2]*z+joints[a+9+k];
+            const d=part.center;
+            for(let k=0;k<3;k++)destination[p+k]=joints[a+k*3]*(x-d[0])+joints[a+k*3+1]*(y-d[1])+joints[a+k*3+2]*(z-d[2])+joints[a+9+k]
+                +joints[12+k*3]*d[0]+joints[12+k*3+1]*d[1]+joints[12+k*3+2]*d[2];
         }else if(part.native){destination.set(positions.subarray(part.ids[b]*3,part.ids[b]*3+3),p);}
         else{
             const a=part.ids[b]*3,c=part.ids[b+1]*3,d=part.ids[b+2]*3;
@@ -190,10 +195,10 @@ async function main(){
         worker.postMessage({type:'pose',pose,id:++id},[pose.buffer]);return true;
     }
     state.submitPose=submit;
-    state.setPose=async(expression,yaw=0)=>{
+    state.setPose=async(expression,yaw=0,rotations=null,translation=[0,0,0])=>{
         state.animate=false;
         while(state.pending)await new Promise(resolve=>setTimeout(resolve,10));
-        submit(expression,yaw);const wanted=id;
+        submit(expression,yaw,rotations,translation);const wanted=id;
         while(state.poseId<wanted){if(state.errors.length)throw Error(state.errors.at(-1));await new Promise(resolve=>setTimeout(resolve,10));}
         return {workerMs:state.workerMs,updateMs:state.updateMs};
     };
