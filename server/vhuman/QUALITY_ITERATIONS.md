@@ -1499,3 +1499,24 @@ Receipts: `tmp/vhuman-quality8h/review_browser_checks/verification.json`, its
 desktop/narrow-viewport screenshots, `review/manifest.json`,
 `review/relocation_validation.json`, and
 `review_relocated/eyelid-fit/relocated_checked.validation.json`.
+
+## Held-out optical gaze check for the depth-fitted lids
+
+An additional fixed-lid robustness audit perturbs optical gaze at open,
+half-closed and closed poses (frames 1, 11 and 21). Six rotations per eye add
+pitch +/-10 degrees, either alone or with yaw +/-10 degrees, around the fitted
+optical centers. These directions were not in the original yaw-only track.
+Both baseline and candidate use identical eye rotations and head transforms.
+
+Across 36 checks, strict transverse skin/shell pairs fall from 4,414 to 3,179
+(28.0%); 32 checks improve and none worsens. Per-pose totals are 1,548 to 1,403
+when open, 1,522 to 1,125 half-closed, and 1,344 to 651 closed. The worst
+candidate check still has 176 pairs during upward diagonal gaze, so this
+supports a bounded improvement, not contact acceptance or default promotion.
+The lids are held fixed while optical gaze changes; gaze-dependent lid response,
+visibility, containment, tangency and unsampled motion remain outside this test.
+
+Recipe: `tmp/vhuman-quality8h/audit_lid_heldout_gaze.py`; receipt:
+`lid_camera_fit_joint/heldout_gaze.json` under the same work directory. The
+receipt hashes the recipe and all six source inputs, including both motion
+files, optical assets and alignment geometry.
