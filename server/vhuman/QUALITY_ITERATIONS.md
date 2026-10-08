@@ -502,3 +502,29 @@ Tests include exact photograph protection, target geometry provenance, omitted
 old coverage claims, transfer-map tampering, and excessive geometry-change
 rejection. Receipts: `completed_anatomy/generated_skin.json`,
 `completed_anatomy_render60/`, and `transfer_metrics.json` under the study root.
+
+## Tone comparison on completed repaired anatomy
+
+A new Blender surface audit covers 896701 skin samples on the repaired mesh.
+It flags 647 of 175458 photographed texels as occluded at the 0.25 mm source-ray
+tolerance; this pass leaves all photographed texels unchanged. The static skin
+USD roundtrip preserves triangle/UV data and texture pixels, with maximum
+coordinate error 7.45e-9 m. This is still skin-only USD, not complete anatomy.
+
+Three normal-compatible surface-tone trials use strength/prior 2/0.5, 8/0.3,
+and 20/0.1. Seam metrics are respectively 0.0400561, 0.0366182 and 0.0334584,
+versus 0.0431738 before correction. Each retains geometry and all photographed
+texels exactly. Four matched OptiX renders reuse the same packed full-anatomy
+scene, camera, lights, seed and materials, changing only the basecolor image.
+Side tone becomes more even; the strongest trial smooths broad color variation
+more aggressively. `completed_tone_balanced` is selected as the working material
+for continued validation (15.18% lower seam metric), not promoted as a final
+reconstruction. Scalp mottling and source-projection artifacts remain visible.
+
+The refinement receipt now describes inherited appearance support accurately
+for transferred priors and gives each output its own candidate ID. Ten focused
+surface/transfer tests pass. All three real outputs also pass candidate hash
+validation and exact geometry/photographic-pixel comparisons. Receipts under
+`tmp/vhuman-quality8h/`: `completed_surface_audit/`,
+`completed_tone_sweep.json`, `tone_comparison/report.json` and
+`tone_comparison/comparison.png`.

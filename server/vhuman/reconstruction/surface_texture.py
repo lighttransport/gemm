@@ -113,9 +113,10 @@ def refine(candidate, audit, out, *, repair_projection=False,confidence_threshol
             repair_projection=repair_projection,confidence_threshold=confidence_threshold,
             editable_photographed_texels=int(editable.sum()),protected_photographed_texels=int(protected.sum()),
             protected_texels_changed=protected_changed,repair_mask_sha256=sha256(out/'skin_projection_repair.png'),
-            coverage_note='Inherited generator coverage; color regularization adds no observation or view support',
+            coverage_note='Existing appearance support is unchanged; color regularization adds no observation or view support',
             seam_before=seam_energy(points,colors,observed),seam_after=seam_energy(points,srgb_to_linear(image[valid]/255.),observed)))
     report['limitations']=list(report['limitations'])+['surface tone is a regularized appearance prior, not measured reflectance']
+    manifest['id']=out.name
     manifest['material']['synthetic_completion']=report
     manifest['material_refinement']=dict(source=str(candidate),geometry_unchanged=True,projection_repair=repair_projection)
     for name,data in [('generated_skin.json',report),('manifest.json',manifest),('skin_material.json',manifest['material'])]:
