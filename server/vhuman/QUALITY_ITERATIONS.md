@@ -1221,3 +1221,50 @@ Receipts under `tmp/vhuman-quality8h/`: `tooth_material_trial/{report.json,
 appearance_metrics.json,mouth_comparison.png,gradient.blend}`,
 `color_ramp_roundtrip/receipt.json`, `usd_material_ramp_tests.log`, and
 `tooth_gradient_usd_baked/{report.json,portable.blend}`.
+
+## Animated inner-lid ribbons and topological attachment
+
+Two tissue-ribbon constructions were evaluated on the 41-frame combined
+blink/head/gaze motion. Both leave the working skin and optical meshes
+unchanged. Four radial rows connect each skin attachment to the fitted
+sclera/cornea shell with a 25 micrometre offset. A minimum radial width of
+50 micrometres prevents collapsed triangles, but allows hidden penetration
+where the outer skin attachment already lies inside the globe.
+
+The first construction projects 192 ordered landmark-contour samples onto
+nearby exterior skin triangles and follows fixed barycentric weights. Initial
+projection distances reach 0.431/0.425 mm for left/right eyes. It has no
+zero-area triangles, but up to 28 strict ribbon self-crossing pairs at a
+saved pose. Crossings cluster between upper/lower strips near the corners.
+At a closed-blink +60-degree view, saved PNG optical-mask pixels above 3/255
+in any channel decrease from 18 to two. That apparent closure benefit does
+not establish valid anatomy because the ribbons intersect themselves.
+
+The second construction recovers each actual 40-vertex eye aperture from
+boundary edges of the exterior skin mesh, subdivides each edge into four
+attachments, and binds exactly to those edges. Each ribbon has 640 vertices
+and 960 triangles. Across 81 saved and half-frame positions per eye (162
+checks), there are no detected strict ribbon self-crossings or ribbon/skin
+crossings. Minimum double triangle area is 4.02968e-9 square metres; maximum
+saved-pose outer attachment error is 1.863e-9 metres after float32 storage.
+These are finite samples, not continuous collision or coplanar-overlap proof.
+Every sampled eye has ribbon/optical-shell crossings, with a maximum of 90
+triangle pairs. The minimum-width rule cannot repair the underlying
+lid/globe overlap.
+
+Matched 1024-square OptiX renders show little visible benefit from this
+second construction: open-eye crop MAE is 0.01389/255 and closed-side crop
+MAE is 0.000730/255. At the same closed-side mask view, exposed optical
+pixels decrease only from 18 to 15. The earlier 15-pixel blink result used
+a different orbit pivot, so only comparisons within this paired recipe are
+used here. Both ribbon constructions remain experimental and unpromoted.
+A coupled lid/globe fitting change is needed before treating added tissue
+as a closure solution.
+
+Recipes and receipts under `tmp/vhuman-quality8h/`:
+`build_inner_lid_motion.py`, `build_inner_lid_boundary_motion.py`,
+`audit_inner_lid_boundary_contacts.py`,
+`inner_lid_motion/geometry_audit.json`,
+`inner_lid_boundary_motion/{geometry_audit,contact_audit}.json`, and
+`inner_lid_boundary_render/{metrics.json,comparison.png}`. The material is
+an authored muted pink prior, not recovered conjunctival reflectance.
