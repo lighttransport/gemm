@@ -1520,3 +1520,22 @@ Recipe: `tmp/vhuman-quality8h/audit_lid_heldout_gaze.py`; receipt:
 `lid_camera_fit_joint/heldout_gaze.json` under the same work directory. The
 receipt hashes the recipe and all six source inputs, including both motion
 files, optical assets and alignment geometry.
+
+A follow-up scales the camera-ray correction by 1.05, 1.10 and 1.25 without
+changing the optical shells. Held-out pair totals fall further to 3,132, 3,070
+and 2,832, but respectively two, two and one checks worsen relative to the
+current candidate. More importantly, all three violate the existing neutral
+triangle-area gate over the 41 saved poses: minimum oriented area ratios are
+0.09056, 0.08002 and 0.04840, versus the required 0.1 and current 0.10090.
+There are 10, 14 and 25 failing face/frame samples. Maximum displacements are
+0.764, 0.801 and 0.910 mm. These variants are rejected; fewer crossing pairs
+alone do not justify more compressed eyelid triangles. Future clearance work
+needs local constrained deformation rather than a uniform depth multiplier.
+
+The separate baseline-relative area diagnostic uses the already deformed blink
+mesh and must not substitute for the neutral-reference gate. The latter rotates
+neutral normals by the recorded head rotation, matching the original repair
+criterion. Recipes are `audit_lid_depth_scale.py` and
+`audit_lid_depth_scale_area.py`; receipts are
+`lid_camera_fit_joint/heldout_depth_scale.json` and
+`lid_camera_fit_joint/heldout_depth_scale_area.json` in the work directory.
