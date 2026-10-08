@@ -55,6 +55,22 @@ class DirectionalSurfaceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             area_constraints(np.zeros((1,3,3)), np.array([[0,1,2]]), [0,1,0])
 
+    def test_barycentric_attachment_stays_fixed(self):
+        frame = np.array([[[0,0,0], [.001,0,0], [0,.001,0]]])
+        ids = np.array([[0,1,2]])
+        weights = np.array([[.25,.25,.5]])
+        offsets, report = constrain_offsets(frame, ids, [0,1,0], [0,0,-2],
+                                            fixed_attachments=(ids, weights))
+        self.assertTrue(report['converged'])
+        self.assertLess(abs((weights@offsets).item()), 1e-8)
+        self.assertGreaterEqual(report['minimum_area_ratio'], .2-1e-8)
+
+    def test_invalid_attachment_rejected(self):
+        frame = np.array([[[0,0,0], [.001,0,0], [0,.001,0]]])
+        with self.assertRaises(ValueError):
+            constrain_offsets(frame, np.array([[0,1,2]]), [0,1,0], [0,0,-2],
+                              fixed_attachments=(np.array([[0,1,3]]), np.array([[0,0,1]])))
+
 
 if __name__ == '__main__':
     unittest.main()

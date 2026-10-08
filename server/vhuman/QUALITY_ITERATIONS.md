@@ -183,10 +183,43 @@ TMPDIR="$PWD/tmp" OMP_NUM_THREADS=2 tmp/vhuman-texture-venv/bin/python -m unitte
   server.vhuman.test_reconstruction
 ```
 
+## Fixed-attachment lip fitting
+
+`directional_surface` now optionally constrains barycentric attachments to zero
+displacement, using equality projections alongside the area and displacement
+constraints. An experiment fixes all 468 canonical face attachments while
+retaining the 21 expression-pose constraints. A strict 0.0000001 mm tolerance
+does not converge within 10,000 sweeps; that result remains diagnostic only.
+Repeating with an explicit 0.001 mm tolerance converges in 2299 sweeps.
+
+The converged trial at `tmp/vhuman-quality8h/oral_anchored_micron` retains tooth
+IoU 0.42331 (495 visible tooth pixels, 414 overlapping the 897-pixel heuristic).
+Maximum landmark shift is 0.001377 px; weighted mouth error is 0.98621 px versus
+the original 0.98633 px, and held-out mouth error is 1.33216 px versus 1.33217 px.
+The denser 101-pose ramp has no reversals and minimum area ratio 0.35572. Thus
+the earlier landmark regression is resolved without losing the visibility gain.
+This is a constrained surface experiment, not an independently held-out fit:
+all attachments, including the original held-out subset, are fixed to their
+baseline 3D positions rather than newly fitted to their image targets.
+
+Orientation and landmarks still do not fully characterize quality. Around the
+lips, triangle normal changes have median 2.86 degrees, 95th percentile 13.14
+degrees and maximum 73.02 degrees; maximum edge stretch is 2.02x. Those local
+distortions require visual inspection and further regularization/contact work
+before promotion. The freshly rebaked candidate is
+`tmp/vhuman-quality8h/lip_candidate_anchored`. No synthetic-completion provenance
+is carried across the geometry change. Its OptiX render and fresh-process packed
+asset reload pass (20.2 seconds, 2709 MiB peak whole-device memory). Front-view
+inspection retains the visibility improvement; it does not resolve the measured
+local distortion or prove contact quality.
+
+The regression command above now passes 39 tests, including new checks for
+fixed barycentric attachments and invalid attachment indices.
+
 ## Next experiments
 
-- Fit actual visible lip surfaces with topology constraints; repeat the oral
-  visibility audit before testing dental arch placement and shading variations.
+- Reduce local distortion in the fixed-attachment lip experiment; repeat the
+  oral visibility audit before testing dental arch placement and shading variations.
 - Inspect tongue/cavity, lip contact and eye-lid contact during jaw opening,
   gaze changes and side views.
 - Evaluate the passing geometry candidates before transferring completed skin
