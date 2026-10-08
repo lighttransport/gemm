@@ -1121,3 +1121,34 @@ Shader-driver serialization remains generally static; this specific preview
 holds expression coefficients constant. Nine joint-motion/blink tests pass.
 Additional receipts: `combined_blink_usd/{report.json,portable.validation.json}`
 and `combined_blink_usd_comparison/{metrics.json,comparison.png}`.
+
+## Bounded tongue-placement study
+
+A first 25-placement sweep mistakenly targeted the repaired gaze peak rather
+than the documented surprise defect. All 125 sampled views have zero visible
+tongue crossings, including the unchanged baseline, so this gives no reason
+to alter gaze anatomy. The evidence was rechecked: the four frontal visible
+tongue/cavity pairs belong to `motion_contacts/surprise_10` and `surprise_21`.
+The corrected trial mesh is exactly equal to the saved surprise_10 evidence.
+
+Nine corrected placements translate only tongue vertices by combinations of
+-1/0/+1 mm in Y and Z. No triangle mixes tongue and non-tongue vertices, so
+rigid translation preserves its triangle shapes and leaves other anatomy
+unchanged. The best static candidate moves 1 mm down and 1 mm forward (norm
+1.414 mm), reducing visible tongue/cavity pairs across five views from four
+to two. None of the nine eliminates the visible contacts. The tongue's 32
+expression coefficients are constant at zero in the current gaze, surprise
+and blink stress tracks; lower-face coefficients still drive mouth motion.
+
+Matched 1024-square, 64-sample OptiX mouth renders show only a modest change:
+foreground RGB MAE 0.08558/255; mouth crop [330,560,710,800] MAE 0.40810/255;
+maximum channel difference 67/255; alpha unchanged. Two contacts persist and
+motion behavior was not established, so the tongue is not repositioned.
+The original four pairs touch cavity triangles 29345 and 23349, with centroids
+around Z=-38.6/-42.5 mm, at the back wall. A localized cavity change is a more
+targeted next test than moving the entire tongue. Tongue self-crossings and
+hidden dental contacts are not solved by this study.
+
+Receipts under `tmp/vhuman-quality8h/`: `tongue_contact_sweep/{report,visibility,
+ranked}.json`, `tongue_surprise_sweep/{report,visibility,ranked}.json`, and
+`tongue_placement_render/{report.json,metrics.json,mouth_comparison.png}`.
