@@ -406,3 +406,37 @@ anatomy export remain open. Receipts are `lip_unfold_selected/`,
 `contact_visibility/report_side_views.json` under the study root.
 Regression: 55 tests pass across directional surface, component spacing,
 mesh crossings, oral visibility, and reconstruction modules.
+
+## Joint gum contact and area constraints
+
+The eight distinct extreme-angle visible pairs involve upper tooth/gum
+transitions. Nine separating-plane plus harmonic-extension trials reduce the
+contacts, but sequential area repair reintroduces four targeted pairs. These
+trials are rejected. A joint SLSQP experiment instead minimizes the displacement
+of ten free gum vertices under tooth-plane clearance, original-mesh area floors
+in 21 reference poses, and bounded coordinate displacements. Teeth, exterior
+skin, and all other vertices remain fixed. Clearances of 0.001/0.005/0.02 mm
+all solve; selected 0.005 mm clearance needs at most 0.108602 mm displacement.
+The larger margin requires 0.219964 mm and is not selected.
+
+`lip_candidate_gum_joint` removes all eight targeted pairs. Upper-arch strict
+crossings fall to five and total audited oral pairs to 897; remaining hidden
+contacts are not asserted harmless in arbitrary motion. A 101-pose cumulative
+area check has minimum 0.15 and no reversals. Skin arrays/maps are unchanged,
+so no new photographic bake is claimed. A final OptiX render at 60-degree yaw
+and packed-asset reload pass; side skin remains visibly incomplete, reinforcing
+the need for the planned completion transfer.
+
+Blender rays across yaw -60/-30/0/30/60 find no sampled visible crossings in the
+captured pose. A five-pose neutral-to-captured audit finds none at ramp fractions
+0, 0.25, 0.75, and 1.0. At 0.5, two skin/lower-lip crossing pairs become visible
+from -60, -30 and zero yaw. This is a newly localized motion defect, not a failed
+dental correction; the candidate remains experimental pending its repair and
+broader motion/eye/texture validation.
+
+Reproduction scripts and receipts under `tmp/vhuman-quality8h/`:
+`gum_contact_sweep.py`, `gum_joint_solve.py`, `build_gum_joint.py`,
+`gum_joint/report.json`, `prepare_gum_ramp.py`, `trace_gum_ramp.py`, and
+`contact_visibility/report_gum_ramp_views.json`. These experiments change no
+production solver code. The 55-test regression from the preceding commit remains
+the latest code regression; this step adds geometric and rendered evidence.
