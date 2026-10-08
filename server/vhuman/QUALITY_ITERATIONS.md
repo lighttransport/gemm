@@ -1539,3 +1539,34 @@ criterion. Recipes are `audit_lid_depth_scale.py` and
 `audit_lid_depth_scale_area.py`; receipts are
 `lid_camera_fit_joint/heldout_depth_scale.json` and
 `lid_camera_fit_joint/heldout_depth_scale_area.json` in the work directory.
+
+## Local area-constrained depth extension
+
+The next experiment starts with a 25% depth extension but halves the extension
+weight at vertices of triangles that violate a 0.1005 neutral-area threshold.
+One spatial weight mask is shared by all 41 frames to avoid independent
+per-frame repair jumps. Ten evaluations converge after constraining 13 vertices.
+Maximum displacement from the original blink is 0.825 mm. Float32 saved poses
+and exact cubic interval bounds both retain a minimum area ratio of 0.100517,
+above the 0.1 gate. Non-skin vertices, joints and rotations remain exact; source
+landmark projection changes by at most 0.00008379 pixels.
+
+On the original animation, 170 eye checks reduce summed shell-crossing pairs
+from 12,435 to 7,215 (42.0%) and the worst count from 152 to 98. No local skin
+self-crossings are detected in either track. However, 12 individual checks
+worsen. On the additional 36 optical-gaze checks, pairs fall from 3,179 to 3,016
+(5.1%), with 17 improving and three worsening. The largest such regression is
+134 to 145 pairs at half closure with +10-degree pitch on the left eye.
+
+This is a geometry-only research candidate in `lid_local_depth/`; it is not
+promoted, rendered, or substituted in the review bundles. It demonstrates that
+local area constraints allow more clearance improvement than uniform scaling,
+but the remaining per-pose regressions require a contact-aware objective.
+Strict crossings and the 25 mm local self-audit exclude coplanar overlap,
+containment, visibility and global collision guarantees.
+
+Recipes in `tmp/vhuman-quality8h/`: `build_lid_local_depth.py`,
+`validate_lid_local_depth.py`, `validate_lid_local_projection.py`,
+`audit_lid_local_depth.py`, `audit_lid_local_self.py`. Receipts in
+`lid_local_depth/`: `recipe.json`, `geometry_validation.json`,
+`projection_validation.json`, `heldout_gaze.json`, and `contact_audit.json`.
