@@ -24,7 +24,6 @@ def scalar(value):
     return None
 
 
-
 def color_ramp_record(ramp):
     return dict(color_mode=ramp.color_mode, interpolation=ramp.interpolation,
                 hue_interpolation=ramp.hue_interpolation,
