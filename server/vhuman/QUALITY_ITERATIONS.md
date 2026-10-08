@@ -1639,3 +1639,47 @@ geometry-only measurement. No texture correction is claimed at this checkpoint.
 Receipts: `initial_views/report.json`, `ear_diagnostics/report.json`, and
 `session.json` in the new workspace. Build, fresh-load verification and render
 recipes are beside those directories. Body, clothing and hair remain excluded.
+
+## Local ear color cleanup
+
+Side-view inspection maps the ears to bounded ellipsoids in the fitted surface
+coordinates. The first trial uses robust nearby log-color medians to replace
+unusually pale/cyan texels. It edits 6,252 texels, including 2,237 with photo
+support, but its reference neighborhood includes the broad right-lobe artifact
+and leaves much of that blue patch intact.
+
+The selected second trial excludes blue/high-luminance reference samples before
+estimating local replacement colors. A smooth spatial feather limits the edit
+to the ear regions. It changes 16,709 texels, including 2,965 photo-supported
+texels. The edit mask, source color hash, surface hash and affected counts are
+recorded in `ear_color_trusted/ear_color_report.json`. This is authored color
+cleanup, not newly observed skin or measured reflectance; some real pigmentation
+could be smoothed. Source portrait bytes are not edited. Historical provenance
+is retained, with the obsolete claim of exact photographed texels removed from
+the current limitation list.
+
+Matched 768-square side renders show reduced blue lobe/root patches on both
+ears. Crop RGB changes average 1.127/255 and 2.068/255, with unchanged alpha.
+Mirrored-light 512-square comparisons also retain the improvement (crop changes
+1.125/255 and 1.870/255, unchanged alpha). These differences quantify the edit,
+not objective perceptual accuracy. Broader skin mottling and simplified ear
+folds remain. Hash comparisons establish exact geometry, normal, ORM, coverage
+and confidence maps. All texels outside the weighted edit region are exact.
+
+`preferred_ear_candidate/head.blend` is the new working scene, keeping the
+previous candidate intact. Fresh-process verification again passes 738 animated
+part/frame checks. The packed basecolor SHA-256 equals the selected PNG and its
+color space is sRGB. Both the studio and alternate-light comparisons were
+visually inspected before selection.
+
+All artifacts are under `tmp/vhuman-quality4h/`: recipes
+`repair_ear_color.py`, `repair_ear_color_trusted.py`, `render_ear_color_trial.py`,
+`render_ear_color_trusted.py`, `render_ear_alternate_light.py`; comparisons and
+metrics in `ear_color_render/`, `ear_color_trusted_render/` and
+`ear_alternate_light/`; scene receipts in `preferred_ear_candidate/`.
+
+The updated `preferred_ear_usd/portable.blend` also passes a fresh-process
+USD import: 18 meshes across 81 samples, 1,458 mesh checks and 972 shader
+checks, zero measured shader error and a relative USD cache. Interchange success
+does not remove the inherited eyelid/tongue contact limitations. The selected
+ear basecolor is packed and remains explicit authored appearance.
