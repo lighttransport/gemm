@@ -1907,7 +1907,7 @@ local eyelid correction or authored aperture-gated stress track. The latter
 remain in the checked Blender/USD scenes. Low-frequency scalp/neck tone patches,
 residual eyelid contacts and the known frame-19.5 exposed-crossing regression
 remain visible limitations. Current pointers and provenance are in
-`tmp/vhuman-quality4h/session.json`. `review/` provides 11 matched image pairs,
+`tmp/vhuman-quality4h/session.json`. `review/` provides 15 matched image pairs,
 two complete USD/Blender ZIPs, measurement links and the updated device page;
 its responsive controls, image loading, links and ZIP integrity are checked.
 
@@ -1927,3 +1927,35 @@ to 109. This is not a full-track comparison and is not substituted for the
 preferred candidate; its tradeoff requires broader saved/fractional pose and
 gaze checks. Receipts are in `lid_strength_probe/`. The known regression remains
 explicit rather than being declared resolved by a one-frame trial.
+
+The final matched session comparison uses CUDA on the RTX 5060 Ti: eight
+768-square, 64-sample images with identical camera, lighting and seed. Ear lift
+changes the frontal/rear silhouette; both side-view alpha masks are identical.
+The preferred ear color is cleaner, while broad scalp and jaw/neck patches
+remain visible. `final_matched_render/` includes images, settings/times and
+pixel metrics. The five-panel gallery passes 30 image checks, 17 evidence/download
+links, visible comparison-control changes and a narrow viewport overflow check.
+The existing localhost server serves it at
+`http://127.0.0.1:45615/vhuman-quality4h/review/`; the updated live avatar is at
+`http://127.0.0.1:45615/vhuman-quality4h/player/`.
+
+### Portable reconstruction evidence
+
+Both current USD bundles now include `candidate_evidence/`: a validated
+22-file subset containing original reconstruction geometry and portrait,
+full-resolution appearance maps, completion metadata and protection/edit masks.
+Model weights and inherited capture reports are excluded. Evidence files are
+hashed in `candidate_evidence.json`, whose hash is bound to the USD report.
+Their reconstruction manifest matches `candidate_manifest.json`, and geometry
+matches the verified USD source. The original portrait is included as source
+evidence; redistribution terms still require separate receipts.
+
+`usd_candidate_evidence.py` attaches this subset only to a matching verified
+bundle. The fresh Blender importer optionally verifies its hashes and records
+the result, preserving compatibility with prior bundles. Both current bundles
+pass the additional fresh imports with all 22 evidence files validated. The
+gallery ZIP check also extracts and verifies that subset. Two tests reject
+changed source files, a wrong candidate manifest and altered receipts, and
+confirm verification survives relocation. Candidate directories contain an
+`EVIDENCE_SCOPE.txt` explaining that inherited reports belong to their named
+parent, including the earlier scalp-only `protection_validation.json`.

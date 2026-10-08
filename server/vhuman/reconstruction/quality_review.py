@@ -78,7 +78,11 @@ def build(work):
                    'blender_materials.json', 'blender_material_animation.json',
                    'candidate_manifest.json', 'source_motion.json']
         paths = [root / name for name in members]
-        for folder in ('textures', 'shader_assets'):
+        if 'candidate_evidence_sha256' in report:
+            from .usd_candidate_evidence import verify as verify_evidence
+            verify_evidence(root)
+            paths.append(root/'candidate_evidence.json')
+        for folder in ('textures', 'shader_assets', 'candidate_evidence'):
             paths.extend(sorted(p for p in (root / folder).rglob('*') if p.is_file()))
         target = downloads / (slug + '.zip')
         with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as bundle:

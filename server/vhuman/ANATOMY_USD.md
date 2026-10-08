@@ -160,3 +160,33 @@ comparison controls and narrow-viewport layout in Chromium. This is static
 review verification, not live-avatar or physical-mobile validation. Eyelid and
 tongue candidates retain residual contacts and remain experimental. The linked
 device test page uses the earlier browser avatar, not these new anatomy bundles.
+
+## Candidate-first ear and skin continuation
+
+The later continuation selects `tmp/vhuman-quality4h/tongue_reconstruction/`.
+Its current default and authored mouth stress bundles are
+`preferred_tongue_usd/` and `preferred_tongue_stress_usd/`, with verified
+`portable.blend` scenes and relative USD caches. The five-panel gallery is
+`tmp/vhuman-quality4h/review/`; the updated live avatar and prepared device page
+are in `tmp/vhuman-quality4h/player/`. See `session.json` and
+[QUALITY_ITERATIONS.md](QUALITY_ITERATIONS.md#native-tongue-rest-lift-and-current-candidate-delivery)
+for the actual selected paths, measurements and contact limitations.
+
+Attach portable source evidence after export, using the matching reconstruction:
+
+```sh
+$PY -m server.vhuman.reconstruction.usd_candidate_evidence \
+  --candidate tmp/vhuman-quality4h/tongue_reconstruction \
+  --bundle tmp/vhuman-quality4h/preferred_tongue_usd
+```
+
+Use a bundle without an existing `candidate_evidence/` directory. The command
+validates reconstruction provenance and the USD hash, then copies source
+geometry/portrait, original-resolution appearance maps and masks with a hashed
+inventory. Model weights and inherited capture reports are excluded. The fresh
+USD importer verifies this optional evidence and records it in its receipt.
+Both current default/stress downloads include it; archive verification checks
+the extracted subset as well. This is source evidence preservation, not new
+anatomical or photographic observation. The live browser retains separate
+offline eyelid and authored tongue-gate limitations; physical mobile validation
+remains pending.

@@ -23,6 +23,10 @@ def main():
     report = json.loads((bundle / 'report.json').read_text())
     if report.get('schema') != 'vhuman.animated_anatomy_usd.v1' or not report.get('passed'):
         raise ValueError('verified animated anatomy report required')
+    evidence = None
+    if 'candidate_evidence_sha256' in report:
+        from server.vhuman.reconstruction.usd_candidate_evidence import verify as verify_evidence
+        evidence = verify_evidence(bundle)
     hashes = [('head.usdc', report['usd_sha256']),
               ('blender_materials.json', report['material_sidecar_sha256'])]
     if 'material_animation_sidecar_sha256' in report:
@@ -88,6 +92,7 @@ def main():
                    sample_checks=len(report['checks']), material_verification=materials,
                    material_animation_verification=material_animation,
                    relative_animation_caches=caches, usd_sha256=report['usd_sha256'])
+    if evidence is not None:receipt['candidate_evidence_verification'] = evidence
     output.with_suffix('.validation.json').write_text(json.dumps(receipt, indent=2))
     print(json.dumps(receipt), flush=True)
 

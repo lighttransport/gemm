@@ -36,7 +36,19 @@ def verify(work, out):
                 raise ValueError('unsafe review archive member')
             if not any(name.endswith('/portable.blend') for name in names):
                 raise ValueError('portable Blender scene missing')
+            evidence_names=[name for name in names if name.endswith('/candidate_evidence.json')]
+            evidence=None
+            if evidence_names:
+                if len(evidence_names)!=1:raise ValueError('ambiguous candidate evidence')
+                from .usd_candidate_evidence import verify as verify_evidence
+                prefix=str(Path(evidence_names[0]).parent)+'/'
+                with tempfile.TemporaryDirectory(prefix='evidence-',dir=out) as directory:
+                    required=[prefix+name for name in ('head.usdc','report.json','candidate_manifest.json','candidate_evidence.json')]
+                    required.extend(name for name in names if name.startswith(prefix+'candidate_evidence/'))
+                    for name in required:archive.extract(name,directory)
+                    evidence=verify_evidence(Path(directory)/Path(prefix))
             archives.append(dict(name=path.name, files=len(names), bytes=path.stat().st_size))
+            if evidence is not None:archives[-1]['candidate_evidence']=evidence
     class Quiet(SimpleHTTPRequestHandler):
         def log_message(self, *_):
             pass
