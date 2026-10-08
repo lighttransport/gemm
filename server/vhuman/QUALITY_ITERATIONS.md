@@ -708,3 +708,67 @@ Receipts/scripts under `tmp/vhuman-quality8h/`: `motion_stress_current_bind/`,
 `repair_motion_current_bind.py`. The preliminary original-neutral results remain
 in `motion_stress/` and `motion_stress_repaired/` and must not be mistaken for the
 current reference or used as accepted animation assets.
+
+## Dynamic oral contacts and rigid-arch counterexample
+
+Visibility tests on the start, peak and final frames of the full-strength
+surprise/blink/gaze stress tracks expose defects absent from the static ramp.
+Late gaze has eight lower-lip crossing pairs at both mouth corners. Surprise
+has tooth/gum, cavity/dental and cavity/tongue contacts, including four visible
+cavity/tongue pairs in the frontal peak and final poses. The blink prior only
+narrows the eyes; it is not a complete-closure test. These are cross-subject
+stress priors, not target-subject expression observations.
+
+A local gaze repair constrains vertices against separating triangle planes
+while preserving the facial attachment matrix through its null space. It also
+retains at least 80% of each affected triangle's pre-contact-repair oriented
+area, caps displacement at 0.3 mm and penalizes changes from the previous
+frame's correction. The initial frame is unchanged. The first trial removes
+the eight endpoint pairs, but a full-frame/midpoint visibility sweep finds
+three additional pairs at frame 13 (zero-based), around triangle 10717.
+Those pairs are added to the second joint solve rather than treating the
+endpoint-only result as an accepted animation.
+
+The second trial's saved float32 geometry changes by at most 0.018090 mm;
+maximum projected attachment shift is 0.00000438 px. All 85 quarter-frame
+linear interpolation samples retain an oriented area ratio of at least
+0.100749 against the current repaired bind under the matching joint pose.
+Maximum correction second difference is 0.036180 mm. These finite samples do
+not prove continuous-time collision freedom or acceptable temporal appearance.
+
+A separate lower-dental experiment tests rigid arch motion fitted to the native
+track. The upper arch already fits a rigid transform to within 0.000026 mm,
+but the lower teeth deviate by up to 2.516 mm at peak surprise. Fitting the
+entire lower teeth/gums to their captured shape requires up to 2.672 mm change.
+It preserves the original within-arch geometry, including 23 hidden strict
+crossing pairs; rigidification cannot remove those existing contacts.
+
+The rigid trial fails its broader contact gate: peak surprise gains four
+frontal lower-dental/tongue crossing pairs and additional side cavity contacts.
+It is not promoted. Matched OptiX renders show a plausible dental shape, but
+appearance alone would miss this failure. The native and rigid peak renders
+both pass packed-asset reload validation, with whole-device peaks of 3792 and
+3879 MiB respectively. The next dental correction needs a coupled arch/gum,
+tongue and cavity treatment, not an isolated rigid replacement.
+
+Receipts/scripts under `tmp/vhuman-quality8h/`: `motion_contacts/visibility.json`,
+`motion_surprise_render/render_result.json`, `repair_gaze_contacts_v2.py`,
+`motion_gaze_contact_repair_v2/validation.json`, `motion_gaze_contact_audit/`,
+`rigid_lower_arch_motion.py`, `motion_rigid_lower_arch/report.json`,
+`motion_rigid_arch_contacts/visibility.json`, and
+`motion_arch_comparison/comparison.png`. No full-anatomy motion is promoted.
+
+The expanded gaze trial then passes the independent oral visibility sweep:
+43 time samples (22 stored frames and 21 linear midpoints) times five yaw views
+produce 215 checks with zero detected visible crossing pairs. This audit uses
+five samples along each strict intersection segment, opaque BVH visibility and
+0.05 mm depth tolerance. Hidden crossings, coplanar contact, unsampled times
+and unsampled views remain outside that result. The corrected frame 13 also
+renders and passes packed-asset reload, at 3878 MiB whole-device peak. See
+`motion_gaze_contact_audit_v2/visibility.json` and
+`motion_gaze_repaired_render/render_result.json`.
+
+Localization of the captured lower arch's 23 strict crossings finds 22
+pairs with exactly one gum triangle and one gum/gum pair; none are tooth/tooth.
+`lower_arch_bind_contacts.json` records their triangle IDs for the next bounded
+gum repair. This explains why arch rigidification alone preserves the problem.
