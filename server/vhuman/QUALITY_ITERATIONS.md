@@ -631,3 +631,39 @@ Receipts under `tmp/vhuman-quality8h/`: `lid_ray_targets/report.json`,
 `eye_conjunctiva_comparison/eyes_comparison.png`, `conjunctiva.npz`, and
 `geometry_audit.json`. Scripts: `audit_lid_ray_targets.py`,
 `render_conjunctiva_trial.py` and `launch_conjunctiva_trial.py` in the study root.
+
+## Complete static anatomy USD and material restoration
+
+The reusable `usd_anatomy_worker.py` exports 18 meshes: skin, cavity, upper/lower
+teeth and gums, tongue, bilateral optical eye parts, tear lines and lashes.
+It requires matching prepared-scene geometry/portrait and permits only a
+basecolor refinement without rebuilding the scene. USD uses metres, Y-up and
+relative texture paths. Original per-component and GNM arrays accompany the
+package as NPZ. Experimental translated eyes and inner-lid strips are excluded.
+
+The first USD import preserves cornea transmission but drops subsurface weights
+and parts of the native material setup. New `usd_materials.py` captures a
+checksummed static Blender node/image sidecar and restores it after USD import.
+It rejects nested node groups and preserves static socket values only, not
+animation drivers. The exporter preserves subdivision settings separately.
+
+The completed `full_anatomy_usd` bundle passes geometry, UV, material binding,
+node/socket/link, and packed-image checks. Relocating the whole directory and
+running `usd_import_worker.py` in a fresh process passes independently: 18 meshes,
+11 materials, 67 nodes and 18 packed images; maximum coordinate error is
+1.77e-8 m, with exact triangle order and UV values. No source render directory
+is read by the importer. The restored scene is saved as a portable `.blend`.
+
+A matched OptiX render after USD import and material restoration differs from
+the native scene by mean 0.2635/255 foreground RGB and 99th-percentile 2/255;
+56 alpha pixels differ. The images are visually close, not pixel-identical.
+This proves static interchange for the tested Blender version, not arbitrary
+USD shader support or motion export. Native expression/skeletal animation is
+still absent. See `ANATOMY_USD.md` for the exact export/import commands.
+
+Validation: two real-Blender material tests pass, covering roundtrip node/image
+restoration, modified shader rejection, corrupted image rejection and external
+asset-path rejection. Python compilation and `git diff --check` also pass.
+Artifacts under `tmp/vhuman-quality8h/`: `full_anatomy_usd/`,
+`full_anatomy_usd_relocated/portable.validation.json`,
+`usd_render_comparison/comparison.png`, and `usd_render_comparison/metrics.json`.
