@@ -96,10 +96,50 @@ tests pass. Three new tests cover bounded ocular fitting, unreachable targets
 and invalid observations. GPU parity and rendered asset-reload checks are
 separate real-hardware evidence.
 
+## Oral visibility audit
+
+The bright, low-chroma source pixels inside the eight observed inner-lip
+landmarks provide a conservative tooth-region heuristic (897 pixels). Rasterizing
+the complete native anatomy with the **fitted** camera finds 370 visible tooth
+pixels, with 308 overlapping the heuristic: IoU 0.32117 and recall 0.34337.
+Of the target pixels, 585 are occluded by exterior skin, specifically 177 by
+upper-lip triangles and 408 by lower-lip triangles. Cavity triangles occlude
+none. This identifies lip surface coverage as a fitting defect even though
+inner-lip attachment projections closely match the source.
+
+The numerical-pass geometry variants only slightly improve this measurement:
+`fit_surface1` has IoU 0.33089 (374 visible tooth pixels), and `fit_combined`
+has IoU 0.33438 (380 pixels). Neither resolves the oral appearance problem.
+
+A 25-trial exploratory sweep applies graph-smoothed upper/lower lip offsets
+of 0, 0.5, 1, 1.5 and 2 mm in camera-up/down directions. The largest offset
+improves IoU to 0.52422, but **all 24 nonzero trials reverse some triangle
+orientations**. None is promoted. Larger tooth exposure is not sufficient
+evidence of a usable fit; future fitting must jointly constrain visible lip
+surfaces, native expressions and topology. These trials also demonstrate why
+landmark error alone is inadequate. Receipts and the exploratory script are
+in `tmp/vhuman-quality8h/oral_audit/`.
+
+The reusable audit records geometry/portrait hashes, the final camera,
+thresholds, masks, visible triangle IDs, depth, overlay and overlapping anatomy
+group counts. It deliberately makes no acceptance decision: bright pixels are
+not independent dental ground truth, and source-view coverage cannot validate
+motion, tooth shape or shading. Three unit tests cover mask exclusion, overlap
+and invalid inputs; the real source audit reproduces the counts above.
+
+```sh
+TMPDIR="$PWD/tmp" OMP_NUM_THREADS=2 tmp/vhuman-texture-venv/bin/python \
+  -m server.vhuman.reconstruction.oral_visibility \
+  /mnt/nvme02/models/vhuman-texture-inputs/obama/material12 \
+  --out tmp/vhuman-quality8h/oral_visibility_baseline
+```
+
+Use a fresh output directory for each run.
+
 ## Next experiments
 
-- Quantify dental silhouette and color against the source mouth region; test
-  bounded arch placement and oral shading variations.
+- Fit actual visible lip surfaces with topology constraints; repeat the oral
+  visibility audit before testing dental arch placement and shading variations.
 - Inspect tongue/cavity, lip contact and eye-lid contact during jaw opening,
   gaze changes and side views.
 - Evaluate the passing geometry candidates before transferring completed skin
