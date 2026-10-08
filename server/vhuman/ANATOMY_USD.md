@@ -108,3 +108,10 @@ field retain the original joint transform.
 `joint_motion.shifted_joint_positions` validates the arrays and proper rotations.
 It does not validate anatomical placement or contacts. Sampled USD bakes the
 resulting positions; it does not preserve this editable joint-center control.
+
+The Blender material sidecar also retains static Color Ramp stops (position
+and RGBA), color mode, interpolation and hue interpolation. Verification checks
+these nested values explicitly. Named point attributes used by a shader still
+need their own mesh round-trip check; restoring a node does not establish that
+its input attribute exists. The tooth-gradient study verifies its `enamel_tip`
+float point values separately on both baked tooth meshes.

@@ -24,6 +24,14 @@ def scalar(value):
     return None
 
 
+
+def color_ramp_record(ramp):
+    return dict(color_mode=ramp.color_mode, interpolation=ramp.interpolation,
+                hue_interpolation=ramp.hue_interpolation,
+                elements=[dict(position=float(e.position), color=list(e.color))
+                          for e in ramp.elements])
+
+
 def capture(materials, out):
     import bpy
     out = Path(out)
@@ -49,6 +57,8 @@ def capture(materials, out):
             entry = dict(name=node.name, type=node.bl_idname, properties=props,
                          inputs={str(i):scalar(s.default_value) for i, s in enumerate(node.inputs)
                                  if hasattr(s, 'default_value') and scalar(s.default_value) is not None})
+            if node.type == 'VALTORGB':
+                entry['color_ramp'] = color_ramp_record(node.color_ramp)
             if node.type == 'TEX_IMAGE' and node.image:
                 image = node.image
                 if image.name not in image_records:
@@ -102,6 +112,16 @@ def restore(directory):
             for key, value in entry['properties'].items():
                 setattr(node, key, value)
             node.name = entry['name']
+            if 'color_ramp' in entry:
+                spec, ramp = entry['color_ramp'], node.color_ramp
+                for key in ('color_mode', 'interpolation', 'hue_interpolation'):
+                    setattr(ramp, key, spec[key])
+                while len(ramp.elements) > 1:
+                    ramp.elements.remove(ramp.elements[-1])
+                for i, stop in enumerate(spec['elements']):
+                    element = ramp.elements[0] if i == 0 else ramp.elements.new(stop['position'])
+                    element.position = stop['position']
+                    element.color = stop['color']
             if 'image' in entry:
                 node.image = images[entry['image']]
             for index, value in entry['inputs'].items():
@@ -136,6 +156,15 @@ def verify(directory):
                 equal = actual == expected if isinstance(expected, (str, bool)) else np.allclose(actual, expected, atol=1e-7, rtol=1e-7)
                 if not equal:
                     raise ValueError('restored node property differs: '+key)
+            if 'color_ramp' in entry:
+                actual, expected = color_ramp_record(node.color_ramp), entry['color_ramp']
+                if (any(actual[key] != expected[key] for key in
+                        ('color_mode', 'interpolation', 'hue_interpolation'))
+                        or len(actual['elements']) != len(expected['elements'])
+                        or any(not np.allclose([a['position'], *a['color']],
+                                               [b['position'], *b['color']], atol=1e-7, rtol=1e-7)
+                               for a, b in zip(actual['elements'], expected['elements']))):
+                    raise ValueError('restored color ramp differs')
             for index, expected in entry['inputs'].items():
                 actual = scalar(node.inputs[int(index)].default_value)
                 equal = actual == expected if isinstance(expected, (str, bool)) else np.allclose(actual, expected, atol=1e-7, rtol=1e-7)

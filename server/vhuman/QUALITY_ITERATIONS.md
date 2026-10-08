@@ -1183,3 +1183,41 @@ Receipts under `tmp/vhuman-quality8h/`: `cavity_backwall_sweep/{report,visibilit
 and `cavity_local_sweep/{report,visibility}.json`. These are static bounded
 geometry studies with finite segment/visibility sampling; no dynamic contact
 acceptance is asserted.
+
+## Tooth appearance priors and color-ramp interchange
+
+Six matched 1024-square, 64-sample OptiX renders compare the existing tooth
+material against a warmer scattering/coat prior and a root-to-tip color
+variation, in smile and open-mouth poses. Each arch has 16 connected tooth
+components. An `enamel_tip` FLOAT/POINT attribute normalizes Y within each
+component, reversing direction for upper teeth. It follows the existing
+mesh deformation; this coordinate is an appearance heuristic, not measured
+enamel thickness. Geometry, tooth spacing and the working fit stay unchanged.
+
+The warm trial uses linear color (0.53,0.46,0.34), roughness 0.23, IOR 1.55,
+SSS weight 0.08 with authored 0.7/0.4/0.2 mm radii, and coat weight 0.12.
+The gradient varies color from (0.45,0.35,0.23) to (0.62,0.58,0.48). These are
+artist settings, not recovered dental reflectance. Mouth-crop RGB MAE versus
+the original material is 0.471/0.692 per 255 for warm smile/open poses and
+0.332/0.475 for gradient. Alpha is unchanged. Visual changes are modest and
+do not establish improved anatomy; the materials remain optional trials.
+
+The trial exposed a material-sidecar omission: color-ramp stops were skipped
+as nested properties. `usd_materials` now serializes/restores/verifies color
+mode, interpolation, hue interpolation, stop positions and RGBA colors.
+A Blender regression test round-trips a nondefault four-stop HSV ramp and
+rejects both modified stop color and changed interpolation before restoring
+successfully. Run it with repository-local TMPDIR and Blender's
+`--python server/vhuman/test_usd_materials.py`; it skips outside Blender.
+
+A static two-mesh USD roundtrip preserves both 934-value `enamel_tip`
+attributes exactly and verifies the four-node gradient shader. The initial
+probe used Blender's default shape-key export, creating a transform hierarchy
+instead of the expected baked mesh objects; the corrected probe explicitly
+disables shape keys, matching the project's sampled-mesh exporter. This is
+static attribute/shader validation, not an animated-material or fit guarantee.
+
+Receipts under `tmp/vhuman-quality8h/`: `tooth_material_trial/{report.json,
+appearance_metrics.json,mouth_comparison.png,gradient.blend}`,
+`color_ramp_roundtrip/receipt.json`, `usd_material_ramp_tests.log`, and
+`tooth_gradient_usd_baked/{report.json,portable.blend}`.
