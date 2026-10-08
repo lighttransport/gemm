@@ -440,3 +440,36 @@ Reproduction scripts and receipts under `tmp/vhuman-quality8h/`:
 `contact_visibility/report_gum_ramp_views.json`. These experiments change no
 production solver code. The 55-test regression from the preceding commit remains
 the latest code regression; this step adds geometric and rendered evidence.
+
+## Landmark-preserving contact repair across the expression ramp
+
+The halfway-expression defects share triangle 10717 at one mouth corner.
+Restricting changes to its two unanchored neighboring vertices fails joint
+full-ramp contact/area constraints. Solving only the 0.4–0.6 interval converges
+but leaves contacts elsewhere on the ramp; those proposals are rejected.
+
+Expanding to a 19-vertex one-ring patch and solving in the null space of its
+facial-attachment matrix retains all fitted barycentric landmark positions.
+The patch has 16 scalar null-space dimensions. A joint constrained solve over
+101 neutral-to-captured poses converges in five iterations with 0.005 mm
+separating-plane clearance and maximum vertex displacement 0.041806 mm. Both
+targeted pairs are absent throughout that sampled ramp. The cumulative full
+mesh area ratio remains at least 0.15, with no reversals; maximum attachment
+displacement is 6.985e-18 mm. Numerical precision, not anatomical accuracy, is
+what this attachment metric establishes.
+
+`lip_candidate_ramp_patch` has a fresh portrait bake, unchanged measured landmark
+errors, and passes final OptiX rendering plus packed-asset reload (20.64 seconds,
+2709 MiB peak whole-device memory). Full audited oral crossing enumeration at
+11 ramp fractions followed by Blender rays at five yaw angles finds zero
+sampled visible pairs in all 55 pose/view combinations. Hidden strict contacts
+remain (897 in the captured pose), and arbitrary expressions, boundary-only,
+coplanar and containment cases are not covered by this test.
+
+This is the working geometry for completed-skin transfer, still unpromoted.
+Next gates include appearance transfer with changed-geometry provenance, wider
+oral motion, eyelid/gaze contact and full-anatomy export/browser comparisons.
+Scripts/receipts under `tmp/vhuman-quality8h/`: `lip_ramp_joint.py`,
+`lip_ramp_local.py`, `lip_ramp_patch.py`, `evaluate_lip_ramp_patch.py`,
+`build_lip_ramp_candidate.py`, `lip_ramp_patch/evaluation.json`, and
+`contact_visibility/report_lip_patch_ramp_views.json`.

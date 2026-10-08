@@ -1,5 +1,12 @@
 # Virtual-human closeout
 
+Historical closeout below describes the September independence pass. The user
+reopened face fitting and texture quality work on October 8, including eyeballs,
+teeth, gums and tongue, with body/clothing/hair excluded. Current experiments,
+validation evidence and remaining gates are tracked in
+[QUALITY_ITERATIONS.md](QUALITY_ITERATIONS.md). Experimental candidates do not
+replace the accepted material until the current gates pass.
+
 The user accepted the existing fitting quality on 2026-09-28. The subsequent
 independence pass replaces the asset-derived eye profile and engine-specific
 material equations, defaults and exports. It does not reopen fitting research.
