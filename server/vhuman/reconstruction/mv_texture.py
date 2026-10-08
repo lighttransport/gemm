@@ -458,6 +458,7 @@ def main():
     p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--one-band',action='store_true');p.add_argument('--spec',default=DEFAULT_HYBRID);p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
+    if a.stage=='generate' and a.backend not in BACKENDS:p.error(f'generate needs --backend in {BACKENDS}')
     if a.stage=='generate':
         opts=dict(seed=a.seed);opts.update(steps=a.steps) if a.steps else None
         print(json.dumps(generate(a.work,a.backend,**opts),indent=1))

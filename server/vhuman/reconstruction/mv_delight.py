@@ -4,7 +4,8 @@ Generated views carry directional shading, scalp sheen and dark blobs that must
 not become albedo. Per view: (1) fit second-order spherical-harmonic shading of
 log-luminance on the GNM normals (robust IRLS) and divide it out; (2) flatten
 remaining broad luminance blobs with a masked low-pass, keeping chroma and
-fine detail. Both steps only rescale luminance, so hue is the generator's.
+fine detail. Both steps only rescale luminance, so hue is the generator's, unless
+chroma=True (used for hybrid structure views) also flattens broad hue blotches.
 """
 import numpy as np
 from scipy.ndimage import gaussian_filter
