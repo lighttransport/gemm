@@ -1692,3 +1692,39 @@ provenance record and edit mask. Five numerical tests cover outlier reduction,
 exact exterior/protected pixels, zero strength, uniform/empty regions, a single
 trusted reference, and invalid/overlapping input. The actual reproduced mask
 contains every changed texel. See `BLENDER_TEXTURE.md` for usage and limitations.
+
+## Region-bounded scalp detail cleanup and ear projection probe
+
+A broader 2.5 mm normal-compatible log-color filter targets upper/posterior
+skin, with a 6 mm feather away from photographed support. Unlike the earlier
+whole-unobserved-surface trial, it uses 1 mm surface/normal voxels and an explicit
+scalp region. Half/full strengths were rendered at front, -75-degree side and
+150-degree rear views. Full strength visibly reduces synthetic scalp speckling;
+broad tone patches remain. A strict protection check caught 18 changed texels
+at the edge of the ear ellipsoid in the first trial. The final recipe explicitly
+excludes both full ear regions, and its three comparison renders were repeated.
+
+The selected `scalp_detail_exactear_1.0` changes 157,900 texels, with zero changes
+to photographed support or either ear region relative to the working ear
+candidate. Geometry, normal, ORM, coverage, confidence and portrait hashes are
+exact. Foreground RGB MAE is 0.03446/255 front, 0.56994/255 side and 0.39218/255
+rear; alpha is unchanged. Boundary color-jump energy rises slightly from
+0.0286184 to 0.0286310 (about 0.04%). Selection is based on the observed reduction
+of speckling, not a claim that every metric improved or that natural skin detail
+was recovered. The filter may attenuate plausible synthetic pigmentation.
+
+`preferred_skin_candidate/head.blend` carries the selected appearance. Fresh
+scene validation passes all 738 animated mesh checks and the packed basecolor
+hash/color-space check. The earlier ear-only portable bundle remains available;
+this additional appearance is not yet exported into that bundle.
+
+A source-camera ear probe separately compares broad geometric ear regions with
+the parser's ear labels. Region IoU is 0.544/0.554, but these ellipsoids are not
+exact anatomical segmentation. More significantly, only 2,181 of 3,661 parsed
+ear pixels are covered by any projected skin (59.6%). The overlay shows missing
+upper-ear extent, motivating a bounded fitting experiment. Parsing is uncertain
+single-view evidence, not ground-truth anatomy; this is not a 3D accuracy score.
+
+Artifacts under `tmp/vhuman-quality4h/`: `filter_scalp_detail_exactear.py`,
+`scalp_detail_exactear_1.0/protection_validation.json`, `scalp_exactear_render/`,
+`preferred_skin_candidate/`, and `ear_projection/{report.json,overlay.png}`.
