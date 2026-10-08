@@ -1615,3 +1615,27 @@ browser avatar, and physical mobile testing when a device is available. The
 latest local eyelid extension remains unpromoted because of its visible
 fractional-frame regression. Prior promoted assets and user-owned resume files
 remain intact. All session commits are local; no push was performed.
+
+## Four-hour continuation: preferred candidate and ears
+
+The user selected the candidate as the preferred working version and requested
+four more hours of cleanup and quality work, now including ear texture and skin.
+The new workspace is `tmp/vhuman-quality4h/`. `preferred_candidate/head.blend`
+uses the local area-constrained eyelid extension, retaining its known contact
+limitations. The prior scene remains available for comparison. Its motion
+provenance now carries the actual local-extension area checks and source hash.
+A fresh Blender process verifies 738 part/frame samples with maximum coordinate
+error 2.053e-9 metres (`preferred_candidate/motion_validation.json`).
+
+Four initial 768-square CPU renders show front, both 75-degree side views and
+closed lids. GPU memory was occupied by another workload, with only 636 MiB
+free; that workload was left intact. Ear diagnostics compare the shaded scene,
+a uniform gray basecolor, and basecolor emission at both side views. Pale/cyan
+lobe patches and irregular adjacent skin persist in the emission view, identifying
+an albedo contribution. The gray diagnostic also shows simplified ear anatomy;
+it retains existing normal/displacement and scattering, so it is not a pure
+geometry-only measurement. No texture correction is claimed at this checkpoint.
+
+Receipts: `initial_views/report.json`, `ear_diagnostics/report.json`, and
+`session.json` in the new workspace. Build, fresh-load verification and render
+recipes are beside those directories. Body, clothing and hair remain excluded.
