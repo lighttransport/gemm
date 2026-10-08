@@ -149,7 +149,7 @@ The later candidate-first ear/skin continuation is documented in
 [QUALITY_ITERATIONS.md](QUALITY_ITERATIONS.md#native-tongue-rest-lift-and-current-candidate-delivery).
 Its current pointers are `tmp/vhuman-quality4h/session.json`: preferred scene
 `preferred_tongue_candidate/head.blend`, complete portable default/stress bundles
-`preferred_tongue_usd/` and `preferred_tongue_stress_usd/`, comparison gallery
+`preferred_final_usd/` and `preferred_final_stress_usd/`, comparison gallery
 `review/`, and updated live browser `player/`. The browser includes new ear and
 tongue rest geometry and preserves fitted optical centers under gaze; the
 offline eyelid correction and authored stress gate remain in Blender/USD.

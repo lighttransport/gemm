@@ -1907,7 +1907,7 @@ local eyelid correction or authored aperture-gated stress track. The latter
 remain in the checked Blender/USD scenes. Low-frequency scalp/neck tone patches,
 residual eyelid contacts and the known frame-19.5 exposed-crossing regression
 remain visible limitations. Current pointers and provenance are in
-`tmp/vhuman-quality4h/session.json`. `review/` provides 15 matched image pairs,
+`tmp/vhuman-quality4h/session.json`. `review/` provides 20 matched image pairs,
 two complete USD/Blender ZIPs, measurement links and the updated device page;
 its responsive controls, image loading, links and ZIP integrity are checked.
 
@@ -1933,7 +1933,7 @@ The final matched session comparison uses CUDA on the RTX 5060 Ti: eight
 changes the frontal/rear silhouette; both side-view alpha masks are identical.
 The preferred ear color is cleaner, while broad scalp and jaw/neck patches
 remain visible. `final_matched_render/` includes images, settings/times and
-pixel metrics. The five-panel gallery passes 30 image checks, 17 evidence/download
+pixel metrics. The initial five-panel gallery passes 30 image checks, 17 evidence/download
 links, visible comparison-control changes and a narrow viewport overflow check.
 The existing localhost server serves it at
 `http://127.0.0.1:45615/vhuman-quality4h/review/`; the updated live avatar is at
@@ -1959,3 +1959,45 @@ changed source files, a wrong candidate manifest and altered receipts, and
 confirm verification survives relocation. Candidate directories contain an
 `EVIDENCE_SCOPE.txt` explaining that inherited reports belong to their named
 parent, including the earlier scalp-only `protection_validation.json`.
+
+## Final tone trials and scene provenance cleanup
+
+Three upper-neck/jaw color approaches were compared without replacing the
+selected skin. A 15 mm normal-compatible log-color lowpass protects photographed
+texels and ears but visibly smooths fine detail. A 4–15 mm band correction
+retains source fine detail, yet leaves the broad jaw transition. A bounded
+additional correction from the existing fitted irradiance estimate also leaves
+the patch boundary visible. Its stronger trial has maximum gain 1.2311 and
+revises 24,391 photo-supported albedo texels; the original portrait and ear
+colors remain unchanged. These are estimates, not new views or reflectance
+measurements. None is selected. All 18 matched CUDA trial comparisons have
+identical alpha. Their metrics and selection reasons are recorded in
+`skin_tone_trial_selection.json`; the final gallery adds an explicitly
+unselected-trials panel, bringing it to six panels and 20 pairs.
+
+The current scene material metadata is synchronized to the selected completion
+record; inherited build metadata is retained as `source_material_at_scene_build`.
+An audit finds that the packed basecolor and active ORM already match the
+selected source, but the unused confidence node retained a parent-bake image.
+Both preferred Blender scenes now pack the current confidence image and carry
+the current geometry/appearance provenance. Active map bytes, motion and shader
+values are unchanged. `scene_provenance_synchronization.json` records old/new
+hashes and confirms that the changed image is unlinked.
+
+`usd_motion_worker.verify_skin_images` now rejects stale packed source maps
+before export. A real-scene regression check rejects both saved parent scenes
+for their old confidence image and accepts both current scenes, binding those
+checks to the exact exported scene hashes. Receipts are in
+`scene_image_guard_validation.json`. The refreshed, preferred portable bundles
+are now **`preferred_final_usd/`** and **`preferred_final_stress_usd/`**. Both pass
+fresh-process mesh/shader and 22-file evidence verification, retaining the
+1,458/972 and 774/516 check counts respectively. Earlier verified bundles remain
+available. The browser's active appearance and native bindings are unchanged.
+The final host Python suite passes 23 tests, including evidence checks.
+
+The final refreshed gallery passes six panels, 40 image checks and 21 reachable
+links; both downloadable archives pass CRC/hash and extracted source-evidence
+verification. The current canonical pointers are in `session.json`, including
+the refreshed portable bundles. Older scenes/bundles and all unselected trial
+recipes remain available. The working tree retains the user's two resume files
+untouched; no push was performed.

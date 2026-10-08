@@ -165,8 +165,8 @@ device test page uses the earlier browser avatar, not these new anatomy bundles.
 
 The later continuation selects `tmp/vhuman-quality4h/tongue_reconstruction/`.
 Its current default and authored mouth stress bundles are
-`preferred_tongue_usd/` and `preferred_tongue_stress_usd/`, with verified
-`portable.blend` scenes and relative USD caches. The five-panel gallery is
+`preferred_final_usd/` and `preferred_final_stress_usd/`, with verified
+`portable.blend` scenes and relative USD caches. The six-panel gallery is
 `tmp/vhuman-quality4h/review/`; the updated live avatar and prepared device page
 are in `tmp/vhuman-quality4h/player/`. See `session.json` and
 [QUALITY_ITERATIONS.md](QUALITY_ITERATIONS.md#native-tongue-rest-lift-and-current-candidate-delivery)
@@ -177,7 +177,7 @@ Attach portable source evidence after export, using the matching reconstruction:
 ```sh
 $PY -m server.vhuman.reconstruction.usd_candidate_evidence \
   --candidate tmp/vhuman-quality4h/tongue_reconstruction \
-  --bundle tmp/vhuman-quality4h/preferred_tongue_usd
+  --bundle tmp/vhuman-quality4h/preferred_final_usd
 ```
 
 Use a bundle without an existing `candidate_evidence/` directory. The command

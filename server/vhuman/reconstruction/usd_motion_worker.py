@@ -23,6 +23,25 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def verify_skin_images(candidate):
+    """Reject a cloned scene whose packed skin maps belong to its parent."""
+    material = bpy.data.materials.get('skin')
+    if material is None:raise ValueError('source skin material is missing')
+    hashes = {}
+    roles = {'skin_basecolor.png', 'skin_confidence.png', 'skin_orm.png', 'skin_normal.png'}
+    for node in material.node_tree.nodes:
+        if node.type != 'TEX_IMAGE' or node.image is None:continue
+        name = Path(node.image.filepath).name
+        if name not in roles:continue
+        packed = node.image.packed_file
+        expected = digest(Path(candidate)/name)
+        if packed is None or hashlib.sha256(bytes(packed.data)).hexdigest() != expected:
+            raise ValueError('packed source skin image mismatch: '+name)
+        hashes[name] = expected
+    if 'skin_basecolor.png' not in hashes:raise ValueError('packed source skin basecolor is missing')
+    return dict(passed=True, image_sha256=hashes)
+
+
 def sample_digest(sample):
     checksum = hashlib.sha256()
     for value, dtype in zip(sample, ('<f8', '<i4', '<f8')):
@@ -81,6 +100,7 @@ def main():
             or track.get('motion_sha256') != digest(motion / 'motion.npz')):
         raise ValueError('motion geometry or content hash mismatch')
     bpy.ops.wm.open_mainfile(filepath=str(source / 'head.blend'))
+    skin_image_verification = verify_skin_images(candidate)
     scene = bpy.context.scene
     stored = json.loads(scene['motion_provenance'])
     if stored.get('motion_sha256') != track['motion_sha256']:
@@ -203,6 +223,7 @@ def main():
         meshes=len(names), up_axis='Y', units='metres',
         material_capture_source_frame=start, material_drivers_baked_to_sidecar=material_drivers,
         material_verification=material_verification, subdivision_modifiers=subdivision,
+        source_skin_image_verification=skin_image_verification,
         material_animation_verification=material_animation_verification,
         material_animation_sidecar_sha256=digest(out / usd_material_animation.FILENAME),
         material_sidecar_sha256=digest(out / 'blender_materials.json'),
