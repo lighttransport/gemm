@@ -38,25 +38,37 @@ EDIT_PROMPT=('Picture 1 is a photo of a person. The LAST picture is a 3D render 
 SEQ_NEGATIVE=('blurry, hat, glasses, text, extra ears, shadows, highlights, clothing, suit, jacket, shirt, collar, '
               'tie, background, scenery, window, room, long hair, hair on the neck')
 
+# Keep the pre-bare-skin recipe verbatim for controlled comparisons.
+ORIGINAL_EDIT_PROMPT=('Picture 1 is a photo of a person. The LAST picture is a 3D render of the same bald head, partly '
+    'untextured (flat uniform beige). Edit only the last picture: replace the flat beige areas with realistic skin of '
+    'the person in Picture 1, matching the skin tone of the already-textured face, natural ear anatomy, and very short '
+    'dark hair stubble on the scalp where hair grows. Do not move, zoom, crop or change the camera; keep the silhouette, '
+    'all textured regions and the gray background identical. Even diffuse light, no shadows, no highlights.')
+EDIT_RECIPES={'original':ORIGINAL_EDIT_PROMPT,'bare-skin':EDIT_PROMPT}
 
-def matted_portrait(candidate):
+
+def _foreground_alpha(img, model):
+    import torch
+    from torchvision import transforms
+    from transformers import AutoModelForImageSegmentation
+    net=AutoModelForImageSegmentation.from_pretrained(str(model),trust_remote_code=True,local_files_only=True).eval().float()
+    x=transforms.Compose([transforms.Resize((1024,1024)),transforms.ToTensor(),
+                          transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])(img)[None]
+    with torch.no_grad():
+        pred=net(x)[-1].sigmoid()[0,0].numpy()
+    return np.asarray(Image.fromarray(np.uint8(pred*255)).resize(img.size),float)/255
+
+
+def matted_portrait(candidate, model='/mnt/disk01/models/BiRefNet', *, strict=False):
     """Portrait reference without its photo context: BiRefNet foreground (keeps hair), cut just below the chin
     (face mask) to drop clothing, on 50% gray. The raw photo's background and shirt leaked into edits."""
     candidate=Path(candidate)
     img=Image.open(candidate/'portrait.png').convert('RGB');rgb=np.asarray(img,float)
     alpha=None
     try:
-        import torch
-        from torchvision import transforms
-        from transformers import AutoModelForImageSegmentation
-        net=AutoModelForImageSegmentation.from_pretrained('/mnt/disk01/models/BiRefNet',trust_remote_code=True).eval().float()
-        x=transforms.Compose([transforms.Resize((1024,1024)),transforms.ToTensor(),
-                              transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])(img)[None]
-        with torch.no_grad():
-            pred=net(x)[-1].sigmoid()[0,0].numpy()
-        alpha=np.asarray(Image.fromarray(np.uint8(pred*255)).resize(img.size),float)/255
-        del net
+        alpha=_foreground_alpha(img,model)
     except Exception as error:   # fall back to the face mask (drops hair) rather than failing the run
+        if strict:raise RuntimeError('requested BiRefNet portrait matte failed') from error
         print(f'[mv_qwen] BiRefNet matte unavailable ({error}); using face silhouette',flush=True)
     face=candidate/'parsing_0_silhouette.png'
     if face.exists():
@@ -75,6 +87,44 @@ def matted_portrait(candidate):
         pad=int(.05*max(rgb.shape[:2]))
         out=out[max(ys.min()-pad,0):ys.max()+pad,max(xs.min()-pad,0):xs.max()+pad]
     return np.uint8(np.clip(out+.5,0,255))
+
+
+def selected(candidate, views, out, editor, *, steps=12, seed=317, cfg=4.,
+             portrait_mode='matted', prompt_recipe='bare-skin', matte_model='/mnt/disk01/models/BiRefNet'):
+    """Independent edits of fixed conditions; seed offsets retain the canonical view order."""
+    from .observations import sha256
+    from .qwen_edit_backend import LICENSE
+    if portrait_mode not in ('raw','matted'):raise ValueError('unknown portrait mode')
+    if prompt_recipe not in EDIT_RECIPES:raise ValueError('unknown edit prompt recipe')
+    if not views or len({v['name'] for v in views})!=len(views) or any(v['name'] not in ORDER for v in views):
+        raise ValueError('selected views must be nonempty, unique and known')
+    candidate,out=Path(candidate),Path(out);out.mkdir(parents=True,exist_ok=True)
+    portrait=(matted_portrait(candidate,matte_model,strict=True) if portrait_mode=='matted'
+              else np.asarray(Image.open(candidate/'portrait.png').convert('RGB')))
+    Image.fromarray(portrait).save(out/'portrait_reference.png')
+    info=dict(generator=editor.generator+' independent selected views',license=LICENSE,steps=steps,seed=seed,cfg=cfg,
+              portrait_mode=portrait_mode,prompt_recipe=prompt_recipe,prompt=EDIT_RECIPES[prompt_recipe],
+              negative_prompt=SEQ_NEGATIVE,editor=getattr(editor,'metadata',{}),output_size=1024,
+              portrait_sha256=sha256(candidate/'portrait.png'),reference_sha256=sha256(out/'portrait_reference.png'),
+              matte_model=str(Path(matte_model).resolve()) if portrait_mode=='matted' else None,
+              order=[v['name'] for v in views],view_runs={},seconds=0.,chained=False,atlas_feedback=False)
+    results=[]
+    for view in views:
+        name=view['name'];folder=out/name;folder.mkdir(exist_ok=True)
+        target=np.asarray(Image.fromarray(view['rgb']).resize((1024,1024),Image.Resampling.LANCZOS))
+        Image.fromarray(target).save(folder/'input.png')
+        actual_seed=seed+ORDER.index(name)
+        image,took=editor([portrait,target],info['prompt'],steps=steps,seed=actual_seed,cfg=cfg,size=1024,
+                          negative=SEQ_NEGATIVE)
+        Image.fromarray(image).save(folder/'edited.png')
+        info['view_runs'][name]=dict(seed=actual_seed,seconds=took,input_sha256=sha256(folder/'input.png'),
+            edited_sha256=sha256(folder/'edited.png'),metrics=getattr(editor,'last_metrics',{}).copy())
+        info['seconds']+=took
+        resized=np.asarray(Image.fromarray(image).resize((view['rgb'].shape[1],view['rgb'].shape[0]),Image.Resampling.LANCZOS))
+        results.append(np.where((_mask(view)>0)[...,None],resized,view['rgb']))
+        # Keep completed views reviewable even if a later inference fails.
+        skin.write_json(out/'progress.json',info)
+    return results,info
 
 
 def _mask(view):
@@ -96,7 +146,8 @@ def _commit(atlas, known, geometry, frame, view, image, valid, points, normals):
     k=known[valid];k[take]=1;known[valid]=k
 
 
-def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9, editor=None):
+def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9, editor=None,
+               matte_model='/mnt/disk01/models/BiRefNet'):
     """editor: optional qwen_edit_backend.Editor (Apache-2.0 Edit-2511) instead of Qwen-Image-2.1."""
     candidate,out=Path(candidate),Path(out)
     with np.load(candidate/'geometry.npz',allow_pickle=False) as z:geometry=dict(z)
@@ -104,7 +155,7 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
     atlas=srgb_to_linear(base/255)
     known=(np.asarray(Image.open(candidate/'skin_coverage.png'))>0).astype(float)
     valid,points,normals=skin.atlas_surface(geometry,len(base))
-    portrait=matted_portrait(candidate)
+    portrait=matted_portrait(candidate,matte_model)
     res=views[0]['depth'].shape[0];by_name={v['name']:v for v in views};results={};seconds=0.;previous=None;previous_ref=None
     for index,name in enumerate(ORDER):
         t_render=time.time()

@@ -1362,6 +1362,15 @@ python -m server.vhuman.mobile.browser_verify \
   --out tmp/vhuman-browser/multiview-check01 --hardware
 ```
 
+### CUDA multiview texture completion
+
+The Edit-2511/MV-Adapter hybrid can be evaluated on RTX 5060 Ti using the GGUF
+editor with `--offload-blocks 1`, explicit local model paths, and saved
+MV-Adapter structure views. `mv_texture compare` runs a controlled portrait/prompt
+comparison; `generate --views` edits fixed views independently. See
+[TEXTURE_CUDA.md](TEXTURE_CUDA.md) for commands, measured results, preservation
+checks and the local viewer workflow. The SDXL-based hybrid remains evaluation-only.
+
 ### Generated detail for unobserved skin
 
 `reconstruction.generated_skin` uses the installed native ROCm Qwen-Image 2.1

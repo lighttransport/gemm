@@ -166,7 +166,8 @@ def export(candidate,out, *, scene,profile='iphone12'):
     completion=manifest['material'].get('synthetic_completion')
     if completion:
         result['licenses'].append(dict(component='Generated skin appearance',license=completion['license'],
-            generator=completion['generator'],source='https://github.com/QwenLM/Qwen-Image-2.1'))
+            generator=completion['generator'],source=('generated_skin.json' if completion.get('method')=='mv_texture'
+                else 'https://github.com/QwenLM/Qwen-Image-2.1')))
         result['validation']['research_generated_skin']=True
         for name in ('skin_generated_support.png','generated_skin.json'):
             shutil.copyfile(candidate/name,out/name)

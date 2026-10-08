@@ -3,6 +3,8 @@
 Stages:
   prepare   render GNM conditions (six MV-Adapter orthographic cameras)
   generate  run one backend into work/<backend>/view_<name>.png
+  compare   run the matched portrait/prompt recipe comparison for one view
+  compose   assemble a hybrid from existing per-view outputs
   bake      project views onto the atlas, fuse, harmonise and fill unseen texels
   eval      score every baked backend and write work/eval.html
 
@@ -10,6 +12,7 @@ Unlike generated_skin (bounded detail residual on a flat fill) this replaces
 the colour of unseen texels. Photographed texels remain byte-identical.
 """
 import argparse
+import html
 import json
 from pathlib import Path
 import shutil
@@ -42,9 +45,9 @@ def load(candidate):
     return geometry,base,observed
 
 
-def conditions(candidate, resolution=RES):
+def conditions(candidate, resolution=RES, *, only=None):
     geometry,base,observed=load(candidate)
-    return cond.render_conditions(geometry,srgb_to_linear(base/255),observed.astype(float),resolution)
+    return cond.render_conditions(geometry,srgb_to_linear(base/255),observed.astype(float),resolution,only=only)
 
 
 def prepare(candidate, work):
@@ -67,6 +70,8 @@ def prepare(candidate, work):
 
 def check(work):
     work=Path(work);record=json.loads((work/'mv_texture.json').read_text())
+    if validate_candidate(record['candidate'])['geometry_sha256']!=record['geometry_sha256']:
+        raise ValueError('candidate geometry changed since prepare')
     if sha256(Path(record['candidate'])/'skin_basecolor.png')!=record['basecolor_sha256']:
         raise ValueError('candidate material changed since prepare')
     for name,digest in record['conditions'].items():
@@ -74,10 +79,23 @@ def check(work):
     return record
 
 
-def generate(work, backend, **options):
+def generate(work, backend, *, selected_views=None, name=None, edit_backend=None, edit_model_root=None,
+             offload_blocks=0, portrait_mode='matted', prompt_recipe='bare-skin', matte_model=None, editor=None, **options):
     record=check(work);work=Path(work);candidate=Path(record['candidate'])
-    out=work/backend;out.mkdir(exist_ok=True)
-    frame,views=conditions(candidate,record['resolution'])
+    if backend not in BACKENDS:raise ValueError('unknown backend '+backend)
+    if selected_views is not None and backend!='qwen_edit_seq':raise ValueError('selected views require qwen_edit_seq')
+    name=name or backend
+    if Path(name).name!=name or name in ('.','..'):raise ValueError('generation name must be a work subdirectory')
+    out=work/name
+    if out.exists() and any(out.iterdir()):raise ValueError('generation output must be empty; use a new --name')
+    if selected_views is not None:
+        names=list(selected_views)
+        if not names or len(set(names))!=len(names) or set(names)-{v['name'] for v in record['views']}:
+            raise ValueError('selected views must be nonempty, unique and known')
+    frame,views=conditions(candidate,record['resolution'],only=selected_views)
+    if selected_views is not None:
+        by_name={v['name']:v for v in views};views=[by_name[n] for n in names]
+    out.mkdir(exist_ok=True)
     if backend=='mvadapter':
         from . import mvadapter_backend as mva
         ref=mva.reference_image(candidate/'portrait.png',candidate/'parsing_0_silhouette.png',record['resolution'])
@@ -89,13 +107,51 @@ def generate(work, backend, **options):
     elif backend=='qwen_edit_seq':
         from . import mv_qwen
         from .qwen_edit_backend import make_editor
-        images,info=mv_qwen.sequential(candidate,frame,views,out,editor=make_editor(),**{'steps':12,**options})
+        editor_options=dict(backend=edit_backend,offload_blocks=offload_blocks)
+        if edit_model_root is not None:editor_options['model_root']=edit_model_root
+        if editor is None:editor=make_editor(**editor_options)
+        if selected_views is not None:
+            recipe=dict(portrait_mode=portrait_mode,prompt_recipe=prompt_recipe)
+            if matte_model is not None:recipe['matte_model']=matte_model
+            images,info=mv_qwen.selected(candidate,views,out,editor,**recipe,**{'steps':12,**options})
+        else:
+            images,info=mv_qwen.sequential(candidate,frame,views,out,editor=editor,
+                **({'matte_model':matte_model} if matte_model is not None else {}),**{'steps':12,**options})
     else:raise ValueError('unknown backend '+backend)
     for v,im in zip(views,images):Image.fromarray(im).save(out/f"view_{v['name']}.png")
     info.update(synthetic=True,geometry_evidence=False,
+        source_geometry_sha256=record['geometry_sha256'],source_basecolor_sha256=record['basecolor_sha256'],
         views={f"view_{v['name']}.png":sha256(out/f"view_{v['name']}.png") for v in views})
     skin.write_json(out/'generation.json',info)
     return info
+
+
+def compare_recipes(work, *, view='right', prefix='recipe', edit_backend=None, edit_model_root=None,
+                    offload_blocks=0, matte_model=None, steps=12, seed=317, editor=None):
+    """Four matched edits with one loaded editor; no automatic quality winner."""
+    from .qwen_edit_backend import make_editor
+    work=Path(work);check(work)
+    names=[f'{prefix}_{portrait}_{prompt}' for portrait in ('raw','matted') for prompt in ('original','bare-skin')]
+    for name in names:
+        if Path(name).name!=name:raise ValueError('recipe prefix must be a directory name')
+        if (work/name).exists():raise ValueError('recipe output already exists: '+name)
+    if editor is None:
+        editor=make_editor(backend=edit_backend,offload_blocks=offload_blocks,
+                           **({'model_root':edit_model_root} if edit_model_root is not None else {}))
+    rows=[];summary={}
+    for portrait in ('raw','matted'):
+        for prompt in ('original','bare-skin'):
+            name=f'{prefix}_{portrait}_{prompt}'
+            info=generate(work,'qwen_edit_seq',selected_views=[view],name=name,editor=editor,
+                          portrait_mode=portrait,prompt_recipe=prompt,matte_model=matte_model,steps=steps,seed=seed)
+            summary[name]=info
+            rows.append(f'<section><h2>{html.escape(name)}</h2><img src="{html.escape(name)}/{view}/edited.png">'
+                        f'<details><summary>Recipe and measurements</summary><pre>{html.escape(json.dumps(info,indent=2))}</pre></details></section>')
+            skin.write_json(work/f'{prefix}_comparison.json',summary)
+            (work/f'{prefix}_comparison.html').write_text('<!doctype html><meta charset="utf-8"><title>Edit recipe comparison</title>'
+                '<style>body{background:#191b1e;color:#eee;font:16px system-ui;margin:24px}main{display:grid;grid-template-columns:1fr 1fr;gap:24px}img{width:100%}pre{white-space:pre-wrap}</style>'
+                '<h1>Edit-2511 portrait × prompt comparison</h1><p>Fixed target, negative prompt, seed and sampling. Generated appearance is synthetic.</p><main>'+''.join(rows)+'</main>')
+    return summary
 
 
 def compose(work, spec, name='hybrid'):
@@ -105,21 +161,40 @@ def compose(work, spec, name='hybrid'):
     'view' takes <dir>/view_<view>.png. Writes <work>/<name>/view_*.png and a generation.json whose licence
     is the union of the sources (MV-Adapter's SDXL base makes the result evaluation-only).
     """
-    record=check(work);work=Path(work);out=work/name;out.mkdir(exist_ok=True)
-    res=record['resolution'];sources={};licences=set();generators={}
+    record=check(work);work=Path(work)
+    if Path(name).name!=name or name in ('.','..'):raise ValueError('hybrid name must be a work subdirectory')
+    out=work/name
+    if out.exists() and any(out.iterdir()):raise ValueError('hybrid output must be empty; use a new backend name')
+    res=record['resolution'];sources={};licences=set();generators={};images={}
     for item in spec.split(','):
         view,src=item.split('=');backend,kind=src.split(':')
+        if view in sources or view not in {v['name'] for v in record['views']}:
+            raise ValueError('duplicate or unknown hybrid view: '+view)
+        if kind not in ('raw','view') or Path(backend).name!=backend or backend in ('.','..'):
+            raise ValueError('invalid hybrid source: '+src)
         path=work/backend/view/'edited.png' if kind=='raw' else work/backend/f'view_{view}.png'
+        info=json.loads((work/backend/'generation.json').read_text())
+        if info.get('source_geometry_sha256',record['geometry_sha256'])!=record['geometry_sha256']:
+            raise ValueError('hybrid source geometry mismatch')
+        if info.get('source_basecolor_sha256',record['basecolor_sha256'])!=record['basecolor_sha256']:
+            raise ValueError('hybrid source basecolor mismatch')
+        digest=sha256(path)
+        expected=(info.get('view_runs',{}).get(view,{}).get('edited_sha256') if kind=='raw'
+                  else info.get('views',{}).get(path.name))
+        if expected is not None and expected!=digest:raise ValueError('hybrid source checksum mismatch: '+str(path))
         im=Image.open(path).convert('RGB')
         if im.size!=(res,res):im=im.resize((res,res),Image.Resampling.LANCZOS)
-        im.save(out/f'view_{view}.png')
-        info=json.loads((work/backend/'generation.json').read_text())
+        images[view]=im
         licences.add(info.get('license','unknown'));generators[view]=f"{info.get('generator',backend)} [{kind}]"
-        sources[view]=dict(backend=backend,kind=kind,sha256=sha256(path))
+        sources[view]=dict(backend=backend,kind=kind,sha256=digest,
+                          generation_sha256=sha256(work/backend/'generation.json'))
     names=[v['name'] for v in record['views']]
     if set(sources)!=set(names):raise ValueError('hybrid spec must cover every view: '+','.join(names))
+    out.mkdir(exist_ok=True)
+    for view,im in images.items():im.save(out/f'view_{view}.png')
     info=dict(generator='hybrid: '+'; '.join(f'{v}={generators[v]}' for v in names),
               license=' + '.join(sorted(licences)),sources=sources,synthetic=True,geometry_evidence=False,
+              source_geometry_sha256=record['geometry_sha256'],source_basecolor_sha256=record['basecolor_sha256'],
               views={f'view_{v}.png':sha256(out/f'view_{v}.png') for v in names})
     skin.write_json(out/'generation.json',info)
     return info
@@ -133,7 +208,7 @@ def fuse(colors, weights):
 
 
 def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_band=True, band_sigma=4.,
-         exclude_clothing=True):
+         exclude_clothing=True, parsing_model=None):
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
     info=json.loads((work/backend/'generation.json').read_text())
     for name,digest in info['views'].items():
@@ -163,7 +238,7 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
         # from skin seen elsewhere or nearest-fill.
         from scipy.ndimage import binary_dilation
         from ..face_parsing import FaceParser, LABELS
-        parser=FaceParser();drop=[LABELS.index(n) for n in ('glasses','earring','necklace','clothes','hat')]
+        parser=FaceParser(model=parsing_model);drop=[LABELS.index(n) for n in ('glasses','earring','necklace','clothes','hat')]
         # Views that cannot see the face: portrait-conditioned edits paint one anyway (a face on the back of the head).
         face_parts=[LABELS.index(n) for n in ('left_brow','right_brow','left_eye','right_eye','nose','mouth','upper_lip','lower_lip')]
         exclusion_report={};views=[dict(v) for v in views]
@@ -415,9 +490,10 @@ def seam_energy(points, valid_result, seen, radius=.004, neighbourhood=.008, sam
     if not len(boundary):return None
     boundary=boundary[np.linspace(0,len(boundary)-1,min(samples,len(boundary))).astype(int)]
     q=points[seen][boundary];jumps=[]
+    photo=valid_result[seen];generated=valid_result[~seen]
     for a,b in zip(tree_seen.query_ball_point(q,neighbourhood),tree_un.query_ball_point(q,neighbourhood)):
         if len(a)>=4 and len(b)>=4:
-            jumps.append(np.abs(valid_result[seen][a].mean(0)-valid_result[~seen][b].mean(0)).mean())
+            jumps.append(np.abs(photo[a].mean(0)-generated[b].mean(0)).mean())
     return float(np.mean(jumps)) if jumps else None
 
 
@@ -452,24 +528,40 @@ def evaluate(work, outs):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('stage',choices=('prepare','generate','compose','regen-polar','bake','eval'))
+    p.add_argument('stage',choices=('prepare','generate','compare','compose','regen-polar','bake','eval'))
     p.add_argument('--candidate');p.add_argument('--work',required=True)
     p.add_argument('--backend',default='mvadapter',help=f'{BACKENDS} for generate; any work subdir for bake');p.add_argument('--out',nargs='*')
+    p.add_argument('--name',help='fresh generation subdirectory (default: backend name)')
+    p.add_argument('--views',nargs='+',choices=('front','right','left','back','top','bottom'),help='independent Edit-2511 views; default is sequential')
+    p.add_argument('--edit-backend',choices=('auto','gguf','native'))
+    p.add_argument('--edit-model-root');p.add_argument('--matte-model');p.add_argument('--parsing-model')
+    p.add_argument('--offload-blocks',type=int,default=0,help='GGUF transformer blocks per CPU offload group; 0 keeps DiT resident')
+    p.add_argument('--portrait-mode',choices=('raw','matted'),default='matted')
+    p.add_argument('--prompt-recipe',choices=('original','bare-skin'),default='bare-skin')
     p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--one-band',action='store_true');p.add_argument('--spec',default=DEFAULT_HYBRID);p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
     if a.stage=='generate' and a.backend not in BACKENDS:p.error(f'generate needs --backend in {BACKENDS}')
     if a.stage=='generate':
         opts=dict(seed=a.seed);opts.update(steps=a.steps) if a.steps else None
-        print(json.dumps(generate(a.work,a.backend,**opts),indent=1))
+        print(json.dumps(generate(a.work,a.backend,selected_views=a.views,name=a.name,edit_backend=a.edit_backend,
+            edit_model_root=a.edit_model_root,offload_blocks=a.offload_blocks,portrait_mode=a.portrait_mode,
+            prompt_recipe=a.prompt_recipe,matte_model=a.matte_model,**opts),indent=1))
+    if a.stage=='compare':
+        if a.views is not None and len(a.views)!=1:p.error('compare takes exactly one view')
+        print(json.dumps(compare_recipes(a.work,view=(a.views or ['right'])[0],prefix=a.name or 'recipe',
+            edit_backend=a.edit_backend,edit_model_root=a.edit_model_root,offload_blocks=a.offload_blocks,
+            matte_model=a.matte_model,steps=a.steps or 12,seed=a.seed),indent=1))
     if a.stage=='regen-polar':
         from . import mv_qwen
         from .qwen_edit_backend import make_editor
         record=check(a.work);frame,views=conditions(Path(record['candidate']),record['resolution'])
-        print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,make_editor(),
+        editor=make_editor(backend=a.edit_backend,offload_blocks=a.offload_blocks,
+            **({'model_root':a.edit_model_root} if a.edit_model_root else {}))
+        print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,editor,
             **({'steps':a.steps} if a.steps else {})),indent=1))
     if a.stage=='compose':print(json.dumps(compose(a.work,a.spec,a.backend if a.backend.startswith('hybrid') else 'hybrid'),indent=1))
-    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band),indent=1))
+    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band,parsing_model=a.parsing_model),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
 

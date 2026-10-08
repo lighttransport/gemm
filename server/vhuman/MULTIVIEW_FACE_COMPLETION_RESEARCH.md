@@ -341,7 +341,7 @@ six views exposed policy failures that the bake cannot fully repair. All bakes c
   - optionally a light Edit-2511 refine of the MV-Adapter back with a side view as reference, not the portrait
   - fuse in `mv_texture.bake` with the parser guards
 - Still open:
-  - a 2×2 recipe A/B on the right view (raw vs matted portrait × original vs bare-skin prompt). Queued, not run.
+  - a 2×2 recipe A/B on the right view (raw vs matted portrait × original vs bare-skin prompt). Completed on CUDA below.
   - MV-Adapter's SDXL base is OpenRAIL++ (evaluation only).
 
 ### MV-Adapter + Edit-2511 hybrid, first results (2026-10-08)
@@ -367,6 +367,28 @@ doll or an unrelated scene, even as a single-image "add stubble" edit. So refine
 
 Next:
 - DONE: per-channel (hue) blob flattening on the structure views removes the pink blotch (`delight(chroma=True)`; seam 0.0468, 0 photographed texels changed)
-- stronger synthesized stubble amplitude on the back
-- regenerate the Edit-2511 sides with the recipe the 2×2 A/B selects
+- DONE: stronger synthesized stubble amplitude on the back (`out_hybrid8`, reproduced on CUDA)
+- DONE: regenerate the Edit-2511 sides with the recipe the 2×2 A/B selects; new views failed promotion (below)
 - the hybrid is evaluation-only (SDXL OpenRAIL++)
+
+### RTX 5060 Ti continuation (2026-10-08)
+
+The GGUF reference now runs locally with one-block CPU offload, FP32 CPU prompt
+encoding and explicit model paths. A resident 1024-square edit exceeded the
+16 GB card's available VRAM; offloading completed all six 12-step comparison
+and selected-view edits. See [TEXTURE_CUDA.md](TEXTURE_CUDA.md) for reproduction,
+timings, comparison metrics and artifact paths.
+
+The matched right-view A/B used seed 318 and identical target/negative prompt.
+Raw/original was the best new recipe, but all four right-only bakes exceeded
+the baseline seam threshold. Matting caused collars in both prompt variants;
+the added bare-skin wording did not solve the problem. Independent raw/original
+front and left edits also invented clothing. Full and side-only hybrids lost
+coverage after parsing, to 82.35% and 90.67% respectively, versus 91.81% for
+`out_hybrid8`. Photographed texels, geometry and existing normal/ORM maps stayed
+unchanged in every bake. The baseline is retained; this experiment establishes
+a reproducible CUDA comparison workflow, not an appearance improvement.
+
+Further quality work should address clothing priors and ear/scalp transitions
+before more independent full-image edits. The preserved photo projection also
+contains ear/temple artifacts that unseen-only synthesis cannot change.
