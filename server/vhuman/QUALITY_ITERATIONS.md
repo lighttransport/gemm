@@ -667,3 +667,44 @@ asset-path rejection. Python compilation and `git diff --check` also pass.
 Artifacts under `tmp/vhuman-quality8h/`: `full_anatomy_usd/`,
 `full_anatomy_usd_relocated/portable.validation.json`,
 `usd_render_comparison/comparison.png`, and `usd_render_comparison/metrics.json`.
+
+## Wider native-motion stress tests and bounded pose corrections
+
+Three existing 22-frame tracks (surprise, blink, gaze) were located under
+`b550:/mnt/disk1/tmp/vhuman-hopper-photoreal/` and copied with their metadata to
+`/mnt/nvme02/models/vhuman-motion-priors/hopper/` (about 14 MB total). They belong
+to a different subject. Only relative expression/joint changes are reused as
+explicitly labeled cross-subject stress priors at strengths 0.25/0.5/1.0; this
+is not observed motion or an expression-accuracy evaluation of the current face.
+The source motion hashes are verified before GPU evaluation.
+
+The first audit compared against the original, unrepaired neutral surface. It
+also flagged three triangles in the starting pose, although the previous
+cumulative checks compared against matching original expression poses. These
+are different normal-orientation references. That initial audit and correction
+are retained as diagnostics, not accepted as proof of new motion failures.
+The corrected dynamic gate uses the current repaired bind surface under the
+same joint pose, matching the native rig's reference. Its starting pose has no
+orientation failures and reproduces the captured coordinates within 0.000062 mm.
+
+Against the repaired bind surface, quarter-strength blink and half-strength
+gaze need no meaningful correction. Surprise probes flag one skin triangle;
+stronger blink flags up to five, and full gaze flags one. Defects cluster at
+mouth corners and some eyelid triangles. Bounded per-frame area-gradient repair
+uses exterior skin/gums as free vertices and keeps tooth vertices fixed.
+All nine sampled tracks converge under a 0.25 mm displacement cap. Maximum
+actual repair is 0.076335 mm and maximum projected landmark shift is 0.097904 px.
+The initial frame remains byte-identical to each input track after float32 save.
+
+A nominal 0.1 area floor in float64 fell as low as 0.099831 after float32 save.
+Using a 0.101 solver target and testing saved precision restores the explicit
+0.1 gate: the minimum measured float32 ratio is 0.100869 across all 198 sampled
+frames. These are per-frame orientation checks, not proofs for interpolation,
+self-contact or temporal appearance. No motion is promoted yet; contact audits,
+representative animation renders and browser/native comparisons remain open.
+
+Receipts/scripts under `tmp/vhuman-quality8h/`: `motion_stress_current_bind/`,
+`motion_current_bind_repaired/report.json`, `audit_motion_current_bind.py`, and
+`repair_motion_current_bind.py`. The preliminary original-neutral results remain
+in `motion_stress/` and `motion_stress_repaired/` and must not be mistaken for the
+current reference or used as accepted animation assets.
