@@ -473,3 +473,32 @@ Scripts/receipts under `tmp/vhuman-quality8h/`: `lip_ramp_joint.py`,
 `lip_ramp_local.py`, `lip_ramp_patch.py`, `evaluate_lip_ramp_patch.py`,
 `build_lip_ramp_candidate.py`, `lip_ramp_patch/evaluation.json`, and
 `contact_visibility/report_lip_patch_ramp_views.json`.
+
+## Completed appearance transfer onto repaired anatomy
+
+New `transfer_skin` requires identical skin topology/UVs, the same source
+portrait, a fresh target bake, a validated synthetic prior and a bounded skin
+displacement (3 mm default). It transfers only prior-supported texels that are
+unobserved in both bakes, with a metric feather on the new geometry. It preserves
+new photographed texels exactly and excludes old photographic projection from
+the prior. Both geometry hashes and all input/output mask hashes are recorded;
+old multiview support scores are deliberately not inherited. Candidate validation
+now detects modified transfer, coverage and generated-support maps.
+
+`completed_anatomy` transfers `out_balanced` onto `lip_candidate_ramp_patch`.
+Maximum skin displacement from the old prior is 2 mm; geometry is byte-identical
+to the repaired candidate. All 175458 photographed texels remain unchanged,
+716736 unobserved texels receive a nonzero prior blend, and 11 formerly observed
+texels are explicitly excluded. These counts describe prior reuse, not newly
+recovered detail or new camera coverage. The low-frequency seam metric improves
+from 0.0469343 to 0.0431738, but remains worse than the old-geometry balanced
+material's 0.0367668. Side rendering shows added detail alongside uneven tone;
+this material is experimental and still needs matched appearance refinement.
+
+OptiX rendering at 60-degree yaw and packed-asset reload pass with 2712 MiB peak
+whole-device usage. Regression: 60 tests pass across `test_transfer_skin`,
+`test_surface_texture`, `test_generated_skin` and `test_reconstruction`.
+Tests include exact photograph protection, target geometry provenance, omitted
+old coverage claims, transfer-map tampering, and excessive geometry-change
+rejection. Receipts: `completed_anatomy/generated_skin.json`,
+`completed_anatomy_render60/`, and `transfer_metrics.json` under the study root.

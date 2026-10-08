@@ -246,3 +246,26 @@ inspection-camera and cancellation checks. This validates the desktop review
 package, not mobile-device performance or visual realism.
 The separate side-only comparison viewer also passed the same hardware checks
 (`tmp/vht-s0/verification.json`).
+
+## Reusing a completion after bounded geometry fitting
+
+A fresh portrait bake can reuse a previous completion as an appearance prior
+when its skin topology, UVs and source portrait are identical. This does not
+rerun generation or establish multiview support on the new geometry:
+
+```sh
+TMPDIR="$PWD/tmp" tmp/vhuman-texture-venv/bin/python \
+  -m server.vhuman.reconstruction.transfer_skin \
+  --candidate tmp/vhuman-quality8h/lip_candidate_ramp_patch \
+  --prior tmp/vhuman-blender/out_balanced \
+  --out tmp/vhuman-quality8h/completed_anatomy \
+  --feather-mm 6 --maximum-displacement-mm 3
+```
+
+Use an empty output directory. The new bake's photographed texels remain exact;
+old photographed texels and unsupported old texels are excluded from transfer.
+The output records both geometry hashes, source completion/material/mask hashes,
+and a transfer mask. Old multiview coverage/consistency scores are not inherited.
+The original completion's license continues to apply. Review the transferred
+material in matched views before promotion; unchanged UV correspondence does
+not guarantee tone or shading quality.

@@ -35,6 +35,16 @@ def validate_candidate(candidate):
         if ('source_geometry_sha256' in completion
                 and completion['source_geometry_sha256'] != manifest['geometry_sha256']):
             raise ValueError('synthetic completion geometry hash mismatch')
+        if completion.get('method') == 'same_uv_prior_transfer':
+            transfer = completion.get('prior_transfer')
+            if not isinstance(transfer, dict) or transfer.get('new_view_evidence') is not False:
+                raise ValueError('invalid prior transfer provenance')
+            checks = [('skin_prior_transfer.png', transfer.get('transfer_mask_sha256')),
+                      ('skin_coverage.png', transfer.get('target_coverage_sha256')),
+                      ('skin_generated_support.png', completion.get('generated_support_sha256'))]
+            for name, expected in checks:
+                if not expected or not (candidate/name).is_file() or sha256(candidate/name) != expected:
+                    raise ValueError('prior transfer asset hash mismatch: '+name)
     return manifest
 
 
