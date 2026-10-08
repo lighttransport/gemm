@@ -1596,3 +1596,22 @@ The same opaque-shell and finite-sampling limitations apply. Recipes are
 `prepare_lid_fractional_visibility.py` and `trace_lid_fractional_visibility.py`;
 results are in `lid_local_fractional_visibility/{visibility,comparison}.json`.
 The host Blender audit completed with exit status zero.
+
+## Eight-hour study handoff
+
+The scheduled study window has elapsed. Iterations covered numerical face
+fitting, source-supported and unobserved texture, optical gaze and eyelid
+placement, teeth/gum appearance and contacts, tongue articulation and shading,
+motion/topology checks, and Blender/USD interchange. The local review page
+provides matched comparisons and three portable bundles. A final evidence
+audit rehashed all 136 review source files and checked five passing portable,
+browser and archive-relocation receipts (`session_audit.json`). The five shader
+animation and three static shader regression tests also have passing logs.
+
+This concludes the time-bounded experiment session, not production avatar
+completion. Remaining work is residual eyelid/oral contact repair, scalp and
+jaw/neck texture cleanup, integration of accepted new anatomy into the live
+browser avatar, and physical mobile testing when a device is available. The
+latest local eyelid extension remains unpromoted because of its visible
+fractional-frame regression. Prior promoted assets and user-owned resume files
+remain intact. All session commits are local; no push was performed.
