@@ -133,3 +133,30 @@ these nested values explicitly. Named point attributes used by a shader still
 need their own mesh round-trip check; restoring a node does not establish that
 its input attribute exists. The tooth-gradient study verifies its `enamel_tip`
 float point values separately on both baked tooth meshes.
+
+## Local quality review and portable downloads
+
+With the quality-iteration artifacts present, build the comparison page and
+three portable archives from repository root:
+
+```sh
+TMPDIR="$PWD/tmp" PYTHONPATH="$PWD" tmp/vhuman-texture-venv/bin/python \
+  -m server.vhuman.reconstruction.quality_review --work tmp/vhuman-quality8h
+TMPDIR="$PWD/tmp" PYTHONPATH="$PWD" tmp/vhuman-texture-venv/bin/python \
+  -m server.vhuman.reconstruction.quality_review_verify \
+  --work tmp/vhuman-quality8h --out tmp/vhuman-quality8h/review_browser_checks
+```
+
+The builder requires the recorded experiment directories; it is not a general
+scene exporter. `review/index.html` contains six comparison panels and links to
+measurements. `review/downloads/` contains eyelid-fit, tongue-motion and
+gaze-wrinkles ZIPs. Extract each archive completely and open `portable.blend`
+alongside its relative USD cache, textures and material sidecars. The manifest
+records source and archive hashes. Serve repository `tmp/` as the HTTP root to
+retain links to experiment evidence and the existing device test page.
+
+The verifier checks archive hashes/CRC, image decoding, evidence links,
+comparison controls and narrow-viewport layout in Chromium. This is static
+review verification, not live-avatar or physical-mobile validation. Eyelid and
+tongue candidates retain residual contacts and remain experimental. The linked
+device test page uses the earlier browser avatar, not these new anatomy bundles.

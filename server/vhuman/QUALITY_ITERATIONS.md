@@ -1472,3 +1472,30 @@ for this review candidate: 18 meshes / 43 samples, all 774 mesh checks and
 516 shader checks pass, with zero measured shader-value error and a relative
 `//head.usdc` cache. The package retains the authored-motion and residual-contact
 limitations; interchange success does not promote the anatomy.
+
+## Review page and relocated portable archives
+
+`reconstruction.quality_review` packages six panels / 14 matched comparisons:
+skin illumination, eyelid depth fitting, tongue articulation, sampled wrinkle
+shaders, tooth appearance and tongue appearance. Source image hashes and
+measurement links preserve provenance; no experimental anatomy is promoted.
+The three downloadable ZIPs include the portable Blender scene, relative USD
+cache, material sidecars, textures and validation reports (33 members each).
+
+`reconstruction.quality_review_verify` passes all 28 image loads and 19 unique
+links, ZIP hashes/CRC and comparison-control screenshot changes. Desktop
+1440x1100 and emulated 390x844 layouts were inspected; the narrow viewport has
+no horizontal overflow and Chromium reports no console errors. The verifier
+uses software rendering and an isolated repository-local runtime directory.
+This does not establish physical-device or real-time avatar performance.
+
+The eyelid archive was extracted to a separate directory and freshly imported
+in Blender: all 1,458 mesh checks and 972 shader checks pass, shader error is
+zero and the cache is relative. All 33 archive member contents match that
+relocated bundle. The browser avatar remains the earlier package; newer Blender
+anatomy still needs live-player integration and validation.
+
+Receipts: `tmp/vhuman-quality8h/review_browser_checks/verification.json`, its
+desktop/narrow-viewport screenshots, `review/manifest.json`,
+`review/relocation_validation.json`, and
+`review_relocated/eyelid-fit/relocated_checked.validation.json`.
