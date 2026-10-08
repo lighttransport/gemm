@@ -1336,3 +1336,63 @@ Recipes and receipts in `tmp/vhuman-quality8h/` include
 `lid_camera_fit_joint/{geometry_validation,contact_audit,projection_validation}.json`,
 `lid_camera_fit_joint_render/{metrics.json,comparison.png}`, and
 `combined_lid_fit_render/motion_validation.json`.
+
+## Sampled wrinkle animation beside animated USD
+
+The static material sidecar previously retained only the first-frame socket
+values. `usd_material_animation.py` now captures animated numeric input and
+output sockets, stores sampled values separately, and restores linear Blender
+keyframes after static shader restoration. Driver dependencies on source-scene
+custom properties are removed. Unsupported animated node properties fail
+explicitly. Validation checks socket identity, channel/value shape, sampled
+key times and values, linear interpolation, and evaluated values at every
+sample. The USD importer hashes this sidecar and requires its frame grid to
+match the mesh sample grid. Legacy static-material bundles remain supported.
+
+Material sampling occurs at original source times before geometry/action
+retiming. This matters for shader drivers that use Blender's `frame` variable;
+sampling them after doubling frame numbers changes their meaning. A regression
+samples `frame * frame` at source times 10/10.5/11, restores samples at export
+frames 1/2/3, and verifies values 100/110.25/121. Five animation regressions pass,
+covering nonlinear scene-property drivers, vector output sockets, intermediate
+linear playback, key/interpolation tampering, unsupported properties, invalid
+frame grids and nonfinite sidecar values. The three existing static shader,
+texture-integrity and color-ramp tests also pass.
+
+The real 22-frame gaze track exercises twelve varying wrinkle channels. Its
+43-sample USD export and fresh-process import verify 18 meshes / 774 mesh
+samples and 516 shader values, with zero measured shader-value error. A separate
+fresh source-scene probe samples the original 24 fps integer/half-frame times
+and matches all twelve exported channels exactly. All twelve vary; this is not
+a constant-expression-only test. The portable scene retains `//head.usdc` and
+baked shader keyframes without the original scene drivers.
+
+Three matched 512-square, 32-sample OptiX renders compare the native gaze pose,
+USD with restored animation, and the same USD frozen to first-frame material
+values. Foreground RGB MAE against native changes from 0.403607/255 (static)
+to 0.400859/255 (animated); p99 remains 4/255 and alpha is unchanged. Animated
+versus static USD MAE is 0.033564/255. This restores shader behavior but is only
+a small appearance improvement at that pose; remaining interchange image
+error is not explained away by the driver fix.
+
+This is a Blender animation sidecar, not a claim that generic USD readers
+recover animated Blender shaders. Original driver expressions are not
+serialized; behavior between samples is linear, and nested node groups remain
+unsupported by the static shader serializer. See `ANATOMY_USD.md` for usage.
+
+Receipts: `tmp/vhuman-quality8h/gaze_usd_animated_materials/{report.json,
+portable.validation.json,blender_material_animation.json}`,
+`gaze_material_source_time/report.json`,
+`gaze_usd_material_comparison/{metrics.json,comparison.png}`,
+`usd_material_animation_tests.log`, and `usd_material_full_tests.log`.
+
+The improved camera-ray eyelid preview also completes this updated workflow:
+`combined_lid_fit_usd_materials/` contains 18 meshes at 81 samples / 96 fps.
+All 1,458 mesh checks and 972 socket checks pass in export and a fresh import;
+maximum measured socket error is zero, and the portable cache is relative.
+This authored blink's expression values are constant, so the varying gaze
+study above remains the dynamic-shader evidence. A matched half-blink render
+(source frame 11, USD frame 21) gives foreground RGB MAE 0.389029/255, p99 3/255,
+and unchanged alpha. Receipts are in `combined_lid_fit_usd_materials/` and
+`combined_lid_fit_usd_comparison/`. The improved fit remains a separate review
+candidate with residual optical contacts, not a globally accepted replacement.

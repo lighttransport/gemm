@@ -1,7 +1,7 @@
 """Blender worker for sampled anatomy animation with verified USD interchange.
 
 Usage: blender -b --python usd_motion_worker.py -- --scene DIR --out DIR
-Mesh animation is baked; material drivers are recorded as a portability limit.
+Mesh animation is baked; shader animation is sampled in a Blender sidecar.
 """
 import argparse
 import hashlib
@@ -16,6 +16,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from server.vhuman.reconstruction.usd_materials import capture, restore, verify
+from server.vhuman.reconstruction import usd_material_animation
 
 
 def digest(path):
@@ -98,8 +99,19 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     factor = args.samples_per_frame
     actions = {}
+    materials = list({mat.name: mat for obj in meshes for mat in obj.data.materials}.values())
+    samples = (end - start) * factor + 1
+    scene.frame_set(start)
+    bpy.context.view_layer.update()
+    capture(materials, out)
+    # Sample before retiming: a driver may use Blender's `frame` variable,
+    # whose meaning must remain the original source time while evaluating.
+    usd_material_animation.capture(materials, out,
+        [start + i / factor for i in range(samples)], scene=scene,
+        output_frames=range(1, samples + 1))
     for owner in [scene, *scene.objects, *[obj.data.shape_keys for obj in scene.objects
-                                        if obj.type == 'MESH' and obj.data.shape_keys]]:
+                                        if obj.type == 'MESH' and obj.data.shape_keys],
+                  *[mat.node_tree for mat in materials if mat.node_tree]]:
         animation = owner.animation_data
         if animation and animation.action:
             actions[animation.action.as_pointer()] = animation.action
@@ -133,9 +145,7 @@ def main():
                         for obj in meshes for mat in obj.data.materials
                         if mat.node_tree and mat.node_tree.animation_data
                         and mat.node_tree.animation_data.drivers}
-    capture(list({mat.name: mat for obj in meshes for mat in obj.data.materials}.values()), out)
     references = {}
-    samples = scene.frame_end
     for frame in range(1, samples + 1):
         scene.frame_set(frame)
         graph = bpy.context.evaluated_depsgraph_get()
@@ -158,7 +168,9 @@ def main():
     bpy.ops.wm.usd_import(filepath=str(out / 'head.usdc'), import_materials=True,
                          import_textures_mode='IMPORT_NONE')
     restore(out)
+    usd_material_animation.restore(out, scene=scene)
     material_verification = verify(out)
+    material_animation_verification = usd_material_animation.verify(out, scene=scene)
     imported = {obj.name: obj for obj in scene.objects if obj.type == 'MESH'}
     if set(imported) != set(names):
         raise ValueError('USD changed the anatomy mesh set')
@@ -189,12 +201,14 @@ def main():
         source_motion_sha256=track['motion_sha256'], source_fps=fps,
         exported_fps=fps * factor, samples_per_frame=factor, samples=samples,
         meshes=len(names), up_axis='Y', units='metres',
-        material_capture_source_frame=start, material_drivers_not_exported=material_drivers,
+        material_capture_source_frame=start, material_drivers_baked_to_sidecar=material_drivers,
         material_verification=material_verification, subdivision_modifiers=subdivision,
+        material_animation_verification=material_animation_verification,
+        material_animation_sidecar_sha256=digest(out / usd_material_animation.FILENAME),
         material_sidecar_sha256=digest(out / 'blender_materials.json'),
         usd_sha256=digest(out / 'head.usdc'), checks=rows,
         limitations=['Finite sampled mesh animation, not an editable native rig',
-                     'Material drivers/wrinkle animation are captured statically at the first frame',
+                     'Blender shader animation uses sampled sidecar keys; generic USD readers may show static materials',
                      'Interchange checks do not establish fit quality or collision freedom'])
     (out / 'report.json').write_text(json.dumps(report, indent=2))
     if not passed:

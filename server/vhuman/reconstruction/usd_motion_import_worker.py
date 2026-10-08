@@ -8,6 +8,7 @@ import bpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from server.vhuman.reconstruction.usd_materials import restore, verify
+from server.vhuman.reconstruction import usd_material_animation
 from server.vhuman.reconstruction.usd_motion_worker import digest, mesh_sample, sample_digest
 
 
@@ -22,8 +23,11 @@ def main():
     report = json.loads((bundle / 'report.json').read_text())
     if report.get('schema') != 'vhuman.animated_anatomy_usd.v1' or not report.get('passed'):
         raise ValueError('verified animated anatomy report required')
-    for filename, expected in [('head.usdc', report['usd_sha256']),
-                               ('blender_materials.json', report['material_sidecar_sha256'])]:
+    hashes = [('head.usdc', report['usd_sha256']),
+              ('blender_materials.json', report['material_sidecar_sha256'])]
+    if 'material_animation_sidecar_sha256' in report:
+        hashes.append((usd_material_animation.FILENAME, report['material_animation_sidecar_sha256']))
+    for filename, expected in hashes:
         if digest(bundle / filename) != expected:
             raise ValueError('bundle hash mismatch: ' + filename)
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -33,6 +37,12 @@ def main():
     bpy.ops.wm.usd_import(filepath=str(bundle / 'head.usdc'), import_materials=True,
                          import_textures_mode='IMPORT_NONE')
     restore(bundle)
+    material_animation = None
+    if 'material_animation_sidecar_sha256' in report:
+        animation_record = usd_material_animation.restore(bundle, scene=scene)
+        if animation_record['frames'] != list(range(1, report['samples'] + 1)):
+            raise ValueError('material and mesh sample frames differ')
+        material_animation = usd_material_animation.verify(bundle, scene=scene)
     materials = verify(bundle)
     objects = {obj.name: obj for obj in scene.objects if obj.type == 'MESH'}
     if set(objects) != {row['mesh'] for row in report['checks']}:
@@ -76,6 +86,7 @@ def main():
     bpy.ops.wm.save_as_mainfile(filepath=str(output))
     receipt = dict(passed=True, samples=len(by_frame), meshes=len(objects),
                    sample_checks=len(report['checks']), material_verification=materials,
+                   material_animation_verification=material_animation,
                    relative_animation_caches=caches, usd_sha256=report['usd_sha256'])
     output.with_suffix('.validation.json').write_text(json.dumps(receipt, indent=2))
     print(json.dumps(receipt), flush=True)

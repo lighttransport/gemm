@@ -85,15 +85,33 @@ valid when moving the directory:
 ```
 
 The importer requires new output filenames, verifies bundle hashes and all
-sample hashes, restores materials/subdivision, and writes a validation receipt.
+sample hashes, restores materials/subdivision and sampled shader animation,
+and writes a validation receipt.
 The saved animation cache uses a relative path. Cameras and review lights are
 not included.
 
-**Material animation is currently limited:** shader drivers, including dynamic
-wrinkle activation, are captured at the first frame. The report lists affected
-materials and driver counts. Geometry animation and texture pixels survive the
-roundtrip; exact animated shading is not claimed. The export gate also does not
-prove fit accuracy, collision freedom, or behavior at unsampled times.
+`blender_material_animation.json` stores numeric input/output socket samples
+for animated material node trees, including dynamic wrinkle activations. The
+exporter samples original source times before retiming, so drivers using
+Blender's `frame` variable retain their original meaning. The importer restores
+linear socket keyframes without the source scene's custom properties or driver
+dependencies. It verifies every channel/sample, keyframe times, interpolation,
+and the sidecar hash. Unsupported animated node properties are rejected.
+
+This animation sidecar is specific to Blender. Generic USD readers may still
+show static materials. Values are verified at sampled times; nonlinear driver
+behavior between samples is approximated by linear interpolation. Original
+driver expressions are not retained. Older bundles without the animation
+sidecar remain readable with their original static-material limitation. The
+export gate does not prove fit accuracy, collision freedom, or behavior at
+unsampled times.
+
+Run shader-animation regressions with a repository-local temporary directory:
+
+```sh
+TMPDIR="$PWD/tmp" "$BLENDER" -b --factory-startup --python-exit-code 1 \
+  --python server/vhuman/test_usd_material_animation.py
+```
 
 ## Fitted optical centers in the Blender scene
 
