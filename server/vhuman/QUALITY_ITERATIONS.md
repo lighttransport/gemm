@@ -216,10 +216,50 @@ local distortion or prove contact quality.
 The regression command above now passes 39 tests, including new checks for
 fixed barycentric attachments and invalid attachment indices.
 
+## Edge-limited lip fitting and block attachment projection
+
+The directional solver can also limit edge stretch. For each edge and reference
+pose, the length bound reduces to an interval for the scalar endpoint-offset
+difference. Intersecting those intervals across poses gives two linear
+inequalities per unique edge, avoiding a separate edge constraint set for every
+pose. This limits stretching, not bending or self-intersection.
+
+At the previous 0.5/1 mm upper/lower targets, a 1.25x edge limit preserves the
+same tooth IoU 0.42331 and landmark accuracy. Maximum stretch over the denser
+101-pose ramp is 1.250087x, versus 2.02x before. The largest lip-triangle normal
+change falls from 73.02 to 51.79 degrees (95th percentile 12.70 degrees). The
+freshly rebaked `lip_candidate_edge125` passes OptiX rendering and asset reload.
+
+A stronger 1/2 mm target first fails to converge within 10,000 sweeps of the
+individual attachment projections. The attachment constraints are now projected
+as one subspace using the pseudoinverse of their Gram matrix, retaining Dykstra
+corrections for the combined constraint sets. A regression test checks dependent
+attachments. The same stronger problem then converges in 124 sweeps at 0.001 mm
+tolerance. At a tighter 0.000001 mm tolerance, it converges in 872 sweeps with
+maximum attachment residual 2.3e-11 mm; the tolerance was tightened, not relaxed.
+
+The tight stronger result (`oral_edge125_block_tight`) has IoU 0.48951, 594
+visible tooth pixels, 490 target overlaps and 10 visible tooth pixels outside
+the coarse mouth polygon. Maximum projected landmark shift is approximately
+3.2e-11 px. The 101-pose ramp has no orientation reversals, minimum area ratio
+0.2 and maximum edge stretch 1.250089x. Intermediate sampled poses can slightly
+exceed the bound imposed at the 21 constraint poses; this is not a continuous
+motion guarantee. The candidate is `lip_candidate_edge125_strong`. Its OptiX
+render and fresh-process asset reload pass (20.2 seconds, 2713 MiB peak device
+memory). The camera-aligned mouth comparison is
+`tmp/vhuman-quality8h/oral_edge_comparison.png`. It shows the greater tooth
+exposure, but substantial crown-shape, gum-exposure and shading differences
+remain relative to the portrait. The source portrait and studio render also
+have different illumination; the comparison is not an albedo measurement.
+
+Regression: 42 tests pass. Both candidate strength settings remain experimental:
+exact mesh contacts, unseen views, broader motion and dental shading still need
+validation before promotion.
+
 ## Next experiments
 
-- Reduce local distortion in the fixed-attachment lip experiment; repeat the
-  oral visibility audit before testing dental arch placement and shading variations.
+- Audit actual lip/teeth/tongue mesh crossings and inspect side views of the
+  edge-limited candidates before dental placement and shading variations.
 - Inspect tongue/cavity, lip contact and eye-lid contact during jaw opening,
   gaze changes and side views.
 - Evaluate the passing geometry candidates before transferring completed skin

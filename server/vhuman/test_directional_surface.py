@@ -71,6 +71,36 @@ class DirectionalSurfaceTests(unittest.TestCase):
             constrain_offsets(frame, np.array([[0,1,2]]), [0,1,0], [0,0,-2],
                               fixed_attachments=(np.array([[0,1,3]]), np.array([[0,0,1]])))
 
+    def test_edge_stretch_bound_across_poses(self):
+        frames = np.array([[[0,0,0], [.001,0,0], [0,.001,0]],
+                           [[0,0,0], [.001,0,0], [0,.0008,0]]])
+        offsets, report = constrain_offsets(frames, np.array([[0,1,2]]), [0,1,0],
+                                            [0,0,2], maximum_edge_ratio=1.25)
+        self.assertTrue(report['converged'])
+        self.assertLessEqual(report['maximum_edge_ratio'], 1.25+1e-7)
+        self.assertGreaterEqual(report['minimum_area_ratio'], .2-1e-8)
+        for frame in frames:
+            changed = frame+offsets[:,None]*np.array([0,.001,0])
+            for a,b in ((0,1),(1,2),(2,0)):
+                self.assertLessEqual(np.linalg.norm(changed[a]-changed[b]),
+                                     1.25*np.linalg.norm(frame[a]-frame[b])+1e-10)
+
+    def test_invalid_edge_bound_rejected(self):
+        frame = np.array([[[0,0,0], [.001,0,0], [0,.001,0]]])
+        with self.assertRaises(ValueError):
+            constrain_offsets(frame, np.array([[0,1,2]]), [0,1,0], [0,0,2], maximum_edge_ratio=1)
+
+    def test_dependent_attachments_project_as_one_subspace(self):
+        frame = np.array([[[0,0,0], [.001,0,0], [0,.001,0]]])
+        ids = np.array([[0,1,2]])
+        weights = np.array([[.25,.25,.5]])
+        one, _ = constrain_offsets(frame, ids, [0,1,0], [0,0,2],
+                                   fixed_attachments=(ids,weights), maximum_edge_ratio=1.25)
+        duplicate, report = constrain_offsets(frame, ids, [0,1,0], [0,0,2],
+            fixed_attachments=(np.repeat(ids,2,axis=0),np.repeat(weights,2,axis=0)), maximum_edge_ratio=1.25)
+        self.assertTrue(report['converged'])
+        np.testing.assert_allclose(duplicate, one, atol=1e-8)
+
 
 if __name__ == '__main__':
     unittest.main()
