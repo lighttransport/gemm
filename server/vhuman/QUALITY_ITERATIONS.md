@@ -1268,3 +1268,71 @@ Recipes and receipts under `tmp/vhuman-quality8h/`:
 `inner_lid_boundary_motion/{geometry_audit,contact_audit}.json`, and
 `inner_lid_boundary_render/{metrics.json,comparison.png}`. The material is
 an authored muted pink prior, not recovered conjunctival reflectance.
+
+## Camera-ray eyelid depth fitting with joint constraints
+
+The actual eye boundary exposes deeper penetration than the landmark contour:
+vertex rays toward the fitted source camera find up to 0.677839 mm of skin
+behind the fitted optical shell. A camera-ray displacement preserves each
+vertex's source projection while moving it toward the camera. The proposal
+uses a 0.05 mm front-shell margin, an inverse-edge-length neighbor average
+with 0.92 decay for smooth positive support, and a 0.75 mm initial movement
+bound. Non-skin vertices and optical transforms remain fixed. The camera
+and ray field follow the authored rigid head motion.
+
+The initial proposal moves at most 0.727839 mm but reduces the minimum
+oriented area ratio to 0.061901. Camera-ray-only area repair restores the
+original 0.1 gate, retaining the required vertex depth as a lower bound.
+Its stricter internal 0.1011 margin cannot be reached on some fixed triangles;
+the independent global saved/interpolated gate passes at 0.1006368. This
+intermediate candidate introduces six right-eye skin self-crossings at the
+closed frame. Preserving original front-to-back order across the projected
+triangle overlap removes those crossings with an additional local 0.145706 mm
+shift, but initially inverts an adjacent triangle (ratio -0.014894). A second
+area step, retaining the depth-order shift as a lower bound, adjusts a
+neighbor by 0.094492 mm and restores the area gate. Only the closed frame
+is replaced in the final joint candidate; other frames are exactly the
+previous area-repaired samples.
+
+Final candidate `lid_camera_fit_joint` has:
+- maximum displacement 0.727839 mm and source landmark projection shift
+  0.0000663 pixels across 41 frames;
+- exact non-skin vertices and optical joint/rotation arrays;
+- minimum saved oriented-area ratio 0.1009005 and conservative exact cubic
+  interval bound 0.1006368, both above the original 0.1 gate;
+- zero detected local skin self-crossings in 85 saved/half-frame/closure
+  quarter-frame samples per eye (170 checks);
+- summed skin/optical-shell crossing pairs reduced from 28,187 to 12,435
+  over those same checks, with worst per-eye sample reduced from 305 to 152.
+
+These pair totals count repeated triangle pairs across poses, not distinct
+anatomical defects. Strict crossing checks omit coplanar overlap, containment
+and boundary-only contact; skin self checks cover a 25 mm neighborhood of
+each optical center. Vertex ray clearance does not establish clearance in
+triangle interiors or at silhouettes. Residual shell contacts prevent full
+contact acceptance.
+
+Matched 1024-square renders show a small appearance change: eye crop MAE
+0.01670/255 open, 0.01445/255 closed frontal, and 0.01027/255 closed side.
+The closed frontal optical mask stays at zero exposed pixels; the +60-degree
+mask falls from 18 to 15. The intermediate area-only version also underwent
+five-point crossing-segment visibility checks at six frames and five yaws;
+visible pair counts decreased in these samples, but that receipt does not
+validate the final joint candidate's altered closed frame.
+
+A separate full animated Blender scene is saved at
+`combined_lid_fit_render/head.blend`. Fresh-process verification checks all
+native parts, surface attachments and fitted optics at every frame: 738
+checks, maximum coordinate error 2.053e-9 metres. Verification temporarily
+disables modifiers to compare base deformation; it does not claim displaced
+surface contact validation. The working pre-existing scene and its USD are
+retained; this candidate has not yet received a matching USD roundtrip or
+full contact acceptance.
+
+Recipes and receipts in `tmp/vhuman-quality8h/` include
+`probe_lid_camera_clearance.py`, `fit_lid_camera_clearance.py`,
+`repair_lid_camera_fit.py`, `repair_lid_depth_order.py`,
+`repair_lid_camera_fit_joint.py`, `audit_lid_camera_fit_joint_full.py`,
+`lid_camera_fit_joint/{geometry_validation,contact_audit,projection_validation}.json`,
+`lid_camera_fit_joint_render/{metrics.json,comparison.png}`, and
+`combined_lid_fit_render/motion_validation.json`.
