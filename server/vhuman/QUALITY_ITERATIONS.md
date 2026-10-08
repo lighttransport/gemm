@@ -1586,3 +1586,13 @@ recipes: `prepare_lid_local_visibility.py` and `trace_lid_local_visibility.py`.
 The sandboxed Blender run wrote its results but stalled in PulseAudio shutdown;
 the owned process was terminated. A host rerun completed with exit status zero
 (`trace_lid_local_visibility_host.log`). No unrelated Blender process was stopped.
+
+The four regressing fractional frames (5.5, 18.5, 19.5, 39.5) were then checked
+using linearly interpolated endpoint skin and optical meshes, matching sampled
+cache playback. Across five yaws each, exposed pairs fall from 486 to 457, but
+frame 19.5 at frontal view increases from 30 to 31. This sampled visible
+regression reinforces the decision not to promote the local extension.
+The same opaque-shell and finite-sampling limitations apply. Recipes are
+`prepare_lid_fractional_visibility.py` and `trace_lid_fractional_visibility.py`;
+results are in `lid_local_fractional_visibility/{visibility,comparison}.json`.
+The host Blender audit completed with exit status zero.
