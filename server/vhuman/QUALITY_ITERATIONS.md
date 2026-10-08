@@ -528,3 +528,44 @@ validation and exact geometry/photographic-pixel comparisons. Receipts under
 `tmp/vhuman-quality8h/`: `completed_surface_audit/`,
 `completed_tone_sweep.json`, `tone_comparison/report.json` and
 `tone_comparison/comparison.png`.
+
+## Optical-eye contact audit and bounded placement trials
+
+The source iris-alignment fit does not constrain the eyelids. A new diagnostic
+samples both landmark-derived lid contours (96 samples each) and casts rays
+from each globe centre into the actual cornea/sclera mesh. Nine gaze offsets
+cover yaw -15/0/15 and pitch -10/0/10 degrees, with captured eyelids held fixed.
+This measures radial contour-to-shell clearance, not volumetric contact or
+anatomical ground truth; canthus samples can legitimately lie beyond the globe.
+
+The reference mesh audit finds source-pose minima around -0.66 mm on both lower
+contours and -0.32/-0.36 mm on upper contours. Maximum corner gaps exceed 5 mm.
+Across the sampled gaze set the minima reach -0.893/-1.086 mm (right/left).
+The analytic shell and explicit triangle-ray results agree closely enough for
+bounded optimization trials, but remain separately recorded.
+
+Initial movable-centre fits improve average gaps while worsening local
+penetration and exceeding a 2 mm displacement norm; they are rejected. Penalty
+trials improve contact but still slightly exceed the desired hard bounds.
+A joint SLSQP trial enforces centre shift <=2 mm and clearance >=-0.25 mm on
+central contour samples in the captured gaze, while fitting iris centre/radius.
+It converges for both eyes. Iris-centre errors are 0.00768/0.01064 px and radius
+errors 0.03211/0.00830 px (right/left). Central clearance RMS toward the authored
+0.15 mm target falls from 2.072/1.738 mm to 1.004/1.036 mm. This target is a
+fitting prior, not a measured tissue thickness.
+
+Matched OptiX baseline/trial renders keep skin, lights, camera and seed fixed.
+The eye appearance remains similar; Blender rays independently confirm source
+lower-contour penetration around 0.249 mm and no upper-contour penetration.
+However, gaze sweeps still reach 0.878/0.524 mm penetration. The experimental
+placement is not promoted or integrated into motion. The next optical fit must
+constrain multiple gaze poses together and inspect eyelid motion, rather than
+using source-pose convergence as a general contact guarantee.
+
+Receipts under `tmp/vhuman-quality8h/`: `eye_contacts/report.json`,
+`eye_contacts/fit_sweep.json`, `fit_penalty_sweep.json`, `fit_hard_bounds.json`,
+`eye_contact_comparison/eyes_comparison.png`, and
+`eye_contact_comparison/contact_audit.json`. Reproduction scripts are
+`prepare_eye_contacts.py`, `trace_eye_contacts.py`, `fit_eye_contact*.py`,
+`render_eye_contact_trial.py`, and `trace_eye_trial.py` in the study root.
+No production fitter or accepted candidate geometry is changed by this trial.
