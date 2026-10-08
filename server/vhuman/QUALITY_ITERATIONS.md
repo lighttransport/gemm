@@ -903,3 +903,49 @@ The final importer additionally rejects a syntactically valid report missing
 one mesh sample before creating output. Its complete-coverage checks are then
 rerun successfully on the full bundle (`portable_guarded.validation.json`).
 The missing-sample negative receipt is `usd_motion_incomplete_fixture/receipt.json`.
+
+## Authored complete blink and coupled optical placement
+
+Native eye-PCA fitting, direct socket-boundary fitting, shell-aware landmark
+closure, and biharmonic displacement were tested. They either leave an opening,
+move unrelated features by several pixels, or reverse triangle orientations.
+They are not accepted as complete blinks. A corrected boundary experiment uses
+anatomical left at positive head X; an earlier swapped-side trial is discarded.
+
+`reconstruction/blink_prior.py` proposes a localized angular closure around each
+eye, with corner falloff and brow anchors. It preserves the movable mask and
+zero-strength pose, supports a rotated head coordinate frame, and explicitly
+marks its output as authored motion requiring geometry/contact validation.
+It does not recover target-subject expressions or automatically accept meshes.
+
+The selected residual aperture is 0.025. At 21 strengths, bounded area repair
+requires at most 0.092207 mm, keeps brow displacement below 0.026 px, and every
+saved float32 pose passes the 0.1 reference-normal area-ratio gate. Exact
+quadratic extrema over the 20 linear interpolation intervals give a minimum
+ratio of 0.10073816. All 21 poses have zero detected strict self-intersections
+in the 3666-face skin region around the eyes. These are orientation and sampled
+intersection checks, not a continuous volumetric collision proof. The tighter
+0.015 aperture had 16 hidden endpoint intersections and is not the default.
+
+Combining this closure with the earlier dense-gaze optical placement improves
+radial contour clearance. Across the 21 strengths, the worst left upper/lower
+values are +0.717/-0.117 mm; right upper/lower are +0.760/+0.234 mm. The small
+left lower penetration remains. The blink warp itself still uses native eye
+centers; the optical-shell audit uses the fitted translated centers.
+
+At 1024 square pixels, opaque optical-shell masks with tear lines hidden show
+0 exposed eye pixels frontally and 6/3/2/15 pixels at yaw -60/-30/+30/+60 degrees.
+The original placement showed 23 exposed pixels frontally with either tested
+closure aperture. These counts use saved RGB PNGs with any channel above 3/255;
+Blender's empty Render Result pixel buffer was discarded as an invalid counter.
+Small side-view corner gaps remain, so combined fitting is still experimental.
+The fitted optical-center offset must follow head rotation when later animated,
+while globe orientation rotates around that shifted center.
+
+Validation: `TMPDIR="$PWD/tmp" tmp/vhuman-texture-venv/bin/python -m unittest
+server.vhuman.test_blink_prior server.vhuman.test_component_spacing -v` passes
+10 tests. Receipts under `tmp/vhuman-quality8h/`:
+`blink_prior_025_validated/{report,interpolation}.json`,
+`blink_prior_025_contacts/{samples,dense_clearance}.json`,
+`blink_optical_masks_dense_views/report.json`, and `blink_025_dense_beauty/`.
+No static anatomy or material candidate is replaced by these experiments.
