@@ -949,3 +949,46 @@ server.vhuman.test_blink_prior server.vhuman.test_component_spacing -v` passes
 `blink_prior_025_contacts/{samples,dense_clearance}.json`,
 `blink_optical_masks_dense_views/report.json`, and `blink_025_dense_beauty/`.
 No static anatomy or material candidate is replaced by these experiments.
+
+## Synthetic-detail attenuation and selective projection study
+
+Two new detail trials average log color over 64 nearby surface samples, using a
+0.8 mm Gaussian and normal dot product above 0.7. Strengths 0.5 and 1.0 feather
+out within 3 mm of photographed support. Both keep all 175458 photographed
+texels, geometry, normal/ORM/specular maps and support masks exactly unchanged.
+They are appearance regularization, with no new view evidence. This local
+k-nearest surface approximation is density-dependent, not a geodesic filter.
+
+Nine matched OptiX renders (front, +60-degree side and frontal right-side key
+lighting, each with baseline/two variants) show only modest fine-detail changes.
+The full-strength foreground RGB MAE is 0.127/255 frontally, 0.361/255 at the
+side and 0.135/255 under the alternate light. Alpha is unchanged. Larger uneven
+tone patches persist, while seam energy slightly worsens from 0.0366182 to
+0.0366584/0.0367201. Neither variant replaces the working material.
+
+A separate controlled study applies a second broad-tone solve to the working
+material, either preserving every photographed texel or allowing edits only
+where confidence is below 0.2 or the Blender source-ray audit marks occlusion.
+The control seam score is 0.0347797; the selective result is 0.0324619. The
+selective mask permits 16275 photographed texels and actually changes 15904;
+159183 protected texels remain exact, with zero edits outside the declared
+photographic edit mask. Edited-region mean absolute RGB change is 4.604/255,
+maximum channel change 32/255. Geometry and support/confidence masks remain
+unchanged; edited colors are explicitly estimates, not new observations.
+
+Receipts under `tmp/vhuman-quality8h/`: `synthetic_detail_filter.json`,
+`synthetic_detail_validation.json`, `detail_comparison/{report,appearance_metrics}.json`,
+`detail_comparison/comparison.png`, `projection_repair_trial.json`, and
+`projection_repair_validation.json`. The projection study's render review is
+recorded below after completion.
+
+All nine projection-study renders complete with unchanged alpha. Selective
+versus original foreground RGB MAE is 0.260/255 frontally, 0.621/255 from the
+side and 0.262/255 with alternate lighting; versus its matched control these
+are only 0.083/255, 0.346/255 and 0.079/255. Visual review finds the broad uneven
+patches still present. Lower seam energy alone is insufficient to promote
+photographic edits, so the working material stays `completed_tone_balanced`.
+The next texture study should address broad appearance/illumination separation
+or a better completion prior rather than repeat local smoothing. The six
+`test_surface_texture` tests pass with repository-local TMPDIR. Final receipts:
+`projection_comparison/{report,appearance_metrics}.json` and `comparison.png`.
