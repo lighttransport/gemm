@@ -371,3 +371,38 @@ Regression: 53 tests pass, adding `server.vhuman.test_component_spacing`.
 - Continue selective photo-projection repairs and surface texture studies on
   the selected geometry, preserving reliable source detail.
 - Export complete anatomy comparisons and run browser/native motion validation.
+
+## Local lip unfolding and cumulative geometry guard
+
+The directional solver now supports explicit scalar attachment targets. Zero
+remains the default; incompatible dependent constraints report nonconvergence.
+A local lower-lip triangle is displaced 0.075 mm along its normal while six
+vertices on the opposing sheet and all 468 facial attachments remain fixed.
+Unpinned smooth-field trials moved both sheets together and were rejected.
+The selected pinned trial converges in 42 sweeps and removes all four local
+skin crossing pairs, with negligible projected facial-attachment displacement.
+
+A cumulative check against the original geometry catches a gum triangle with
+area ratio 0.0274, despite passing the previous per-step guards. An additional
+gum-only correction of at most 2.762 micrometres restores a cumulative 0.15 area
+floor without moving teeth or skin. Across 101 neutral-to-captured samples,
+the complete geometry has minimum oriented-area ratio 0.15000001 and no face
+reversals. This ramp does not cover arbitrary expressions or contact clearance.
+
+The resulting `lip_candidate_unfolded_guarded` passes OptiX rendering and
+packed-asset reload (20.45 seconds, 2711 MiB peak whole-device usage). Blender
+intersection-segment ray checks find zero source-visible oral crossing pairs,
+versus 14 in the original and three in the tooth-spaced predecessor. Across
+camera yaw -60/-30/0/30/60 degrees, visible counts are 4/0/0/0/4, versus original
+14/12/14/19/6. Remaining extreme-angle pairs are between upper tooth-material and gum
+triangles; they require gum-transition correction while keeping teeth fixed. Total strict oral
+pairs remain 909, mostly hidden. These are finite segment samples with opaque
+geometry, not proof of general collision freedom.
+
+This is the working anatomy candidate, not a promoted completed material.
+Completed skin transfer, broader expression/eye-contact checks, and complete
+anatomy export remain open. Receipts are `lip_unfold_selected/`,
+`lip_candidate_unfolded_guarded/cumulative_area_ramp.json`, and
+`contact_visibility/report_side_views.json` under the study root.
+Regression: 55 tests pass across directional surface, component spacing,
+mesh crossings, oral visibility, and reconstruction modules.

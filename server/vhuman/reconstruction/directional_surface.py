@@ -42,10 +42,11 @@ def area_constraints(frames, triangles, direction):
 
 def constrain_offsets(frames, triangles, direction, desired_mm, *, minimum_ratio=.2,
                       limit_mm=2., tolerance=1e-8, max_sweeps=2000, fixed_attachments=None,
-                      maximum_edge_ratio=None):
+                      maximum_edge_ratio=None, attachment_targets_mm=None):
     """Project onto area halfspaces and a displacement box using Dykstra sweeps.
 
-    Optional (vertex_ids, barycentric_weights) attachments have zero displacement.
+    Optional (vertex_ids, barycentric_weights) attachments have zero displacement,
+    or the supplied scalar attachment_targets_mm along the fixed direction.
     Optional maximum_edge_ratio bounds edge stretch in every supplied pose;
     the scalar interval intersections are exact for the fixed direction.
     Return offsets plus convergence diagnostics. Callers must reject a report
@@ -79,6 +80,8 @@ def constrain_offsets(frames, triangles, direction, desired_mm, *, minimum_ratio
     inequality_count = matrix.shape[0]
     anchors = None
     attachment_count = 0
+    if attachment_targets_mm is not None and fixed_attachments is None:
+        raise ValueError('attachment targets require attachment definitions')
     if fixed_attachments is not None:
         ids, weights = map(np.asarray, fixed_attachments)
         if (ids.ndim != 2 or ids.shape[1] != 3 or weights.shape != ids.shape
@@ -89,6 +92,10 @@ def constrain_offsets(frames, triangles, direction, desired_mm, *, minimum_ratio
         anchors = coo_matrix((weights.ravel(), (np.repeat(np.arange(len(ids)), 3), ids.ravel())),
                              shape=(len(ids), matrix.shape[1])).tocsr()
         attachment_count = len(ids)
+        targets=np.zeros(attachment_count) if attachment_targets_mm is None else np.asarray(attachment_targets_mm,float)
+        if (targets.shape!=(attachment_count,) or not np.isfinite(targets).all()
+                or (np.abs(targets)>limit_mm).any()):
+            raise ValueError('invalid attachment displacement targets')
         # Project the entire attachment subspace at once. Individual row
         # projections converge very slowly for nearby/dependent attachments.
         gram_inverse = np.linalg.pinv((anchors@anchors.T).toarray(), rcond=1e-12, hermitian=True)
@@ -117,14 +124,15 @@ def constrain_offsets(frames, triangles, direction, desired_mm, *, minimum_ratio
             multipliers[row] = multiplier
         if anchors is not None:
             point = offsets+anchor_residual
-            offsets = point-anchors.T@(gram_inverse@(anchors@point))
+            offsets = point-anchors.T@(gram_inverse@(anchors@point-targets))
             anchor_residual = point-offsets
         point = offsets+box_residual
         offsets = np.clip(point, -limit_mm, limit_mm)
         box_residual = point-offsets
         evaluated = matrix@offsets
         ratios = 1+evaluated[:area_count]
-        anchor_error = float(np.max(np.abs(anchors@offsets), initial=0)) if anchors is not None else 0.
+        anchor_error = float(np.max(np.abs(anchors@offsets-targets), initial=0)) if anchors is not None else 0.
+        anchor_offset = float(np.max(np.abs(anchors@offsets), initial=0)) if anchors is not None else 0.
         inequality_error = float(np.max(bounds-evaluated[:inequality_count], initial=0))
         if (inequality_error <= tolerance and anchor_error <= tolerance
                 and np.max(np.abs(offsets-before)) < tolerance):
@@ -134,7 +142,8 @@ def constrain_offsets(frames, triangles, direction, desired_mm, *, minimum_ratio
                   minimum_area_ratio=float(ratios.min()), minimum_required=minimum_ratio,
                   offset_tolerance_mm=tolerance, area_ratio_tolerance=tolerance,
                   max_offset_mm=float(np.abs(offsets).max()), limit_mm=limit_mm,
-                  fixed_attachments=attachment_count, max_attachment_offset_mm=anchor_error,
+                  fixed_attachments=attachment_count, max_attachment_offset_mm=anchor_offset,
+                  max_attachment_error_mm=anchor_error,
                   max_projection_correction_mm=float(np.abs(offsets-desired).max()))
     if edges is not None:
         changed = vectors+(offsets[edges[:,1]]-offsets[edges[:,0]])[None,:,None]*direction*.001

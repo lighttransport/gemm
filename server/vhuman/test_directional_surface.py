@@ -101,6 +101,21 @@ class DirectionalSurfaceTests(unittest.TestCase):
         self.assertTrue(report['converged'])
         np.testing.assert_allclose(duplicate, one, atol=1e-8)
 
+    def test_nonzero_attachment_target(self):
+        frame=np.array([[[0,0,0],[.001,0,0],[0,.001,0]]])
+        offsets,report=constrain_offsets(frame,np.array([[0,1,2]]),[0,1,0],[0,0,0],
+            fixed_attachments=(np.array([[2,2,2]]),np.array([[1.,0,0]])),attachment_targets_mm=[.1])
+        self.assertTrue(report['converged'])
+        self.assertAlmostEqual(offsets[2],.1)
+        self.assertLess(report['max_attachment_error_mm'],1e-8)
+
+    def test_inconsistent_attachment_targets_do_not_converge(self):
+        frame=np.array([[[0,0,0],[.001,0,0],[0,.001,0]]])
+        _,report=constrain_offsets(frame,np.array([[0,1,2]]),[0,1,0],[0,0,0],max_sweeps=3,
+            fixed_attachments=(np.array([[2,2,2],[2,2,2]]),np.array([[1.,0,0],[1.,0,0]])),
+            attachment_targets_mm=[.1,-.1])
+        self.assertFalse(report['converged'])
+
 
 if __name__ == '__main__':
     unittest.main()
