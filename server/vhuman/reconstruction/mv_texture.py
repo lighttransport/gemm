@@ -154,7 +154,7 @@ def compare_recipes(work, *, view='right', prefix='recipe', edit_backend=None, e
     return summary
 
 
-def compose(work, spec, name='hybrid'):
+def compose(work, spec, name='hybrid', *, require_approved_edits=False):
     """Assemble a per-view hybrid generation (e.g. Edit-2511 for face-seeing views, MV-Adapter elsewhere).
 
     spec: 'view=<backend dir>:<raw|view>,...'. 'raw' takes <dir>/<view>/edited.png (full editor output),
@@ -179,6 +179,9 @@ def compose(work, spec, name='hybrid'):
         if info.get('source_basecolor_sha256',record['basecolor_sha256'])!=record['basecolor_sha256']:
             raise ValueError('hybrid source basecolor mismatch')
         digest=sha256(path)
+        if kind=='raw' and require_approved_edits:
+            from .edit_guard import require_approved
+            require_approved(work/backend,view,digest,record)
         expected=(info.get('view_runs',{}).get(view,{}).get('edited_sha256') if kind=='raw'
                   else info.get('views',{}).get(path.name))
         if expected is not None and expected!=digest:raise ValueError('hybrid source checksum mismatch: '+str(path))
@@ -532,6 +535,7 @@ def main():
     p.add_argument('--candidate');p.add_argument('--work',required=True)
     p.add_argument('--backend',default='mvadapter',help=f'{BACKENDS} for generate; any work subdir for bake');p.add_argument('--out',nargs='*')
     p.add_argument('--name',help='fresh generation subdirectory (default: backend name)')
+    p.add_argument('--require-approved-edits',action='store_true',help='compose rejects raw views without a passing, checksummed clothing guard receipt')
     p.add_argument('--views',nargs='+',choices=('front','right','left','back','top','bottom'),help='independent Edit-2511 views; default is sequential')
     p.add_argument('--edit-backend',choices=('auto','gguf','native'))
     p.add_argument('--edit-model-root');p.add_argument('--matte-model');p.add_argument('--parsing-model')
@@ -560,7 +564,7 @@ def main():
             **({'model_root':a.edit_model_root} if a.edit_model_root else {}))
         print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,editor,
             **({'steps':a.steps} if a.steps else {})),indent=1))
-    if a.stage=='compose':print(json.dumps(compose(a.work,a.spec,a.backend if a.backend.startswith('hybrid') else 'hybrid'),indent=1))
+    if a.stage=='compose':print(json.dumps(compose(a.work,a.spec,a.backend if a.backend.startswith('hybrid') else 'hybrid',require_approved_edits=a.require_approved_edits),indent=1))
     if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band,parsing_model=a.parsing_model),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 

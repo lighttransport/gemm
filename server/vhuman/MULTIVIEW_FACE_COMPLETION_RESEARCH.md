@@ -392,3 +392,16 @@ a reproducible CUDA comparison workflow, not an appearance improvement.
 Further quality work should address clothing priors and ear/scalp transitions
 before more independent full-image edits. The preserved photo projection also
 contains ear/temple artifacts that unseen-only synthesis cannot change.
+
+### Blender-assisted surface correction (2026-10-08)
+
+The follow-up [Blender workflow](BLENDER_TEXTURE.md) promotes a conservative
+surface-tone correction of `out_hybrid8`, with no new diffusion views. The
+chosen solve reduces seam error from 0.04674751 to 0.03676682 (21.35%), retains
+91.8141% source-generation coverage and changes zero photographed texels.
+Blender/OptiX provides matched shading review and a ray audit; USD geometry,
+UVs and texture pixels round-trip exactly. A separate occlusion-only repair
+changes 605 of 627 flagged photo samples and remains experimental under the
+strict photo-preservation gate. Guarded composition now rejects garment-bearing
+raw edits before baking. A downloadable mobile-device test page is prepared;
+physical phone/tablet validation awaits a device.

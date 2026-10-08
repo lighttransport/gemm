@@ -43,7 +43,7 @@ def speech_fixture(package):
     finally:stop.set();thread.join(timeout=5)
 
 
-def verify(player,out,hardware=False):
+def verify(player,out,hardware=False,device_test=False):
     player,out=Path(player).resolve(),Path(out).resolve();out.mkdir(parents=True,exist_ok=True)
     if not find_chrome():raise RuntimeError('Chromium not installed')
     class Quiet(SimpleHTTPRequestHandler):
@@ -159,8 +159,28 @@ def verify(player,out,hardware=False):
                 animated_pose_fps=(animation_end['poses']-animation_start['poses'])*1000/(animation_end['time']-animation_start['time']),
                 audio=audio,frame_checks=['relighting','dynamic detail','ear/rear/crown cameras','audio sample clock','cancellation'],
                 passed=bool(float(np.percentile(errors,95))<.25 and float(np.percentile(binding_errors,95))<.25 and max(activation_errors,default=0)<1e-5))
-            (out/'verification.json').write_text(json.dumps(result,indent=2))
             if not result['passed']:raise AssertionError(result)
+            if device_test:
+                downloads=out/'downloads';downloads.mkdir(exist_ok=True)
+                cdp.call('Browser.setDownloadBehavior',{'behavior':'allow','downloadPath':str(downloads)})
+                cdp.call('Page.navigate',{'url':f'http://127.0.0.1:{server.server_port}/device-test.html'})
+                cdp.wait_for('window.vhumanDeviceTest && document.getElementById("viewer").contentWindow.vhuman?.ready',timeout=120)
+                cdp.evaluate('document.getElementById("model").value="Desktop automated smoke test; not mobile"; vhumanDeviceTest.run({phaseMs:3000}); true')
+                cdp.wait_for('vhumanDeviceTest.report && !document.getElementById("run").disabled',timeout=40)
+                receipt=cdp.evaluate('vhumanDeviceTest.report')
+                config=json.loads((player/'config.json').read_text())
+                if (receipt.get('errors') or len(receipt.get('phases',[]))!=4
+                        or receipt.get('package_sha256')!=config['package_sha256'] or receipt.get('visual_review_complete')):
+                    raise AssertionError(receipt)
+                cdp.evaluate('document.getElementById("download").click()')
+                downloaded=downloads/'vhuman-device-test.json'
+                for _ in range(50):
+                    if downloaded.exists():break
+                    time.sleep(.1)
+                if json.loads(downloaded.read_text())!=receipt:raise AssertionError('device report download differs')
+                result['device_test_page']=dict(passed=True,receipt='downloads/vhuman-device-test.json',
+                    timing_pass=receipt['timing_pass'],physical_mobile_test=False)
+            (out/'verification.json').write_text(json.dumps(result,indent=2))
             return result
     finally:
         if cdp:cdp.close()
@@ -173,7 +193,8 @@ def verify(player,out,hardware=False):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--player',required=True);p.add_argument('--out',required=True)
-    p.add_argument('--hardware',action='store_true');print(json.dumps(verify(**vars(p.parse_args())),indent=2))
+    p.add_argument('--hardware',action='store_true');p.add_argument('--device-test',action='store_true')
+    print(json.dumps(verify(**vars(p.parse_args())),indent=2))
 
 
 if __name__=='__main__':main()

@@ -1371,6 +1371,13 @@ comparison; `generate --views` edits fixed views independently. See
 [TEXTURE_CUDA.md](TEXTURE_CUDA.md) for commands, measured results, preservation
 checks and the local viewer workflow. The SDXL-based hybrid remains evaluation-only.
 
+[Blender-assisted surface refinement](BLENDER_TEXTURE.md) adds exact USD/UV/texture
+round-trip checks, source-camera ray visibility, protected surface-tone correction,
+optional masked projection repairs and garment rejection before composition.
+The promoted correction reduces seam error 21.35% with all photographed texels
+unchanged. Built players include `device-test.html` for package-bound timing
+receipts on a phone/tablet; physical mobile testing remains pending.
+
 ### Generated detail for unobserved skin
 
 `reconstruction.generated_skin` uses the installed native ROCm Qwen-Image 2.1

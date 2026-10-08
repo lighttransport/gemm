@@ -60,6 +60,8 @@ def build(package,out,three,detail=None,skin_review=None):
         (out/target).write_text(text)
     for name in ('vhuman_mobile.html','vhuman_mobile.js','vhuman_mobile_hash.js','vhuman_mobile_worker.js','vhuman_mobile_stream.js','vhuman_mobile_audio.js'):
         shutil.copyfile(ROOT/'web'/name,out/('index.html' if name.endswith('.html') else name))
+    shutil.copyfile(ROOT/'web/vhuman_device_test.html',out/'device-test.html')
+    shutil.copyfile(ROOT/'web/vhuman_device_test.js',out/'vhuman_device_test.js')
     (out/'config.json').write_text(json.dumps(dict(schema='vhuman.browser.v1',package='avatar/',
         package_sha256=sha256(package/'avatar.json'),detail='detail/' if detail else None,
         detail_sha256=sha256(detail/'detail.json') if detail else None,

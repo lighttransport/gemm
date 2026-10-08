@@ -1,5 +1,9 @@
 # Multiview texture continuation on RTX 5060 Ti
 
+Follow-up: [Blender-assisted surface refinement](BLENDER_TEXTURE.md) promotes a
+photo-preserving correction of this baseline. The diffusion comparison below
+remains unchanged; none of its newly generated views was promoted.
+
 This workflow continues the Edit-2511/MV-Adapter appearance experiment on the
 existing Obama `material12` GNM candidate. Generated appearance is synthetic;
 the hybrid retains the SDXL base's evaluation-only provenance. It does not

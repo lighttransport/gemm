@@ -171,6 +171,12 @@ def export(candidate,out, *, scene,profile='iphone12'):
         result['validation']['research_generated_skin']=True
         for name in ('skin_generated_support.png','generated_skin.json'):
             shutil.copyfile(candidate/name,out/name)
+        refinement=completion.get('surface_refinement')
+        if refinement:
+            name='skin_projection_repair.png'
+            if sha256(candidate/name)!=refinement['repair_mask_sha256']:
+                raise ValueError('projection repair mask checksum mismatch')
+            shutil.copyfile(candidate/name,out/name)
     result['files']={p.name:dict(sha256=sha256(p),bytes=p.stat().st_size) for p in sorted(out.iterdir()) if p.is_file()}
     (out/'avatar.json').write_text(json.dumps(result,indent=2));validate_package(out)
     return result

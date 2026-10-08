@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Virtual human · device test</title>
+<style>body{margin:0;background:#151719;color:#eee;font:16px system-ui}header,section{max-width:1000px;margin:auto;padding:20px}iframe{width:100%;height:68vh;border:0}button,select,input{font:inherit;padding:8px;margin:6px;background:#30363b;color:#eee;border:1px solid #667;border-radius:4px}label{display:block;margin:8px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#9cf}.muted{color:#bbc}</style>
+<header><h1>Device test</h1><p>Run this page on the target phone or tablet. Keep it visible and disable battery-saving mode for a comparable measurement. Results stay on this device until you download them.</p>
+<label>Device model <input id="model" placeholder="e.g. iPhone 12 / Pixel 8"></label>
+<label>Seconds per phase <select id="duration"><option value="10">10 — quick check</option><option value="30" selected>30 — standard</option><option value="60">60 — sustained</option></select></label>
+<button id="run">Run test</button><button id="download" disabled>Download results</button><a href="./">Open viewer</a><p id="status" role="status">Waiting for the avatar to load.</p></header>
+<iframe id="viewer" src="./index.html" title="Avatar under test" allow="autoplay"></iframe>
+<section><h2>Visual review</h2><p class="muted">Timing results do not establish appearance quality. Inspect both ears, crown and neck under different lights in the viewer.</p>
+<label><input id="visual-seams" type="checkbox">No objectionable ear/scalp seams or clothing patches</label>
+<label><input id="visual-identity" type="checkbox">Identity and anatomy remain consistent during motion</label>
+<label><input id="visual-lighting" type="checkbox">No clipped highlights or unstable detail under relighting</label>
+<p class="muted">This test covers local rendering and motion. Speech/audio and comparison with native geometry require the separate hardware verifier; they are not certified by this page.</p><pre id="result"></pre></section>
+<script type="module" src="./vhuman_device_test.js"></script></html>
