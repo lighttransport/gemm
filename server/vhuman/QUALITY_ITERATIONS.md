@@ -1728,3 +1728,53 @@ single-view evidence, not ground-truth anatomy; this is not a 3D accuracy score.
 Artifacts under `tmp/vhuman-quality4h/`: `filter_scalp_detail_exactear.py`,
 `scalp_detail_exactear_1.0/protection_validation.json`, `scalp_exactear_render/`,
 `preferred_skin_candidate/`, and `ear_projection/{report.json,overlay.png}`.
+
+## Constrained ear height fitting
+
+A 0--10 mm vertical ear-region sweep improves source parser coverage but moves
+11 facial landmarks (up to 6.76 px at 8 mm). The revised solve freezes the local
+patch boundary and fixed facial attachments, using `directional_surface` with
+a 0.2 area floor and 1.25 edge-stretch limit. Its local mesh has 1,687 vertices
+and 174 attachment constraints, including 156 boundary vertices. The 6/8/10 mm
+solutions preserve source-pose facial landmarks to numerical precision. Larger
+lifts turn some triangles more strongly: maximum normal turn is 26.74 degrees
+at 6 mm versus 43.72 at 8 mm. Matched front/side previews favor the 6 mm shape.
+
+Float32 storage and half-frame interpolation initially produce peak edge
+stretch 1.250025 rather than the requested 1.25. The final field is scaled
+slightly toward the original shape, making its maximum lift 5.997 mm, and all
+checks are repeated on that actual track. Across 81 saved/half-frame samples,
+minimum local relative area is 0.235803 and peak edge stretch 1.249880. Strict
+crossings involving altered ear triangles against the entire skin are zero.
+Non-exterior-skin vertices remain exact. Full-mesh neutral-reference orientation
+also passes its exact cubic interval check at minimum 0.100517, unchanged from
+the inherited eyelid limit. Containment, tangency and arbitrary-time collision
+freedom are outside these tests.
+
+Source ear coverage rises from 2,181/3,661 (59.6%) to 2,393/3,661 (65.4%). The
+shape adds 306 parsed-ear pixels and loses 94; it adds no background pixels and
+30 parser-hair pixels. Hair geometry is not introduced. This is fitting to
+uncertain single-view parsing, not independent anatomical accuracy. Face
+landmark shift on the actual stored track is at most 0.000001735 px across the
+81 samples. Fresh Blender validation passes all 738 part/frame checks.
+
+The selected scene is `ear_lift_final_scene_06/head.blend`; its motion is
+`ear_lift_final_motion_06/`. The inherited UV appearance is retained as a prior
+on the displaced ears, so this is not a fresh portrait-color bake. The parent
+skin/ear scene and larger shape trials remain available for comparison.
+
+`preferred_ear_shape_usd/portable.blend` passes fresh import with 18 meshes /
+81 samples, 1,458 mesh checks, 972 shader checks, zero socket error and relative
+`//head.usdc`. A matched 512-square CPU render has native/USD foreground RGB
+MAE 0.450116/255, p99 5/255 and unchanged alpha; both images were inspected.
+Interchange therefore preserves the selected shape and shading closely, with
+the measured rendering difference retained rather than claiming pixel identity.
+Inherited eyelid/oral contact limitations remain.
+
+All recipes and receipts are under `tmp/vhuman-quality4h/`: `sweep_ear_lift.py`,
+`constrain_ear_lift.py`, `ear_lift_constrained/`, `ear_lift_final_motion_06/`,
+`ear_lift_final_render/`, `preferred_ear_shape_usd/` and
+`ear_shape_usd_render_comparison/`. Recipe and exterior-skin mapping hashes are
+recorded beside the constrained fields. The exterior mapping has 11,460 native
+vertices; the Blender skin object additionally contains 658 other native skin
+vertices, which are preserved by the field.
