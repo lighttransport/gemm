@@ -992,3 +992,37 @@ The next texture study should address broad appearance/illumination separation
 or a better completion prior rather than repeat local smoothing. The six
 `test_surface_texture` tests pass with repository-local TMPDIR. Final receipts:
 `projection_comparison/{report,appearance_metrics}.json` and `comparison.png`.
+
+## Color/displacement isolation and broad unseen-tone normalization
+
+Four matched side renders isolate baseline, no displacement, uniform basecolor,
+and unlit basecolor. The broad patch pattern survives disabling displacement
+and appears in the unlit color pass; uniform color largely removes it. This
+locates the principal problem in the appearance map rather than pore height.
+A matched source-coverage emission render places much of the pale lateral-face
+band inside photographed support. Unseen-only corrections cannot remove that
+part without explicitly revising the photographic albedo estimate.
+
+Two further trials normalize broad unseen log color toward the median of
+49801 confidently projected, parser-labelled skin texels. A normal-compatible
+96-neighbor field on 1.5 mm voxels uses a 6 mm Gaussian, 12 mm feather from
+photographed support and a bounded 0.5 log gain. Strengths 0.5 and 1.0 retain
+all photographed texels, geometry and auxiliary maps exactly. This uniform
+unseen-tone target is an authored appearance prior, not recovered reflectance.
+
+Nine matched renders show broader changes than the earlier detail filter,
+but leave the photographed transition visible. Full strength foreground RGB
+MAE is 1.455/255 frontally, 2.874/255 at +60 degrees and 1.532/255 with the
+alternate key light; alpha is unchanged. Seam scores worsen to 0.0374785 and
+0.0386489 from 0.0366182. Neither trial replaces the working material.
+
+The next targeted hypothesis is excessive illumination compensation at the
+source projection's grazing angles. Compare the current first-order diffuse
+estimate against partial compensation using the original source samples,
+with an explicit photographic edit mask and matched completion control.
+This hypothesis is not yet validated by the color-only ablation.
+
+Receipts under `tmp/vhuman-quality8h/`: `skin_ablation/{report.json,comparison.png}`,
+`skin_coverage_diagnostic/albedo.png`, `unseen_tone_normalization.json`,
+`unseen_tone_validation.json`, and
+`unseen_tone_comparison/{report.json,appearance_metrics.json,comparison.png}`.
