@@ -772,3 +772,82 @@ Localization of the captured lower arch's 23 strict crossings finds 22
 pairs with exactly one gum triangle and one gum/gum pair; none are tooth/tooth.
 `lower_arch_bind_contacts.json` records their triangle IDs for the next bounded
 gum repair. This explains why arch rigidification alone preserves the problem.
+
+## Lower gum correction trials and Blender trimming
+
+The lower dental mesh has 196 vertices shared by the `teeth` and `gums`
+groups. These form the open boundaries of the separately rendered teeth/gum
+surfaces. Consequently, preserving every tooth vertex also fixes these gum
+boundary vertices. The hard cases occur at these root junctions.
+
+Several bounded, fixed-tooth displacement experiments were tested against 21
+neutral/captured samples. The initial tooth-plane formulation imposed
+contradictory half-spaces on adjacent gum triangles; consistent plane sides
+remove that implementation error. Expanding from 29 to 57 free gum vertices
+clears the original pairs, but requires 0.673 mm despite a 0.5 mm cap and leaves
+11 captured-pose crossings elsewhere. It is rejected. Adding neighboring pairs
+and a 1 mm cap reduces the captured crossings to two, but leaves contacts in
+the neutral portion and fails its constraints. That result is also rejected.
+
+An alternative uses triangle normals and edge-cross-product separating axes.
+It limits displacement to about 0.236 mm and reduces captured lower-arch
+crossings from 23 to four, but does not converge to a feasible joint solution.
+The selected axes plus linearized area constraints are infeasible; excluding
+one difficult tooth face, examining only the captured pose, and testing an
+unsigned-area variant do not resolve that linearized problem. These failures
+are specific to these axes/linearizations and do not prove that no bounded
+nonlinear correction exists. None of these offsets is installed in the working
+candidate, and the existing signed-area gate is not waived.
+
+A separate Blender experiment changes topology at the peak surprise frame.
+It copies evaluated lower teeth to a hidden cutter, caps 196 boundary edges
+with 16 faces, verifies that the cutter is closed, and applies an exact Boolean
+difference to the open gum surface. Visible teeth are unchanged. Gum polygons
+increase from 1188 to 1202 (1246 evaluated triangles), with no degenerate
+triangles detected. Contact audits weld exact duplicate coordinates first so
+split material-boundary vertices do not produce extra adjacency reports.
+
+At this frame, strict tooth/gum pairs fall from 19 to three; gum self-crossings
+increase from two to three. Finite visibility checks show a useful but partial
+result: lower-arch self-contact pairs fall from nine to zero at yaw -30 degrees
+and from three to one at +30 degrees. The remaining upper-dental/cavity,
+cavity/tongue and side lower-dental/cavity contacts persist. Static appearance
+is rendered with OptiX. This topology-changing experiment is not promoted;
+expression stability, UV continuity, remaining contacts and animated export
+still require validation.
+
+Receipts/scripts under `tmp/vhuman-quality8h/`: `lower_gum_repair*/`,
+`repair_lower_gums*.py`, `repair_lower_gums_partial.log`,
+`repair_lower_gums_captured.log`, `repair_lower_gums_unsigned.log`,
+`gum_boolean_trial/{report,contact_audit}.json`,
+`gum_boolean_visibility/visibility.json`, `render_gum_boolean_trial.py`, and
+`audit_gum_boolean.py`.
+
+## Optional oral microstructure and wet-coat appearance
+
+A matched static shader trial adds a rest-position vertex attribute to tongue
+and gum objects, drives fine bump and roughness variation from it, and adds a
+restrained wet coat. Authored bump distance is 40 micrometres for tongue and
+18 micrometres for gums, at strength 0.25. These values are appearance priors,
+not measured tissue detail. The static attribute is intended to follow shape
+keys; motion appearance and USD primvar transport are not yet verified.
+
+The unchanged and modified scenes render at 64 samples with seed 0. The mouth
+crop changes by mean absolute RGB 0.280/255; the visual difference is subtle and
+does not establish a quality gain. Geometry and photographed skin maps are
+unchanged. This remains optional, with no production material change. See
+`oral_shader_trial/{head.blend,comparison.png,comparison.json,report.json}` and
+`render_oral_shader_trial.py` in the study directory.
+
+
+Enabling Blender Boolean `use_self` improves the static trimming result:
+735 gum vertices and 1255 triangles have no detected degenerates or gum
+self-crossings. Three tooth/gum strict pairs remain, but none is visible in
+the five sampled peak-frame views; the previous +30-degree lower-arch contact
+is gone. Remaining visible oral contacts are one upper-dental/cavity pair at
+-30 degrees, four cavity/tongue pairs frontally and ten lower-dental/cavity
+pairs at +60 degrees. This isolates the next work: animated trim stability and
+cavity/tongue coordination. It is still a static experimental alternative.
+Receipts: `gum_boolean_self_trial/{report,contact_audit,comparison}.json`,
+`gum_boolean_self_trial/comparison.png`, and
+`gum_boolean_self_visibility/visibility.json` in the study directory.
