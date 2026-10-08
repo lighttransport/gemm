@@ -1778,3 +1778,47 @@ All recipes and receipts are under `tmp/vhuman-quality4h/`: `sweep_ear_lift.py`,
 recorded beside the constrained fields. The exterior mapping has 11,460 native
 vertices; the Blender skin object additionally contains 658 other native skin
 vertices, which are preserved by the field.
+
+## Ear rest geometry, source-photo rebake and support guards
+
+The ear correction is now incorporated into `full_neutral`, `full_captured`,
+the exterior-skin arrays and `portrait_surface_delta`, making it part of the
+reconstruction rather than only an animated preview field. The new geometry
+hash is `ab695623791703c54c88efbc130f69997cd470a6a711544201cb5b64f993aaea`.
+Its corrected ear positions agree with the selected motion's first frame within
+3.61e-9 metres. The existing vertex snapshots are rebound to this geometry,
+explicitly recording that the ear field must not be applied again. The new
+neutral-reference cubic orientation check retains minimum 0.100517.
+
+A full portrait bake is followed by localized ear sampling, retaining the
+selected face/scalp colors outside the edit. Unrestricted regional sampling
+reintroduces pale root patches, so it is not selected. The old exclusion mask
+allows four background-class source pixels; the strict trial excludes all
+background/hair/other prohibited classes and uses an ear mask eroded by two
+source pixels for its color samples. Excluding those four pixels does not change
+the total observed count in this geometry, so they are not asserted to be the
+sole cause of the patches. Restricting the ear sampling footprint removes the
+large root patches but retains a cool lobe tint. A subsequent localized color
+cleanup removes that tint while preserving the geometry-specific photo sampling.
+
+`ear_rebake_clean` is selected after inspecting both matched 768-square side
+comparisons. The geometry-specific reference uses the same strict source mask.
+The final coverage has 175,025 observed texels; source pixels are unchanged.
+Unobserved and formerly observed colors retained from the parent are explicitly
+appearance priors. Illumination removal and color matching remain estimates;
+there is no new view evidence. The rebake mask, source masks, coverage,
+confidence, support and geometry hashes are bound to the completion record.
+
+`preferred_rebaked_candidate/head.blend` updates the skin rest basis and packed
+basecolor, retains the tested snapshots, and passes fresh validation: 738
+part/frame checks and exact packed-image hash/color-space verification. The
+prior ear-only USD bundle remains available; this rebaked version has not yet
+replaced it. Eye and oral contact limitations are inherited.
+
+`validate_candidate` now verifies localized rebake asset hashes. Two additional
+tests reject changed support/edit/source masks, changed coverage/confidence, and
+false new-view claims. All 11 transfer/protection tests pass. Recipes, reference
+bakes and comparisons are in `tmp/vhuman-quality4h/`: `bake_ear_geometry.py`,
+`compose_ear_rebake_strict.py`, `ear_geometry_strict_reference/`,
+`ear_rebake_strict_render/`, `ear_rebake_clean_render/`, `ear_rebake_motion/`,
+and `preferred_rebaked_candidate/`.

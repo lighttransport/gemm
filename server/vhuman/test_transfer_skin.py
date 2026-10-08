@@ -92,5 +92,61 @@ class PriorTransferIntegrationTests(unittest.TestCase):
             self.assertFalse((root/'out').exists())
 
 
+class LocalizedRebakeProvenanceTests(unittest.TestCase):
+    def fixture(self, root):
+        import json
+        from PIL import Image
+        from .reconstruction.observations import sha256
+        path = PriorTransferIntegrationTests().fixture(root, 'candidate', .005, True)
+        for name in ('ear_rebake_mask.png', 'skin_confidence.png',
+                     'skin_source_core_mask_0.png', 'skin_strict_exclusion_0.png'):
+            Image.new('L', (8, 8), 64).save(path/name)
+        manifest = json.loads((path/'manifest.json').read_text())
+        report = manifest['material']['synthetic_completion']
+        report.update(method='localized_geometry_rebake',
+            generated_support_sha256=sha256(path/'skin_generated_support.png'),
+            localized_rebake=dict(new_view_evidence=False,
+                mask_sha256=sha256(path/'ear_rebake_mask.png'),
+                target_coverage_sha256=sha256(path/'skin_coverage.png'),
+                target_confidence_sha256=sha256(path/'skin_confidence.png'),
+                source_core_mask_sha256=sha256(path/'skin_source_core_mask_0.png'),
+                strict_source_mask_sha256=sha256(path/'skin_strict_exclusion_0.png')))
+        (path/'generated_skin.json').write_text(json.dumps(report))
+        (path/'manifest.json').write_text(json.dumps(manifest))
+        return path
+
+    def test_changed_support_and_source_masks_are_rejected(self):
+        import tempfile
+        from pathlib import Path
+        from PIL import Image
+        from .reconstruction.provenance import validate_candidate
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.fixture(Path(directory))
+            validate_candidate(path)
+            for name in ('ear_rebake_mask.png', 'skin_generated_support.png',
+                         'skin_coverage.png', 'skin_confidence.png',
+                         'skin_source_core_mask_0.png', 'skin_strict_exclusion_0.png'):
+                original = (path/name).read_bytes()
+                Image.new('L', (8, 8), 0).save(path/name)
+                with self.assertRaisesRegex(ValueError, 'localized rebake asset hash'):
+                    validate_candidate(path)
+                (path/name).write_bytes(original)
+
+    def test_reprojecting_one_photo_does_not_become_new_view_evidence(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from .reconstruction.provenance import validate_candidate
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.fixture(Path(directory))
+            manifest = json.loads((path/'manifest.json').read_text())
+            report = manifest['material']['synthetic_completion']
+            report['localized_rebake']['new_view_evidence'] = True
+            (path/'manifest.json').write_text(json.dumps(manifest))
+            (path/'generated_skin.json').write_text(json.dumps(report))
+            with self.assertRaisesRegex(ValueError, 'invalid localized rebake'):
+                validate_candidate(path)
+
+
 if __name__ == '__main__':
     unittest.main()

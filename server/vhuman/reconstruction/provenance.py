@@ -45,6 +45,21 @@ def validate_candidate(candidate):
             for name, expected in checks:
                 if not expected or not (candidate/name).is_file() or sha256(candidate/name) != expected:
                     raise ValueError('prior transfer asset hash mismatch: '+name)
+        if completion.get('method') == 'localized_geometry_rebake':
+            revision = completion.get('localized_rebake')
+            if not isinstance(revision, dict) or revision.get('new_view_evidence') is not False:
+                raise ValueError('invalid localized rebake provenance')
+            checks = [('ear_rebake_mask.png', revision.get('mask_sha256')),
+                      ('skin_generated_support.png', completion.get('generated_support_sha256'))]
+            for key, name in [('target_coverage_sha256', 'skin_coverage.png'),
+                              ('target_confidence_sha256', 'skin_confidence.png'),
+                              ('source_core_mask_sha256', 'skin_source_core_mask_0.png'),
+                              ('strict_source_mask_sha256', 'skin_strict_exclusion_0.png')]:
+                if key in revision:
+                    checks.append((name, revision[key]))
+            for name, expected in checks:
+                if not expected or not (candidate/name).is_file() or sha256(candidate/name) != expected:
+                    raise ValueError('localized rebake asset hash mismatch: '+name)
     return manifest
 
 
