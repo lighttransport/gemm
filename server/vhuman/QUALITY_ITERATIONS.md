@@ -136,6 +136,53 @@ TMPDIR="$PWD/tmp" OMP_NUM_THREADS=2 tmp/vhuman-texture-venv/bin/python \
 
 Use a fresh output directory for each run.
 
+## Directionally constrained lip experiments
+
+The first failed 0.5 mm lower-lip shift reverses only two very thin exterior
+skin triangles (double areas approximately 0.052 and 0.108 square millimetres).
+`directional_surface` exploits a restricted deformation: all vertices move
+along one fixed unit direction, with a scalar displacement per vertex. The
+oriented area ratio is then exactly affine in those scalars. Dykstra projection
+enforces linear area inequalities and a displacement box, reporting convergence
+explicitly. This is an orientation constraint relative to reference geometry,
+not a proof of self-intersection freedom or anatomically correct motion.
+
+All 25 trials were repeated with a minimum ratio of 0.2 relative to both neutral
+and captured reference poses. For example, 0.5 mm upper/1 mm lower lip targets
+retain IoU 0.42390, 497 visible tooth pixels and only one visible tooth pixel
+outside the mouth polygon. The maximum adjustment to the proposed displacement
+field is 0.189 mm. However, weighted mouth landmark error increases from
+0.98633 to 1.29568 px and held-out mouth error from 1.33217 to 1.36986 px.
+This does not pass the existing fit acceptance gate.
+
+A 21-pose neutral-to-captured expression ramp also found 11 triangle reversals
+across intermediate poses despite the endpoint constraints. That version is
+rejected. Including all 21 poses in the projection converges in 1921 sweeps;
+a denser 101-pose evaluation then has no orientation reversals and minimum
+ratio 0.2. This covers only the recorded linear expression ramp, not independent
+jaw/gaze animation, collision checks or continuous-time guarantees.
+
+The endpoint candidate was rebaked from the portrait and rendered at 1024 pixels
+with OptiX: packed-asset reload passed, 2711 MiB peak whole-device memory,
+20.1 seconds for rendering and validation. More teeth are visible, but dental
+shading and source matching still need work. The sampled-ramp candidate is
+stored separately as `tmp/vhuman-quality8h/lip_candidate_ramp`; no candidate
+from these experiments replaces the promoted texture/geometry. Its independent
+oral audit reproduces IoU 0.42390, and its own OptiX render and packed-asset
+reload pass. Next fitting
+should constrain the observed lip attachments while adjusting intervening
+occluding surfaces, rather than accepting the landmark regression.
+
+Regression: 37 tests pass, including six directional projection tests covering
+the exact area identity, analytical projection solution, multiple poses,
+nonconvergence reporting and invalid/degenerate inputs. Command:
+
+```sh
+TMPDIR="$PWD/tmp" OMP_NUM_THREADS=2 tmp/vhuman-texture-venv/bin/python -m unittest \
+  server.vhuman.test_directional_surface server.vhuman.test_oral_visibility \
+  server.vhuman.test_reconstruction
+```
+
 ## Next experiments
 
 - Fit actual visible lip surfaces with topology constraints; repeat the oral
