@@ -65,7 +65,7 @@ def acceptance_gate(before,after,minimum_area_ratio,target_px=None):
         and (target_px is None or after['heldout_px']<target_px))
 
 
-def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm=0.,target_px=None,device='cuda:0'):
+def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm=0.,target_px=None,device='cuda:0',parsing_model=None):
     import torch
     from ..rig.gnm_model import GNMModel
     from .dense_landmarks import attachments
@@ -75,7 +75,7 @@ def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm
     if not 50<=iterations<=2000 or not 8<=modes<=128 or not 0<=identity_modes<=128:raise ValueError('invalid fit budget')
     if not 0<=surface_mm<=5:raise ValueError('surface correction must be 0..5 mm')
     if target_px is not None and (not np.isfinite(target_px) or target_px<=0):raise ValueError('target error must be finite and positive')
-    if str(device).startswith('cuda') and torch.version.hip is None:raise RuntimeError('PyTorch ROCm required')
+    if str(device).startswith('cuda') and not torch.cuda.is_available():raise RuntimeError('PyTorch CUDA/ROCm device unavailable')
     candidate,out=Path(candidate).resolve(),Path(out).resolve()
     if out.exists() and any(out.iterdir()):raise ValueError('output must be empty')
     manifest=validate_candidate(candidate);observations=load(candidate/'observations.json')
@@ -85,7 +85,7 @@ def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm
     model=GNMModel();skin=np.flatnonzero(model.group('skin_exterior'))
     ids,bary,_=attachments();full_ids=skin[ids]
     target=np.zeros((468,2));weights=np.zeros(468);lip_landmarks=np.zeros(468,bool)
-    labels,_=FaceParser().predict(np.asarray(Image.open(candidate/'portrait.png').convert('RGB')))
+    labels,_=FaceParser(model=parsing_model).predict(np.asarray(Image.open(candidate/'portrait.png').convert('RGB')))
     for i in range(468):
         anchor=view['anchors'].get(f'mp_{i:03d}')
         if anchor is None:continue
@@ -183,6 +183,7 @@ def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm
         target_met=None if target_px is None else after['heldout_px']<target_px,
         identity_rank=identity_rank,identity_delta_l2=float(delta.norm()),
         surface_limit_mm=surface_mm,surface_max_mm=float(correction.norm(dim=-1).max())*1000,
+        cumulative_surface_max_mm=float(np.linalg.norm(geometry.get('portrait_surface_delta',np.zeros_like(numpy(correction)))+numpy(correction),axis=-1).max())*1000,
         surface_controls=int(correction_basis.shape[1]),surface_width_mm=8.,surface_camera_depth_preserved=True,
         robust_scale_px=2.,lip_training_weight=3.,
         before=before,after=after,expression_rank=rank,expression_dim=383,iterations=iterations,
@@ -197,7 +198,8 @@ def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm
     np.savez_compressed(out/'landmark_diagnostic.npz',before=numpy(project(baseline)),after=pixels,target=target,weights=weights,heldout=heldout)
     if not accepted:return report
     for file in candidate.iterdir():
-        if file.is_file() and file.name not in ('fit_refinement.json','landmark_diagnostic.npz','manifest.json'):
+        if file.is_file() and file.name not in ('fit_refinement.json','landmark_diagnostic.npz','manifest.json',
+                'generated_skin.json','skin_generated_support.png','skin_projection_repair.png'):
             shutil.copyfile(file,out/file.name)
     coefficients=numpy(coeff)
     delta_np=numpy(delta)
@@ -238,10 +240,12 @@ def main():
     p.add_argument('--identity-modes',type=int,default=0)
     p.add_argument('--surface-mm',type=float,default=0.)
     p.add_argument('--target-px',type=float,help='require held-out mean error below this pixel threshold')
+    p.add_argument('--parsing-model',help='explicit checksum-pinned face parsing ONNX path')
     p.add_argument('--device',default='cuda:0');a=p.parse_args()
-    backend='rocm' if a.device.startswith('cuda') else 'cpu';index=int(a.device.split(':')[-1]) if ':' in a.device else 0
+    import torch
+    backend=('rocm' if torch.version.hip else 'cuda') if a.device.startswith('cuda') else 'cpu';index=int(a.device.split(':')[-1]) if ':' in a.device else 0
     with gpu.execution(backend,index):
-        with gpu.device_session(2048) if backend=='rocm' else nullcontext():
+        with gpu.device_session(2048) if backend in ('rocm','cuda') else nullcontext():
             print(json.dumps(refine(**vars(a)),indent=2))
 
 

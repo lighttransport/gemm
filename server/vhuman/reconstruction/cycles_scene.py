@@ -1,4 +1,4 @@
-"""Blender worker: physical materials and AMD HIP offline head rendering.
+"""Blender worker: physical materials and explicitly selected GPU head rendering.
 
 Run through offline_render; this module intentionally imports only Blender and
 its bundled NumPy, not the project's PyTorch environment.
@@ -155,11 +155,12 @@ def run(request):
     bpy.context.preferences.filepaths.temporary_directory=str(out/'cache')
     (out/'cache').mkdir(exist_ok=True)
     scene=bpy.context.scene;scene.render.engine='CYCLES'
-    if request['device']=='hip':
+    if request['device'] in ('hip','cuda','optix'):
         preferences=bpy.context.preferences.addons['cycles'].preferences
-        preferences.compute_device_type='HIP';preferences.get_devices()
-        devices=[d for d in preferences.devices if d.type=='HIP']
-        if not devices:raise RuntimeError('Cycles found no HIP device; CPU rendering must be requested explicitly')
+        device_type=request['device'].upper()
+        preferences.compute_device_type=device_type;preferences.get_devices()
+        devices=[d for d in preferences.devices if d.type==device_type]
+        if not devices:raise RuntimeError(f'Cycles found no {device_type} device; CPU rendering must be requested explicitly')
         for device in preferences.devices:device.use=device==devices[request.get('gpu_index',0)]
         if hasattr(preferences,'use_hiprt'):preferences.use_hiprt=False
         scene.cycles.device='GPU';device_name=devices[request.get('gpu_index',0)].name

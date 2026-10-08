@@ -1,4 +1,4 @@
-"""Complete GNM v3 evaluation with NumPy or differentiable PyTorch ROCm.
+"""Complete GNM v3 evaluation with NumPy or differentiable PyTorch.
 
 Implements the public GNM equations: identity-dependent bind joints, expression
 offsets, rotation correctives and hierarchical LBS. No procedural jaw transform
@@ -24,8 +24,8 @@ class GNMModel:
         self.tensors = {}
         if device is not None:
             import torch
-            if str(device).startswith('cuda') and torch.version.hip is None:
-                raise ValueError('GPU GNM fitting requires PyTorch ROCm')
+            if str(device).startswith('cuda') and not torch.cuda.is_available():
+                raise ValueError('GPU GNM fitting requires an available PyTorch CUDA/ROCm device')
             for key, value in self.data.items():
                 if value.dtype.kind == 'f':
                     self.tensors[key] = torch.as_tensor(value,dtype=torch.float32,device=device)

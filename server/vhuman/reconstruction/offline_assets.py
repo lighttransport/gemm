@@ -139,7 +139,8 @@ def bound_tubes(paths,root_ids,root_weights,full,radius):
     return positions,triangles,dict(ids=ids,weights=weights,offsets=offsets)
 
 
-def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
+def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_fit=None,parsing_model=None,
+            include_hair=True,fit_eyes=False):
     import cv2
     from ..face_parsing import FaceParser
     from ..rig.gnm_model import GNMModel
@@ -180,12 +181,14 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
             if (selected&cavity).any():part('mouth_cavity',full,tri[selected&cavity],uv[selected&cavity],'cavity',native=True)
         else:part(str(name),full,tri[selected],uv[selected],material,native=True)
     head_folder=candidate.parents[1]
-    fit_document=json.loads((head_folder/'fit.json').read_text())
+    fit_path=Path(head_fit) if head_fit is not None else head_folder/'fit.json'
+    from .observations import sha256
+    fit_document=json.loads(fit_path.read_text())
     eye_params=fit_document['eye_params']
     eye_params=params_module.validate(eye_params)
     image=np.asarray(Image.open(candidate/'portrait.png').convert('RGB'))
     Image.fromarray(image).save(out/'accessory_source.png')
-    labels,confidence=FaceParser().predict(image)
+    labels,confidence=FaceParser(model=parsing_model).predict(image)
     pupil_status='source eye fitting estimate'
     if (labels==6).sum()>20 and any(e.get('color',{}).get('status','').startswith('native iris') for e in fit_document['eyes']):
         # The native tracker observes iris rings, not pupil boundaries. A dark
@@ -196,23 +199,33 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
     it,st=assets.structures(eye_params,512)
     Image.fromarray(assets.srgb_u8(iris.bake_color(it,eye_params,512,sclera.sampler(st,eye_params)))).save(out/'iris.png')
     Image.fromarray(assets.shell_textures(eye_params,st,512)['base']).save(out/'sclera.png')
+    ocular_reports={}
     for side,joint in [('left',2),('right',3)]:
+        rotation=np.eye(3);eye_scale=1.
+        if fit_eyes:
+            from .ocular_fit import fit_eye
+            observation=next(e for e in fit_document['eyes'] if e['side']==side)
+            report=fit_eye(camera,joints[joint],profile.iris_z(eye_params['optics']['chamber_depth']),
+                           optics.iris_radius(eye_params,profile),observation)
+            ocular_reports[side]=report
+            if report['accepted']:rotation=np.asarray(report['rotation']);eye_scale=report['scale']
+        def place_eye(positions):return positions@rotation.T*eye_scale+joints[joint]
         shell=geometry.shell(profile,rings=80,segments=96)
         idx=shell.indices.reshape(-1,3)
         cornea=(shell.positions[idx,2].mean(1)>profile.z_limbus)
         for name,mask,material in [('cornea',cornea,'cornea'),('sclera',~cornea,'sclera')]:
-            part(side+'_'+name,shell.positions+joints[joint],idx[mask],shell.uvs[idx[mask]],material,joint=joint)
+            part(side+'_'+name,place_eye(shell.positions),idx[mask],shell.uvs[idx[mask]],material,joint=joint)
         disk=geometry.iris_disk(eye_params,profile,rings=32,segments=96);idx=disk.indices.reshape(-1,3)
         pupil_radius=optics.iris_radius(eye_params,profile)*params_module.pupil_ratio(eye_params)
         radius=np.linalg.norm(disk.positions[:,:2],axis=1)
         idx=idx[(radius[idx]>=pupil_radius).all(1)]
-        part(side+'_iris',disk.positions+joints[joint],idx,disk.uvs[idx],'iris',joint=joint)
+        part(side+'_iris',place_eye(disk.positions),idx,disk.uvs[idx],'iris',joint=joint)
         angle=np.linspace(0,2*np.pi,96,endpoint=False)
         z=profile.iris_z(eye_params['optics']['chamber_depth'])
         ring=np.stack((np.cos(angle)*pupil_radius*1.4,np.sin(angle)*pupil_radius*1.4,np.full(96,z-.0002)),-1)
         cup=np.concatenate((np.array([[0,0,z-.004]]),ring))
         faces=np.stack((np.zeros(96,int),np.arange(96)+1,np.roll(np.arange(96),-1)+1),-1)
-        part(side+'_pupil_cup',cup+joints[joint],faces,np.zeros((96,3,2)),'pupil',joint=joint)
+        part(side+'_pupil_cup',place_eye(cup),faces,np.zeros((96,3,2)),'pupil',joint=joint)
     h,w=image.shape[:2]
     obs=json.loads((candidate/'observations.json').read_text())['views'][0]['anchors']
     eye_pixels=[np.asarray(obs[k]['xy']) for k in ('eye_right','eye_left')]
@@ -267,13 +280,14 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
     if accessories not in ('keep','omit'):raise ValueError('invalid accessories policy')
     # Visible scalp and side hair; hat pixels never seed hair.
     hair=(labels==17)&(confidence>.4)
+    if not include_hair:hair[:]=False
     if (labels==18).sum()>=100:hair&=yy>min(v[1] for v in eye_pixels)-ipd*.25
     skin=model.group('skin_exterior');p=full[skin];skin_tri=model.data['triangles']
     remap=np.full(len(full),-1,int);remap[np.flatnonzero(skin)]=np.arange(skin.sum())
     allowed=skin[skin_tri].all(1);normals=vertex_normals(p,remap[skin_tri[allowed]])
     projected,_=camera.project(p)
     hy,hx=np.nonzero(hair);rng=np.random.default_rng(19)
-    short_hair=short_scalp_prior(labels,confidence,min(v[1] for v in eye_pixels))
+    short_hair=include_hair and short_scalp_prior(labels,confidence,min(v[1] for v in eye_pixels))
     from .reference import srgb_to_linear
     # Dark quartile resists skin pixels mixed into a cropped short hairline.
     samples=image[hy,hx,:3] if len(hy) else np.array([[160,158,151]])
@@ -358,11 +372,12 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature'):
     detail=build(candidate,out,preset=detail_preset)
     scene=dict(schema='vhuman.offline_scene.v1',candidate=str(candidate.resolve()),parts=parts,
         camera=camera.as_dict(),source_size=[w,h],curves=list(curves),accessories=accessory_records,
-        hair=dict(strands=len(hair_paths),lashes=len(lash_paths),short_hair=short_hair,color_linear=hair_color.tolist(),source_color_linear=source_hair_color.tolist(),color_gain_prior=.25 if short_hair else 1.,
+        hair=dict(enabled=include_hair,strands=len(hair_paths),lashes=len(lash_paths),short_hair=short_hair,color_linear=hair_color.tolist(),source_color_linear=source_hair_color.tolist(),color_gain_prior=.25 if short_hair else 1.,
             crown_gap_completion_prior=short_hair,crown_cutoff_y_m=crown_cutoff,crown_feather_width_m=.004,source_mask_sigma_px=1.,
             undercoat='opaque shader on native skin; no overlapping scalp meshes',root_attachment='source-camera visible triangle barycentrics',
             source='visible parsing + front-facing scalp attachment; short undercoat, density, strand shape and depth inferred'),
         optical_eyes=dict(source='analytic GNM-profile shell, iris annulus and recessed pupil cavity',
+            fitting=ocular_reports,head_fit_source=str(fit_path.resolve()),head_fit_sha256=sha256(fit_path),
             pupil_ratio=params_module.pupil_ratio(eye_params),pupil_status=pupil_status,
             ior=eye_params['optics']['ior_cornea'] if 'ior_cornea' in eye_params['optics'] else 1.376),
         detail=detail,material=manifest['material'])

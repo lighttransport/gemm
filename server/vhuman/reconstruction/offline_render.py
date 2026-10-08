@@ -1,4 +1,4 @@
-"""Portable offline head scene and explicitly selected Cycles HIP rendering."""
+"""Portable offline head scene and explicitly selected Cycles GPU rendering."""
 import argparse
 from contextlib import nullcontext
 import json
@@ -18,8 +18,9 @@ DEFAULT_BLENDER = Path('/mnt/disk01/data/vhuman/tools/blender-4.5.14-linux-x64/b
 def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            detail_preset='mature', blender=DEFAULT_BLENDER, gpu_index=0,
            hard_limit_mib=14336, cancel=None, motion=None, frame=1, appearance=None,
-           lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08):
-    if device not in ('hip', 'cpu') or preset not in ('draft', 'final'):
+           lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08,head_fit=None,parsing_model=None,
+           include_hair=True,fit_eyes=False):
+    if device not in ('hip', 'cuda', 'optix', 'cpu') or preset not in ('draft', 'final'):
         raise ValueError('invalid render device or preset')
     if not 1024 <= hard_limit_mib <= 14336:
         raise ValueError('hard GPU limit must be 1024..14336 MiB')
@@ -36,7 +37,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     out.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(out).free < 4 * 1024**3:
         raise RuntimeError('offline rendering requires 4 GiB free disk headroom')
-    prepare(candidate, out, accessories=accessories, detail_preset=detail_preset)
+    prepare(candidate, out, accessories=accessories, detail_preset=detail_preset,head_fit=head_fit,
+            parsing_model=parsing_model,include_hair=include_hair,fit_eyes=fit_eyes)
     if appearance:
         appearance=Path(appearance).resolve()
         from .observations import sha256
@@ -65,8 +67,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     usage_path = usage_paths[gpu_index] if gpu_index < len(usage_paths) else None
     if device == 'hip' and usage_path is None:
         raise RuntimeError('AMD VRAM monitor unavailable; refusing an unbounded HIP render')
-    with gpu.execution('rocm' if device == 'hip' else 'cpu', gpu_index):
-        session = gpu.device_session(4096, cancel) if device == 'hip' else nullcontext()
+    backend='rocm' if device=='hip' else 'cuda' if device in ('cuda','optix') else 'cpu'
+    with gpu.execution(backend, gpu_index):
+        session = gpu.device_session(4096, cancel) if backend!='cpu' else nullcontext()
         with session, (out/'cycles.log').open('w') as log:
             env = dict(os.environ, TMPDIR=str(out/'cache'), TEMP=str(out/'cache'), TMP=str(out/'cache'))
             (out/'cache').mkdir(exist_ok=True)
@@ -74,6 +77,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
                 '--python', str(Path(__file__).with_name('cycles_scene.py')), '--', str(out/'request.json')],
                 stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
             try:
+                next_cuda_poll=0.
                 while process.poll() is None:
                     if cancel is not None and cancel.is_set():
                         raise gpu.Cancelled('offline render cancelled')
@@ -82,6 +86,12 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
                         peak = max(peak, used)
                         if used > hard_limit_mib:
                             raise RuntimeError(f'AMD VRAM usage exceeded {hard_limit_mib} MiB')
+                    if backend=='cuda' and time.monotonic()>=next_cuda_poll:
+                        status=gpu.gpu_status(gpu_index,'cuda')
+                        if status is None:raise RuntimeError('NVIDIA VRAM monitor unavailable')
+                        used=status['total_mib']-status['free_mib'];peak=max(peak,used)
+                        if used>hard_limit_mib:raise RuntimeError(f'NVIDIA VRAM usage exceeded {hard_limit_mib} MiB')
+                        next_cuda_poll=time.monotonic()+.5
                     time.sleep(.05)
                 if process.returncode:
                     raise RuntimeError(f'Cycles exited {process.returncode}; see {out / "cycles.log"}')
@@ -104,8 +114,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     result['float_map_storage']=validation['storage']
     result['asset_reload_validated']=validation['passed']
     result.update(elapsed_seconds=time.monotonic()-started, peak_device_used_mib=peak,
-                  target_12gib_met=peak <= 12288 if device == 'hip' else None,
-                  memory_measurement='whole-device AMD sysfs usage, sampled every 50 ms',
+                  target_12gib_met=peak <= 12288 if backend!='cpu' else None,
+                  memory_measurement=('whole-device NVIDIA usage, sampled every 500 ms' if backend=='cuda' else
+                    'whole-device AMD sysfs usage, sampled every 50 ms' if backend=='rocm' else 'CPU'),
                   hard_limit_mib=hard_limit_mib)
     (out/'render_result.json').write_text(json.dumps(result, indent=2))
     return result
@@ -114,7 +125,10 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('candidate'); parser.add_argument('--out', required=True)
-    parser.add_argument('--device', choices=('hip','cpu'), default='hip')
+    parser.add_argument('--device', choices=('hip','cuda','optix','cpu'), default='hip')
+    parser.add_argument('--head-fit');parser.add_argument('--parsing-model')
+    parser.add_argument('--no-hair',dest='include_hair',action='store_false')
+    parser.add_argument('--fit-eyes',action='store_true')
     parser.add_argument('--preset', choices=('draft','final'), default='draft')
     parser.add_argument('--accessories', choices=('keep','omit'), default='keep')
     parser.add_argument('--detail-preset', choices=('source','mature'), default='mature')
