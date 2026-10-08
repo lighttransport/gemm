@@ -1570,3 +1570,19 @@ Recipes in `tmp/vhuman-quality8h/`: `build_lid_local_depth.py`,
 `audit_lid_local_depth.py`, `audit_lid_local_self.py`. Receipts in
 `lid_local_depth/`: `recipe.json`, `geometry_validation.json`,
 `projection_validation.json`, `heldout_gaze.json`, and `contact_audit.json`.
+
+A targeted visibility audit examines six saved frames with worsening geometric
+counts (3, 5, 19, 22, 38, 40), five camera yaws each (-60 to +60 degrees),
+sampling five points per crossing segment. Summed exposed pair counts decrease
+from 911 to 821; 20 of 30 views improve and none worsens. This evidence applies
+only to those views and frames: opaque optical-shell visibility is an
+approximation for refractive corneas, and no subdivision/displacement or
+rendered comparison is included. Fractional-frame regressions and the additional
+pitch-gaze regressions still need visibility checks. The geometry candidate
+therefore remains separate despite the encouraging exposed-contact result.
+
+Receipts: `lid_local_contact_visibility/{manifest,visibility,comparison}.json`;
+recipes: `prepare_lid_local_visibility.py` and `trace_lid_local_visibility.py`.
+The sandboxed Blender run wrote its results but stalled in PulseAudio shutdown;
+the owned process was terminated. A host rerun completed with exit status zero
+(`trace_lid_local_visibility_host.log`). No unrelated Blender process was stopped.
