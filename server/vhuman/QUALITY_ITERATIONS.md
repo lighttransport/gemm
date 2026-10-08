@@ -569,3 +569,34 @@ Receipts under `tmp/vhuman-quality8h/`: `eye_contacts/report.json`,
 `prepare_eye_contacts.py`, `trace_eye_contacts.py`, `fit_eye_contact*.py`,
 `render_eye_contact_trial.py`, and `trace_eye_trial.py` in the study root.
 No production fitter or accepted candidate geometry is changed by this trial.
+
+## Joint multi-gaze optical placement
+
+Nine-gaze contact constraints converge but a denser check detects a roughly
+0.0004 mm violation between samples. A subsequent joint fit uses all 117 gaze
+samples (13 yaw values across +/-15 degrees, nine pitch values across +/-10
+ degrees), with captured lids fixed. SLSQP's 1e-12 stopping tolerance stalls at
+numerical residuals around 3e-11 mm; a 1e-9 stopping tolerance converges while
+retaining the same independently checked hard constraints.
+
+Both eye-centre shifts remain at the 2 mm norm bound. Iris-centre errors stay
+below 0.018 px and radius errors below 0.041 px. Source-pose central contour
+RMS is 1.439/1.272 mm (right/left), better than the original 2.072/1.738 mm but
+worse than the source-only placement trial. The analytic minimum is -0.25 mm
+across all constrained samples. Independent Blender mesh rays across all 234
+eye/gaze combinations find a minimum of -0.249395 mm. The matched frontal render
+retains a similar eye appearance.
+
+This does not solve lid contact: source-pose upper-contour median gaps remain
+about 1.41/1.29 mm and corner gaps exceed 4 mm. The placement is retained only
+as an experiment for a coupled lid/eye study, not promoted. Fixed lids limit
+what a single translated/rotated globe can satisfy across gaze. Next work needs
+surface-bound eyelid fitting or gaze-driven lid motion, plus apparent-iris and
+blink checks, while preserving the observed facial projection.
+
+Receipts under `tmp/vhuman-quality8h/`: `eye_contacts/fit_multi_gaze.json`,
+`eye_contacts/fit_dense_gaze.json`, `eye_dense_comparison/eyes_comparison.png`,
+`eye_dense_comparison/contact_audit.json`, and
+`eye_dense_comparison/mesh_dense_audit.json`. Scripts: `fit_eye_multi_gaze.py`,
+`fit_eye_dense_gaze.py`, `render_eye_dense_trial.py`, and `trace_eye_117.py`.
+No production eye fitter, material or skin geometry changes in this experiment.
