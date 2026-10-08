@@ -600,3 +600,34 @@ Receipts under `tmp/vhuman-quality8h/`: `eye_contacts/fit_multi_gaze.json`,
 `eye_dense_comparison/mesh_dense_audit.json`. Scripts: `fit_eye_multi_gaze.py`,
 `fit_eye_dense_gaze.py`, `render_eye_dense_trial.py`, and `trace_eye_117.py`.
 No production eye fitter, material or skin geometry changes in this experiment.
+
+## Projection-preserving lid targets and inner-lid tissue experiment
+
+Blender camera-ray queries test whether moving existing contour samples only
+in depth can meet the optical shell. The baseline right eye has 19 missed rays
+out of 192; its left eye has none. The dense-gaze placement has zero/six misses
+(right/left), but the farthest successful corner targets still need roughly
+8.2/6.5 mm depth movement. Baseline extremes need 11–13 mm. Only about 110 of
+192 samples per eye fall within a 2 mm depth shift for the dense-gaze placement.
+This rejects a blanket camera-ray snap as a bounded lid-fitting solution.
+
+A separate static experiment adds four radial inner-lid tissue strips between
+the unchanged observed contour and the dense-gaze optical shell. The strip
+uses an authored muted pink wet material, a 0.025 mm shell offset, and four
+radial rows; it does not move skin or redefine photographic evidence. Matched
+OptiX renders show a small corner fill while retaining the eye opening. Mean
+absolute RGB change over the eye review rectangle is 0.154/255. This is an
+appearance difference, not a source-photo accuracy score.
+
+Each strip has 384 vertices and 570 triangles. Static checks find no degenerate
+triangles or strict self-crossings within any strip. Inter-component contact,
+actual skin attachment and deformation during blink/gaze are unverified; the
+optional tissue geometry is not integrated or promoted. Its useful static
+result motivates an eventual surface-bound implementation rather than large
+unobserved changes to the facial contour. Complete-anatomy USD export is the
+next independent deliverable while this coupled lid/eye issue remains open.
+
+Receipts under `tmp/vhuman-quality8h/`: `lid_ray_targets/report.json`,
+`eye_conjunctiva_comparison/eyes_comparison.png`, `conjunctiva.npz`, and
+`geometry_audit.json`. Scripts: `audit_lid_ray_targets.py`,
+`render_conjunctiva_trial.py` and `launch_conjunctiva_trial.py` in the study root.
