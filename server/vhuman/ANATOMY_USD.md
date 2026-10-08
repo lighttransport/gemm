@@ -48,3 +48,49 @@ This package is a static captured pose. It does not serialize native expression
 animation, skeletal animation or shader drivers. Nested node groups and object
 modifiers other than subdivision are rejected. The optional eye-placement and
 inner-lid tissue experiments are separate from this bundle.
+
+## Sampled animation
+
+`usd_motion_worker.py` exports all anatomy meshes from an animated
+`offline_render` directory. It verifies the source motion/geometry hashes,
+bakes point animation, restores Blender materials, and checks every exported
+sample after USD import. It retains subdivision as a separate Blender setting.
+Boolean geometry can be baked, but that does not establish its anatomical or
+temporal quality.
+
+```sh
+"$BLENDER" -b --factory-startup --python-exit-code 1 \
+  --python server/vhuman/reconstruction/usd_motion_worker.py -- \
+  --scene tmp/vhuman-quality8h/motion_gaze_repaired_render \
+  --samples-per-frame 2 \
+  --out tmp/vhuman-quality8h/full_gaze_motion_usd_verified
+```
+
+The default two samples per frame retain integer frames and midpoints. A
+22-frame, 24 fps source becomes 43 samples at 48 fps with the same elapsed
+time from first to last pose. Output includes `head.usdc`, relative textures,
+the Blender material sidecar, a reimported scene, source metadata and a report
+with geometry/UV checks and hashes for each mesh sample. This is sampled mesh
+animation, not an editable native expression or skeletal rig.
+
+For a fresh-process verification and a portable `.blend`, use the animation
+importer. Keep its output directly inside the bundle so `//head.usdc` remains
+valid when moving the directory:
+
+```sh
+"$BLENDER" -b --factory-startup --python-exit-code 1 \
+  --python server/vhuman/reconstruction/usd_motion_import_worker.py -- \
+  --bundle tmp/vhuman-quality8h/full_gaze_motion_usd_verified \
+  --out tmp/vhuman-quality8h/full_gaze_motion_usd_verified/portable.blend
+```
+
+The importer requires new output filenames, verifies bundle hashes and all
+sample hashes, restores materials/subdivision, and writes a validation receipt.
+The saved animation cache uses a relative path. Cameras and review lights are
+not included.
+
+**Material animation is currently limited:** shader drivers, including dynamic
+wrinkle activation, are captured at the first frame. The report lists affected
+materials and driver counts. Geometry animation and texture pixels survive the
+roundtrip; exact animated shading is not claimed. The export gate also does not
+prove fit accuracy, collision freedom, or behavior at unsampled times.

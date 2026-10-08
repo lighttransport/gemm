@@ -851,3 +851,55 @@ cavity/tongue coordination. It is still a static experimental alternative.
 Receipts: `gum_boolean_self_trial/{report,contact_audit,comparison}.json`,
 `gum_boolean_self_trial/comparison.png`, and
 `gum_boolean_self_visibility/visibility.json` in the study directory.
+
+## Animated gum trim and complete sampled USD animation
+
+The capped dental cutter now follows the lower teeth through shape keys. At
+43 samples (22 frames and 21 midpoints), its evaluated positions match the
+rendered teeth exactly. Trimmed gum vertex counts range from 734 to 750 and
+triangle counts from 1251 to 1263; UV values are finite. Two triangles at source
+frame 4.5 and one at frame 7.5 have double-area below 1e-14 square metres.
+The topology-changing result therefore needs cleanup and temporal scrutiny.
+
+A 215-view whole-mouth contact sweep finds visible lower-arch self-contact in
+21 views, despite the clean peak-frame result. The static success does not
+extend to the whole motion. All 22 native and trimmed frames were rendered
+from a matched +30-degree camera with identical 32-sample settings and seed.
+The mouth crops look nearly identical: maximum per-frame RGB MAE is only
+0.00571/255. Reducing these microscopic contact counts has not established a
+visible quality gain, so the Boolean experiment remains unpromoted.
+Artifacts: `gum_boolean_motion/`, `gum_boolean_motion_visibility/visibility.json`,
+`gum_boolean_motion_comparison/{comparison.gif,contact_sheet.png,appearance_metrics.json}`.
+
+A gum-only USD prototype preserves all 43 variable-topology samples at 48 fps,
+including UVs, through export/import. This independently motivates the new
+`usd_motion_worker.py` for complete sampled anatomy, and
+`usd_motion_import_worker.py` for fresh-process verification and portable cache
+paths. The complete exporter is validated on the repaired gaze track instead
+of presenting the failed Boolean motion as accepted anatomy.
+
+The complete gaze bundle has 18 meshes and 43 time samples. All 774 checks
+preserve coordinates (maximum measured error 0), triangle order and UVs. A
+relocated fresh-process import verifies every sample hash, 11 materials,
+67 nodes and 18 packed images. After moving the saved bundle again, reopening
+`portable.blend` verifies 54 mesh samples at first/middle/last times and resolves
+its animation cache as `//head.usdc`. A deliberately wrong USD hash is rejected
+before writing an output scene. Python compilation and `git diff --check` pass.
+
+Twelve skin material drivers are captured at the first frame; dynamic wrinkle
+shading is not serialized. A matched OptiX comparison at source frame 14
+(USD sample 27) has foreground RGB MAE 0.461/255, 99th percentile 5/255, and
+no alpha-pixel differences. The images are visually close, not identical.
+This is verified sampled interchange, not an editable GNM rig or a claim of
+observed target-subject motion. See `ANATOMY_USD.md` for commands and limits.
+
+Receipts under `tmp/vhuman-quality8h/`: `full_gaze_motion_usd_verified/report.json`,
+`full_gaze_motion_usd_portable_moved/portable.validation.json`,
+`full_gaze_motion_usd_portable_moved/reopen.validation.json`,
+`usd_motion_hash_fixture/receipt.json`, and
+`motion_usd_render_comparison/{comparison.png,metrics.json}`.
+
+The final importer additionally rejects a syntactically valid report missing
+one mesh sample before creating output. Its complete-coverage checks are then
+rerun successfully on the full bundle (`portable_guarded.validation.json`).
+The missing-sample negative receipt is `usd_motion_incomplete_fixture/receipt.json`.
