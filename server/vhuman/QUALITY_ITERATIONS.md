@@ -256,10 +256,60 @@ Regression: 42 tests pass. Both candidate strength settings remain experimental:
 exact mesh contacts, unseen views, broader motion and dental shading still need
 validation before promotion.
 
+## Native mesh crossing audit and dental pose experiment
+
+`mesh_crossings` adds a batched spatial broad phase and strict transverse
+triangle-crossing test. It excludes shared-vertex pairs, degenerate facets,
+coplanar overlaps and boundary-only touches. It does not measure penetration
+depth or prove collision freedom. Tests include analytic crossing/separation,
+degeneracy, symmetry and broad-phase agreement with brute force. An independent
+Blender ray/triangle check agrees on 699 sampled source-pose pairs (200 positives)
+after geometry is expressed in millimetres with normalized ray directions;
+the initial metre-scale Blender check had numerical mismatches. Both diagnostic
+workers finished their receipts but required termination after an audio-thread
+shutdown hang in the sandbox; the GPU render/reload workers exited normally.
+
+The baseline has **595 upper/lower crown crossing pairs** in the captured pose,
+separate from gum/root and mouth-cavity intersections. The lower dental arch's
+mean captured displacement is 3.53 mm upward relative to its neutral geometry.
+GNM lower-face expression coefficients move the lower arch and tongue; the
+model's four skeletal joints are neck/head/eyes, with no explicit jaw joint.
+The earlier skin-only landmark fitting did not constrain these dental contacts.
+Both edge-limited lip candidates retain the same crown-crossing problem because
+they do not change the dental arches. Across five sampled poses, the stronger
+lip candidate reduces captured exterior-skin self-crossing pairs from 14 to 4,
+but also changes hidden mouth-cavity contacts.
+
+A lower-arch/tongue translation sweep (0–6 mm camera-down) reduces crown
+crossings from 595 to 44 but does not eliminate them. A rigid alignment of the
+captured lower arch toward its neutral prior uses a 7.04-degree rotation and
+has 0.339 mm RMS fit residual. Adding 1 mm camera-down is the smallest tested
+increment with zero upper/lower crown crossings (0.5 mm retains 27).
+
+The resulting `lip_candidate_oral_aligned` preserves skin geometry and its
+maps exactly. The source-frame correction is encoded as a fixed bind residual,
+with maximum displacement 11.46 mm across the lower arch and tongue; it is a
+prior correction, not measured dental pose. Its 101-pose orientation ramp has
+minimum ratio 0.96269 relative to the preceding geometry and no reversals. In
+all five contact-audit poses, upper/lower crown crossings are absent. However,
+captured lower-crown/mouth-cavity crossings increase to 284, and 42 lower-arch
+and 11 upper-arch within-arch crown crossings remain. Total strict oral crossing
+pairs decrease from 1926 to 1123, which is not sufficient for acceptance.
+
+The candidate's OptiX render and packed-asset reload pass. Tooth-mask IoU falls
+from 0.48951 to 0.46999 as the interpenetrating lower crowns are removed from
+the visible row. This reinforces that coverage alone is not a quality gate.
+The dental correction remains experimental pending coordinated cavity/contact
+work. Receipts are in `oral_contacts/`, `oral_contacts_aligned/`,
+`oral_arch_sweep/`, and `lip_candidate_oral_aligned_audit/` under the study root.
+
+Regression: 47 tests pass with `server.vhuman.test_mesh_crossings` added to the
+previous test command.
+
 ## Next experiments
 
-- Audit actual lip/teeth/tongue mesh crossings and inspect side views of the
-  edge-limited candidates before dental placement and shading variations.
+- Coordinate lower-arch/tongue placement with mouth-cavity contact correction;
+  inspect side views and remaining within-arch crossings before promotion.
 - Inspect tongue/cavity, lip contact and eye-lid contact during jaw opening,
   gaze changes and side views.
 - Evaluate the passing geometry candidates before transferring completed skin
