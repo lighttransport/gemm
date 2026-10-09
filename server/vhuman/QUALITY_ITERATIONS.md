@@ -2066,3 +2066,111 @@ panels and seven matched pairs, downloadable native USD/Blender bundles, direct
 dense eyelid scene/NumPy links and contact/protection evidence. Saved experiment
 recipes, masks and audits are archived in
 `review/downloads/recipes-and-audits.zip`. Contact acceptance remains false.
+
+## Refined ear shape and texture synthesis
+
+Workspace: `tmp/vhuman-ear-synth/` (session `session.json`). The parent is the
+contact-tone candidate (geometry `ccb869bc…`, basecolor `edcd8d8d…`). The new
+candidate is `reconstruction_final3`, geometry `a2f43542…` and basecolor
+`0989f254…`. Native GNM arrays, bases and both motion tracks are byte-identical
+to the parent; only new `ear_*` fields are added to `geometry.npz`.
+
+**Representation.** In GNM v3 the ear vertices carry zero expression and zero
+pose-corrective deltas, and are skinned 0.97–1.0 to the head joint. The ear
+disk (505 quads per side) plus a 20 mm band of near-rigid scalp skin (expression
+motion ≤0.5 mm, no dense-landmark attachments) receives one Catmull-Clark level
+with an unsplit native boundary. The 4,990 new vertices are surface-bound to the
+hidden native triangles by barycentric anchors plus attachment-frame offsets.
+This is the same scheme lashes use and the existing VHBND002 mobile format
+encodes. Binding is exact under rigid anchor motion; across all 41 default
+frames it matches a cage-rigid transform within 7e-6 mm. 10,124 refined
+triangles replace 2,568 native ones and per-corner UVs stay inside the existing
+islands (no overlaps).
+
+**Shape.** Frontal ear masks are the parser's label 7, split by image side and
+refined with GrabCut. Lobe-pivoted length, protrusion and flare are fitted
+jointly for both ears (penalized asymmetry); the result is length ×1.238,
+protrusion 4.7° and flare 15.1°, with ear length about 68 mm. Two constraints
+shape the solve:
+- The GNM root loop spans the full ear height. A feathered blend therefore
+  folded triangles near the root (minimum area −1.8) and ARAP with a fixed root
+  stretched edges up to 3.1×.
+- The selected solve uses ARAP with free-ear handles beyond 14 mm. Band and
+  old-root vertices slide on the smooth subdivided head surface; the earlier
+  projection onto coarse native facets left visible ripples.
+
+An authored anatomical relief is applied before placement as union-combined
+ridges and grooves in normalized lateral-view coordinates: helix rim, antihelix
+with superior and inferior crura, triangular fossa, scapha, crus of helix,
+concha, tragus, antitragus and intertragic notch.
+
+Coverage of the refined frontal masks rises from 61.5% to 89.3% (left) and from
+63.7% to 94.1% (right); IoU is 0.857/0.872. Minimum relative triangle area is
+0.215 and the maximum edge ratio is 2.51 against the subdivided base, where the
+largest stretch is band scalp. No strict crossings involve the ears at rest or
+in any of 81 default plus 43 stress saved/midpoint samples.
+
+Rejected or replaced along the way:
+- Triangle-only Catmull-Clark in Blender produced streak ripples, so the ear is
+  given to Blender as its native quads (96% paired).
+- Pinning only the old root-loop vertex points left a sawtooth along the
+  postauricular sulcus; the root-loop edge points are now pinned too.
+
+The fold shapes are a generic prior: the frontal photo shows each ear at only
+about 60 px and cannot reveal this subject's folds. Ear width is tied to length
+by a prior.
+
+**Texture.** Only the refined patch's atlas texels change; the other texels are
+byte-identical.
+- *Photographed samples:* ear cores (GrabCut mask eroded 2 px) are resampled on
+  the new geometry with visibility, facing and a half irradiance correction. The
+  colour gain from 29,944 lateral face anchors comes out at 1.000. A chroma
+  guard down-weights background bleed, and a bounded cavity de-shadowing floor
+  lifts photographed concha/notch occlusion.
+- *Unseen tone and detail:* tone is completed harmonically from the
+  photographed ear and pulled toward neighbouring head tone within 3 mm of the
+  old root, clamped so dark sideburn texels cannot bleed in. Detail combines
+  pore-scale (1.2 mm high-pass, 2σ-clipped) facial exemplar residual, ≤1.5 mm
+  high-pass detail and bounded chroma from generated close-ups, and a capped
+  rim/lobe tint.
+- *Generated views:* Qwen-Image-Edit-2511 (Apache-2.0) close-ups were run as
+  single-image edits.
+  - The two lateral views pass the guard: silhouette IoU >0.9, ear shift ≤8 px,
+    and recorded visual review.
+  - The 135° back view was rejected (hallucinated translucent tissue), and the
+    matching left view was not run.
+  - Earlier whole-head two-image edits either copied the portrait or produced a
+    ghosted double exposure; both were discarded.
+  - The face parser does not work at macro scale, so it is not used as the
+    guard.
+- *Result:* 3,988 photographed ear texels and 14,428 texels with generated
+  detail. The pink/cyan patches and the red rim tip are gone.
+
+Remaining: the ear backs are synthesized only, the left ear keeps some concha
+shading, and the colour is an appearance prior, not measured reflectance.
+
+**Integration.** `offline_assets`, `cycles_scene` and `cycles_validate` accept
+native parts with appended bound vertices. The mobile exporter writes per-vertex
+bindings, and the web and native players switch from a part-level native flag to
+a per-vertex native/bound mode (`player.cpp` was not compiled; no Filament SDK
+here). The dense ear would exceed the 80k mobile triangle budget, so mobile
+uses a coarse LOD: native ear topology with shaped vertex points, 75,620
+triangles, no flips, no crossings.
+
+**Validation.**
+- **Blender:** fresh-process scene verification passes 738 (default) and 396
+  (stress) part/frame checks, maximum error 7.8e-9 m, with the packed basecolor
+  hash matching.
+- **USD:** export plus fresh portable import passes 1,458 mesh / 972 shader
+  checks (default) and 774 / 516 (stress), with 22-file candidate evidence.
+- **Browser:** hardware verification on RTX 5060 Ti runs at 30 FPS with exact
+  WASM/native parity, binding p95 3.3e-6 mm, and the device test page passes.
+  No physical mobile device was tested.
+- **Unchanged by construction:** eyelid and oral metrics and face landmark
+  positions.
+
+Review: `http://127.0.0.1:45615/vhuman-ear-synth/review/` (three panels,
+13 matched pairs including source-camera overlays and mirrored light; bundles
+and recipe/audit archive). Browser:
+`http://127.0.0.1:45615/vhuman-ear-synth/final3_player/`. Contact acceptance
+remains false.
