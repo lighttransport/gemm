@@ -2205,3 +2205,44 @@ Remaining limits:
 - Inner-lip skin is not occluded yet.
 - The iOS/Filament player lacks the shader terms.
 - No phone was measured.
+
+## Mouth contact and full-geometry mouth lighting
+
+Feedback: occlusion still looked wrong, and a visible space separated the
+lips/mouth lining from the teeth, gums and tongue. Workspaces:
+`tmp/vhuman-mouth-contact/` (geometry) and `tmp/vhuman-mouth-gi/` (lighting).
+Details are in `MOUTH_RENDERING_RESEARCH.md` (v2).
+
+- **v1 occlusion reference was invalid.** Its occluder set kept only native
+  triangles within 90 mm of the mouth, so rays leaked out of the head. The
+  correct visibility is 5–50× darker. The v1 metrics are kept but marked
+  superseded.
+- **New reference:** Cycles per-vertex irradiance bakes (direct + bounce) on
+  full geometry, 100 training and 62 held-out poses. Indirect model held-out
+  MAE: 0.0061/0.0078, against 0.022/0.028 for a static bake. Direct light uses
+  a learned per-light transfer (MAE 0.0087/0.0137, against 0.017/0.028 for the
+  analytic aperture × gate), blended to the analytic term away from the
+  trained light directions. The GTAO lift was removed.
+- **Contact:** the refined mouth lining is surface-bound to the GNM sock, and
+  a per-pose deformer (Python/Blender and JS) presses the vestibule onto the
+  labial arch at 0.5 mm. Median gap 2.86 → 0.91 mm; the visible band has no
+  penetration. A pseudo-normal fix removed tie-induced popping.
+- **Rejected:** a rigid arch widen/advance (4 % widening only closes the
+  corner gap 5.7 → 4.7 mm per side and needs a native rest rewrite; advancing
+  crosses the lips), and a static multi-pose bind-space solve (could not close
+  the gap without penetration).
+- **Cavity material:** near-black → mucosa (.33, .09, .09) in Blender and
+  mobile.
+- **Artifacts:**
+  - candidate `reconstruction_contact` (geometry a135af80…);
+  - scenes `contact_scene` and `contact_stress_scene` (738/396 checks, 2e-8 m);
+  - USD `contact_{default,stress}_usd` (fresh import passed);
+  - mobile package `contact_mobile` and player `contact_player` (77,818
+    triangles; hardware browser verify passed at 30 FPS on RTX 5060 Ti).
+
+Remaining limits:
+- Deep lining still penetrates in 2.3 % of vertices (not visible).
+- Lighting is fitted to the browser key/fill rig.
+- Bounce light uses albedo priors.
+- The iOS/Filament player lacks the oral shader and the contact deformer.
+- No phone was measured.

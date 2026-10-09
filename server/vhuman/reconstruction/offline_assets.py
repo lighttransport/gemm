@@ -158,9 +158,11 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         full=z['full_captured'][0];tri=z['full_triangles'];uv=z['full_triangle_uvs']
         joints=z['gnm_joint_positions'];component=z['full_component_ids'];names=z['component_names']
         # Optional refined ears: surface-bound vertices replacing native ear faces.
-        ear=({k:z[k] for k in ('ear_dense_captured','ear_dense_triangles','ear_dense_triangle_uvs',
-              'ear_bind_ids','ear_bind_weights','ear_bind_offsets','ear_removed_triangles')}
-             if 'ear_dense_triangles' in z else None)
+        bound_keys=('dense_captured','dense_triangles','dense_triangle_uvs','bind_ids','bind_weights','bind_offsets','removed_triangles')
+        ear=({k:z['ear_'+k] for k in bound_keys} if 'ear_dense_triangles' in z else None)
+        # Optional refined mouth lining with a per-pose lip/arch contact deformer.
+        sock=({k:z['sock_'+k] for k in bound_keys} if 'sock_dense_triangles' in z else None)
+        if sock is not None:sock['contact']={k:z['sock_contact_'+k] for k in ('active','weight','candidates','params','edges')}
     model=GNMModel();parts=[];arrays={}
     def part(name,positions,triangles,texcoords,material, *, native=False, joint=None,surface=None):
         ids,remapped=np.unique(triangles,return_inverse=True)
@@ -171,19 +173,24 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         if surface:
             for key,value in surface.items():arrays[name+'_surface_'+key]=value[ids]
         parts.append(dict(name=name,material=material,native=native,joint=joint,surface_bound=bool(surface)))
-    def append_bound_ears(name,ear):
+    def append_bound(name,ear):
         # Native vertices keep their GNM ids; appended vertices follow anchor triangles
         # exactly like attachment-bound parts (barycentric root + attachment-frame offset).
-        native_ids=arrays[name+'_native_ids'];count=len(full);t=ear['ear_dense_triangles']
-        if not np.isin(t[t<count],native_ids).all():raise ValueError('refined ear boundary is not on the skin part')
+        native_ids=arrays[name+'_native_ids'];count=len(full);t=ear['dense_triangles']
+        if not np.isin(t[t<count],native_ids).all():raise ValueError('refined patch boundary is not on the part: '+name)
         local=np.where(t<count,np.searchsorted(native_ids,np.minimum(t,count-1)),len(native_ids)+t-count)
-        arrays[name+'_positions']=np.concatenate((arrays[name+'_positions'],ear['ear_dense_captured'].astype(np.float32)))
+        arrays[name+'_positions']=np.concatenate((arrays[name+'_positions'],ear['dense_captured'].astype(np.float32)))
         arrays[name+'_triangles']=np.concatenate((arrays[name+'_triangles'],local.astype(np.int32)))
-        arrays[name+'_uvs']=np.concatenate((arrays[name+'_uvs'],ear['ear_dense_triangle_uvs'].astype(np.float32)))
-        arrays[name+'_bound_ids']=ear['ear_bind_ids'].astype(np.int64)
-        arrays[name+'_bound_weights']=ear['ear_bind_weights'].astype(np.float64)
-        arrays[name+'_bound_offsets']=ear['ear_bind_offsets'].astype(np.float64)
-        parts[-1]['bound_vertices']=int(len(ear['ear_dense_captured']))
+        arrays[name+'_uvs']=np.concatenate((arrays[name+'_uvs'],ear['dense_triangle_uvs'].astype(np.float32)))
+        arrays[name+'_bound_ids']=ear['bind_ids'].astype(np.int64)
+        arrays[name+'_bound_weights']=ear['bind_weights'].astype(np.float64)
+        arrays[name+'_bound_offsets']=ear['bind_offsets'].astype(np.float64)
+        part_record=next(p for p in parts if p['name']==name);part_record['bound_vertices']=int(len(ear['dense_captured']))
+        if 'contact' in ear:
+            # Contact indices refer to the appended bound vertices; shift into part-vertex order.
+            c=ear['contact'];arrays[name+'_contact_active']=(c['active']+len(native_ids)).astype(np.int64)
+            for key in ('weight','candidates','params'):arrays[name+'_contact_'+key]=c[key]
+            arrays[name+'_contact_edges']=(c['edges']+len(native_ids)).astype(np.int64)
     for i,name in enumerate(names):
         if name in ('left_eye','right_eye'):continue
         selected=component==i
@@ -198,8 +205,17 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
             if ear is not None:
                 skin_faces[ear['ear_removed_triangles']]=False
             part('skin',full,tri[skin_faces],uv[skin_faces],'skin',native=True)
-            if ear is not None:append_bound_ears('skin',ear)
-            if (selected&cavity).any():part('mouth_cavity',full,tri[selected&cavity],uv[selected&cavity],'cavity',native=True)
+            if ear is not None:append_bound('skin',ear)
+            cavity_faces=selected&cavity
+            if sock is not None:cavity_faces[sock['removed_triangles']]=False
+            if sock is not None:
+                # The refined lining replaces every sock face; only the native lip rim stays.
+                rim=np.unique(sock['dense_triangles'][sock['dense_triangles']<len(full)])
+                arrays['mouth_cavity_native_ids']=rim;arrays['mouth_cavity_positions']=full[rim].astype(np.float32)
+                arrays['mouth_cavity_triangles']=np.zeros((0,3),np.int32);arrays['mouth_cavity_uvs']=np.zeros((0,3,2),np.float32)
+                parts.append(dict(name='mouth_cavity',material='cavity',native=True,joint=None,surface_bound=False))
+                append_bound('mouth_cavity',sock)
+            elif cavity_faces.any():part('mouth_cavity',full,tri[cavity_faces],uv[cavity_faces],'cavity',native=True)
         else:part(str(name),full,tri[selected],uv[selected],material,native=True)
     head_folder=candidate.parents[1]
     fit_path=Path(head_fit) if head_fit is not None else head_folder/'fit.json'

@@ -93,6 +93,19 @@ export function apertureShadow(px,py,pz,l,frame,{angularRadius=.12,minPenumbra=.
 
 export const MAX_RIM=32;
 
+function frameOf(a,b,c){
+    const x=[b[0]-a[0],b[1]-a[1],b[2]-a[2]],lx=Math.hypot(...x);x.forEach((v,i)=>x[i]=v/lx);
+    const w=[c[0]-a[0],c[1]-a[1],c[2]-a[2]],z=[x[1]*w[2]-x[2]*w[1],x[2]*w[0]-x[0]*w[2],x[0]*w[1]-x[1]*w[0]],lz=Math.hypot(...z);z.forEach((v,i)=>z[i]=v/lz);
+    const y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]];return [x,y,z];
+}
+// Rotation R (row-major 3x3) mapping rest head frame to the current one.
+export function headRotation(native,ref){
+    const cur=ref.native_ids.map(id=>[native[id*3],native[id*3+1],native[id*3+2]]);
+    const F=frameOf(...cur),G=frameOf(...ref.rest),R=new Float64Array(9);
+    for(let i=0;i<3;i++)for(let j=0;j<3;j++)R[i*3+j]=F[0][i]*G[0][j]+F[1][i]*G[1][j]+F[2][i]*G[2][j];
+    return R;
+}
+
 // CPU reference of the shader (verification/tests). part: {mesh, vertices, occlusion:{weights}}.
 export function cpuOralOcclusion(part,native,spec,lights){
     const {rim,frame}=rimFrame(native,spec),area=frame.area*1e4,total=lights.reduce((s,x)=>s+x.intensity,0)||1;
@@ -100,7 +113,8 @@ export function cpuOralOcclusion(part,native,spec,lights){
     for(let v=0;v<part.vertices;v++){
         const x=p[v*3],y=p[v*3+1],z=p[v*3+2];
         out[v*2]=Math.max(0,Math.min(1,w[v*3]+w[v*3+1]*area+w[v*3+2]*frame.height*100));
-        let direct=0;for(const light of lights)direct+=light.intensity*apertureShadow(x,y,z,light.direction,frame);out[v*2+1]=direct/total*Math.min(1,out[v*2]/(spec.direct_gate??.5));
+        let direct=0;for(const light of lights)direct+=light.intensity*apertureShadow(x,y,z,light.direction,frame);
+        const aperture=spec.direct_mode==='gate'?1:direct/total;out[v*2+1]=aperture*Math.min(1,out[v*2]/(spec.direct_gate??.5));
     }
     return out;
 }
@@ -116,7 +130,7 @@ export function oralUniforms(){
     return {oralEnabled:{value:1},oralRim:{value:new Float32Array(MAX_RIM*3)},oralRimCount:{value:0},
         oralOutline:{value:new Float32Array(MAX_RIM*2)},oralCentroid:{value:new Float32Array(3)},
         oralAxisX:{value:new Float32Array(3)},oralAxisY:{value:new Float32Array(3)},oralNormal:{value:new Float32Array(3)},
-        oralArea:{value:0},oralHeight:{value:0},oralGate:{value:.5},oralLightDir:{value:new Float32Array(6)},oralLightWeight:{value:new Float32Array(2)}};
+        oralArea:{value:0},oralHeight:{value:0},oralGate:{value:.5},oralApertureMix:{value:1},oralLightColor:{value:new Float32Array(6)},oralBlend:{value:new Float32Array(2)},oralTransfer:{value:0},oralLightDir:{value:new Float32Array(6)},oralLightWeight:{value:new Float32Array(2)}};
 }
 
 // Per pose: upload the lip-rim polygon, its plane frame/outline/area and the light directions.
@@ -125,17 +139,27 @@ export function setOralUniforms(u,native,spec,lights){
     const {rim,frame}=rimFrame(native,spec),total=lights.reduce((s,x)=>s+x.intensity,0)||1;
     u.oralRim.value.fill(0);u.oralRim.value.set(rim);u.oralOutline.value.fill(0);u.oralOutline.value.set(frame.outline);
     u.oralRimCount.value=spec.rim.length;u.oralCentroid.value.set(frame.c);u.oralAxisX.value.set(frame.ux);u.oralAxisY.value.set(frame.uy);
-    u.oralNormal.value.set(frame.n);u.oralArea.value=frame.area*1e4;u.oralHeight.value=frame.height*100;u.oralGate.value=spec.direct_gate??.5;
-    lights.forEach((light,i)=>{u.oralLightDir.value.set(light.direction,i*3);u.oralLightWeight.value[i]=light.intensity/total;});
+    u.oralNormal.value.set(frame.n);u.oralArea.value=frame.area*1e4;u.oralHeight.value=frame.height*100;u.oralGate.value=spec.direct_gate??.5;u.oralApertureMix.value=spec.direct_mode==='gate'?0:1;
+    lights.forEach((light,i)=>{u.oralLightDir.value.set(light.direction,i*3);u.oralLightWeight.value[i]=light.intensity/total;
+        if(light.color)u.oralLightColor.value.set(light.color,i*3);});
+    u.oralTransfer.value=spec.transfer?1:0;
+    if(spec.transfer&&spec.head_reference){
+        // Head rotation from three rigid upper-teeth vertices; blend learned transfer toward the analytic
+        // aperture term as each light leaves its trained head-frame direction.
+        const R=headRotation(native,spec.head_reference);
+        lights.forEach((light,i)=>{const d=light.direction,h=[R[0]*d[0]+R[3]*d[1]+R[6]*d[2],R[1]*d[0]+R[4]*d[1]+R[7]*d[2],R[2]*d[0]+R[5]*d[1]+R[8]*d[2]];
+            const t=spec.transfer.lights[light.name]||[0,0,1],c=Math.max(-1,Math.min(1,(h[0]*t[0]+h[1]*t[1]+h[2]*t[2])/Math.hypot(...t)));
+            const a=Math.acos(c),x=Math.max(0,Math.min(1,(a-.15)/.35));u.oralBlend.value[i]=x*x*(3-2*x);});
+    }
     return frame;
 }
 
 const GLSL=`
 #define ORAL_MAX_RIM ${MAX_RIM}
 uniform vec3 oralRim[ORAL_MAX_RIM];uniform vec2 oralOutline[ORAL_MAX_RIM];uniform int oralRimCount;
-uniform vec3 oralCentroid,oralAxisX,oralAxisY,oralNormal;uniform float oralArea,oralHeight,oralGate;
-uniform vec3 oralLightDir[2];uniform float oralLightWeight[2];
-attribute vec3 oralWeights;varying vec2 vOralOcclusion;
+uniform vec3 oralCentroid,oralAxisX,oralAxisY,oralNormal;uniform float oralArea,oralHeight,oralGate,oralApertureMix;
+uniform vec3 oralLightDir[2];uniform float oralLightWeight[2];uniform float oralBlend[2];uniform float oralTransfer;
+attribute vec3 oralWeights,oralKey,oralFill;varying vec2 vOralOcclusion,vOralTransfer;
 // Form factor kept for reference; the shipped model uses opening area/height.
 float oralEdge(vec3 a,vec3 b,vec3 n){vec3 c=cross(a,b);return acos(clamp(dot(a,b),-1.0,1.0))*dot(c,n)/max(length(c),1e-9);}
 float oralFormFactor(vec3 p,vec3 n){
@@ -182,17 +206,25 @@ export function patchOralMaterial(material,u){
             {// Indirect: per-vertex visibility as an affine function of the lip opening (area cm^2, height cm).
              float oralIndirect=clamp(oralWeights.x+oralWeights.y*oralArea+oralWeights.z*oralHeight,0.0,1.0);
              // Direct: aperture shadow, gated by the vertex's own visibility (teeth/tongue self-shadowing proxy).
-             float oralDirect=(oralLightWeight[0]*oralShadow(transformed,oralLightDir[0])+oralLightWeight[1]*oralShadow(transformed,oralLightDir[1]))*min(1.0,oralIndirect/oralGate);
+             float s0=oralShadow(transformed,oralLightDir[0]),s1=oralShadow(transformed,oralLightDir[1]);
+             float oralAperture=oralLightWeight[0]*s0+oralLightWeight[1]*s1;
+             float oralGateTerm=min(1.0,oralIndirect/oralGate);
+             float oralDirect=mix(1.0,oralAperture,oralApertureMix)*oralGateTerm;
+             // Learned per-light transfer (direct+bounce, relative to an unoccluded surface facing the light),
+             // blended toward the analytic aperture estimate when the light leaves its trained direction.
+             vec3 oralN=normalize(objectNormal);
+             float a0=max(dot(oralN,oralLightDir[0]),0.0)*s0*oralGateTerm,a1=max(dot(oralN,oralLightDir[1]),0.0)*s1*oralGateTerm;
+             float t0=clamp(oralKey.x+oralKey.y*oralArea+oralKey.z*oralHeight,0.0,1.2),t1=clamp(oralFill.x+oralFill.y*oralArea+oralFill.z*oralHeight,0.0,1.2);
+             vOralTransfer=vec2(mix(t0,a0,oralBlend[0]),mix(t1,a1,oralBlend[1]));
              vOralOcclusion=vec2(oralIndirect,oralDirect);}`);
-        shader.fragmentShader='uniform float oralEnabled;\nvarying vec2 vOralOcclusion;\n'+shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
+        shader.fragmentShader='uniform float oralEnabled,oralTransfer;\nuniform vec3 oralLightColor[2];\nvarying vec2 vOralOcclusion,vOralTransfer;\n'+shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
             float occIndirect=mix(1.0,vOralOcclusion.x,oralEnabled),occDirect=mix(1.0,vOralOcclusion.y,oralEnabled);
-            // Multi-bounce lift of escape visibility (Jimenez et al. 2016, GTAO): interreflection from
-            // the surrounding lips/teeth approximated with the surface albedo.
-            vec3 oralAlbedo=clamp(diffuseColor.rgb,0.0,1.0);
-            vec3 mbA=2.0404*oralAlbedo-0.3324,mbB=-4.7951*oralAlbedo+0.6417,mbC=2.7552*oralAlbedo+0.6903;
-            vec3 occBounce=max(vec3(occIndirect),((occIndirect*mbA+mbB)*occIndirect+mbC)*occIndirect);
-            reflectedLight.directDiffuse*=occDirect;reflectedLight.directSpecular*=occDirect;
-            reflectedLight.indirectDiffuse*=occBounce;reflectedLight.indirectSpecular*=occIndirect*occIndirect;`);
+            // Visibility is fitted to Cycles-baked irradiance that already includes interreflection,
+            // so no separate multi-bounce lift is applied.
+            vec3 oralTransferDiffuse=BRDF_Lambert(diffuseColor.rgb)*(oralLightColor[0]*vOralTransfer.x+oralLightColor[1]*vOralTransfer.y);
+            reflectedLight.directDiffuse=mix(reflectedLight.directDiffuse,mix(reflectedLight.directDiffuse*occDirect,oralTransferDiffuse,oralTransfer),oralEnabled);
+            reflectedLight.directSpecular*=occDirect;
+            reflectedLight.indirectDiffuse*=occIndirect;reflectedLight.indirectSpecular*=occIndirect*occIndirect;`);
     };
-    material.customProgramCacheKey=()=> 'vhuman-oral-occlusion-v5';material.needsUpdate=true;
+    material.customProgramCacheKey=()=> 'vhuman-oral-occlusion-v8';material.needsUpdate=true;
 }

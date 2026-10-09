@@ -79,6 +79,13 @@ def verify(player,out,hardware=False,device_test=False):
             from ..reconstruction.offline_assets import attachment_frames
             manifest=json.loads((player/'avatar/avatar.json').read_text());glb=GLB.load(player/'avatar/avatar.glb')
             bindings=np.load(player/'avatar/bindings.npz',allow_pickle=False)
+            contact_parts={}
+            if (player/'avatar/oral_contact.json').is_file():
+                from ..reconstruction.contact_runtime import contact_deform
+                for cname,c in json.loads((player/'avatar/oral_contact.json').read_text())['parts'].items():
+                    e=np.asarray(c['edges']);pr=c['params']
+                    contact_parts[cname]=(np.asarray(c['render_to_part']),int(c['part_vertices']),dict(active=np.asarray(c['active']),weight=np.asarray(c['weight']),
+                        candidates=np.asarray(c['candidates']),clearance=pr[0],max_move=pr[1],smoothing=[pr[2],int(pr[3])],neighbours=(np.r_[e[:,0],e[:,1]],np.r_[e[:,1],e[:,0]])))
             errors=[];binding_errors=[];timings=[];activation_errors=[]
             with Native(build(out/'native'),player/'avatar/gnm.bin') as native:
                 for index,yaw in enumerate((0,.35,-.35)):
@@ -109,6 +116,10 @@ def verify(player,out,hardware=False,device_test=False):
                         else:
                             root=(expected[ids]*weights[:,:,None]).sum(1)
                             want=root+np.einsum('vij,vj->vi',attachment_frames(expected[ids[:,:3]]),offset)
+                        if name in contact_parts:
+                            # Same per-pose lip/arch contact deformer as the player, in part-vertex space.
+                            render_to_part,count,cspec=contact_parts[name];partp=np.zeros((count,3));partp[render_to_part]=want
+                            want=contact_deform(partp,expected.astype(float),cspec)[render_to_part]
                         rendered=np.asarray(cdp.evaluate(f'vhuman.renderVertices({json.dumps(name)})')).reshape(-1,3)
                         binding_errors.extend(np.linalg.norm(rendered-want,axis=1)*1000)
                     if (player/'detail/detail.json').is_file():

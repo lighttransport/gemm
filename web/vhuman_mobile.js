@@ -3,6 +3,7 @@ import {GLTFLoader} from './GLTFLoader.js';
 import {AvatarStream} from './vhuman_mobile_stream.js';
 import {sha256} from './vhuman_mobile_hash.js';
 import {oralUniforms,setOralUniforms,patchOralMaterial,cpuOralOcclusion} from './vhuman_mobile_occlusion.js';
+import {partContact} from './vhuman_mobile_contact.js';
 
 const $=id=>document.getElementById(id), status=$('status');
 const state={ready:false,pending:false,animate:false,frames:0,poseId:0,workerMs:0,updateMs:0,detail:true,errors:[]};
@@ -145,7 +146,7 @@ async function main(){
         if(name.includes('/')||name.includes('\\')||file.bytes>256*1024*1024)throw Error('Invalid asset filename/size');
         status.textContent=`Checking ${name}…`;
         const data=await bytes(config.package+name,file.sha256,file.bytes);
-        if(['gnm.bin','avatar.glb','bindings.bin','controls.json','oral_occlusion.json'].includes(name))buffers[name]=data;
+        if(['gnm.bin','avatar.glb','bindings.bin','controls.json','oral_occlusion.json','oral_contact.json'].includes(name))buffers[name]=data;
     }
     const controls=json(buffers['controls.json']), parts=readBindings(buffers['bindings.bin'],manifest.parts);
     const speech=new AvatarStream(config.package_sha256,manifest.source_geometry_sha256,controls.reference,message=>{$('speech-status').textContent=message;});
@@ -180,6 +181,12 @@ async function main(){
     const fill=new THREE.DirectionalLight(0xcbdfff,1.1);fill.position.set(.7,.1,1);
     const ambient=new THREE.HemisphereLight(0xd6e4ff,0x5f4837,1.2);scene.add(key,fill,ambient);
     // Mouth-interior occlusion: lip-aperture visibility (indirect) and aperture shadow (direct lights).
+    // Lip/arch contact deformer for the refined mouth lining (runs after bindings, before normals).
+    const contactUpdates=[];
+    if(buffers['oral_contact.json']){
+        const spec=json(buffers['oral_contact.json']);if(spec.schema!=='vhuman.oral_contact.v1')throw Error('Unsupported oral contact');
+        for(const [name,partSpec] of Object.entries(spec.parts)){const part=parts.find(p=>p.name===name);if(!part)throw Error('Oral contact part missing');contactUpdates.push(partContact(part,partSpec));}
+    }
     let oralParts=[],oralSpec=null,lastNative=null;const oralU=oralUniforms();state.oral=true;
     if(buffers['oral_occlusion.json']){
         oralSpec=json(buffers['oral_occlusion.json']);
@@ -188,8 +195,12 @@ async function main(){
         for(const part of parts){
             const spec=oralSpec.parts[part.name];if(!spec)continue;
             if(!part.native)throw Error('Oral occlusion requires native parts');
-            const lookup=new Map(spec.native_ids.map((id,i)=>[id,i])),weights=new Float32Array(part.vertices*3);
-            for(let v=0;v<part.vertices;v++){const i=lookup.get(part.ids[v*6]);if(i===undefined)throw Error('Oral occlusion vertex missing');weights.set(spec.weights[i],v*3);}
+            const weights=new Float32Array(part.vertices*3);
+            if(spec.render_weights){if(spec.render_weights.length!==part.vertices)throw Error('Oral occlusion vertex count');spec.render_weights.forEach((w,v)=>weights.set(w,v*3));
+                for(const [key,attr] of [['render_key_weights','oralKey'],['render_fill_weights','oralFill']]){
+                    const a=new Float32Array(part.vertices*3);if(spec[key])spec[key].forEach((w,v)=>a.set(w,v*3));part.mesh.geometry.setAttribute(attr,new THREE.BufferAttribute(a,3));}}
+            else{const lookup=new Map(spec.native_ids.map((id,i)=>[id,i]));
+                for(let v=0;v<part.vertices;v++){const i=lookup.get(part.ids[v*6]);if(i===undefined)throw Error('Oral occlusion vertex missing');weights.set(spec.weights[i],v*3);}}
             if(spec.flip)throw Error('Flipped oral normals are not supported');
             part.occlusion={weights};
             part.mesh.geometry.setAttribute('oralWeights',new THREE.BufferAttribute(weights,3));
@@ -197,7 +208,8 @@ async function main(){
             oralParts.push(part);
         }
     }else{$('oral').disabled=true;}
-    const oralLights=()=>[key,fill].map(light=>({intensity:light.intensity,direction:light.position.clone().sub(light.target.position).normalize().toArray()}));
+    const oralLights=()=>[['key',key],['fill',fill]].map(([name,light])=>({name,intensity:light.intensity,color:light.color.clone().multiplyScalar(light.intensity).toArray(),
+        direction:light.position.clone().sub(light.target.position).normalize().toArray()}));
     const updateOral=native=>{
         if(!oralSpec||!native)return;const start=performance.now();
         state.oralFrame=setOralUniforms(oralU,native,oralSpec,oralLights());state.oralMs=performance.now()-start;
@@ -243,7 +255,7 @@ async function main(){
         if(data.type==='ready'){submit();return;}
         if(data.type==='pose'){
             latestPose=data;const start=performance.now();
-            for(const part of parts)attach(data.positions,data.joints,part);normals(parts,shared);updateDetail(latestExpression);
+            for(const part of parts)attach(data.positions,data.joints,part);for(const update of contactUpdates)update(data.positions);normals(parts,shared);updateDetail(latestExpression);
             lastNative=data.positions;updateOral(data.positions);
             state.updateMs=performance.now()-start;state.workerMs=data.milliseconds;state.poseId=data.id;state.pending=false;
             state.ready=true;state.reference=controls.reference;state.vertexSample=Array.from(data.positions.slice(0,30));

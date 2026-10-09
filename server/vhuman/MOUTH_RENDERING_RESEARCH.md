@@ -70,7 +70,14 @@ the actual lip shape every frame.
    MAE/p95 per part and matched Blender-vs-browser mouth crops for open,
    speaking and closed poses.
 
-## Measured results
+## Measured results (v1, superseded)
+
+> **Invalid reference.** The v1 occluder set kept only native triangles within
+> 90 mm of the mouth centre, so rays escaped through the missing head/neck
+> geometry and the targets were far too bright (tongue escape visibility 0.151
+> vs 0.0027 with all non-eye triangles; upper teeth 0.057 vs 0.012). The
+> torch tracer, Blender `ray_cast` and a Cycles bake agree on the full
+> geometry. The v1 numbers below measure fit to the leaky target only; see v2.
 
 Reference: cosine-weighted escape visibility of all 4,611 oral vertices, GPU
 ray traced (64 rays/vertex) against skin and oral geometry within 90 mm.
@@ -115,6 +122,77 @@ flash-lit portrait; that is lighting, not an occlusion error.
 Browser: 75,620 triangles unchanged; hardware verification 30 FPS on RTX 5060
 Ti, exact WASM/native parity, binding p95 3.3e-6 mm. Not measured on a phone.
 The iOS/Filament player does not yet implement the oral shader terms.
+
+## v2: full-geometry Cycles reference, learned light transfer, lip/arch contact
+
+**Reference.** `tmp/vhuman-mouth-gi/bake_gi.py` bakes per-vertex diffuse
+irradiance (direct + interreflection, 64 spp, colour off) of all oral parts in
+Cycles, with the whole head as occluder and albedo priors for bounce light
+(teeth .65/.6/.5, gums .35/.08/.07, tongue .4/.09/.08, mucosa .33/.09/.09).
+Passes: uniform environment (indirect), and the browser key and fill suns.
+Training: 100 of the 200 sampled expressions; test: every second sample of
+the default and stress tracks (fully held out). Units: an unoccluded,
+light-facing surface is 1.0.
+
+Indirect (environment) irradiance, held-out MAE (p95):
+
+| Model | default | stress |
+| --- | --- | --- |
+| reference mean | 0.016 | 0.047 |
+| no occlusion (1.0) | 0.98 | 0.95 |
+| static per-vertex bake | 0.022 | 0.028 |
+| **per-vertex affine in area + height (shipped)** | **0.0061 (0.033)** | **0.0078 (0.031)** |
+
+The interior is far darker than v1 assumed; since the bake already includes
+interreflection, the GTAO multi-bounce lift was removed.
+
+Direct light, held-out MAE of irradiance relative to an unoccluded surface
+facing the light:
+
+| Model | default | stress |
+| --- | --- | --- |
+| no shadow (n·l) | 0.242 | 0.248 |
+| n·l × aperture shadow × min(1, indirect/0.3) | 0.017 | 0.028 |
+| **learned per-light transfer, affine in area + height (shipped)** | **0.0087** | **0.0137** |
+
+The learned transfer captures direct + bounce for the trained light directions
+and removes the per-tooth blotches the analytic aperture term produced in the
+rest smile. When a light leaves its trained head-frame direction (head turns,
+other rigs), the shader blends to the analytic term (smoothstep 0.15–0.5 rad),
+with head rotation taken from three rigid upper-teeth vertices.
+
+**Contact (gum/teeth gap).** The GNM mouth sock ran straight from the lip
+rim into the palate and floor, leaving a 3–6 mm dark gap behind the lips.
+One Catmull-Clark level is now surface-bound to the sock with the native lip
+rim fixed (`oral_contact.py`). A per-pose deformer (`contact_runtime.py`,
+mirrored in `web/vhuman_mobile_contact.js`) presses 588 vestibular lining
+vertices onto the posed labial teeth/gum surface at 0.5 mm clearance. Weights
+are feathered by depth from the rim, moves are capped at 8 mm, followed by two
+smoothing passes and a one-sided push-out. This approximates lip tone pressing
+the mucosa onto the arch; it is not a soft-tissue simulation. The signed
+distance uses a pseudo-normal blended over near-tied candidate triangles: a
+single argmin face normal flipped the push direction at shared edges (2.5 mm
+jumps from 1e-7 input changes, i.e. popping).
+
+Held-out (every 4th default/stress sample):
+
+| Metric | before | after |
+| --- | --- | --- |
+| median lining-to-arch gap | 2.86 mm | 0.91 mm |
+| lining vertices inside the arch | 18.9 % | 2.3 % |
+| visible band (0–8 mm from rim): median gap / inside | 4.48 mm / 0 % | 1.72 mm / 0 % |
+
+Remaining penetration is deep (palate/floor side, not visible). The cavity
+material changed from near-black to a mucosa albedo, because occlusion now
+supplies the darkening.
+
+**Runtime.** 77,818 triangles; the JS deformer takes about 4 ms per pose on a
+desktop CPU (node). Browser verification passes with the deformer applied in
+both the player and the Python reference (binding p95 3.7e-6 mm; 30 FPS in hardware mode on RTX 5060 Ti). Fresh
+Blender scenes match `native_part_positions` to 2e-8 m over 738 + 396 checks,
+and USD export/import passes (1,458 + 774 sample checks). Not measured on a
+phone; the iOS/Filament player has neither the oral shader terms nor the
+contact deformer.
 
 ## References
 

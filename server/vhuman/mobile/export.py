@@ -85,7 +85,7 @@ def export(candidate,out, *, scene,profile='iphone12'):
     def material(kind):
         if kind in materials:return materials[kind]
         colors={'teeth':[.72,.66,.52,1],'gums':[.28,.045,.055,1],'tongue':[.3,.07,.09,1],
-                'cavity':[.015,.004,.006,1],'pupil':[.001,.001,.001,1],'lash':[.008,.005,.003,1],
+                'cavity':[.32,.085,.085,1],'pupil':[.001,.001,.001,1],'lash':[.008,.005,.003,1],
                 'hair':[*description['hair']['color_linear'],1],'glass':[1,1,1,.18],'tear':[1,1,1,.2],
                 'cornea':[1,1,1,.08]}
         pbr=dict(baseColorFactor=colors.get(kind,[1,1,1,1]),metallicFactor=0.,roughnessFactor=.5)
@@ -113,7 +113,7 @@ def export(candidate,out, *, scene,profile='iphone12'):
         assets.update({name+'_positions':v,name+'_triangles':t,name+'_uvs':uv,
             name+'_surface_ids':anchors,name+'_surface_weights':weights,
             name+'_surface_offsets':np.einsum('vji,vj->vi',frame,v-root)})
-    records=[];bindings={};streams=[];triangles=0
+    records=[];bindings={};streams=[];triangles=0;contact={};render_maps={}
     for part in parts:
         name=part['name'];pos=assets[name+'_positions'];tri=assets[name+'_triangles'];uv=assets[name+'_uvs']
         normals=vertex_normals(pos,tri)
@@ -139,7 +139,12 @@ def export(candidate,out, *, scene,profile='iphone12'):
         else:
             joint=part.get('joint') if part.get('joint') is not None else 1
             offset=pos[mapping]-g['gnm_joint_positions'][joint]
-        bindings[name+'_ids']=ids;bindings[name+'_weights']=weights;bindings[name+'_offset']=offset
+        bindings[name+'_ids']=ids;bindings[name+'_weights']=weights;bindings[name+'_offset']=offset;render_maps[name]=mapping
+        if name+'_contact_active' in assets:
+            # Per-pose lip/arch contact deformer, evaluated in part-vertex space (render_to_part scatters seams).
+            contact[name]=dict(render_to_part=mapping.tolist(),part_vertices=int(len(pos)),active=assets[name+'_contact_active'].tolist(),
+                weight=np.round(assets[name+'_contact_weight'],6).tolist(),candidates=assets[name+'_contact_candidates'].tolist(),
+                params=assets[name+'_contact_params'].tolist(),edges=assets[name+'_contact_edges'].tolist())
         center=np.asarray(part.get('rotation_center_offset',[0,0,0]),dtype=np.float32)
         if center.shape!=(3,) or not np.isfinite(center).all():raise ValueError('invalid fitted joint center')
         records.append(dict(name=name,mesh=mi,vertices=n,triangles=len(tri),joint=joint,native=part['native'],
@@ -201,6 +206,9 @@ def export(candidate,out, *, scene,profile='iphone12'):
             if sha256(candidate/name)!=refinement['repair_mask_sha256']:
                 raise ValueError('projection repair mask checksum mismatch')
             shutil.copyfile(candidate/name,out/name)
+    if contact:
+        (out/'oral_contact.json').write_text(json.dumps(dict(schema='vhuman.oral_contact.v1',geometry_sha256=manifest['geometry_sha256'],parts=contact)))
+        result['oral_contact']=manifest['geometry'].get('oral_contact',{}).get('contact')
     if (scene/'oral_occlusion.json').is_file():
         # Optional lip-aperture mouth occlusion fitted for this geometry (native oral parts only).
         oral=json.loads((scene/'oral_occlusion.json').read_text())
@@ -209,10 +217,15 @@ def export(candidate,out, *, scene,profile='iphone12'):
         by_name={p['name']:p for p in description['parts']}
         for name,spec in oral['parts'].items():
             if name not in by_name or not by_name[name]['native']:raise ValueError('oral occlusion part is not native: '+name)
-            if not set(assets[name+'_native_ids'].tolist())<=set(spec['native_ids']) or len(spec['weights'])!=len(spec['native_ids']):
+            if 'part_weights' in spec:
+                # Part-vertex weight sets (refined parts with bound vertices) -> render-vertex order.
+                for key in [k for k in list(spec) if k.startswith('part_') and k.endswith('weights')]:
+                    if len(spec[key])!=len(assets[name+'_positions']):raise ValueError('oral occlusion does not cover part vertices: '+name)
+                    spec['render_'+key[5:]]=np.asarray(spec.pop(key))[render_maps[name]].round(6).tolist()
+            elif not set(assets[name+'_native_ids'].tolist())<=set(spec['native_ids']) or len(spec['weights'])!=len(spec['native_ids']):
                 raise ValueError('oral occlusion does not cover part vertices: '+name)
         if not oral['rim'] or max(oral['rim'])>=len(g['full_captured'][0]):raise ValueError('invalid oral rim')
-        shutil.copyfile(scene/'oral_occlusion.json',out/'oral_occlusion.json')
+        (out/'oral_occlusion.json').write_text(json.dumps(oral))
         result['oral_occlusion']={k:oral[k] for k in ('model','metrics','limitations') if k in oral}
     result['files']={p.name:dict(sha256=sha256(p),bytes=p.stat().st_size) for p in sorted(out.iterdir()) if p.is_file()}
     (out/'avatar.json').write_text(json.dumps(result,indent=2));validate_package(out)

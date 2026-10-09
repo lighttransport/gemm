@@ -36,6 +36,20 @@ def native_part_positions(data, name, vertices):
         roots=(corners*weights[...,None]).sum(-2)
         bound=roots+np.einsum('...vij,vj->...vi',attachment_frames(corners),data[name+'_bound_offsets'])
         positions=np.concatenate((positions,bound.astype(positions.dtype)),axis=-2)
+    if name+'_contact_active' in data:
+        # Per-pose lip/arch contact deformer (numpy-only module, importable inside Blender).
+        if __package__:
+            from .contact_runtime import contact_deform
+        else:
+            sys.path.insert(0,str(Path(__file__).parent))
+            from contact_runtime import contact_deform
+        edges=data[name+'_contact_edges'];params=data[name+'_contact_params']
+        spec=dict(active=data[name+'_contact_active'],weight=data[name+'_contact_weight'],candidates=data[name+'_contact_candidates'],
+                  clearance=float(params[0]),max_move=float(params[1]),smoothing=[float(params[2]),int(params[3])],
+                  neighbours=(np.r_[edges[:,0],edges[:,1]],np.r_[edges[:,1],edges[:,0]]))
+        frames=positions.reshape(-1,*positions.shape[-2:])
+        native=vertices.reshape(-1,*vertices.shape[-2:])
+        positions=np.stack([contact_deform(f,n,spec) for f,n in zip(frames,native)]).reshape(positions.shape).astype(positions.dtype)
     return positions
 
 
@@ -248,7 +262,7 @@ def run(request):
     links.new(displacement.outputs[0],nodes.get('Material Output').inputs['Displacement'])
     skin.displacement_method='BOTH';materials['skin']=skin
     for name,color,roughness in [('teeth',(.65,.6,.5),.25),('gums',(.35,.08,.07),.35),
-        ('tongue',(.4,.09,.08),.4),('cavity',(.04,.009,.009),.65),('sclera',(.7,.65,.6),.25),
+        ('tongue',(.4,.09,.08),.4),('cavity',(.33,.09,.09),.45),('sclera',(.7,.65,.6),.25),
         ('iris',(.12,.065,.035),.55),('frame',(.12,.045,.025),.25),('pupil',(.001,.001,.001),1),('lash',(.025,.018,.012),.45)]:
         materials[name],principled=material(name,color,roughness)
         if name in ('gums','tongue'):
