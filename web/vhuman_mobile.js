@@ -195,9 +195,10 @@ async function main(){
     const worker=new Worker('./vhuman_mobile_worker.js',{type:'module'}),shared=new Float32Array(17821*3);
     let latestPose=null,latestExpression=controls.reference.slice(),sweepStarted=0,lastReport=performance.now(),frames=0,poseDirty=false;
     let id=0;
-    function submit(expression=controls.reference,yaw=Number($('yaw').value),rotations=null,translation=[0,0,0]){
+    function submit(expression=controls.reference,yaw=Number($('yaw').value),rotations=null,translation=[0,0,0],pitch=Number($('pitch').value)){
         if(state.pending)return false;
-        const pose=new Float32Array(398);pose.set(expression);if(rotations)pose.set(rotations,383);else pose[384]=yaw;pose.set(translation,395);
+        // Turn at the neck (joint 0, +Y); nod at the head (joint 1, +X). Positive pitch looks up.
+        const pose=new Float32Array(398);pose.set(expression);if(rotations)pose.set(rotations,383);else{pose[384]=yaw;pose[386]=-pitch;}pose.set(translation,395);
         latestExpression=Array.from(expression);state.pending=true;
         worker.postMessage({type:'pose',pose,id:++id},[pose.buffer]);return true;
     }
@@ -226,9 +227,21 @@ async function main(){
     state.renderVertices=name=>Array.from(parts.find(p=>p.name===name).mesh.geometry.attributes.position.array);
     worker.postMessage({type:'init',weights:buffers['gnm.bin']},[buffers['gnm.bin']]);
     $('yaw').oninput=()=>{state.animate=false;poseDirty=true;};
+    $('pitch').oninput=()=>{state.animate=false;poseDirty=true;};
+    // Pointer drag on the viewport: horizontal turns, vertical tilts (mouse, pen and touch).
+    const canvas=$('viewport');let drag=null;
+    const clampInput=(input,value)=>{input.value=String(Math.max(Number(input.min),Math.min(Number(input.max),value)));};
+    canvas.addEventListener('pointerdown',event=>{if(event.button!==0)return;drag={x:event.clientX,y:event.clientY,yaw:Number($('yaw').value),pitch:Number($('pitch').value)};canvas.setPointerCapture(event.pointerId);canvas.classList.add('dragging');});
+    canvas.addEventListener('pointermove',event=>{
+        if(!drag)return;const rect=canvas.getBoundingClientRect(),gain=1.6/Math.max(rect.width,rect.height,1);
+        clampInput($('yaw'),drag.yaw+(event.clientX-drag.x)*gain);clampInput($('pitch'),drag.pitch-(event.clientY-drag.y)*gain);
+        state.animate=false;poseDirty=true;
+    });
+    const endDrag=event=>{if(!drag)return;drag=null;canvas.classList.remove('dragging');if(canvas.hasPointerCapture(event.pointerId))canvas.releasePointerCapture(event.pointerId);};
+    canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);
     $('detail').onchange=()=>{state.detail=$('detail').checked;updateDetail(latestExpression);};
     $('sweep').onclick=()=>{state.animate=!state.animate;sweepStarted=performance.now();$('sweep').textContent=state.animate?'Pause sweep':'Play pose sweep';};
-    $('reset').onclick=()=>{state.animate=false;$('yaw').value=0;state.setView('front');$('sweep').textContent='Play pose sweep';poseDirty=true;};
+    $('reset').onclick=()=>{state.animate=false;$('yaw').value=0;$('pitch').value=0;state.setView('front');$('sweep').textContent='Play pose sweep';poseDirty=true;};
     document.addEventListener('visibilitychange',()=>{if(document.hidden){state.animate=false;speech.close();}});
     window.addEventListener('pagehide',()=>{worker.terminate();speech.close();});
     let lastDraw=0;
