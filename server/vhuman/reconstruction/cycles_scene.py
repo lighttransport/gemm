@@ -27,6 +27,18 @@ def attachment_frames(points):
     return np.stack((x,np.cross(z,x),z),-1)
 
 
+def native_part_positions(data, name, vertices):
+    """Per-frame native part coordinates, plus any appended surface-bound vertices (refined ears)."""
+    positions=vertices[...,data[name+'_native_ids'],:]
+    if name+'_bound_ids' in data:
+        ids=data[name+'_bound_ids'];weights=data[name+'_bound_weights']
+        corners=vertices[...,ids,:]
+        roots=(corners*weights[...,None]).sum(-2)
+        bound=roots+np.einsum('...vij,vj->...vi',attachment_frames(corners),data[name+'_bound_offsets'])
+        positions=np.concatenate((positions,bound.astype(positions.dtype)),axis=-2)
+    return positions
+
+
 def animate(scene, request, config, data, objects):
     directory=Path(request['motion']);track=json.loads((directory/'motion.json').read_text())
     motion=np.load(directory/'motion.npz',allow_pickle=False)
@@ -41,7 +53,7 @@ def animate(scene, request, config, data, objects):
     for part in config['parts']:
         obj=objects[part['name']]
         if part['native']:
-            positions=motion['vertices'][:,data[part['name']+'_native_ids']]
+            positions=native_part_positions(data,part['name'],motion['vertices'])
         elif part.get('surface_bound'):
             name=part['name'];ids=data[name+'_surface_ids'];weights=data[name+'_surface_weights']
             roots=(motion['vertices'][:,ids]*weights[None,:,:,None]).sum(2)

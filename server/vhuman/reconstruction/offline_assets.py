@@ -157,6 +157,10 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         if 'full_captured' not in z:raise ValueError('offline rendering needs complete GNM anatomy; rebuild candidate')
         full=z['full_captured'][0];tri=z['full_triangles'];uv=z['full_triangle_uvs']
         joints=z['gnm_joint_positions'];component=z['full_component_ids'];names=z['component_names']
+        # Optional refined ears: surface-bound vertices replacing native ear faces.
+        ear=({k:z[k] for k in ('ear_dense_captured','ear_dense_triangles','ear_dense_triangle_uvs',
+              'ear_bind_ids','ear_bind_weights','ear_bind_offsets','ear_removed_triangles')}
+             if 'ear_dense_triangles' in z else None)
     model=GNMModel();parts=[];arrays={}
     def part(name,positions,triangles,texcoords,material, *, native=False, joint=None,surface=None):
         ids,remapped=np.unique(triangles,return_inverse=True)
@@ -167,6 +171,19 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         if surface:
             for key,value in surface.items():arrays[name+'_surface_'+key]=value[ids]
         parts.append(dict(name=name,material=material,native=native,joint=joint,surface_bound=bool(surface)))
+    def append_bound_ears(name,ear):
+        # Native vertices keep their GNM ids; appended vertices follow anchor triangles
+        # exactly like attachment-bound parts (barycentric root + attachment-frame offset).
+        native_ids=arrays[name+'_native_ids'];count=len(full);t=ear['ear_dense_triangles']
+        if not np.isin(t[t<count],native_ids).all():raise ValueError('refined ear boundary is not on the skin part')
+        local=np.where(t<count,np.searchsorted(native_ids,np.minimum(t,count-1)),len(native_ids)+t-count)
+        arrays[name+'_positions']=np.concatenate((arrays[name+'_positions'],ear['ear_dense_captured'].astype(np.float32)))
+        arrays[name+'_triangles']=np.concatenate((arrays[name+'_triangles'],local.astype(np.int32)))
+        arrays[name+'_uvs']=np.concatenate((arrays[name+'_uvs'],ear['ear_dense_triangle_uvs'].astype(np.float32)))
+        arrays[name+'_bound_ids']=ear['ear_bind_ids'].astype(np.int64)
+        arrays[name+'_bound_weights']=ear['ear_bind_weights'].astype(np.float64)
+        arrays[name+'_bound_offsets']=ear['ear_bind_offsets'].astype(np.float64)
+        parts[-1]['bound_vertices']=int(len(ear['ear_dense_captured']))
     for i,name in enumerate(names):
         if name in ('left_eye','right_eye'):continue
         selected=component==i
@@ -177,7 +194,11 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
                 if mask.any():part(str(name)+'_'+kind,full,tri[mask],uv[mask],kind,native=True)
         elif material=='skin':
             cavity=model.group('mouth_sock')[tri].all(1)
-            part('skin',full,tri[selected&~cavity],uv[selected&~cavity],'skin',native=True)
+            skin_faces=selected&~cavity
+            if ear is not None:
+                skin_faces[ear['ear_removed_triangles']]=False
+            part('skin',full,tri[skin_faces],uv[skin_faces],'skin',native=True)
+            if ear is not None:append_bound_ears('skin',ear)
             if (selected&cavity).any():part('mouth_cavity',full,tri[selected&cavity],uv[selected&cavity],'cavity',native=True)
         else:part(str(name),full,tri[selected],uv[selected],material,native=True)
     head_folder=candidate.parents[1]
@@ -306,8 +327,7 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         valid=(pixel[:,0]>=0)&(pixel[:,0]<w)&(pixel[:,1]>=0)&(pixel[:,1]<h)&facing&(abs(p[:,0])<.025)
         ids=np.flatnonzero(valid);ids=ids[hair[pixel[ids,1],pixel[ids,0]]]
         crown_cutoff=float(np.percentile(p[ids,1],5)*.95) if len(ids) else .08
-        native=arrays['skin_native_ids']
-        arrays['skin_hair_crown']=crown_coverage(full[native],crown_cutoff).astype(np.float32)
+        arrays['skin_hair_crown']=crown_coverage(arrays['skin_positions'],crown_cutoff).astype(np.float32)
         source_pixels,_=camera.project(arrays['skin_positions'])
         source_uv=source_pixels/[w,h]
         arrays['skin_source_uvs']=source_uv[arrays['skin_triangles']].astype(np.float32)

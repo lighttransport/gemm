@@ -66,7 +66,13 @@ def export(candidate,out, *, scene,profile='iphone12'):
     # A scene path alone is not sufficient provenance: inspect native positions.
     for p in description['parts']:
         if p['native']:
-            np.testing.assert_allclose(assets[p['name']+'_positions'],g['full_captured'][0,assets[p['name']+'_native_ids']],atol=1e-7)
+            name=p['name'];expected=g['full_captured'][0,assets[name+'_native_ids']]
+            if name+'_bound_ids' in assets:
+                corners=g['full_captured'][0][assets[name+'_bound_ids']].astype(float)
+                bound=(corners*assets[name+'_bound_weights'][:,:,None]).sum(1)+np.einsum(
+                    'vij,vj->vi',attachment_frames(corners),assets[name+'_bound_offsets'])
+                expected=np.concatenate((expected,bound))
+            np.testing.assert_allclose(assets[name+'_positions'],expected,atol=1e-7)
     out.mkdir(parents=True,exist_ok=True)
     model=GNMModel();native=write_model(out/'gnm.bin',model,g)
     skin_maps=skin_textures(candidate,scene,assets,description,out)
@@ -120,7 +126,13 @@ def export(candidate,out, *, scene,profile='iphone12'):
         n=len(mapping);ids=np.zeros((n,6),np.uint32);weights=np.zeros((n,6),np.float32);offset=np.zeros((n,3),np.float32)
         joint=-1
         if part['native']:
-            ids[:,0]=assets[name+'_native_ids'][mapping];weights[:,0]=1
+            native_count=len(assets[name+'_native_ids']);direct=mapping<native_count
+            ids[direct,0]=assets[name+'_native_ids'][mapping[direct]];weights[direct,0]=1
+            if (~direct).any():
+                # Appended refined-ear vertices: barycentric anchor + attachment-frame offset.
+                bound=mapping[~direct]-native_count
+                ids[~direct,:3]=assets[name+'_bound_ids'][bound];weights[~direct,:3]=assets[name+'_bound_weights'][bound]
+                offset[~direct]=assets[name+'_bound_offsets'][bound]
         elif part.get('surface_bound'):
             src=assets[name+'_surface_ids'][mapping];w=assets[name+'_surface_weights'][mapping]
             ids[:,:src.shape[1]]=src;weights[:,:w.shape[1]]=w;offset=assets[name+'_surface_offsets'][mapping]

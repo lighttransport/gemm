@@ -58,6 +58,13 @@ def validate(out):
             key=keys[f'GNM_{frame+1:03d}'];positions=np.empty(len(key.data)*3,np.float32)
             key.data.foreach_get('co',positions)
             expected=motion['vertices'][frame,assets['skin_native_ids']]
+            if 'skin_bound_ids' in assets:
+                corners=motion['vertices'][frame][assets['skin_bound_ids']].astype(float)
+                x=corners[:,1]-corners[:,0];x/=np.maximum(np.linalg.norm(x,axis=1,keepdims=True),1e-12)
+                z=np.cross(x,corners[:,2]-corners[:,0]);z/=np.maximum(np.linalg.norm(z,axis=1,keepdims=True),1e-12)
+                frames=np.stack((x,np.cross(z,x),z),-1)
+                bound=(corners*assets['skin_bound_weights'][:,:,None]).sum(1)+np.einsum('vij,vj->vi',frames,assets['skin_bound_offsets'])
+                expected=np.concatenate((expected,bound))
             if np.max(abs(positions.reshape(-1,3)-expected))>1e-7:
                 raise ValueError('native motion coordinates changed after scene reload')
     result=dict(passed=True,float_maps=checks,hair_points_checked=len(expected_hair),hair_mask_checked=(out/'hair_coverage.png').is_file(),native_crown_checked='skin_hair_crown' in assets,native_motion_checked=bool(request.get('motion')),

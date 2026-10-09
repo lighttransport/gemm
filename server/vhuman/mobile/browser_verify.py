@@ -93,7 +93,13 @@ def verify(player,out,hardware=False,device_test=False):
                     errors.append(np.linalg.norm(actual-expected,axis=1)*1000);timings.append(times)
                     for part in manifest['parts']:
                         name=part['name'];ids=bindings[name+'_ids'];weights=bindings[name+'_weights'];offset=bindings[name+'_offset']
-                        if part['native']:want=expected[ids[:,0]]
+                        bound_rows=(weights[:,1:]!=0).any(1)|(offset!=0).any(1)|(weights[:,0]!=1)
+                        if part['native'] and not bound_rows.any():want=expected[ids[:,0]]
+                        elif part['native']:
+                            # Native part with appended refined-ear vertices.
+                            want=expected[ids[:,0]].copy()
+                            root=(expected[ids[bound_rows]]*weights[bound_rows][:,:,None]).sum(1)
+                            want[bound_rows]=root+np.einsum('vij,vj->vi',attachment_frames(expected[ids[bound_rows][:,:3]]),offset[bound_rows])
                         elif part['joint']>=0:
                             primitive=glb.doc['meshes'][part['mesh']]['primitives'][0]
                             rest=glb.accessor(primitive['attributes']['POSITION']);matrix,translation=native.joint_transform(part['joint'])

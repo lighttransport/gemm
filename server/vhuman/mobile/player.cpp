@@ -51,7 +51,9 @@ struct Part {
     std::vector<float2> uv;
     std::vector<uint32_t> triangles,ids;
     std::vector<float> weights;
+    std::vector<uint8_t> direct;  // native parts: per-vertex native copy vs appended surface binding
     std::vector<Vertex> vertices;
+    bool shared(size_t i) const {return native&&direct[i];}
     VertexBuffer* vb=nullptr;IndexBuffer* ib=nullptr;
 };
 }
@@ -115,6 +117,12 @@ struct Player::Impl {
                 if(part.joint<0&&std::abs(sum-1)>1e-4f)throw std::runtime_error("binding weights do not sum to one");
                 for(int k=0;k<3;k++)if(!std::isfinite(part.offset[i][k]))throw std::runtime_error("invalid binding offset");
             }
+            part.direct.assign(n,0);
+            for(size_t i=0;i<n && part.native;i++) {
+                const float* w=&part.weights[i*6];
+                part.direct[i]=w[0]==1.f&&w[1]==0.f&&w[2]==0.f&&w[3]==0.f&&w[4]==0.f&&w[5]==0.f
+                    &&part.offset[i].x==0.f&&part.offset[i].y==0.f&&part.offset[i].z==0.f;
+            }
             part.position=part.rest;
             utils::Entity entity{};
             for(size_t i=0;i<asset->getRenderableEntityCount();i++) {
@@ -143,7 +151,7 @@ struct Player::Impl {
             for(size_t i=0;i<part.triangles.size();i+=3) {
                 auto a=part.triangles[i],b=part.triangles[i+1],c=part.triangles[i+2];
                 auto normal=cross(part.position[b]-part.position[a],part.position[c]-part.position[a]);
-                for(auto v:{a,b,c}) {part.normal[v]+=normal;if(part.native)shared[part.ids[v*6]]+=normal;}
+                for(auto v:{a,b,c}) {part.normal[v]+=normal;if(part.shared(v))shared[part.ids[v*6]]+=normal;}
             }
         }
         for(auto& part:parts) {
@@ -157,7 +165,7 @@ struct Player::Impl {
                 }
             }
             for(size_t i=0;i<part.position.size();i++) {
-                auto n=unit(part.native?shared[part.ids[i*6]]:part.normal[i]);
+                auto n=unit(part.shared(i)?shared[part.ids[i*6]]:part.normal[i]);
                 auto t=tangent[i]-n*dot(n,tangent[i]);
                 if(length(t)<1e-8f)t=cross(std::abs(n.y)<.9f?float3{0,1,0}:float3{1,0,0},n);
                 t=unit(t);auto b=cross(n,t);
@@ -223,7 +231,7 @@ void Player::pose(const float* expressions,const float* rotations,const float* t
                 auto d=part.center,x=part.rest[i]-d;
                 for(int k=0;k<3;k++)part.position[i][k]=affine[k*3]*x.x+affine[k*3+1]*x.y+affine[k*3+2]*x.z+affine[9+k]
                     +parent[k*3]*d.x+parent[k*3+1]*d.y+parent[k*3+2]*d.z;
-            } else if(part.native)part.position[i]=p->native[part.ids[i*6]];
+            } else if(part.shared(i))part.position[i]=p->native[part.ids[i*6]];
             else {
                 float3 root{0};for(int k=0;k<6;k++)root+=p->native[part.ids[i*6+k]]*part.weights[i*6+k];
                 auto a=p->native[part.ids[i*6]],b=p->native[part.ids[i*6+1]],c=p->native[part.ids[i*6+2]];

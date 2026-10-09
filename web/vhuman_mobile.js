@@ -33,7 +33,13 @@ function readBindings(buffer,records){
         if(center.some(v=>!Number.isFinite(v)))throw Error('Invalid fitted center');
         const ids=array(Uint32Array,count*6),weights=array(Float32Array,count*6),offset=array(Float32Array,count*3);
         if(ids.some(v=>v>=17821)||weights.some(v=>!Number.isFinite(v)||v<0||v>1.0001)||offset.some(v=>!Number.isFinite(v)))throw Error('Invalid binding value');
-        return {...record,ids,weights,offset,center};
+        // Native parts may append surface-bound vertices (refined ears): a vertex is
+        // native only with a single unit weight and zero offset.
+        const direct=new Uint8Array(count);
+        if(record.native)for(let i=0;i<count;i++){const b=i*6,p=i*3;
+            direct[i]=weights[b]===1&&weights[b+1]===0&&weights[b+2]===0&&weights[b+3]===0&&weights[b+4]===0&&weights[b+5]===0
+                &&offset[p]===0&&offset[p+1]===0&&offset[p+2]===0?1:0;}
+        return {...record,ids,weights,offset,center,direct};
     });
     if(cursor!==buffer.byteLength)throw Error('Trailing binding data');return result;
 }
@@ -46,7 +52,7 @@ function attach(positions,joints,part){
             const d=part.center;
             for(let k=0;k<3;k++)destination[p+k]=joints[a+k*3]*(x-d[0])+joints[a+k*3+1]*(y-d[1])+joints[a+k*3+2]*(z-d[2])+joints[a+9+k]
                 +joints[12+k*3]*d[0]+joints[12+k*3+1]*d[1]+joints[12+k*3+2]*d[2];
-        }else if(part.native){destination.set(positions.subarray(part.ids[b]*3,part.ids[b]*3+3),p);}
+        }else if(part.native&&(!part.direct||part.direct[i])){destination.set(positions.subarray(part.ids[b]*3,part.ids[b]*3+3),p);}
         else{
             const a=part.ids[b]*3,c=part.ids[b+1]*3,d=part.ids[b+2]*3;
             let xx=positions[c]-positions[a],xy=positions[c+1]-positions[a+1],xz=positions[c+2]-positions[a+2];
@@ -74,11 +80,12 @@ function normals(parts,shared){
             const x=p[b]-p[a],y=p[b+1]-p[a+1],z=p[b+2]-p[a+2],u=p[c]-p[a],v=p[c+1]-p[a+1],w=p[c+2]-p[a+2];
             const nx=y*w-z*v,ny=z*u-x*w,nz=x*v-y*u;
             for(let k=0;k<3;k++){const index=t[i+k]*3;n[index]+=nx;n[index+1]+=ny;n[index+2]+=nz;
-                if(part.native){const q=part.ids[t[i+k]*6]*3;shared[q]+=nx;shared[q+1]+=ny;shared[q+2]+=nz;}}
+                if(part.native&&(!part.direct||part.direct[t[i+k]])){const q=part.ids[t[i+k]*6]*3;shared[q]+=nx;shared[q+1]+=ny;shared[q+2]+=nz;}}
         }
     }
     for(const part of parts){const n=part.mesh.geometry.attributes.normal.array;
-        for(let i=0;i<part.vertices;i++){const p=i*3,q=part.ids[i*6]*3,source=part.native?shared:n,index=part.native?q:p;
+        for(let i=0;i<part.vertices;i++){const shareable=part.native&&(!part.direct||part.direct[i]);
+            const p=i*3,q=part.ids[i*6]*3,source=shareable?shared:n,index=shareable?q:p;
             const length=Math.hypot(source[index],source[index+1],source[index+2])||1;
             n[p]=source[index]/length;n[p+1]=source[index+1]/length;n[p+2]=source[index+2]/length;}
         part.mesh.geometry.attributes.normal.needsUpdate=true;
