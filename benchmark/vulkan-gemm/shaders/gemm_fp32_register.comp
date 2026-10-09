@@ -36,6 +36,15 @@ void main() {
     uint tid = gl_LocalInvocationIndex;
     uint row_base = gl_WorkGroupID.y * BLOCK;
     uint col_base = gl_WorkGroupID.x * BLOCK_N;
+    // BK/4 and both vector widths divide 256 for every supported tile.
+    // Reuse lane addresses and add uniform offsets for successive load strips.
+    uint ar = tid/(BK/4), ak = tid%(BK/4);
+    uint avr = tid%VECTORS, avk = tid/VECTORS;
+    uint br = tid/VECTORS_N, bc = tid%VECTORS_N;
+    uint abase = PACK_A!=0 ? avk*(p.m/4)+row_base/4+avr : (row_base+ar)*(p.k/4)+ak;
+    uint astep = PACK_A!=0 ? (256/VECTORS)*(p.m/4) : (256/(BK/4))*(p.k/4);
+    uint bbase = br*(p.n/4)+col_base/4+bc;
+    uint bstep = (256/VECTORS_N)*(p.n/4);
     vec4 sums[MICRO * STRIPS_N];
     const uint LOADS = (BLOCK * BK / 4 + 255) / 256;
     const uint LOADS_N = (BLOCK_N * BK / 4 + 255) / 256;
@@ -45,18 +54,18 @@ void main() {
         [[unroll]] for (uint l = 0; l < LOADS; ++l) {
             uint i = tid + l*256;
             if (BLOCK * BK / 4 < 256 && i >= BLOCK * BK / 4) continue;
-            uint r = i / (BK/4), kk = (i % (BK/4))*4;
+            uint r=ar+l*(256/(BK/4)), kk=ak*4;
             if (PACK_A != 0) next_a[l] = FULL_TILES != 0 || (i/VECTORS < p.k && row_base+(i%VECTORS)*4 < p.m)
-                ? a4[(i/VECTORS)*(p.m/4)+row_base/4+i%VECTORS] : vec4(0);
+                ? a4[abase+l*astep] : vec4(0);
             else next_a[l] = FULL_TILES != 0 || (row_base+r < p.m && kk < p.k)
-                ? a4[(row_base+r)*(p.k/4)+kk/4] : vec4(0);
+                ? a4[abase+l*astep] : vec4(0);
         }
         [[unroll]] for (uint l = 0; l < LOADS_N; ++l) {
             uint i = tid + l*256;
             if (BLOCK_N * BK / 4 < 256 && i >= BLOCK_N * BK / 4) continue;
             uint kk = i / VECTORS_N;
             next_b[l] = FULL_TILES != 0 || (kk < p.k && col_base+(i%VECTORS_N)*4 < p.n)
-                ? b4[kk*(p.n/4)+col_base/4+i%VECTORS_N] : vec4(0);
+                ? b4[bbase+l*bstep] : vec4(0);
         }
     }
 
@@ -66,11 +75,11 @@ void main() {
                 [[unroll]] for (uint l = 0; l < LOADS; ++l) {
                     uint i = tid+l*256;
                     if (BK*VECTORS < 256 && i >= BK*VECTORS) continue;
-                    uint kk = i / VECTORS, vr = i % VECTORS;
+                    uint kk=avk+l*(256/VECTORS), vr=avr;
                     vec4 value;
                     if (PREFETCH != 0) value = next_a[l];
                     else value = FULL_TILES != 0 || (tile+kk < p.k && row_base+vr*4 < p.m)
-                        ? a4[(tile+kk)*(p.m/4)+row_base/4+vr] : vec4(0);
+                        ? a4[abase+l*astep+tile*(p.m/4)] : vec4(0);
                     ta[kk][vr] = value;
                 }
             } else {
@@ -78,15 +87,15 @@ void main() {
               [[unroll]] for (uint l = 0; l < LOADS; ++l) {
                 uint i = tid+l*256;
                 if (BLOCK*BK/4 < 256 && i >= BLOCK*BK/4) continue;
-                uint r = i / (BK/4), kk = (i % (BK/4))*4;
+                uint r=ar+l*(256/(BK/4)), kk=ak*4;
                 vec4 value;
                 if (PREFETCH != 0) value = next_a[l];
                 else value = FULL_TILES != 0 || (row_base+r < p.m && tile+kk < p.k)
-                    ? a4[(row_base+r)*(p.k/4)+tile/4+kk/4] : vec4(0);
-                ta[kk+0][r/4][r%4] = value.x;
-                ta[kk+1][r/4][r%4] = value.y;
-                ta[kk+2][r/4][r%4] = value.z;
-                ta[kk+3][r/4][r%4] = value.w;
+                    ? a4[abase+l*astep+tile/4] : vec4(0);
+                ta[kk+0][ar/4+l*(256/(BK/4)/4)][ar%4] = value.x;
+                ta[kk+1][ar/4+l*(256/(BK/4)/4)][ar%4] = value.y;
+                ta[kk+2][ar/4+l*(256/(BK/4)/4)][ar%4] = value.z;
+                ta[kk+3][ar/4+l*(256/(BK/4)/4)][ar%4] = value.w;
               }
             }
         } else {
@@ -109,13 +118,13 @@ void main() {
         [[unroll]] for (uint l = 0; l < LOADS_N; ++l) {
             uint i = tid+l*256;
             if (BK*VECTORS_N < 256 && i >= BK*VECTORS_N) continue;
-            uint kk = i / VECTORS_N, vc = i % VECTORS_N;
+            uint kk=br+l*(256/VECTORS_N), vc=bc;
             uint col = col_base + vc * 4, k = tile + kk;
             vec4 bv = vec4(0);
             if (ALIGNED != 0) {
                 if (PREFETCH != 0) bv = next_b[l];
                 else bv = FULL_TILES != 0 || (k < p.k && col < p.n)
-                    ? b4[k*(p.n/4)+col/4] : vec4(0);
+                    ? b4[bbase+l*bstep+tile*(p.n/4)] : vec4(0);
             } else if (k < p.k) {
                 if (col+0 < p.n) bv.x = b[k*p.n+col+0];
                 if (col+1 < p.n) bv.y = b[k*p.n+col+1];
@@ -130,18 +139,18 @@ void main() {
             [[unroll]] for (uint l = 0; l < LOADS; ++l) {
                 uint i = tid + l*256;
                 if (BLOCK * BK / 4 < 256 && i >= BLOCK * BK / 4) continue;
-                uint r = i / (BK/4), kk = (i % (BK/4))*4;
+                uint r=ar+l*(256/(BK/4)), kk=ak*4;
                 if (PACK_A != 0) next_a[l] = FULL_TILES != 0 || (tile+BK+i/VECTORS < p.k && row_base+(i%VECTORS)*4 < p.m)
-                    ? a4[(tile+BK+i/VECTORS)*(p.m/4)+row_base/4+i%VECTORS] : vec4(0);
+                    ? a4[abase+l*astep+(tile+BK)*(p.m/4)] : vec4(0);
                 else next_a[l] = FULL_TILES != 0 || (row_base+r < p.m && tile+BK+kk < p.k)
-                    ? a4[(row_base+r)*(p.k/4)+(tile+BK+kk)/4] : vec4(0);
+                    ? a4[abase+l*astep+(tile+BK)/4] : vec4(0);
             }
             [[unroll]] for (uint l = 0; l < LOADS_N; ++l) {
                 uint i = tid + l*256;
                 if (BLOCK_N * BK / 4 < 256 && i >= BLOCK_N * BK / 4) continue;
                 uint kk = i / VECTORS_N;
                 next_b[l] = FULL_TILES != 0 || (tile+BK+kk < p.k && col_base+(i%VECTORS_N)*4 < p.n)
-                    ? b4[(tile+BK+kk)*(p.n/4)+col_base/4+i%VECTORS_N] : vec4(0);
+                    ? b4[bbase+l*bstep+(tile+BK)*(p.n/4)] : vec4(0);
             }
         }
         vec4 current_a[STRIPS], current_b[STRIPS_N];

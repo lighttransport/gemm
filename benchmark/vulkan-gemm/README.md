@@ -296,6 +296,38 @@ benchmark/vulkan-gemm/build-mingw/bench_vulkan_gemm.exe --type fp32 `
 Paired measurements and exact arguments are in `logs/edge-performance.json`;
 correctness and argument-check output is in `logs/edge-validation.log`.
 
+### Address-calculation WIP (2026-10-09)
+
+Recovered the measured candidate from the tuning logs after experiments had
+restored the production shader. It computes invariant A/B lane addresses once,
+then adds uniform offsets for subsequent load strips. The same decomposition
+simplifies LDS addresses. These identities rely on the supported K steps
+(8/16/32) and vector widths (16/32), each of which divides the 256-thread group.
+The defaults and tile-selection rules are unchanged.
+
+Paired LLVM-MinGW measurements taken while the RX570 was installed used three
+trials, 100 warmups and 200 timed iterations per run. Median run averages:
+
+| Shape | Kstep | Before TFLOP/s | WIP TFLOP/s | Gain |
+|---|---:|---:|---:|---:|
+| 2048 cubed | 8 | 3.113 | 3.605 | 15.8% |
+| 2048 cubed | 16 (default) | 3.624 | 3.704 | 2.2% |
+| 4096 cubed | 8 | 3.149 | 3.611 | 14.7% |
+| 4096 cubed | 16 (default) | 3.524 | 3.586 | 1.8% |
+
+All these runs passed the full 19x23x29 reference and the requested-shape sampled
+checks. The AMD shader report used 124 VGPRs for the default aligned path, versus
+128 previously, with no scratch memory. Exact commands and results are in ignored
+`logs/address-paired-performance.json`. The device also reported 32 active compute
+units, four SIMDs per compute unit, 64-lane waves, and 256 VGPRs per SIMD through
+`VK_AMD_shader_core_properties` and `VK_AMD_shader_core_properties2`.
+
+**WIP limitation:** the AMD GPU has been removed. The previously reported 112-case
+suite predates this address change; a full runtime regression of ragged, packed-A,
+and alternate-tile modes remains pending. Only compilation/static checks can be
+repeated now. Sustained 4+ TFLOP/s is still unmet. One-wave workgroups, 96x96 tiles,
+and additional LDS prefetch experiments were slower and are not included.
+
 ## Validation commands
 
 ```powershell
