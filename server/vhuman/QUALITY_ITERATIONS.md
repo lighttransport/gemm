@@ -2001,3 +2001,68 @@ verification. The current canonical pointers are in `session.json`, including
 the refreshed portable bundles. Older scenes/bundles and all unselected trial
 recipes remain available. The working tree retains the user's two resume files
 untouched; no push was performed.
+
+## Eyelid/oral contact and broad skin-tone follow-up
+
+The next review workspace is `tmp/vhuman-contact-tone/`. Its `session.json`
+records the selected native reconstruction, default/stress scenes, portable
+USD bundles and browser. Geometry SHA256 is
+`ccb869bc75092dcfbfe50607b06a3aa0079cb1306e21c7e361d59aaaca8ed00c`.
+The earlier four-hour candidate remains available and links to this iteration.
+
+The selected tongue-root change localizes native expression basis 353 at -0.5
+to crossing vertices, with full weight within 1 mm and a feather to 4 mm along
+the tongue surface. The field is incorporated in rest geometry and carried
+through native joint skinning. Across 43 stress saved/midpoint samples, strict
+tongue self-crossing totals fall from 764 to 258; six pairs remain per sample.
+Maximum local displacement is 0.602 mm and minimum relative oriented tongue
+area is 0.284. The 215-view opaque visibility audit remains 70 to 70, with no
+tested view worsening. Mouth-floor and dental contacts remain. A global native
+basis change reduced self-crossings but worsened visible contacts and was
+rejected. Default and stress scenes pass fresh native-coordinate verification
+(738 and 396 checks respectively).
+
+The selected broad-tone edit applies half of a bounded log-RGB gain to
+unobserved upper-neck skin. Reference samples come from photo-supported cheeks;
+the neck field feathers at its ends and away from photo support. It revises
+332,076 texels with zero photographed or ear texel edits. Multiplicative gains
+retain fine texture. The matched 512-pixel CUDA renders use 32 samples and the
+same cameras, lights and seed as their baseline. The stronger gain and jaw
+chroma trial remain unselected. This is an authored appearance prior; the broad
+jaw band and scalp patches are not resolved or measured pigmentation.
+
+Eye tests revealed that clearance on the unsubdivided skin does not establish
+clearance at render subdivision level. Moving the eye shells deeper eliminated
+base-mesh crossings but worsened render-level visible contacts. Tiny local lid
+rollbacks and alternative subdivision creases also worsened some views and
+were rejected. No such eye geometry change enters the selected native package.
+
+The separate `dense_eye_scene/head.blend` experiment bakes subdivision level 2
+and an exterior camera-ray corrective. `sequence_clearance.constrain_sequence`
+attenuates shared vertex weights until saved poses and linear midpoints meet a
+relative oriented-area bound. The final 41-frame bake changes 208 dense vertices
+by at most 0.194 mm and passes 81 orientation samples (minimum ratio 0.205).
+Fresh Blender verification checks all 41 poses and UVs; maximum coordinate
+error is 1.87e-9 m. Four critical-pose exterior crossings decrease 1,556 to
+1,173 (24.6%), but internal crossings increase 6,038 to 6,439. Opaque visibility
+stays 464 to 464 across 20 views, with no tested view worsening. This is an
+offline experiment, not overall contact acceptance. Its NumPy mesh sequence is
+`lid_dense_motion/motion.npz`; the native browser retains the previous eyelid
+path. Physical displacement, refraction, containment, tangencies and continuous
+collision freedom are not established by these finite crossing checks.
+
+Both selected native bundles pass USD export/reimport and fresh portable import
+with source-evidence verification: default 1,458 mesh / 972 shader-animation
+checks and stress 774 / 516. The native browser includes the root and neck
+updates, passes hardware verification on RTX 5060 Ti and runs at its configured
+30 FPS desktop cap. The prepared device test page passes its desktop smoke
+check; no physical mobile device was available. Twelve relevant host tests pass,
+including three sequence corrective tests covering saved-pose folds, midpoint
+collapse despite valid saved endpoints, and unchanged/invalid inputs.
+
+Review: `http://127.0.0.1:45615/vhuman-contact-tone/review/`; live browser:
+`http://127.0.0.1:45615/vhuman-contact-tone/player/`. The gallery contains three
+panels and seven matched pairs, downloadable native USD/Blender bundles, direct
+dense eyelid scene/NumPy links and contact/protection evidence. Saved experiment
+recipes, masks and audits are archived in
+`review/downloads/recipes-and-audits.zip`. Contact acceptance remains false.
