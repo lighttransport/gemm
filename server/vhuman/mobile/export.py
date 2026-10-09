@@ -201,6 +201,19 @@ def export(candidate,out, *, scene,profile='iphone12'):
             if sha256(candidate/name)!=refinement['repair_mask_sha256']:
                 raise ValueError('projection repair mask checksum mismatch')
             shutil.copyfile(candidate/name,out/name)
+    if (scene/'oral_occlusion.json').is_file():
+        # Optional lip-aperture mouth occlusion fitted for this geometry (native oral parts only).
+        oral=json.loads((scene/'oral_occlusion.json').read_text())
+        if oral.get('schema')!='vhuman.oral_occlusion.v1' or oral.get('geometry_sha256')!=manifest['geometry_sha256']:
+            raise ValueError('oral occlusion belongs to another geometry')
+        by_name={p['name']:p for p in description['parts']}
+        for name,spec in oral['parts'].items():
+            if name not in by_name or not by_name[name]['native']:raise ValueError('oral occlusion part is not native: '+name)
+            if not set(assets[name+'_native_ids'].tolist())<=set(spec['native_ids']) or len(spec['weights'])!=len(spec['native_ids']):
+                raise ValueError('oral occlusion does not cover part vertices: '+name)
+        if not oral['rim'] or max(oral['rim'])>=len(g['full_captured'][0]):raise ValueError('invalid oral rim')
+        shutil.copyfile(scene/'oral_occlusion.json',out/'oral_occlusion.json')
+        result['oral_occlusion']={k:oral[k] for k in ('model','metrics','limitations') if k in oral}
     result['files']={p.name:dict(sha256=sha256(p),bytes=p.stat().st_size) for p in sorted(out.iterdir()) if p.is_file()}
     (out/'avatar.json').write_text(json.dumps(result,indent=2));validate_package(out)
     return result

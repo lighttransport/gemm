@@ -58,7 +58,7 @@ def build(package,out,three,detail=None,skin_review=None):
         text=(three/source).read_text()
         text=text.replace("from 'three'","from './three.module.js'").replace("'../utils/BufferGeometryUtils.js'","'./BufferGeometryUtils.js'")
         (out/target).write_text(text)
-    for name in ('vhuman_mobile.html','vhuman_mobile.js','vhuman_mobile_hash.js','vhuman_mobile_worker.js','vhuman_mobile_stream.js','vhuman_mobile_audio.js'):
+    for name in ('vhuman_mobile.html','vhuman_mobile.js','vhuman_mobile_occlusion.js','vhuman_mobile_hash.js','vhuman_mobile_worker.js','vhuman_mobile_stream.js','vhuman_mobile_audio.js'):
         shutil.copyfile(ROOT/'web'/name,out/('index.html' if name.endswith('.html') else name))
     shutil.copyfile(ROOT/'web/vhuman_device_test.html',out/'device-test.html')
     shutil.copyfile(ROOT/'web/vhuman_device_test.js',out/'vhuman_device_test.js')

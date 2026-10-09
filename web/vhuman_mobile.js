@@ -2,6 +2,7 @@ import * as THREE from './three.module.js';
 import {GLTFLoader} from './GLTFLoader.js';
 import {AvatarStream} from './vhuman_mobile_stream.js';
 import {sha256} from './vhuman_mobile_hash.js';
+import {oralUniforms,setOralUniforms,patchOralMaterial,cpuOralOcclusion} from './vhuman_mobile_occlusion.js';
 
 const $=id=>document.getElementById(id), status=$('status');
 const state={ready:false,pending:false,animate:false,frames:0,poseId:0,workerMs:0,updateMs:0,detail:true,errors:[]};
@@ -144,7 +145,7 @@ async function main(){
         if(name.includes('/')||name.includes('\\')||file.bytes>256*1024*1024)throw Error('Invalid asset filename/size');
         status.textContent=`Checking ${name}…`;
         const data=await bytes(config.package+name,file.sha256,file.bytes);
-        if(['gnm.bin','avatar.glb','bindings.bin','controls.json'].includes(name))buffers[name]=data;
+        if(['gnm.bin','avatar.glb','bindings.bin','controls.json','oral_occlusion.json'].includes(name))buffers[name]=data;
     }
     const controls=json(buffers['controls.json']), parts=readBindings(buffers['bindings.bin'],manifest.parts);
     const speech=new AvatarStream(config.package_sha256,manifest.source_geometry_sha256,controls.reference,message=>{$('speech-status').textContent=message;});
@@ -178,7 +179,33 @@ async function main(){
     const key=new THREE.DirectionalLight(0xffefd9,3.2);key.position.set(-.4,.5,1);
     const fill=new THREE.DirectionalLight(0xcbdfff,1.1);fill.position.set(.7,.1,1);
     const ambient=new THREE.HemisphereLight(0xd6e4ff,0x5f4837,1.2);scene.add(key,fill,ambient);
-    $('lighting').onchange=()=>{const mode=$('lighting').value;key.position.set(mode==='side'?-1:-.4,.5,mode==='side'?.2:1);key.intensity=mode==='soft'?1.2:3.2;fill.intensity=mode==='side'?.25:1.1;};
+    // Mouth-interior occlusion: lip-aperture visibility (indirect) and aperture shadow (direct lights).
+    let oralParts=[],oralSpec=null,lastNative=null;const oralU=oralUniforms();state.oral=true;
+    if(buffers['oral_occlusion.json']){
+        oralSpec=json(buffers['oral_occlusion.json']);
+        if(oralSpec.schema!=='vhuman.oral_occlusion.v1')throw Error('Unsupported oral occlusion');
+        const patched=new Set();
+        for(const part of parts){
+            const spec=oralSpec.parts[part.name];if(!spec)continue;
+            if(!part.native)throw Error('Oral occlusion requires native parts');
+            const lookup=new Map(spec.native_ids.map((id,i)=>[id,i])),weights=new Float32Array(part.vertices*3);
+            for(let v=0;v<part.vertices;v++){const i=lookup.get(part.ids[v*6]);if(i===undefined)throw Error('Oral occlusion vertex missing');weights.set(spec.weights[i],v*3);}
+            if(spec.flip)throw Error('Flipped oral normals are not supported');
+            part.occlusion={weights};
+            part.mesh.geometry.setAttribute('oralWeights',new THREE.BufferAttribute(weights,3));
+            if(!patched.has(part.mesh.material)){patchOralMaterial(part.mesh.material,oralU);patched.add(part.mesh.material);}
+            oralParts.push(part);
+        }
+    }else{$('oral').disabled=true;}
+    const oralLights=()=>[key,fill].map(light=>({intensity:light.intensity,direction:light.position.clone().sub(light.target.position).normalize().toArray()}));
+    const updateOral=native=>{
+        if(!oralSpec||!native)return;const start=performance.now();
+        state.oralFrame=setOralUniforms(oralU,native,oralSpec,oralLights());state.oralMs=performance.now()-start;
+    };
+    // CPU evaluation of the shader terms, for verification only.
+    state.oralVisibility=name=>Array.from(cpuOralOcclusion(parts.find(p=>p.name===name),lastNative,oralSpec,oralLights()));
+    $('oral').onchange=()=>{state.oral=$('oral').checked;oralU.oralEnabled.value=state.oral?1:0;};
+    $('lighting').onchange=()=>{const mode=$('lighting').value;key.position.set(mode==='side'?-1:-.4,.5,mode==='side'?.2:1);key.intensity=mode==='soft'?1.2:3.2;fill.intensity=mode==='side'?.25:1.1;updateOral(lastNative);};
     let updateDetail=()=>{};
     if(config.detail){
         const detail=json(await bytes(config.detail+'detail.json',config.detail_sha256));
@@ -217,6 +244,7 @@ async function main(){
         if(data.type==='pose'){
             latestPose=data;const start=performance.now();
             for(const part of parts)attach(data.positions,data.joints,part);normals(parts,shared);updateDetail(latestExpression);
+            lastNative=data.positions;updateOral(data.positions);
             state.updateMs=performance.now()-start;state.workerMs=data.milliseconds;state.poseId=data.id;state.pending=false;
             state.ready=true;state.reference=controls.reference;state.vertexSample=Array.from(data.positions.slice(0,30));
             for(const name of ['sweep','reset'])$(name).disabled=false;
@@ -259,7 +287,7 @@ async function main(){
         renderer.render(scene,camera);state.frames++;frames++;
         if(now-lastReport>1000){
             state.fps=frames*1000/(now-lastReport);frames=0;lastReport=now;
-            status.textContent=`WebGL2 • ${manifest.triangles.toLocaleString()} triangles\nDisplay ${state.fps.toFixed(1)} FPS\nWASM pose ${state.workerMs.toFixed(1)} ms\nBindings + normals ${state.updateMs.toFixed(1)} ms\n${state.detailMetrics?(state.detailDriver==='trained'?'Trained strain driver · held-out checked':'Analytic strain driver · fit rejected'):'Static skin detail'}\nReference build · device quality unverified`;
+            status.textContent=`WebGL2 • ${manifest.triangles.toLocaleString()} triangles\nDisplay ${state.fps.toFixed(1)} FPS\nWASM pose ${state.workerMs.toFixed(1)} ms\nBindings + normals ${state.updateMs.toFixed(1)} ms\n${oralSpec?`Mouth occlusion ${(state.oralMs||0).toFixed(1)} ms\n`:''}${state.detailMetrics?(state.detailDriver==='trained'?'Trained strain driver · held-out checked':'Analytic strain driver · fit rejected'):'Static skin detail'}\nReference build · device quality unverified`;
         }
     }
     requestAnimationFrame(frame);

@@ -2174,3 +2174,34 @@ Review: `http://127.0.0.1:45615/vhuman-ear-synth/review/` (three panels,
 and recipe/audit archive). Browser:
 `http://127.0.0.1:45615/vhuman-ear-synth/final3_player/`. Contact acceptance
 remains false.
+
+## Dynamic mouth-interior occlusion in the browser
+
+Teeth, gums, tongue and cavity were flat-colour materials without occlusion in
+the WebGL2/mobile runtime, so the mouth interior glowed. Workspace:
+`tmp/vhuman-mouth-occlusion/`; research and proposal:
+`server/vhuman/MOUTH_RENDERING_RESEARCH.md`.
+
+A GPU ray tracer gives cosine-weighted escape visibility for all 4,611 oral
+vertices on 200 sampled training expressions. The default and oral-stress
+tracks (124 samples) are held out. The shipped indirect model is per-vertex
+visibility affine in the lip-rim opening's area and height. Held-out MAE is
+0.012 (default) and 0.018 (stress), against 0.028/0.047 for static baked AO
+and 0.94/0.93 with no occlusion. The analytic rim form factor did not predict
+visibility on this anatomy and was not shipped.
+
+Direct light uses a soft aperture shadow gated by min(1, visibility/0.5), with
+the constant chosen on the default track. Held-out direct MAE falls from
+0.92–0.98 to 0.03–0.06 for the key and fill lights. Indirect light also gets a
+GTAO multi-bounce lift.
+
+Everything runs in the oral materials' shaders; per-pose CPU work is a uniform
+upload. Package `tmp/vhuman-ear-synth/final3_oral_mobile` (75,620 triangles,
+`oral_occlusion.json` hash-listed) and player `final3_oral_player` pass
+hardware browser verification at 30 FPS with exact parity.
+
+Remaining limits:
+- Coarse tooth meshes show per-vertex blotches.
+- Inner-lip skin is not occluded yet.
+- The iOS/Filament player lacks the shader terms.
+- No phone was measured.
