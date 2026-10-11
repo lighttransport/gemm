@@ -28,7 +28,8 @@ MAX_UPLOAD = 64 << 20
 MAX_SECONDS = 8
 MAX_FRAMES = 32
 FPS = 4
-MOTION_FILES = {"motion.json", "motion.glb", "manifest.json"}
+MOTION_FILES = {"motion.json", "motion.glb", "manifest.json", "baseline.json",
+                "baseline.glb", "evaluation.json"}
 
 
 def upload(service, stream, length: int, content_type: str) -> dict:
@@ -199,7 +200,10 @@ def _continuous(rotations: np.ndarray) -> np.ndarray:
     return out
 
 
-def _export_glb(avatar: Path, out: Path, names: list[str], rotations: np.ndarray, times: np.ndarray) -> None:
+def _export_glb(avatar: Path, out: Path, names: list[str], rotations: np.ndarray, times: np.ndarray,
+                *, root_translation=None, root_joint="mhr_root") -> None:
+    from .motion_format import validate_tracks
+    rotations, times, root_translation = validate_tracks(names, rotations, times, root_translation)
     source = GLB.load(avatar)
     b = GLBBuilder("vhuman uploaded body motion")
     b.doc = source.doc
@@ -208,6 +212,10 @@ def _export_glb(avatar: Path, out: Path, names: list[str], rotations: np.ndarray
     for key in ("images", "textures", "samplers"):
         b.doc.setdefault(key, [])
     nodes = {n.get("name"): i for i, n in enumerate(b.doc["nodes"])}
+    if root_translation is not None:
+        if root_joint not in names or root_joint not in nodes:
+            raise ValueError("motion root is missing from avatar")
+        b.doc["nodes"][nodes[root_joint]]["translation"] = root_translation[0].tolist()
     for j, name in enumerate(names):
         if name not in nodes:
             raise ValueError(f"avatar is missing MHR joint {name}")
@@ -227,12 +235,30 @@ def _export_glb(avatar: Path, out: Path, names: list[str], rotations: np.ndarray
             animation["samplers"].append({"input": t_acc, "output": acc, "interpolation": "LINEAR"})
             animation["channels"].append({"sampler": sampler,
                                           "target": {"node": nodes[name], "path": "rotation"}})
+        if root_translation is not None:
+            view = b._view(root_translation.astype("<f4").tobytes())
+            acc = len(b.doc["accessors"])
+            b.doc["accessors"].append({"bufferView": view, "componentType": FLOAT,
+                                      "count": len(times), "type": "VEC3"})
+            sampler = len(animation["samplers"])
+            animation["samplers"].append({"input": t_acc, "output": acc, "interpolation": "LINEAR"})
+            animation["channels"].append({"sampler": sampler,
+                "target": {"node": nodes[root_joint], "path": "translation"}})
         b.doc.setdefault("animations", []).append(animation)
     b.write(out)
 
 
 def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DIR,
-        rig_python=body_job.DEFAULT_RIG_PYTHON, mock=False) -> dict:
+        rig_python=body_job.DEFAULT_RIG_PYTHON, mock=False, musclemimic_python=None,
+        musclemimic_assets=None, musclemimic_device="cpu") -> dict:
+    backend = request.get("backend", "sam3d")
+    if backend == "musclemimic":
+        from .musclemimic import fit as physical_fit
+        return physical_fit(service, request, progress, cancel, model_dir=model_dir,
+                            python=musclemimic_python, assets=musclemimic_assets,
+                            device=musclemimic_device)
+    if backend != "sam3d" or request.get("reference_motion"):
+        raise ValueError("reference motions require backend=musclemimic; backend must be sam3d or musclemimic")
     hid = request.get("head_id")
     avatar = service.body_file(hid, "avatar.glb")
     avatar_json = service.body_file(hid, "avatar.json")

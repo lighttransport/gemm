@@ -104,6 +104,7 @@ class ServerTest(unittest.TestCase):
         status, ctype, body = self.get("/rig")
         self.assertEqual(status, 200)
         self.assertIn(b"class LinearRig", body)
+        self.assertIn(b"body-motion-backend", body)
         status, _, body = self.get("/rig?head=abc&take=123")
         self.assertEqual(status, 200)
         self.assertIn(b"params.get('take')", body)
@@ -114,6 +115,24 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 202)
         job = self.wait_job(json.loads(body)["id"])
         self.assertEqual(job["state"], "failed")
+
+    def test_physical_motion_catalog_and_private_diagnostics(self):
+        status, _, data = self.get("/v1/body/reference-motions")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data), {"available": False, "references": []})
+        body = self.work / "heads/physicaltest/body"
+        body.mkdir(parents=True)
+        (body / "avatar.json").write_text("{}")
+        take = body / "motions/0123456789ab"
+        take.mkdir(parents=True)
+        (take / "manifest.json").write_text('{"id":"0123456789ab","accepted":false}')
+        (take / "evaluation.json").write_text('{"completed":false}')
+        (take / "rollout.npz").write_bytes(b"private")
+        base = "/v1/heads/physicaltest/body/motions"
+        entries = json.loads(self.get(base)[2])["motions"]
+        self.assertEqual(set(entries[0]["urls"]), {"evaluation"})
+        self.assertEqual(self.status_of(base + "/0123456789ab/evaluation.json"), 200)
+        self.assertEqual(self.status_of(base + "/0123456789ab/rollout.npz"), 404)
 
     def test_face_video_upload_boundary(self):
         media = b"\x00\x00\x00\x18ftypisom" + bytes(16)

@@ -124,12 +124,21 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
         <button id="body-pose-reset">reset body pose</button>
       </div>
       <div id="body-motion-tools" hidden>
+        <label for="body-motion-backend">Motion processing</label>
+        <select id="body-motion-backend"><option value="sam3d">Pose fitting</option><option value="musclemimic">Physical refinement · research</option></select>
+        <div id="body-physical-options" hidden>
+          <label for="body-reference-motion">Reference motion or uploaded video</label>
+          <select id="body-reference-motion"><option value="">Use uploaded video</option></select>
+          <label><input type="checkbox" id="body-fixed-camera">Video has one fully visible person, a fixed camera and a flat floor</label>
+        </div>
         <label for="body-motion-file">Fit pose or motion from a full-body image or short video</label>
         <input type="file" id="body-motion-file" accept="image/png,image/jpeg,image/webp,video/mp4,video/webm,video/quicktime">
         <button class="primary" id="fit-body-motion">Fit uploaded media</button>
         <div class="msg" id="body-motion-msg">One visible person; videos sample the first 8 seconds at 4 fps.</div>
         <label for="body-motion-select">Saved fits</label>
         <select id="body-motion-select"><option value="">select a fit</option></select>
+        <label><input type="checkbox" id="body-motion-baseline">Compare baseline without simulation</label>
+        <a id="body-motion-report" class="dl" hidden>evaluation report</a>
         <div class="tools">
           <button id="body-motion-play">▶ play</button>
           <button id="body-motion-clear">clear</button>
@@ -571,6 +580,10 @@ function applyRig() {
       if (!bone) continue;
       bone.quaternion.fromArray(a.rotations[j]);
       if (w) bone.quaternion.slerp(new THREE.Quaternion().fromArray(b.rotations[j]), w);
+    }
+    if (state.bodyMotion.version === 2) {
+      const root = state.bones[state.bodyMotion.root_joint];
+      if (root) root.position.fromArray(a.root_translation).lerp(new THREE.Vector3().fromArray(b.root_translation), w);
     }
   }
   if (state.avatarMode) {
@@ -1712,10 +1725,31 @@ async function loadMotions(headId, selectId = null) {
   state.motions = data.motions;
   const select = $('body-motion-select');
   select.replaceChildren(new Option('select a fit', ''));
-  for (const m of data.motions) select.add(new Option(`${m.kind} · ${m.frames} frame${m.frames === 1 ? '' : 's'} · ${m.id}`, m.id));
+  for (const m of data.motions) select.add(new Option(`${m.kind}${m.status ? ' · ' + m.status : ''} · ${m.frames} frame${m.frames === 1 ? '' : 's'} · ${m.id}`, m.id));
   const chosen = selectId || state.bodyMotionId;
   if (chosen && data.motions.some((m) => m.id === chosen)) { select.value = chosen; await selectMotion(chosen); }
   else if (state.bodyMotionId) await selectMotion('');
+}
+function validateBodyMotion(m) {
+  if (![1, 2].includes(m.version) || !Array.isArray(m.joints) || !m.joints.length ||
+      !m.joints.every((name) => typeof name === 'string' && name.length) ||
+      new Set(m.joints).size !== m.joints.length || !Array.isArray(m.frames) || !m.frames.length || m.frames.length > 24001)
+    throw new Error('Unsupported body motion');
+  if (m.version === 2 && (m.units !== 'm' || m.up_axis !== 'Y' || m.root_joint !== 'mhr_root' ||
+      m.root_translation !== 'animated' || !m.joints.includes(m.root_joint))) throw new Error('Invalid motion coordinate system');
+  let previous = -1;
+  for (const f of m.frames) {
+    if (!Number.isFinite(f.t) || f.t < 0 || f.t <= previous || !Array.isArray(f.rotations) || f.rotations.length !== m.joints.length)
+      throw new Error('Invalid body motion timestamps');
+    previous = f.t;
+    for (const q of f.rotations) if (!Array.isArray(q) || q.length !== 4 || !q.every(Number.isFinite) || Math.abs(Math.hypot(...q)-1) > .001)
+      throw new Error('Invalid body motion rotation');
+    if (m.version === 2 && (!Array.isArray(f.root_translation) || f.root_translation.length !== 3 || !f.root_translation.every(Number.isFinite)))
+      throw new Error('Invalid body root translation');
+  }
+  if (Math.abs(m.frames[0].t) > 1e-6 || !Number.isFinite(m.duration) || Math.abs(previous-m.duration) > 1e-5)
+    throw new Error('Invalid body motion duration');
+  return m;
 }
 async function selectMotion(id) {
   state.bodyMotionPlaying = false;
@@ -1724,21 +1758,50 @@ async function selectMotion(id) {
   if (!id) {
     state.bodyMotion = null; state.bodyMotionTime = 0;
     $('body-motion-glb').hidden = $('body-motion-json').hidden = true;
+    $('body-motion-report').hidden = true;
     applyRig(); return;
   }
   const m = state.motions.find((x) => x.id === id);
   if (!m) return;
-  state.bodyMotion = await api(m.urls.motion);
+  const baseline = ($('body-motion-baseline').checked && !!m.urls.baseline) || !m.urls.motion;
+  const motionUrl = baseline ? m.urls.baseline : m.urls.motion;
+  const glbUrl = baseline ? m.urls.baseline_glb : m.urls.glb;
+  $('body-motion-report').hidden = !m.urls.evaluation;
+  if (m.urls.evaluation) $('body-motion-report').href = m.urls.evaluation;
+  if (!motionUrl) {
+    state.bodyMotion = null; state.bodyMotionTime = 0;
+    $('body-motion-glb').hidden = $('body-motion-json').hidden = true;
+    $('body-motion-msg').textContent = m.error || 'Refinement rejected; see evaluation report.';
+    applyRig(); return;
+  }
+  state.bodyMotion = validateBodyMotion(await api(motionUrl));
   state.bodyMotionTime = 0;
   $('body-motion-time').max = state.bodyMotion.duration;
   $('body-motion-time').value = 0;
   $('body-motion-time-label').textContent = '0.00 s';
-  for (const [name, url] of [['body-motion-glb', m.urls.glb], ['body-motion-json', m.urls.motion]]) {
+  for (const [name, url] of [['body-motion-glb', glbUrl], ['body-motion-json', motionUrl]]) {
     const link = $(name); link.href = url; link.hidden = false;
   }
   if (!state.avatarMode) { state.avatarMode = true; $('avatar-mode').checked = true; await loadRig(state.current); }
   applyRig();
 }
+$('body-motion-baseline').addEventListener('change', () => selectMotion(state.bodyMotionId).catch((e) => {
+  $('body-motion-msg').textContent = e.message;
+}));
+$('body-motion-backend').addEventListener('change', async () => {
+  const physical = $('body-motion-backend').value === 'musclemimic';
+  $('body-physical-options').hidden = !physical;
+  $('body-motion-msg').textContent = physical ? 'Research preview: up to 8 seconds; a textured background is needed to verify the fixed camera.' :
+    'One visible person; videos sample the first 8 seconds at 4 fps.';
+  if (physical) {
+    try {
+      const data = await api('/v1/body/reference-motions');
+      $('body-reference-motion').replaceChildren(new Option('Use uploaded video', ''));
+      for (const name of data.references) $('body-reference-motion').add(new Option(name, name));
+      if (!data.available) $('body-motion-msg').textContent = 'Physical refinement is not configured on this server.';
+    } catch (e) { $('body-motion-msg').textContent = e.message; }
+  }
+});
 $('body-motion-select').addEventListener('change', (e) => selectMotion(e.target.value).catch((err) => {
   $('body-motion-msg').textContent = String(err.message || err); $('body-motion-msg').className = 'msg bad';
 }));
@@ -1761,25 +1824,35 @@ $('body-motion-clear').addEventListener('click', () => {
   $('body-motion-select').value = '';
   state.bodyMotion = null; state.bodyMotionId = null; state.bodyMotionPlaying = false; state.bodyMotionTime = 0;
   $('body-motion-glb').hidden = $('body-motion-json').hidden = true;
+  $('body-motion-report').hidden = true;
+  $('body-motion-play').textContent = '▶ play';
   $('body-motion-time').value = 0; $('body-motion-time-label').textContent = '0.00 s';
   applyRig();
 });
 $('fit-body-motion').addEventListener('click', async () => {
   const media = $('body-motion-file').files[0];
-  if (!state.current?.body || !media || state.job) return;
+  const backend = $('body-motion-backend').value;
+  const reference = backend === 'musclemimic' ? $('body-reference-motion').value : '';
+  if (!state.current?.body || (!media && !reference) || state.job) return;
   const msg = $('body-motion-msg'), button = $('fit-body-motion');
   const headId = state.current.id;
   button.disabled = true; msg.className = 'msg';
   try {
-    if (media.size > 64 * 1024 * 1024) throw new Error('media exceeds 64 MiB');
-    msg.textContent = 'uploading media…';
-    const ext = media.name.split('.').pop().toLowerCase();
-    const contentType = media.type || ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
-      mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime' })[ext];
-    const response = await fetch('/v1/body/uploads', { method: 'POST', headers: { 'Content-Type': contentType }, body: media });
-    const upload = await response.json();
-    if (!response.ok) throw new Error(upload.error || response.statusText);
-    const job = await api('/v1/jobs', { kind: 'body_motion', head_id: headId, upload_id: upload.id });
+    const request = { kind: 'body_motion', head_id: headId, backend, fixed_camera: $('body-fixed-camera').checked };
+    if (reference) request.reference_motion = reference;
+    else {
+      if (backend === 'musclemimic' && !request.fixed_camera) throw new Error('Confirm the fixed-camera video requirements.');
+      if (media.size > 64 * 1024 * 1024) throw new Error('media exceeds 64 MiB');
+      msg.textContent = 'uploading media…';
+      const ext = media.name.split('.').pop().toLowerCase();
+      const contentType = media.type || ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+        mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime' })[ext];
+      const response = await fetch('/v1/body/uploads', { method: 'POST', headers: { 'Content-Type': contentType }, body: media });
+      const upload = await response.json();
+      if (!response.ok) throw new Error(upload.error || response.statusText);
+      request.upload_id = upload.id;
+    }
+    const job = await api('/v1/jobs', request);
     state.job = job.id;
     for (;;) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -1788,7 +1861,8 @@ $('fit-body-motion').addEventListener('click', async () => {
       msg.textContent = j.message;
       if (j.state === 'done') {
         await loadMotions(headId, j.result.id);
-        msg.textContent = `${j.result.frames} frame${j.result.frames === 1 ? '' : 's'} fitted`;
+        msg.textContent = j.result.accepted === false ? 'Physical refinement rejected; baseline and diagnostics retained.' :
+          `${j.result.frames} frame${j.result.frames === 1 ? '' : 's'} fitted${backend === 'musclemimic' ? ' · visual review pending' : ''}`;
         break;
       }
       if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);

@@ -211,7 +211,10 @@ class App:
                         clip_bpe=getattr(args, "clip_bpe", body_job.CLIP_BPE), mock=args.mock),
             "body_motion": lambda req, prog, cancel: body_motion.fit(self.service, req, prog, cancel,
                         rig_python=getattr(args, "rig_python", None) or body_job.DEFAULT_RIG_PYTHON,
-                        model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock),
+                        model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock,
+                        musclemimic_python=getattr(args, "musclemimic_python", None),
+                        musclemimic_assets=getattr(args, "musclemimic_assets", None),
+                        musclemimic_device=getattr(args, "musclemimic_device", "cpu")),
             "rig_speech": lambda req, prog, cancel: rig_speech.speech_job(
                 self.service, req, prog, cancel, model=getattr(args, "tts_model", None) or rig_speech.DEFAULT_MODEL,
                 aligner=getattr(args, "aligner", None) or rig_speech.DEFAULT_ALIGNER,
@@ -354,6 +357,10 @@ def make_handler(app: App, quiet: bool = False):
                                       {"Cache-Control": "no-cache"})
                 if path == "/v1/heads":
                     return self._json(200, {"heads": app.service.list_heads()})
+                if path == "/v1/body/reference-motions":
+                    from .body.musclemimic import catalog
+                    return self._json(200, catalog(getattr(app.args, "musclemimic_assets", None),
+                                                   getattr(app.args, "musclemimic_python", None)))
                 if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js"):
                     return self._file(ROOT / "web" / path[1:])
                 if path.startswith("/v1/heads/") and "/videos" in path:
@@ -499,6 +506,8 @@ def main(argv=None) -> int:
                     help="interpreter for the facial rig builder (numpy, scipy, torch)")
     ap.add_argument("--sam3d-body-model", default=None,
                     help="local SAM 3D Body checkpoint directory")
+    from .body.musclemimic import add_arguments as musclemimic_arguments
+    musclemimic_arguments(ap)
     ap.add_argument("--sam3-model", default=None,
                     help="optional SAM 3 garment segmentation checkpoint")
     ap.add_argument("--clip-bpe", default=None,

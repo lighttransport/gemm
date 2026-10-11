@@ -330,15 +330,22 @@ def cmd_body_motion(args) -> dict:
     import mimetypes
     from .body import motion
     svc = EyeService(Path(args.work))
-    media = Path(args.media)
-    ctype = mimetypes.guess_type(media.name)[0]
-    if not ctype:
-        raise ValueError("cannot determine image/video type from file extension")
-    with media.open("rb") as stream:
-        item = motion.upload(svc, stream, media.stat().st_size, ctype)
-    return motion.fit(svc, {"head_id": args.head, "upload_id": item["id"]},
+    request = {"head_id": args.head, "backend": args.backend, "fixed_camera": args.fixed_camera}
+    if args.reference_motion:
+        request["reference_motion"] = args.reference_motion
+    else:
+        media = Path(args.media)
+        ctype = mimetypes.guess_type(media.name)[0]
+        if not ctype:
+            raise ValueError("cannot determine image/video type from file extension")
+        with media.open("rb") as stream:
+            item = motion.upload(svc, stream, media.stat().st_size, ctype)
+        request["upload_id"] = item["id"]
+    return motion.fit(svc, request,
                       _progress, threading.Event(), model_dir=args.sam3d_body_model,
-                      rig_python=args.rig_python or motion.body_job.DEFAULT_RIG_PYTHON, mock=args.mock)
+                      rig_python=args.rig_python or motion.body_job.DEFAULT_RIG_PYTHON, mock=args.mock,
+                      musclemimic_python=args.musclemimic_python, musclemimic_assets=args.musclemimic_assets,
+                      musclemimic_device=args.musclemimic_device)
 
 
 def cmd_rig_track(args) -> dict:
@@ -441,6 +448,8 @@ def main(argv=None) -> int:
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
     ap.add_argument("--rig-python", default=None)
     ap.add_argument("--sam3d-body-model", default=None)
+    from .body.musclemimic import add_arguments as musclemimic_arguments
+    musclemimic_arguments(ap)
     ap.add_argument("--sam3-model", default=None,
                     help="optional SAM 3 garment segmentation checkpoint")
     ap.add_argument("--clip-bpe", default=None,
@@ -601,7 +610,11 @@ def main(argv=None) -> int:
     sp.set_defaults(fn=cmd_body)
     sp = sub.add_parser("body-motion", help="fit uploaded image/video pose to an existing MHR avatar")
     sp.add_argument("--head", required=True, help="head with an assembled body avatar")
-    sp.add_argument("--media", required=True, help="PNG/JPEG/WebP image or MP4/WebM/MOV video")
+    source = sp.add_mutually_exclusive_group(required=True)
+    source.add_argument("--media", help="PNG/JPEG/WebP image or MP4/WebM/MOV video")
+    source.add_argument("--reference-motion", help="registered MuscleMimic reference ID")
+    sp.add_argument("--backend", choices=("sam3d", "musclemimic"), default="sam3d")
+    sp.add_argument("--fixed-camera", action="store_true", help="confirm one visible person, fixed camera and flat floor")
     sp.set_defaults(fn=cmd_body_motion)
     sp = sub.add_parser("rig-track", help="LightRig face track (timestamp + 52 controls per line) -> USD animation")
     sp.add_argument("--head", required=True)

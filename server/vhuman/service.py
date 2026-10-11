@@ -353,7 +353,10 @@ class EyeService:
                 take = path.parent.name
                 manifest = json.loads(self.body_file(hid, f"motions/{take}/manifest.json").read_text())
                 base = f"/v1/heads/{hid}/body/motions/{take}/"
-                manifest["urls"] = {"motion": base + "motion.json", "glb": base + "motion.glb"}
+                manifest["urls"] = {key: base + filename for key, filename in
+                    (("motion", "motion.json"), ("glb", "motion.glb"), ("baseline", "baseline.json"),
+                     ("baseline_glb", "baseline.glb"), ("evaluation", "evaluation.json"))
+                    if (path.parent / filename).is_file()}
                 out.append(manifest)
             except (ValueError, ServiceError):
                 continue
