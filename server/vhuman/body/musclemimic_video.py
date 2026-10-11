@@ -65,8 +65,14 @@ def _sample_with_probe(source, out, cancel, ffprobe, ffmpeg):
 def check_camera(frames, boxes):
     """Track background features outside the subject; fail closed if unobservable."""
     import cv2
+    if len(frames) < 3 or len(boxes) != len(frames):
+        raise ValueError("fixed camera needs at least three frames with person boxes")
+    # Include the final frame and require every scheduled check to succeed.
+    # Skipping failed tracks can mistake two early matches for full-clip evidence.
+    checks = np.unique(np.linspace(1, len(frames)-1, min(12, len(frames)-1), dtype=int))
     displacements = []
-    for i in range(1, len(frames), max(1, len(frames) // 12)):
+    for i in checks:
+        unobservable = f"fixed camera cannot be verified at frame {i}: need a textured visible background"
         a, b = (cv2.imread(str(frames[k]), cv2.IMREAD_GRAYSCALE) for k in (0, i))
         if a is None or b is None or a.shape != b.shape:
             raise ValueError("video frame dimensions changed")
@@ -77,18 +83,18 @@ def check_camera(frames, boxes):
             mask[max(0, y0-pad):min(a.shape[0], y1+pad), max(0, x0-pad):min(a.shape[1], x1+pad)] = 0
         points = cv2.goodFeaturesToTrack(a, 200, .02, 8, mask=mask)
         if points is None or len(points) < 12:
-            continue
+            raise ValueError(unobservable)
         tracked, status, error = cv2.calcOpticalFlowPyrLK(a, b, points, None)
         if tracked is None or status is None or error is None:
-            continue
+            raise ValueError(unobservable)
         good = status[:, 0].astype(bool) & (error[:, 0] < 20)
-        if good.sum() >= 12:
-            displacements.append(float(np.median(np.linalg.norm(tracked[good] - points[good], axis=-1))) / max(a.shape))
-    if len(displacements) < 2:
-        raise ValueError("fixed camera cannot be verified: need a textured visible background")
+        if good.sum() < 12:
+            raise ValueError(unobservable)
+        displacements.append(float(np.median(np.linalg.norm(tracked[good] - points[good], axis=-1))) / max(a.shape))
     if max(displacements) > .002:
         raise ValueError("background moves: physical fitting requires a fixed camera")
-    return {"background_motion_max_fraction": max(displacements), "camera_checks": len(displacements)}
+    return {"background_motion_max_fraction": max(displacements), "camera_checks": len(displacements),
+            "camera_check_frames": checks.tolist()}
 
 
 def person_boxes(frames):

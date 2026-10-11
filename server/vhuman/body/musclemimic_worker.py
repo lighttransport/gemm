@@ -14,7 +14,15 @@ import numpy as np
 from .musclemimic_assets import read_installation, reference
 
 
-def configure_process(work, device):
+def configure_process(work, device, device_index=0):
+    if device not in ("cpu", "cuda") or isinstance(device_index, bool) or not isinstance(device_index, int) or device_index < 0:
+        raise ValueError("policy device must be cpu/cuda with a non-negative device index")
+    if device == "cuda":
+        # The pipeline's lock/memory probe addresses a physical GPU index.
+        # Restrict visibility before importing JAX so its logical device 0 is
+        # that GPU, including when the parent has a different visibility mask.
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
     work = Path(work).resolve()
     cache = work / "cache"
     cache.mkdir(parents=True, exist_ok=True)
@@ -312,6 +320,7 @@ def run(request, installation, work):
     ref = np.array([f["positions"] for f in reference_frames[:len(frames)]])
     report.update(termination=reason, completed=reason == "reference_end", frames=len(frames),
                   control_dt=dt, physics="mujoco-cpu", policy_device=str(jax.devices()[0]),
+                  cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES") if jax.devices()[0].platform == "gpu" else None,
                   relative_site_rms_m=float(np.sqrt(np.mean(((pos-pos[:, :1])-(ref-ref[:, :1]))**2))),
                   root_rms_m=float(np.sqrt(np.mean((pos[:, 0]-ref[:, 0])**2))),
                   model={"nq": model.nq, "nv": model.nv, "actuators": model.nu},
@@ -325,9 +334,11 @@ def main():
     ap.add_argument("--assets", type=Path, required=True)
     ap.add_argument("--work", type=Path, required=True)
     ap.add_argument("--policy-device", choices=("cpu", "cuda"), default="cpu")
+    ap.add_argument("--policy-device-index", type=int, default=0,
+                    help="physical CUDA GPU index, matching the pipeline's --device")
     args = ap.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
-    configure_process(args.work, args.policy_device)
+    configure_process(args.work, args.policy_device, args.policy_device_index)
     start = time.monotonic()
     report = {}
     try:

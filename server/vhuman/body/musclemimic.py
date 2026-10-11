@@ -44,6 +44,8 @@ def fit(service, request, progress, cancel, *, model_dir=None, python=None, asse
         raise ValueError("configure --musclemimic-python with the isolated offline interpreter")
     if device not in ("cpu", "cuda"):
         raise ValueError("MuscleMimic policy device must be cpu or cuda")
+    if device == "cuda" and gpu.backend() != "cuda":
+        raise ValueError("CUDA policy inference requires the pipeline's --backend cuda")
     if request.get("reference_motion"):
         reference(installation, request["reference_motion"])
     hid = request.get("head_id")
@@ -102,7 +104,8 @@ def fit(service, request, progress, cancel, *, model_dir=None, python=None, asse
         try:
             with session:
                 job._run([str(python), "-m", "server.vhuman.body.musclemimic_worker", "--request", str(request_path.resolve()),
-                          "--assets", str(Path(assets).resolve()), "--work", str(stage.resolve()), "--policy-device", device],
+                          "--assets", str(Path(assets).resolve()), "--work", str(stage.resolve()), "--policy-device", device,
+                          "--policy-device-index", str(gpu.device_index())],
                          cancel, timeout=7200)
         except (RuntimeError, ValueError):
             if cancel.is_set():

@@ -1,6 +1,7 @@
 """Portable unit tests; real CPU simulator tests require the isolated environment."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -200,11 +201,48 @@ class BodyPhysicalMotionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot be verified"):
                 check_camera(paths, boxes)
 
+    def test_camera_gate_requires_late_tracking_and_the_final_frame(self):
+        import cv2
+        from .musclemimic_video import check_camera
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as directory:
+            rng = np.random.default_rng(42)
+            initial = rng.integers(0, 256, (240, 320), dtype=np.uint8)
+            for count, invalid_from in ((16, 3), (240, 239)):
+                paths = [Path(directory) / f"{i}.png" for i in range(count)]
+                boxes = [(130, 50, 190, 220)] * len(paths)
+                with self.subTest(count=count, invalid_from=invalid_from):
+                    for i, path in enumerate(paths):
+                        image = initial.copy() if i < invalid_from else rng.integers(0, 256, initial.shape, dtype=np.uint8)
+                        image[50:220, 130:190] = 120
+                        cv2.imwrite(str(path), image)
+                    with self.assertRaisesRegex(ValueError, "cannot be verified"):
+                        check_camera(paths, boxes)
+            for path in paths:
+                cv2.imwrite(str(path), initial)
+            report = check_camera(paths, boxes)
+            self.assertEqual(report["camera_checks"], 12)
+            self.assertEqual(report["camera_check_frames"][-1], len(paths)-1)
+
+    def test_cuda_process_restricts_visibility_to_the_locked_gpu(self):
+        from .musclemimic_worker import configure_process
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as directory:
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "7,3", "CUDA_DEVICE_ORDER": "FASTEST_FIRST"}):
+                configure_process(Path(directory), "cuda", 2)
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "2")
+                self.assertEqual(os.environ["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+                self.assertEqual(os.environ["JAX_PLATFORMS"], "cuda")
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "7,3"}):
+                configure_process(Path(directory), "cpu", 2)
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "7,3")
+                self.assertEqual(os.environ["JAX_PLATFORMS"], "cpu")
+            with self.assertRaises(ValueError):
+                configure_process(Path(directory), "cuda", -1)
+
     def test_rejected_job_publishes_diagnostics_and_cancel_publishes_nothing(self):
         from . import musclemimic, mhr
         from .. import gpu
-        for cancelled in (False, True):
-            with self.subTest(cancelled=cancelled), tempfile.TemporaryDirectory(dir=ROOT / "tmp") as directory:
+        for cancelled, backend in ((False, "cpu"), (True, "cpu"), (False, "cuda")):
+            with self.subTest(cancelled=cancelled, backend=backend), tempfile.TemporaryDirectory(dir=ROOT / "tmp") as directory:
                 work = Path(directory)
                 body = work / "heads/abc/body"; body.mkdir(parents=True)
                 for name in ("avatar.glb", "avatar.json", "body_mhr.glb.json"):
@@ -215,6 +253,9 @@ class BodyPhysicalMotionTest(unittest.TestCase):
                 event = threading.Event()
                 def worker(command, cancel, **kwargs):
                     self.assertIn("--policy-device", command)
+                    self.assertEqual(command[command.index("--policy-device") + 1], backend)
+                    self.assertEqual(command[command.index("--policy-device-index") + 1], "2")
+                    self.assertEqual(gpu.device_index(), 2)
                     stage = Path(command[command.index("--work") + 1])
                     if cancelled:
                         event.set()
@@ -222,11 +263,17 @@ class BodyPhysicalMotionTest(unittest.TestCase):
                     (stage / "simulation.json").write_text(json.dumps({"completed": False, "termination": "tracking_failure"}))
                     (stage / "baseline.json").write_text(json.dumps({"frames": [{}, {}], "duration": .1}))
                     raise RuntimeError("worker rejected the motion")
-                with patch.object(musclemimic, "read_installation", return_value={}), \
+                def device_session(*args, **kwargs):
+                    self.assertEqual(gpu.backend(), "cuda")
+                    self.assertEqual(gpu.device_index(), 2)
+                    return nullcontext()
+                with gpu.execution(backend, 2), \
+                     patch.object(musclemimic.gpu, "device_session", side_effect=device_session) as lock, \
+                     patch.object(musclemimic, "read_installation", return_value={}), \
                      patch.object(musclemimic, "reference", return_value={}), \
                      patch.object(musclemimic.job, "_run", side_effect=worker):
                     args = (EyeService(work), {"head_id": "abc", "reference_motion": "test"}, lambda *a: None, event)
-                    opts = dict(model_dir=model.parent, python=sys.executable, assets=work)
+                    opts = dict(model_dir=model.parent, python=sys.executable, assets=work, device=backend)
                     if cancelled:
                         with self.assertRaises(gpu.Cancelled):
                             musclemimic.fit(*args, **opts)
@@ -238,6 +285,7 @@ class BodyPhysicalMotionTest(unittest.TestCase):
                         take = body / "motions" / result["id"]
                         self.assertTrue((take / "evaluation.json").exists())
                         self.assertFalse((take / "motion.json").exists())
+                    self.assertEqual(lock.call_count, int(backend == "cuda"))
 
 
 @unittest.skipUnless(os.environ.get("MHR_TEST_ASSETS") and os.environ.get("MHR_TEST_AVATAR"), "local MHR assets/avatar not selected")

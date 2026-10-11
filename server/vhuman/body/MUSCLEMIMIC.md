@@ -59,6 +59,9 @@ separate from the native SAM/MHR programs and server environment. CPU physics
 works without a GPU. `--musclemimic-device cuda` selects JAX policy inference
 only and requires the matching JAX 0.7.2 CUDA plugin installation; it has not
 been validated here. It does not select a MuJoCo GPU physics implementation.
+Use the pipeline's `--backend cuda --device N` with CUDA policy inference.
+The parent checks and locks physical GPU N; the worker restricts CUDA visibility
+to that GPU before loading JAX, so JAX's logical GPU 0 uses the locked device.
 
 Obtain the complete base checkpoint at the revision above into a local directory
 after reviewing its terms. Register it with the isolated interpreter:
@@ -109,6 +112,8 @@ Provide the same three worker options to `server.vhuman.app` or the CLI.
 assets, including exported MHR rig metadata. Reference jobs need only its MHR
 assets; video additionally needs the native SAM inference assets.
 Both `ffmpeg` and `ffprobe` must be on the server's `PATH` for video sampling.
+Camera checks span the clip and include its final frame. Every scheduled check
+must have enough reliable background tracks; missing coverage rejects the input.
 
 ```sh
 python -m server.vhuman.cli --work /path/to/vhuman-work \
