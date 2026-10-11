@@ -1,5 +1,10 @@
 # Independent procedural virtual humans
 
+For the additive GenIA foundations, prepared-observation validation and native
+CUDA primitive tests, see [GenIA integration status](../../doc/genia.md). The
+`/genia` page validates prepared bundles; full guided reconstruction and TTR
+remain unavailable and do not replace existing avatar jobs.
+
 For RX 9070 XT / RDNA4, see [ROCm setup and validation](ROCM.md).
 For Wan/H3/HV1.5 expression capture, downloaded face models and GNM mapping,
 see [ROCm expression candidates and GNM](VIDEO_EXPRESSIONS.md).

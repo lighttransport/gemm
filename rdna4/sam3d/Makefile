@@ -38,6 +38,7 @@ KERNEL_TESTS = test_layernorm_token test_dinov2_gpu_upload test_dinov2_patch_emb
                test_slat_cross_attn_residual test_slat_transformer_block
 
 COMMON_DEPS = hip_sam3d_runner.h hip_sam3d_kernels.h sam3d_cpu.h \
+              ../../common/sam3d_pose_tokens.h \
               hip_sam3d_ssdit_gpu.h hip_sam3d_ssdit_forward.h hip_sam3d_ssdit_outer.h \
               hip_sam3d_slat_dit_gpu.h hip_sam3d_slat_dit_forward.h \
               hip_sam3d_ss_decoder_gpu.h hip_sam3d_ss_decoder_forward.h \

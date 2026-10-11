@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GenIA observations · vhuman</title>
+  <style>
+    body { margin: 0; font: 16px system-ui,sans-serif; color: #202b37; background: #f4f6f8; }
+    main { max-width: 760px; margin: 48px auto; padding: 24px; }
+    form, pre { background: white; padding: 24px; border-radius: 12px; border: 1px solid #dce2e8; }
+    h1 { font-size: 30px; } p { line-height: 1.6; }
+    input { display: block; margin: 18px 0; } button { padding: 10px 16px; border-radius: 6px; border: 1px solid #276653; background: #276653; color: white; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; } pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
+    #status { min-height: 24px; } a { color: #276653; }
+  </style>
+</head>
+<body><main>
+  <a href="/rig">← vhuman</a>
+  <h1>GenIA prepared observations</h1>
+  <p>Validate a single object observed in one image or several static views.
+    Upload a ZIP containing <code>scene.json</code> and its RGB images, masks,
+    float32 Z-depth maps and calibrated cameras.</p>
+  <p id="availability" role="status">Checking reconstruction availability…</p>
+  <form id="form">
+    <label for="bundle">Prepared observation bundle (ZIP, up to 64 MiB)</label>
+    <input id="bundle" type="file" accept=".zip,application/zip" required>
+    <button id="validate" type="submit">Upload and validate</button>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+  <pre id="result" hidden></pre>
+</main>
+<script type="module">
+const status = document.querySelector('#status'), result = document.querySelector('#result');
+async function jsonResponse(response) {
+  const body = await response.json();
+  if (!response.ok) throw Error(body.error || `HTTP ${response.status}`);
+  return body;
+}
+fetch('/health').then(jsonResponse).then(health => {
+  document.querySelector('#availability').textContent = health.genia?.reason || 'Native reconstruction is unavailable.';
+}).catch(error => { document.querySelector('#availability').textContent = error.message; });
+document.querySelector('#form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = document.querySelector('#validate'); button.disabled = true; result.hidden = true;
+  try {
+    const file = document.querySelector('#bundle').files[0];
+    if (!file || file.size > 64 * 1024 * 1024) throw Error('Choose a ZIP of at most 64 MiB.');
+    status.textContent = 'Uploading and checking observations…';
+    const upload = await jsonResponse(await fetch('/v1/genia/uploads', {method:'POST',headers:{'Content-Type':'application/zip'},body:file}));
+    const created = await jsonResponse(await fetch('/v1/jobs', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'genia_validate',upload_id:upload.upload_id})}));
+    for (;;) {
+      const job = await jsonResponse(await fetch(`/v1/jobs/${created.id}`));
+      if (job.state === 'done') { result.textContent = JSON.stringify(job.result,null,2); result.hidden = false; status.textContent = 'Prepared observations validated.'; break; }
+      if (job.state === 'failed' || job.state === 'cancelled') throw Error(job.error || job.state);
+      status.textContent = job.message || 'Validating observations…';
+      await new Promise(resolve => setTimeout(resolve,500));
+    }
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+});
+</script></body></html>

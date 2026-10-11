@@ -388,3 +388,12 @@ ref/minimax_h3_native/*
 
 # Repository scratch may be an existing symlink.
 /tmp
+/cuda/genia/*.o
+/cuda/genia/*.so
+/cuda/genia/test_genia
+/cuda/genia/genia_kernels.inc
+!/cuda/genia/test_genia.cpp
+!ref/genia/
+!ref/genia/*.py
+!ref/genia/*.json
+!ref/genia/*.md

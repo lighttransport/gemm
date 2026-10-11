@@ -24,6 +24,7 @@
  */
 
 #include "hip_sam3d_runner.h"
+#include "../../common/sam3d_pose_tokens.h"
 #include "../rocew.h"
 #include "hip_sam3d_wmma.h"
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
@@ -166,6 +167,7 @@ typedef struct {
 } cs3d_gs_head_ws;
 
 struct hip_sam3d_ctx {
+    sam3d_pose_tokens pose_tokens;
     hip_sam3d_config cfg;
     char    *safetensors_dir_resolved;
 
@@ -960,6 +962,7 @@ static void cs3d_ode_fill_randn(float *buf, int n, uint64_t *state) {
 
 int hip_sam3d_run_ss_dit(hip_sam3d_ctx *ctx) {
     if (!ctx) return HIP_SAM3D_E_INVAL;
+    ctx->pose_tokens.valid = 0;
     const cs3d_host_2d *cond = cs3d_active_cond(ctx);
     if (!cond->data) {
         fprintf(stderr, "hip_sam3d: ss_dit needs cond tokens — "
@@ -1070,6 +1073,7 @@ int hip_sam3d_run_ss_dit(hip_sam3d_ctx *ctx) {
         for (int c = 0; c < 8; c++)
             latent[c * 4096 + n] = lat[SAM3D_SS_LAT_SHAPE][n * 8 + c];
 
+    sam3d_pose_tokens_store(&ctx->pose_tokens, lat);
     for (int i = 0; i < SAM3D_SS_DIT_N_LATENTS; i++) {
         free(lat[i]); free(vel[i]); free(vel_u[i]);
     }
@@ -1086,7 +1090,9 @@ int hip_sam3d_run_ss_dit(hip_sam3d_ctx *ctx) {
                 "hip_sam3d: ss_dit latent min=%.6g max=%.6g mean=%.6g d=%.3g rescale_t=3 reversed=0 cfg_steps=%d\n",
                 mn, mx, sum / (8.0 * 4096.0), d, cfg_steps);
     }
-    return cs3d_adopt_ss_latent(ctx, latent, dims);
+    int adopted = cs3d_adopt_ss_latent(ctx, latent, dims);
+    if (adopted != HIP_SAM3D_E_OK) ctx->pose_tokens.valid = 0;
+    return adopted;
 
 oom:
     for (int i = 0; i < SAM3D_SS_DIT_N_LATENTS; i++) {
@@ -3610,4 +3616,11 @@ int hip_sam3d_debug_override_slat(hip_sam3d_ctx *ctx, const float *feats,
     memcpy(ctx->ovr_slat.coords, coords, k_bytes);
     ctx->ovr_slat.n = n; ctx->ovr_slat.c = c;
     return HIP_SAM3D_E_OK;
+}
+
+int hip_sam3d_get_ss_pose_tokens(hip_sam3d_ctx *ctx, int modality, float *out,
+                                size_t capacity, int *out_n, int *out_c)
+{
+    if (!ctx) return -1;
+    return sam3d_pose_tokens_get(&ctx->pose_tokens, modality, out, capacity, out_n, out_c);
 }

@@ -86,6 +86,12 @@ int sam3d_get_slat_tokens(sam3d_ctx *ctx, float *out_feats,
 /* Gaussians: [n_gauss, SAM3D_GS_STRIDE]. */
 int sam3d_get_gaussians(sam3d_ctx *ctx, float *out, int *out_n);
 
+/* Retained Stage-1 pose tokens. modality: 1=normalized 6D rotation,
+ * 2=translation, 3=log-scale, 4=translation-scale. out=NULL queries shape;
+ * capacity is a float count. Returns -4 before a successful SS run. */
+int sam3d_get_ss_pose_tokens(sam3d_ctx *ctx, int modality, float *out,
+                               size_t capacity, int *out_n, int *out_c);
+
 /* Debug: override stage inputs with pytorch-reference tensors, so
  * verify_*.c can isolate drift to a single stage. */
 int sam3d_debug_override_dinov2(sam3d_ctx *ctx, const float *tokens,

@@ -100,6 +100,46 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(job["state"], "failed")
         self.assertIn("frames", job["error"])
 
+    def test_genia_prepared_upload_and_capability_gate(self):
+        import io
+        import zipfile
+        import numpy as np
+        from PIL import Image
+        from .genia import FORMAT
+        status, ctype, page = self.get("/genia")
+        self.assertEqual((status, ctype), (200, "text/html; charset=utf-8"))
+        self.assertIn(b"Upload and validate", page)
+        image, mask, depth = io.BytesIO(), io.BytesIO(), io.BytesIO()
+        Image.new("RGB", (16,12), (90,100,110)).save(image, format="PNG")
+        Image.new("L", (16,12), 255).save(mask, format="PNG")
+        np.save(depth, np.full((12,16), 2, np.float32))
+        scene = {"format": FORMAT, "units": "m", "views": [{"image": "image.png",
+            "mask": "mask.png", "depth": "depth.npy", "K": [[10,0,8],[0,10,6],[0,0,1]],
+            "c2w": np.eye(4).tolist()}]}
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("scene.json", json.dumps(scene))
+            archive.writestr("image.png", image.getvalue())
+            archive.writestr("mask.png", mask.getvalue())
+            archive.writestr("depth.npy", depth.getvalue())
+        request = urllib.request.Request(self.base + "/v1/genia/uploads", bundle.getvalue(),
+                                         {"Content-Type": "application/zip"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            self.assertEqual(response.status, 201)
+            uploaded = json.loads(response.read())
+        status, _, raw = self.post("/v1/jobs", {"kind": "genia_validate", "upload_id": uploaded["upload_id"]})
+        self.assertEqual(status, 202)
+        validated = self.wait_job(json.loads(raw)["id"])
+        self.assertEqual(validated["state"], "done", validated)
+        self.assertEqual(validated["result"]["observations"]["format"], FORMAT)
+        health = json.loads(self.get("/health")[2])
+        self.assertFalse(health["genia"]["available"])
+        status, _, raw = self.post("/v1/jobs", {"kind": "genia_reconstruct", "upload_id": uploaded["upload_id"]})
+        failed = self.wait_job(json.loads(raw)["id"])
+        self.assertEqual(failed["state"], "failed")
+        self.assertIn("not implemented", failed["error"])
+        self.assertFalse((self.work / "genia").exists())
+
     def test_rig_page_and_routes(self):
         status, ctype, body = self.get("/rig")
         self.assertEqual(status, 200)

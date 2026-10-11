@@ -1,0 +1,17 @@
+{
+  "format": "gemm.genia_reference_lock.v1",
+  "repository": "https://github.com/facebookresearch/GenIA.git",
+  "revision": "6fbd691ac90248eedb16e1099f2c7bef6831c69c",
+  "sam3d_revision": "f91db411c50efee93d8db7aeb323885650f6f722",
+  "mapanything_revision": "f7ebafb4d8349776705aaa686cf928988d1bd7f4",
+  "python": "3.11",
+  "torch": "2.7.1+cu128",
+  "torchvision": "0.22.1+cu128",
+  "cuda": "12.8",
+  "gsplat": "1.5.3",
+  "pytorch3d": "0.7.9",
+  "nvdiffrast": "0.4.0",
+  "license": "CC-BY-NC-4.0",
+  "sam3d_license": "SAM License",
+  "visibility_source_sha256": "de494f81ac4ed5fdbddc6032c8aeb16c9f79a0c9a74c125f5b9c036cd9db26c7"
+}

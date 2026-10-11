@@ -24,6 +24,7 @@
  */
 
 #include "cuda_sam3d_runner.h"
+#include "../../common/sam3d_pose_tokens.h"
 #include "../cuew.h"
 #define CUDA_RUNNER_COMMON_IMPLEMENTATION
 #include "../cuda_runner_common.h"
@@ -183,6 +184,7 @@ typedef struct {
 } cs3d_gs_head_ws;
 
 struct cuda_sam3d_ctx {
+    sam3d_pose_tokens pose_tokens;
     cuda_sam3d_config cfg;
     cuda_sam3d_profile profile;
     char    *safetensors_dir_resolved;
@@ -1052,6 +1054,7 @@ static void cs3d_ode_fill_randn(float *buf, int n, uint64_t *state) {
 int cuda_sam3d_run_ss_dit(cuda_sam3d_ctx *ctx) {
     double t0 = cs3d_time_ms();
     if (!ctx) return CUDA_SAM3D_E_INVAL;
+    ctx->pose_tokens.valid = 0;
     const cs3d_host_2d *cond = cs3d_active_cond(ctx);
     if (!cond->data) {
         fprintf(stderr, "cuda_sam3d: ss_dit needs cond tokens — "
@@ -1162,6 +1165,7 @@ int cuda_sam3d_run_ss_dit(cuda_sam3d_ctx *ctx) {
         for (int c = 0; c < 8; c++)
             latent[c * 4096 + n] = lat[SAM3D_SS_LAT_SHAPE][n * 8 + c];
 
+    sam3d_pose_tokens_store(&ctx->pose_tokens, lat);
     for (int i = 0; i < SAM3D_SS_DIT_N_LATENTS; i++) {
         free(lat[i]); free(vel[i]); free(vel_u[i]);
     }
@@ -1179,6 +1183,7 @@ int cuda_sam3d_run_ss_dit(cuda_sam3d_ctx *ctx) {
                 mn, mx, sum / (8.0 * 4096.0), d, cfg_steps);
     }
     rc = cs3d_adopt_ss_latent(ctx, latent, dims);
+    if (rc != CUDA_SAM3D_E_OK) ctx->pose_tokens.valid = 0;
     ctx->profile.ss_dit_ms = cs3d_time_ms() - t0;
     ctx->profile.ss_steps = steps;
     ctx->profile.cfg_steps = cfg_steps;
@@ -4532,4 +4537,11 @@ int cuda_sam3d_debug_override_slat(cuda_sam3d_ctx *ctx, const float *feats,
     memcpy(ctx->ovr_slat.coords, coords, k_bytes);
     ctx->ovr_slat.n = n; ctx->ovr_slat.c = c;
     return CUDA_SAM3D_E_OK;
+}
+
+int cuda_sam3d_get_ss_pose_tokens(cuda_sam3d_ctx *ctx, int modality, float *out,
+                                size_t capacity, int *out_n, int *out_c)
+{
+    if (!ctx) return -1;
+    return sam3d_pose_tokens_get(&ctx->pose_tokens, modality, out, capacity, out_n, out_c);
 }

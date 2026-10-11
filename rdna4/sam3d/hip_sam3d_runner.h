@@ -86,6 +86,12 @@ int hip_sam3d_get_slat_tokens(hip_sam3d_ctx *ctx, float *out_feats,
                                int32_t *out_coords, int *out_n, int *out_c);
 int hip_sam3d_get_gaussians(hip_sam3d_ctx *ctx, float *out, int *out_n);
 
+/* Retained Stage-1 pose tokens. modality: 1=normalized 6D rotation,
+ * 2=translation, 3=log-scale, 4=translation-scale. out=NULL queries shape;
+ * capacity is a float count. Returns -4 before a successful SS run. */
+int hip_sam3d_get_ss_pose_tokens(hip_sam3d_ctx *ctx, int modality, float *out,
+                               size_t capacity, int *out_n, int *out_c);
+
 /* Debug overrides — feed pytorch ref tensors at any stage boundary so a
  * single verify_*.c can isolate drift. */
 int hip_sam3d_debug_override_dinov2(hip_sam3d_ctx *ctx, const float *tokens,

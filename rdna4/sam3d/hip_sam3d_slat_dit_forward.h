@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 typedef struct {
-    hipFunction_t gemm, gemm_wmma, mod_ln, ln, qkv_split, kv_split, mhrms, sdpa;
+    hipFunction_t gemm, mod_ln, ln, qkv_split, kv_split, mhrms, sdpa;
     hipFunction_t gelu, gated, resadd, silu;
     hipFunction_t gemm_wmma;   /* gemm_bf16w_bf16a_wmma_t (gfx12; optional) */
     int           use_wmma;    /* 1 iff SAM3D_WMMA!=0 and gemm_wmma resolved */

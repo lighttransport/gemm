@@ -52,6 +52,7 @@ from .service import ROOT, WORK, EyeService, ServiceError
 PAGE = ROOT / "web" / "vhuman_eye.html"
 HEAD_PAGE = ROOT / "web" / "vhuman_head.html"
 RIG_PAGE = ROOT / "web" / "vhuman_rig.html"
+GENIA_PAGE = ROOT / "web" / "vhuman_genia.html"
 EYE_SHADER = ROOT / "web" / "vhuman_eye_shader.js"      # shared by both pages
 MAX_BODY = 1 << 20
 MAX_JOBS_QUEUED = 8
@@ -176,6 +177,7 @@ class App:
         from .head import pipeline as head_pipeline
         from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue, soft_deformer, video_fit
         from .body import job as body_job, motion as body_motion
+        from .genia import job as genia_job
         from .reconstruction.job import reconstruction_job
         from .reconstruction.upload import server_request
         self.rig_job = rig_job
@@ -186,6 +188,8 @@ class App:
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
         handlers = {
+            "genia_validate": lambda req, prog, cancel: genia_job.validate_job(self.service, req, prog, cancel),
+            "genia_reconstruct": lambda req, prog, cancel: genia_job.reconstruct_job(self.service, req, prog, cancel),
             "video_generate": lambda req, prog, cancel: video.video_job(self.service, req, prog, cancel,
                 model=getattr(args, "video_model", None), runner=getattr(args, "video_runner", None),
                 mock=args.mock, allow_experimental=getattr(args, "video_experimental", False),
@@ -246,11 +250,13 @@ class App:
 
     def _health(self) -> dict:
         from . import baseline, qwen, video
+        from .genia import job as genia_job
         return {"video": video.availability(getattr(self.args, "video_model", None),
                     getattr(self.args, "video_runner", None), mock=self.args.mock,
                     allow_experimental=getattr(self.args, "video_experimental", False),
                     backend=getattr(self.args, "video_backend", "repo")),
                 "ok": True, "backend": gpu.backend(), "device": gpu.device_index(), "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
+                "genia": genia_job.availability(),
                 "pixal3d": baseline.availability(mock=self.args.mock), "plates": len(self.service.list_plates()),
                 "rig": self.rig_job.availability(getattr(self.args, "rig_python", None)),
                 "body": self.body_job.availability(getattr(self.args, "sam3d_body_model", self.body_job.MODEL_DIR),
@@ -355,6 +361,9 @@ def make_handler(app: App, quiet: bool = False):
                 if path in ("/rig", "/vhuman_rig"):
                     return self._send(200, RIG_PAGE.read_bytes(), "text/html; charset=utf-8",
                                       {"Cache-Control": "no-cache"})
+                if path in ("/genia", "/vhuman_genia"):
+                    return self._send(200, GENIA_PAGE.read_bytes(), "text/html; charset=utf-8",
+                                      {"Cache-Control": "no-cache"})
                 if path == "/v1/heads":
                     return self._json(200, {"heads": app.service.list_heads()})
                 if path == "/v1/body/reference-motions":
@@ -433,6 +442,14 @@ def make_handler(app: App, quiet: bool = False):
         def do_POST(self):
             path = self.path.split("?", 1)[0]
             try:
+                if path == "/v1/genia/uploads":
+                    from .genia.upload import upload, MAX_UPLOAD
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length > MAX_UPLOAD:
+                        self.close_connection = True
+                        raise TooLarge("GenIA upload exceeds 64 MiB")
+                    return self._json(201, upload(app.service, self.rfile, length,
+                                                 self.headers.get("Content-Type", "")))
                 if path == "/v1/portrait/uploads":
                     from .reconstruction.upload import upload, MAX_UPLOAD
                     length = int(self.headers.get("Content-Length") or 0)

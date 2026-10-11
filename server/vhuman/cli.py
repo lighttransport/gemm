@@ -70,6 +70,14 @@ def cmd_eye(args) -> dict:
             "live": live["timings"], "seconds": round(time.perf_counter() - started, 2)}
 
 
+def cmd_genia(args) -> dict:
+    from .genia import job
+    result = job.check(args.observations)
+    if not args.check:
+        raise ValueError(result["genia"]["reason"])
+    return result
+
+
 def cmd_sheet(args) -> dict:
     size = args.size
     names = list(P.PRESETS)
@@ -455,6 +463,11 @@ def main(argv=None) -> int:
     ap.add_argument("--clip-bpe", default=None,
                     help="directory containing garment tokenizer vocab.json and merges.txt")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("genia", help="validate prepared observations and inspect native GenIA readiness")
+    sp.add_argument("--observations", required=True, help="prepared scene.json, RGB/masks/Z-depth and cameras")
+    sp.add_argument("--check", action="store_true", help="validate without attempting reconstruction")
+    sp.set_defaults(fn=cmd_genia)
 
     def with_params(sp):
         sp.add_argument("--preset", choices=list(P.PRESETS))

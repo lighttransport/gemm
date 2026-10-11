@@ -1,6 +1,7 @@
 /* sam3d_runner.c — v1 CPU runner for SAM-3D-Objects. */
 
 #include "sam3d_runner.h"
+#include "../../common/sam3d_pose_tokens.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,7 @@ typedef struct {
 } slat_buf;
 
 struct sam3d_ctx {
+    sam3d_pose_tokens pose_tokens;
     sam3d_config cfg;
 
     /* Resolved safetensors directory (cfg.safetensors_dir or inferred
@@ -488,6 +490,7 @@ static const int sam3d_ss_lat_elts[5] = { 4096 * 8, 1 * 6, 1 * 3, 1 * 3, 1 * 1 }
 int sam3d_run_ss_dit(sam3d_ctx *ctx)
 {
     if (!ctx) return -1;
+    ctx->pose_tokens.valid = 0;
     if (!ctx->cond_tokens.data) {
         fprintf(stderr, "[sam3d] ss_dit: cond tokens not set — run "
                         "sam3d_run_cond_fuser() (or override) first\n");
@@ -611,6 +614,7 @@ int sam3d_run_ss_dit(sam3d_ctx *ctx)
                 mn, mx, sum / (8.0 * 4096.0), d, cfg_steps);
     }
 
+    sam3d_pose_tokens_store(&ctx->pose_tokens, lat);
     for (int i = 0; i < SAM3D_SS_DIT_N_LATENTS; i++) free(lat[i]);
     return 0;
 
@@ -979,4 +983,11 @@ int sam3d_debug_override_slat(sam3d_ctx *ctx, const float *f,
     memcpy(ctx->slat.coords, co, (size_t)n * 4 * sizeof(int32_t));
     ctx->slat.n = n; ctx->slat.c = c;
     return 0;
+}
+
+int sam3d_get_ss_pose_tokens(sam3d_ctx *ctx, int modality, float *out,
+                                size_t capacity, int *out_n, int *out_c)
+{
+    if (!ctx) return -1;
+    return sam3d_pose_tokens_get(&ctx->pose_tokens, modality, out, capacity, out_n, out_c);
 }
