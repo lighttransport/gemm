@@ -71,6 +71,22 @@ class ObservationsTest(unittest.TestCase):
                 mutate(); self.write()
                 with self.assertRaises(ValueError): observations.load(self.root / "scene.json")
 
+    def test_camera_float32_overflow(self):
+        for field, row, column in (("K", 0, 0), ("c2w", 0, 3)):
+            with self.subTest(field=field):
+                self.document["views"][0]["K"] = [[10,0,8],[0,10,6],[0,0,1]]
+                self.document["views"][0]["c2w"] = np.eye(4).tolist()
+                self.document["views"][0][field][row][column] = 1e300
+                self.write()
+                with self.assertRaisesRegex(ValueError, "float32"):
+                    observations.load(self.root / "scene.json")
+
+        self.document["views"][0]["c2w"] = np.eye(4).tolist()
+        self.document["views"][0]["K"][0][0] = 1e-300
+        self.write()
+        with self.assertRaisesRegex(ValueError, "underflow"):
+            observations.load(self.root / "scene.json")
+
     def test_manifest_bounds_checksums_and_containment(self):
         self.document["views"][0]["image"] = "../image.png"; self.write()
         with self.assertRaises(ValueError): observations.load(self.root / "scene.json")

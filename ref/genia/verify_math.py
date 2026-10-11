@@ -17,12 +17,43 @@ def pointer(array, kind=FP):
     return array.ctypes.data_as(kind)
 
 
+def validate_arrays(arrays):
+    """Check native buffer contracts independently of self-described metadata."""
+    coords = arrays.get("coords")
+    cameras = arrays.get("cameras")
+    if coords is None or coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError("invalid oracle coordinates")
+    if cameras is None or cameras.ndim != 2 or cameras.shape[1] != 3:
+        raise ValueError("invalid oracle cameras")
+    n, views = len(coords), len(cameras)
+    if not 1 <= n <= 64**3 or not 1 <= views <= 16:
+        raise ValueError("invalid oracle dimensions")
+    expected = {"coords": ((n, 3), "int32"), "cameras": ((views, 3), "float32"),
+                "occupancy": ((64, 64, 64), "uint8"),
+                "visibility": ((views, n), "float32"),
+                "velocities": ((views, n, 8), "float32"),
+                "weights": ((views, n), "float32")}
+    expected.update({name: ((n, 8), "float32") for name in
+                     ("fused", "latent", "gradient", "clean", "guided")})
+    if set(arrays) != set(expected):
+        raise ValueError("unexpected oracle arrays")
+    for name, (shape, dtype) in expected.items():
+        array = arrays[name]
+        if array.shape != shape or array.dtype != np.dtype(dtype):
+            raise ValueError("invalid native oracle buffer: " + name)
+        if not np.isfinite(array).all():
+            raise ValueError("nonfinite oracle buffer: " + name)
+    if np.any(coords < 0) or np.any(coords >= 64):
+        raise ValueError("oracle coordinates outside grid")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, default=ROOT / "tmp/genia-ref/math")
     parser.add_argument("--library", type=Path, default=ROOT / "cuda/genia/libgenia_cuda.so")
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
+    (args.reference / "parity.json").unlink(missing_ok=True)
     manifest = json.loads((args.reference / "manifest.json").read_text())
     lock = json.loads((Path(__file__).parent / "lock.json").read_text())
     if manifest.get("format") != "gemm.genia_math_reference.v1" or manifest.get("lock") != lock:
@@ -40,6 +71,7 @@ def main():
         if list(array.shape) != rec["shape"] or str(array.dtype) != rec["dtype"]:
             raise ValueError("oracle shape/dtype mismatch")
         arrays[path.stem] = np.ascontiguousarray(array)
+    validate_arrays(arrays)
     lib = C.CDLL(str(args.library.resolve()))
     lib.genia_cuda_open.argtypes = [C.c_int, C.c_size_t]; lib.genia_cuda_open.restype = C.c_void_p
     lib.genia_cuda_close.argtypes = [C.c_void_p]

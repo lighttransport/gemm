@@ -142,10 +142,17 @@ def load(path):
                 or abs(np.linalg.det(c2w[:3, :3])-1) > 1e-5):
             raise ValueError("c2w must be a rigid, right-handed camera-to-world transform")
         c2w[:3, 3] *= UNIT_SCALE[units]
+        limit = np.finfo(np.float32).max
+        if np.any(np.abs(k) > limit) or np.any(np.abs(c2w) > limit):
+            raise ValueError("camera values exceed float32 range")
+        k = k.astype(np.float32)
+        c2w = c2w.astype(np.float32)
+        if k[0, 0] <= 0 or k[1, 1] <= 0:
+            raise ValueError("focal lengths underflow float32 range")
         hashes = {key: digest(p) for key, p in paths.items()}
         for key, value in hashes.items():
             expected = rec.get(key + "_sha256")
             if expected is not None and expected != value:
                 raise ValueError(key + " checksum mismatch")
-        views.append(View(pixels, mask, depth, k.astype(np.float32), c2w.astype(np.float32), hashes))
+        views.append(View(pixels, mask, depth, k, c2w, hashes))
     return Observations(tuple(views), digest(path), path, units)
