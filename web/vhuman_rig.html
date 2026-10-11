@@ -125,11 +125,19 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       </div>
       <div id="body-motion-tools" hidden>
         <label for="body-motion-backend">Motion processing</label>
-        <select id="body-motion-backend"><option value="sam3d">Pose fitting</option><option value="musclemimic">Physical refinement · research</option></select>
+        <select id="body-motion-backend"><option value="sam3d">Pose fitting</option><option value="musclemimic">Physical refinement · research</option><option value="terra">Terrain-aware refinement · research</option></select>
         <div id="body-physical-options" hidden>
           <label for="body-reference-motion">Reference motion or uploaded video</label>
           <select id="body-reference-motion"><option value="">Use uploaded video</option></select>
-          <label><input type="checkbox" id="body-fixed-camera">Video has one fully visible person, a fixed camera and a flat floor</label>
+          <label><input type="checkbox" id="body-fixed-camera">Video has one fully visible person, a fixed camera<span id="body-flat-floor-label"> and a flat floor</span></label>
+          <div id="body-terra-options" hidden>
+            <label for="body-terra-terrain">Supporting terrain</label>
+            <select id="body-terra-terrain"><option value="auto">Estimate floor, steps or ramp</option><option value="flat">Flat floor</option><option value="file">Known terrain JSON</option></select>
+            <input type="file" id="body-terra-file" accept="application/json,.json" hidden>
+            <label for="body-terra-actions">Policy actions</label>
+            <select id="body-terra-actions"><option value="sampled">Sampled</option><option value="mean">Mean</option></select>
+            <label for="body-terra-seed">Sampling seed</label><input type="number" id="body-terra-seed" min="0" max="4294967295" value="0" step="1">
+          </div>
         </div>
         <label for="body-motion-file">Fit pose or motion from a full-body image or short video</label>
         <input type="file" id="body-motion-file" accept="image/png,image/jpeg,image/webp,video/mp4,video/webm,video/quicktime">
@@ -557,6 +565,7 @@ function effectiveValues() {
   return v;
 }
 function applyRig() {
+  if (state.terrainGroup) state.terrainGroup.visible = state.avatarMode && !!state.bodyMotion;
   if (!state.rig || !state.model) return;
   const values = effectiveValues();
   const ev = state.rig.evaluate(values);
@@ -1751,7 +1760,34 @@ function validateBodyMotion(m) {
     throw new Error('Invalid body motion duration');
   return m;
 }
+function clearBodyTerrain() {
+  if (!state.terrainGroup) return;
+  scene.remove(state.terrainGroup);
+  state.terrainGroup.traverse((m) => { m.geometry?.dispose(); m.material?.dispose(); });
+  state.terrainGroup = null;
+}
+function showBodyTerrain(data) {
+  clearBodyTerrain();
+  if (data.version !== 1 || data.units !== 'm' || data.up_axis !== 'Y' ||
+      !Number.isFinite(data.floor_height) || !Array.isArray(data.boxes) || data.boxes.length > 128)
+    throw new Error('Invalid supporting terrain');
+  const group = new THREE.Group();
+  for (const b of [...data.boxes, {position:[0,data.floor_height-.01,0],half_extents:[10,.01,10],rotation:[0,0,0,1]}]) {
+    if (!Array.isArray(b.position) || b.position.length !== 3 || !b.position.every(Number.isFinite) ||
+        !Array.isArray(b.half_extents) || b.half_extents.length !== 3 || !b.half_extents.every(v => Number.isFinite(v) && v > 0) ||
+        !Array.isArray(b.rotation) || b.rotation.length !== 4 || !b.rotation.every(Number.isFinite) || Math.abs(Math.hypot(...b.rotation)-1) > .001) {
+      group.traverse(m => { m.geometry?.dispose(); m.material?.dispose(); });
+      throw new Error('Invalid supporting terrain box');
+    }
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(...b.half_extents.map(v=>v*2)),
+      new THREE.MeshStandardMaterial({color:0x3d617a,roughness:.85}));
+    mesh.position.fromArray(b.position); mesh.quaternion.fromArray(b.rotation); group.add(mesh);
+  }
+  state.terrainGroup = group; scene.add(group);
+}
+$('body-terra-terrain').addEventListener('change', () => { $('body-terra-file').hidden = $('body-terra-terrain').value !== 'file'; });
 async function selectMotion(id) {
+  clearBodyTerrain();
   state.bodyMotionPlaying = false;
   $('body-motion-play').textContent = '▶ play';
   state.bodyMotionId = id || null;
@@ -1775,6 +1811,10 @@ async function selectMotion(id) {
     applyRig(); return;
   }
   state.bodyMotion = validateBodyMotion(await api(motionUrl));
+  if (state.bodyMotion.terrain) {
+    if (state.bodyMotion.terrain !== 'terrain.json') throw new Error('Unsupported motion terrain reference');
+    showBodyTerrain(await api(motionUrl.replace(/[^/]+$/, 'terrain.json')));
+  }
   state.bodyMotionTime = 0;
   $('body-motion-time').max = state.bodyMotion.duration;
   $('body-motion-time').value = 0;
@@ -1789,13 +1829,18 @@ $('body-motion-baseline').addEventListener('change', () => selectMotion(state.bo
   $('body-motion-msg').textContent = e.message;
 }));
 $('body-motion-backend').addEventListener('change', async () => {
-  const physical = $('body-motion-backend').value === 'musclemimic';
+  const backend = $('body-motion-backend').value;
+  const physical = backend !== 'sam3d';
+  $('body-motion-file').accept = physical ? 'video/mp4,video/webm,video/quicktime' :
+    'image/png,image/jpeg,image/webp,video/mp4,video/webm,video/quicktime';
+  $('body-terra-options').hidden = backend !== 'terra';
+  $('body-flat-floor-label').hidden = backend === 'terra';
   $('body-physical-options').hidden = !physical;
   $('body-motion-msg').textContent = physical ? 'Research preview: up to 8 seconds; a textured background is needed to verify the fixed camera.' :
     'One visible person; videos sample the first 8 seconds at 4 fps.';
   if (physical) {
     try {
-      const data = await api('/v1/body/reference-motions');
+      const data = await api(`/v1/body/reference-motions?backend=${backend}`);
       $('body-reference-motion').replaceChildren(new Option('Use uploaded video', ''));
       for (const name of data.references) $('body-reference-motion').add(new Option(name, name));
       if (!data.available) $('body-motion-msg').textContent = 'Physical refinement is not configured on this server.';
@@ -1821,6 +1866,7 @@ $('body-motion-time').addEventListener('input', (e) => {
   applyRig();
 });
 $('body-motion-clear').addEventListener('click', () => {
+  clearBodyTerrain();
   $('body-motion-select').value = '';
   state.bodyMotion = null; state.bodyMotionId = null; state.bodyMotionPlaying = false; state.bodyMotionTime = 0;
   $('body-motion-glb').hidden = $('body-motion-json').hidden = true;
@@ -1832,16 +1878,26 @@ $('body-motion-clear').addEventListener('click', () => {
 $('fit-body-motion').addEventListener('click', async () => {
   const media = $('body-motion-file').files[0];
   const backend = $('body-motion-backend').value;
-  const reference = backend === 'musclemimic' ? $('body-reference-motion').value : '';
+  const reference = backend !== 'sam3d' ? $('body-reference-motion').value : '';
   if (!state.current?.body || (!media && !reference) || state.job) return;
   const msg = $('body-motion-msg'), button = $('fit-body-motion');
   const headId = state.current.id;
   button.disabled = true; msg.className = 'msg';
   try {
     const request = { kind: 'body_motion', head_id: headId, backend, fixed_camera: $('body-fixed-camera').checked };
+    if (backend === 'terra') {
+      request.terrain = $('body-terra-terrain').value;
+      if (request.terrain === 'file') {
+        const file = $('body-terra-file').files[0];
+        if (!file || file.size > 65536) throw new Error('Choose a terrain JSON file under 64 KiB.');
+        request.terrain = JSON.parse(await file.text());
+      }
+      request.seed = Number($('body-terra-seed').value);
+      request.policy_actions = $('body-terra-actions').value;
+    }
     if (reference) request.reference_motion = reference;
     else {
-      if (backend === 'musclemimic' && !request.fixed_camera) throw new Error('Confirm the fixed-camera video requirements.');
+      if (backend !== 'sam3d' && !request.fixed_camera) throw new Error('Confirm the fixed-camera video requirements.');
       if (media.size > 64 * 1024 * 1024) throw new Error('media exceeds 64 MiB');
       msg.textContent = 'uploading media…';
       const ext = media.name.split('.').pop().toLowerCase();
@@ -1862,7 +1918,7 @@ $('fit-body-motion').addEventListener('click', async () => {
       if (j.state === 'done') {
         await loadMotions(headId, j.result.id);
         msg.textContent = j.result.accepted === false ? 'Physical refinement rejected; baseline and diagnostics retained.' :
-          `${j.result.frames} frame${j.result.frames === 1 ? '' : 's'} fitted${backend === 'musclemimic' ? ' · visual review pending' : ''}`;
+          `${j.result.frames} frame${j.result.frames === 1 ? '' : 's'} fitted${backend !== 'sam3d' ? ' · visual review pending' : ''}`;
         break;
       }
       if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);

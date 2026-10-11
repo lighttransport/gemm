@@ -24,11 +24,11 @@ def validate_tracks(names, rotations, times, root_translation=None):
     return q, t, root
 
 
-def document(names, rotations, times, root_translation, *, provenance=None):
+def document(names, rotations, times, root_translation, *, provenance=None, kind="musclemimic", terrain=None):
     q, t, root = validate_tracks(names, rotations, times, root_translation)
     if root is None or "mhr_root" not in names:
         raise ValueError("v2 requires an animated mhr_root")
-    return {"version": 2, "kind": "musclemimic", "fps": float(1 / np.median(np.diff(t))) if len(t) > 1 else 0,
+    return {"version": 2, "kind": kind, **({"terrain": terrain} if terrain else {}), "fps": float(1 / np.median(np.diff(t))) if len(t) > 1 else 0,
             "duration": float(t[-1]), "joints": list(names), "space": "MHR local xyzw",
             "units": "m", "up_axis": "Y", "root_joint": "mhr_root", "root_translation": "animated",
             "provenance": provenance or {}, "frames": [

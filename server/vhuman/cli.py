@@ -339,6 +339,11 @@ def cmd_body_motion(args) -> dict:
     from .body import motion
     svc = EyeService(Path(args.work))
     request = {"head_id": args.head, "backend": args.backend, "fixed_camera": args.fixed_camera}
+    if args.backend == "terra":
+        terrain = args.terrain
+        if terrain not in ("auto", "flat"):
+            terrain = json.loads(Path(terrain).read_text())
+        request.update(terrain=terrain, seed=args.seed, policy_actions=args.policy_actions)
     if args.reference_motion:
         request["reference_motion"] = args.reference_motion
     else:
@@ -353,7 +358,8 @@ def cmd_body_motion(args) -> dict:
                       _progress, threading.Event(), model_dir=args.sam3d_body_model,
                       rig_python=args.rig_python or motion.body_job.DEFAULT_RIG_PYTHON, mock=args.mock,
                       musclemimic_python=args.musclemimic_python, musclemimic_assets=args.musclemimic_assets,
-                      musclemimic_device=args.musclemimic_device)
+                      musclemimic_device=args.musclemimic_device, terra_python=args.terra_python,
+                      terra_assets=args.terra_assets, terra_device=args.terra_device)
 
 
 def cmd_rig_track(args) -> dict:
@@ -458,6 +464,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sam3d-body-model", default=None)
     from .body.musclemimic import add_arguments as musclemimic_arguments
     musclemimic_arguments(ap)
+    from .body.terra import add_arguments as terra_arguments
+    terra_arguments(ap)
     ap.add_argument("--sam3-model", default=None,
                     help="optional SAM 3 garment segmentation checkpoint")
     ap.add_argument("--clip-bpe", default=None,
@@ -625,9 +633,12 @@ def main(argv=None) -> int:
     sp.add_argument("--head", required=True, help="head with an assembled body avatar")
     source = sp.add_mutually_exclusive_group(required=True)
     source.add_argument("--media", help="PNG/JPEG/WebP image or MP4/WebM/MOV video")
-    source.add_argument("--reference-motion", help="registered MuscleMimic reference ID")
-    sp.add_argument("--backend", choices=("sam3d", "musclemimic"), default="sam3d")
+    source.add_argument("--reference-motion", help="registered reference ID for the selected motion backend")
+    sp.add_argument("--backend", choices=("sam3d", "musclemimic", "terra"), default="sam3d")
     sp.add_argument("--fixed-camera", action="store_true", help="confirm one visible person, fixed camera and flat floor")
+    sp.add_argument("--terrain", default="auto", help="Terra: auto, flat, or a canonical TerrainSpec JSON file")
+    sp.add_argument("--policy-actions", choices=("sampled", "mean"), default="sampled")
+    sp.add_argument("--seed", type=int, default=0, help="Terra policy sampling seed")
     sp.set_defaults(fn=cmd_body_motion)
     sp = sub.add_parser("rig-track", help="LightRig face track (timestamp + 52 controls per line) -> USD animation")
     sp.add_argument("--head", required=True)

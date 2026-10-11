@@ -29,7 +29,7 @@ MAX_SECONDS = 8
 MAX_FRAMES = 32
 FPS = 4
 MOTION_FILES = {"motion.json", "motion.glb", "manifest.json", "baseline.json",
-                "baseline.glb", "evaluation.json"}
+                "baseline.glb", "evaluation.json", "terrain.json"}
 
 
 def upload(service, stream, length: int, content_type: str) -> dict:
@@ -250,15 +250,19 @@ def _export_glb(avatar: Path, out: Path, names: list[str], rotations: np.ndarray
 
 def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DIR,
         rig_python=body_job.DEFAULT_RIG_PYTHON, mock=False, musclemimic_python=None,
-        musclemimic_assets=None, musclemimic_device="cpu") -> dict:
+        musclemimic_assets=None, musclemimic_device="cpu", terra_python=None, terra_assets=None, terra_device="cpu") -> dict:
     backend = request.get("backend", "sam3d")
+    if backend == "terra":
+        from .terra import fit as terra_fit
+        return terra_fit(service, request, progress, cancel, model_dir=model_dir,
+                         python=terra_python, assets=terra_assets, device=terra_device)
     if backend == "musclemimic":
         from .musclemimic import fit as physical_fit
         return physical_fit(service, request, progress, cancel, model_dir=model_dir,
                             python=musclemimic_python, assets=musclemimic_assets,
                             device=musclemimic_device)
     if backend != "sam3d" or request.get("reference_motion"):
-        raise ValueError("reference motions require backend=musclemimic; backend must be sam3d or musclemimic")
+        raise ValueError("reference motions require a physical backend; backend must be sam3d, musclemimic or terra")
     hid = request.get("head_id")
     avatar = service.body_file(hid, "avatar.glb")
     avatar_json = service.body_file(hid, "avatar.json")

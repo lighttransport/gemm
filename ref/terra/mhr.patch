@@ -1,0 +1,349 @@
+--- a/src/terra/assembly.py
++++ b/src/terra/assembly.py
+@@ -1,3 +1,4 @@
++# Modified for vhuman: support named prepared MHR motion without SMPL assets.
+ """Configure the retargeting terms used to solve a single motion.
+ 
+ The helpers in this module update a shared :class:`SolveContext` and attach
+@@ -128,6 +129,9 @@
+     warmup: int = 0
+     diagnostics: SolveDiagnostics = field(default_factory=SolveDiagnostics)
+     stage: SolveStage = SolveStage.PREPARED
++    source_joint_names: tuple[str, ...] | None = None
++    prepared_orientation: dict | None = None
++    prepared_root_quaternion: np.ndarray | None = None
+ 
+     def __post_init__(self) -> None:
+         """Validate public mapping inputs before any constraint can consume them."""
+@@ -151,7 +155,7 @@
+     @property
+     def demo_joints(self) -> list[str]:
+         """Return joint names in the order used by ``human_joints``."""
+-        return list(SMPLH_DEMO_JOINTS)
++        return list(self.source_joint_names or SMPLH_DEMO_JOINTS)
+ 
+     def warmup_frames(self) -> int:
+         """Return the configured nonnegative warm-up length."""
+@@ -179,7 +183,7 @@
+     nonpen_mode = cfg.nonpen_mode
+     if nonpen_mode == "scene":
+         env_geoms = scene_geom_ids(ctx.model)
+-        starts_raised = ctx.on_terrain and starts_on_raised_terrain(ctx.human_joints, SMPLH_DEMO_JOINTS, ctx.terrain)
++        starts_raised = ctx.on_terrain and starts_on_raised_terrain(ctx.human_joints, ctx.demo_joints, ctx.terrain)
+         engage = cfg.nonpen_engage_frame
+         if engage is None:
+             engage = 0 if starts_raised else ctx.default_engage_frame()
+@@ -268,7 +272,7 @@
+ 
+     ctx.human_joints = ctx.human_joints.copy()
+     for joint, dz in offsets.items():
+-        ctx.human_joints[:, SMPLH_DEMO_JOINTS.index(joint), 2] += dz
++        ctx.human_joints[:, ctx.demo_joints.index(joint), 2] += dz
+     if source_offsets is not None:
+         # Downstream functions see these already-shifted targets, so their anatomical
+         # offsets require the same shift: (p + dz) - (h + dz) == p - h.  Reusing ``h``
+@@ -300,6 +304,8 @@
+ 
+     ctx.human_joints = pad(ctx.human_joints)
+     ctx.smpl_rotations = pad(ctx.smpl_rotations)
++    if ctx.prepared_orientation is not None:
++        ctx.prepared_orientation = {**ctx.prepared_orientation, "targets": pad(ctx.prepared_orientation["targets"])}
+     ctx.scene = {
+         **ctx.scene,
+         **{k: pad(np.asarray(ctx.scene[k])) for k in ("object_poses", "object_poses_augmented", "object_poses_src")},
+@@ -438,7 +444,8 @@
+         logger.info("Orientation cost disabled (all orientation weights are zero)")
+         return
+ 
+-    orient = build_orientation_targets(env, robot_conf, fitted_shape_path, ctx.smpl_rotations)
++    orient = (build_orientation_targets(env, robot_conf, fitted_shape_path, ctx.smpl_rotations)
++              if ctx.prepared_orientation is None else {**ctx.prepared_orientation, "targets": ctx.prepared_orientation["targets"].copy()})
+ 
+     if torso_frame_mode == "positions":
+         torso_index = orient["names"].index("upper_body_mimic")
+@@ -623,11 +630,12 @@
+     human_joints: np.ndarray,
+     surface,
+     sole_offsets: dict[str, float],
++    demo_joints=None,
+ ) -> dict[str, np.ndarray]:
+     """Measure each source foot landmark above its local support surface."""
+     clearances = {}
+     for joint in FOOT_LANDMARK_SIDES:
+-        point = human_joints[:, SMPLH_DEMO_JOINTS.index(joint)]
++        point = human_joints[:, (SMPLH_DEMO_JOINTS if demo_joints is None else demo_joints).index(joint)]
+         clearances[joint] = point[:, 2] - float(sole_offsets[joint]) - _surface_heights(surface, point)
+     return clearances
+ 
+@@ -709,7 +717,7 @@
+ 
+     for joint, side in FOOT_LANDMARK_SIDES.items():
+         contact, midstance = contacts[side]
+-        joint_index = SMPLH_DEMO_JOINTS.index(joint)
++        joint_index = ctx.demo_joints.index(joint)
+         point = corrected[:, joint_index]
+         allowed = np.full(len(point), np.inf, dtype=float)
+         if config.loaded_cap is not None:
+@@ -777,6 +785,7 @@
+         ctx.human_joints,
+         walkable_terrain(ctx.terrain),
+         source_offsets,
++        ctx.demo_joints,
+     )
+     result = _cap_stance_landmarks(ctx, toe_contact, config, source_clearance, target_offsets)
+     ctx.human_joints = result.human_joints
+@@ -831,13 +840,14 @@
+             ctx.human_joints,
+             source_support,
+             source_offsets,
++            ctx.demo_joints,
+         )
+ 
+     selected_fraction = {}
+     for joint, side in FOOT_LANDMARK_SIDES.items():
+         toe = "L_Toe" if side == "l" else "R_Toe"
+         body = ctx.joints_mapping[joint]
+-        source = ctx.human_joints[:, SMPLH_DEMO_JOINTS.index(joint)]
++        source = ctx.human_joints[:, ctx.demo_joints.index(joint)]
+         surface_z = _surface_heights(support, source)
+         targets[body] = surface_z + body_offsets[joint]
+         authority = contact_ramp(
+@@ -1150,7 +1160,7 @@
+     route_targets = {}
+     route_activation = {}
+     for joint, side in FOOT_LANDMARK_SIDES.items():
+-        joint_idx = SMPLH_DEMO_JOINTS.index(joint)
++        joint_idx = ctx.demo_joints.index(joint)
+         point = ctx.human_joints[:, joint_idx]
+         z = point[:, 2] + route[side]
+         body = ctx.joints_mapping[joint]
+@@ -1165,7 +1175,7 @@
+     )
+     ctx.human_joints = ctx.human_joints.copy()
+     for joint, side in FOOT_LANDMARK_SIDES.items():
+-        ctx.human_joints[:, SMPLH_DEMO_JOINTS.index(joint), 2] += route[side]
++        ctx.human_joints[:, ctx.demo_joints.index(joint), 2] += route[side]
+     logger.info(
+         "Whole-foot swing route: "
+         + "  ".join(
+--- a/src/terra/postprocess.py
++++ b/src/terra/postprocess.py
+@@ -1,3 +1,4 @@
++# Modified for vhuman: support named prepared MHR motion without SMPL assets.
+ """Repair solver output and assemble cached retargeting trajectories."""
+ 
+ from __future__ import annotations
+@@ -211,6 +212,7 @@
+     model: mujoco.MjModel,
+     joints_mapping: dict[str, str],
+     target_joint_count: int,
++    demo_joints=None,
+ ) -> tuple[np.ndarray, np.ndarray]:
+     """Resolve and validate the landmark indices used by the quality gate."""
+     if not joints_mapping:
+@@ -222,7 +224,7 @@
+         if body_id < 0:
+             raise ValueError(f"materialized tendon repair body {body!r} does not exist in the model")
+         try:
+-            joint_index = SMPLH_DEMO_JOINTS.index(joint)
++            joint_index = (SMPLH_DEMO_JOINTS if demo_joints is None else demo_joints).index(joint)
+         except ValueError as error:
+             raise ValueError(f"materialized tendon repair landmark {joint!r} is not in SMPLH_DEMO_JOINTS") from error
+         if joint_index >= target_joint_count:
+@@ -341,6 +343,7 @@
+         model,
+         ctx.joints_mapping,
+         target_joints.shape[1],
++        getattr(ctx, "demo_joints", None),
+     )
+     self_collision_bodies = ctx.config.posthoc_selfpen_pairs if selfpen_mode == "legs" else ()
+     return _MaterializedTendonValidator(
+--- a/src/terra/robot.py
++++ b/src/terra/robot.py
+@@ -1,3 +1,4 @@
++# Modified for vhuman: support named prepared MHR motion without SMPL assets.
+ """Configure the OmniRetarget retargeter for a MuscleMimic robot model."""
+ 
+ from __future__ import annotations
+@@ -25,6 +26,7 @@
+     joints_mapping: dict[str, str],
+     foot_links: dict[str, str],
+     object_name: str = "ground",
++    demo_joints=None,
+ ) -> SimpleNamespace:
+     """Build the task constants required by the OmniRetarget retargeter.
+ 
+@@ -47,7 +49,7 @@
+         OBJECT_NAME=object_name,
+         OBJECT_URDF_FILE=None,
+         OBJECT_MESH_FILE=None,
+-        DEMO_JOINTS=list(SMPLH_DEMO_JOINTS),
++        DEMO_JOINTS=list(SMPLH_DEMO_JOINTS if demo_joints is None else demo_joints),
+         JOINTS_MAPPING=dict(joints_mapping),
+         FOOT_STICKING_LINKS=list(foot_links.keys()),
+         MANUAL_LB={},
+--- a/src/terra/pipeline.py
++++ b/src/terra/pipeline.py
+@@ -1,3 +1,4 @@
++# Modified for vhuman: support named prepared MHR motion without SMPL assets.
+ """Run TERRA retargeting or the OmniRetarget comparison method.
+ 
+ The pipeline prepares SMPL-H landmarks, resolves terrain, configures solver terms,
+@@ -380,6 +381,7 @@
+         joints_mapping=ctx.joints_mapping,
+         foot_links=MYOFULLBODY_FOOT_LINKS,
+         object_name=ctx.scene["object_name"],
++        demo_joints=ctx.demo_joints,
+     )
+     retargeter = TerraRetargeter(
+         task_constants=constants,
+@@ -489,9 +491,14 @@
+     # Initial base pose: position from the human pelvis, orientation estimated from frame 0.
+     # An identity quaternion would leave the SQP to rotate the whole body from scratch under
+     # a 0.2 trust region, which converges poorly.
+-    _, quat_init = transform_from_human_to_world(
+-        ctx.human_joints[0, 0, :], ctx.scene["object_poses_src"][0], np.zeros(3)
+-    )
++    if getattr(ctx, "prepared_root_quaternion", None) is None:
++        _, quat_init = transform_from_human_to_world(
++            ctx.human_joints[0, 0, :], ctx.scene["object_poses_src"][0], np.zeros(3)
++        )
++    else:
++        # Prepared motion supplies anatomical heading; a pelvis at the world
++        # origin cannot define an orientation by pointing toward that origin.
++        quat_init = ctx.prepared_root_quaternion
+     if ctx.model.nq != 7 + robot_dof:
+         raise ValueError(f"robot_dof/model mismatch during initialization: {robot_dof} vs nq={ctx.model.nq}")
+     q_init = np.asarray(ctx.model.qpos0, dtype=float).copy()
+--- /dev/null
++++ b/src/terra/prepared.py
+@@ -0,0 +1,129 @@
++"""vhuman extension: named prepared landmarks, without licensed body models.
++
++Modified from the Apache-2.0 Terra orchestration pipeline. Keep source geometry
++and robot calibration explicit; do not synthesize SMPL parameters or shape caches.
++"""
++from dataclasses import dataclass
++from types import SimpleNamespace
++
++import mujoco
++import numpy as np
++
++from terra._musclemimic import TerrainSpec
++from terra.assembly import SolveContext
++from terra.constants import MYOFULLBODY_SITE_CALIBRATION, SMPLH_TO_MYOFULLBODY
++from terra.pipeline import (
++    _build_environment, _configure_solver, _interaction_scene, _motion_analysis,
++    _postprocess_solution, _solve,
++)
++from terra.postprocess import repair_collisions
++from terra.profiles import resolve_solver_config
++from terra.reconstruction import CalibrationEvidence, ReconstructionRequest, reconstruct_terrain
++from terra.stability import apply_stability_policy
++
++
++@dataclass(frozen=True)
++class PreparedMotion:
++    joint_names: tuple[str, ...]
++    positions: np.ndarray
++    rotations: np.ndarray
++    rest_positions: np.ndarray
++    rest_rotations: np.ndarray
++    fps: float
++    sole_offsets: dict
++    neutral_foot_pitch: dict
++
++    def validate(self):
++        n, j = len(self.positions), len(self.joint_names)
++        if (n < 5 or len(set(self.joint_names)) != j or self.joint_names[0] != "Pelvis"
++                or set(self.joint_names) != set(SMPLH_TO_MYOFULLBODY)
++                or not np.isfinite(self.fps) or self.fps <= 0
++                or self.positions.shape != (n, j, 3) or self.rotations.shape != (n, j, 3, 3)
++                or self.rest_positions.shape != (j, 3) or self.rest_rotations.shape != (j, 3, 3)):
++            raise ValueError("invalid prepared motion dimensions or names")
++        if not all(np.isfinite(x).all() for x in
++                   (self.positions, self.rotations, self.rest_positions, self.rest_rotations)):
++            raise ValueError("nonfinite prepared motion")
++        for rotations in (self.rotations, self.rest_rotations):
++            if (not np.allclose(rotations @ np.swapaxes(rotations, -1, -2), np.eye(3), atol=1e-4)
++                    or not np.allclose(np.linalg.det(rotations), 1, atol=1e-4)):
++                raise ValueError("prepared rotations must be proper orthogonal matrices")
++        if set(self.sole_offsets) != {"L_Ankle", "R_Ankle", "L_Toe", "R_Toe"}:
++            raise ValueError("prepared motion needs four calibrated sole offsets")
++        if not np.isfinite(list(self.sole_offsets.values())).all():
++            raise ValueError("invalid sole calibration")
++
++
++def fit_prepared_motion(motion, robot_conf, logger, *, terrain="auto", config=None):
++    """Use TERRA's unchanged constraint/solve/postprocess stages for prepared MHR."""
++    motion.validate()
++    raw = dict(config or {}) | {"use_fitted_shape": False, "calibrate_sites": False,
++                                "seat_contact_mode": "off", "extra_landmarks": {}}
++    cfg = resolve_solver_config("terra", raw)
++    names = motion.joint_names
++    if isinstance(terrain, str) and terrain == "auto":
++        result = reconstruct_terrain(ReconstructionRequest(
++            mode="fit", joints=motion.positions, joint_names=names, fps=motion.fps,
++            fit_options={"seat": "off", "calibrated_joint_offsets": motion.sole_offsets,
++                         "neutral_foot_pitch": motion.neutral_foot_pitch,
++                         "neutral_foot_pitch_source": "mhr_native_rest"},
++            calibration=CalibrationEvidence(neutral_foot_pitch=motion.neutral_foot_pitch,
++                                             joint_offsets=motion.sole_offsets, source="mhr_native_rest")))
++        if not result.validation.get("passed", False):
++            raise ValueError(f"terrain reconstruction rejected: {result.validation}")
++        spec, reconstruction = result.terrain, {"fit": result.report, "validation": result.validation}
++    elif terrain is None or isinstance(terrain, str) and terrain == "flat":
++        spec, reconstruction = None, {"validation": {"passed": True}, "source": "explicit-flat"}
++    else:
++        spec = terrain if isinstance(terrain, TerrainSpec) else TerrainSpec.from_dict(terrain)
++        from terra.terrain import validate_terrain
++        check = validate_terrain(motion.positions, list(names), spec, motion.fps, offsets=motion.sole_offsets)
++        if not check.get("passed", False):
++            raise ValueError(f"known terrain rejected: {check}")
++        reconstruction = {"validation": check, "source": "explicit"}
++    env = _build_environment("MyoFullBody", robot_conf, spec, logger)
++    model = env._model
++    rest = mujoco.MjData(model); mujoco.mj_forward(model, rest)
++    mapping = dict(SMPLH_TO_MYOFULLBODY)
++    sites, targets, site_names = [], [], []
++    for site, joint, _body in MYOFULLBODY_SITE_CALIBRATION:
++        index = names.index(joint)
++        sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site)
++        if sid < 0:
++            raise ValueError(f"missing robot calibration site: {site}")
++        offset = motion.rest_rotations[index].T @ rest.site_xmat[sid].reshape(3, 3)
++        targets.append(motion.rotations[:, index] @ offset)
++        sites.append(sid); site_names.append(site)
++    from scipy.spatial.transform import Rotation
++    source_left = motion.rest_positions[names.index("L_Shoulder")] - motion.rest_positions[names.index("R_Shoulder")]
++    robot_left = rest.site_xpos[sites[3]] - rest.site_xpos[sites[6]]
++    if min(np.linalg.norm(source_left[:2]), np.linalg.norm(robot_left[:2])) < .05:
++        raise ValueError("unobservable neutral anatomical heading")
++    yaw = np.arctan2(source_left[1],source_left[0]) - np.arctan2(robot_left[1],robot_left[0])
++    heading = Rotation.from_euler("z",yaw).as_matrix()
++    free = np.flatnonzero(model.jnt_type == mujoco.mjtJoint.mjJNT_FREE)
++    if len(free) != 1:
++        raise ValueError("prepared motion requires one robot free root")
++    root_body = model.jnt_bodyid[free[0]]
++    root_rotation = motion.rotations[0,0] @ motion.rest_rotations[0].T @ heading @ rest.xmat[root_body].reshape(3,3)
++    root_quaternion = Rotation.from_matrix(root_rotation).as_quat(scalar_first=True)
++    # Height is measured from the native robot, never from a fitted SMPL shape.
++    robot_height = float(rest.site_xpos[sites[2], 2] - min(rest.site_xpos[sites[k], 2] for k in (11,12,15,16)))
++    cfg = resolve_solver_config("terra", raw | {"source_sole_offsets": motion.sole_offsets}).for_scene(
++        on_terrain=spec is not None and not spec.is_flat)
++    scene = _interaction_scene(None, spec, len(motion.positions), cfg, logger)
++    ctx = SolveContext(config=cfg, logger=logger, model=model, terrain=spec, fps=motion.fps,
++        joints_mapping=mapping, human_joints=motion.positions.copy(), smpl_rotations=motion.rotations.copy(),
++        scene=scene, source_joint_names=names, prepared_root_quaternion=root_quaternion,
++        prepared_orientation={"site_ids": np.array(sites), "targets": np.stack(targets, axis=1), "names": site_names})
++    assets = SimpleNamespace(base_env_name="MyoFullBody", fitted_shape_path=None)
++    setup = _configure_solver(ctx, env, robot_conf, assets, model.nq - 7, robot_height)
++    native = _solve(ctx, setup.retargeter, setup.foot_sticking, model.nq - 7)
++    native = repair_collisions(ctx, native, setup.selfpen_mode)
++    solved = _postprocess_solution(ctx, env, "MyoFullBody", setup.retargeter, native, setup.selfpen_mode)
++    analysis = _motion_analysis(ctx, setup.retargeter, native, solved, spec)
++    analysis.update(source_format="mhr", source_joint_names=names,
++                    site_calibration_version="myofullbody_mhr_sites_v1", reconstruction=reconstruction)
++    output = SimpleNamespace(trajectory=solved.trajectory, analysis=analysis, terrain=spec)
++    return apply_stability_policy(output, config=raw, retry=lambda overrides:
++        fit_prepared_motion(motion, robot_conf, logger, terrain=spec, config=overrides))

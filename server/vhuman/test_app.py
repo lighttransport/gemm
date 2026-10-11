@@ -174,6 +174,30 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.status_of(base + "/0123456789ab/evaluation.json"), 200)
         self.assertEqual(self.status_of(base + "/0123456789ab/rollout.npz"), 404)
 
+    def test_terra_catalog_and_public_terrain_boundary(self):
+        status, _, data = self.get("/v1/body/reference-motions?backend=terra")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data), {"available": False, "references": [], "backend": "terra"})
+        self.assertEqual(self.status_of("/v1/body/reference-motions?backend=unknown"), 404)
+        body = self.work / "heads/terratest/body"
+        body.mkdir(parents=True)
+        (body / "avatar.json").write_text("{}")
+        take = body / "motions/0123456789ab"; take.mkdir(parents=True)
+        (take / "manifest.json").write_text('{"id":"0123456789ab","accepted":false,"backend":"terra"}')
+        (take / "terrain.json").write_text('{"version":1,"units":"m","up_axis":"Y","boxes":[],"floor_height":0}')
+        (take / "solver-terrain.json").write_text('{"boxes":[]}')
+        base = "/v1/heads/terratest/body/motions"
+        listing = json.loads(self.get(base)[2])["motions"][0]
+        self.assertEqual(set(listing["urls"]), {"terrain"})
+        self.assertEqual(self.status_of(base + "/0123456789ab/terrain.json"), 200)
+        self.assertEqual(self.status_of(base + "/0123456789ab/solver-terrain.json"), 404)
+        status, _, result = self.post("/v1/jobs", {"kind":"body_motion","head_id":"terratest","backend":"terra",
+                                                  "reference_motion":"missing","terrain":"/etc/passwd"})
+        self.assertEqual(status, 202)
+        result = self.wait_job(json.loads(result)["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("server paths", result["error"])
+
     def test_face_video_upload_boundary(self):
         media = b"\x00\x00\x00\x18ftypisom" + bytes(16)
         req = urllib.request.Request(self.base + "/v1/rig/uploads", media,

@@ -86,6 +86,11 @@ python3 -m server.vhuman.cli --mock body --head HEAD_ID --quality preview
 
 ## Fit uploaded pose or motion
 
+For floor/step/ramp reconstruction and offline policy refinement with native
+MHR sources, see [Terra setup and motion validation](TERRA.md). The optional
+`terra` backend does not require SMPL body assets and keeps its Python stack
+separate from the existing MuscleMimic backend.
+
 Open `/rig`, select a head with a full body avatar, and choose a full-body
 PNG/JPEG/WebP image or MP4/WebM/MOV video in **Fit pose or motion**. The server
 stores at most 64 MiB per upload. For video it samples at 4 fps, up to 32

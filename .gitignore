@@ -397,3 +397,8 @@ ref/minimax_h3_native/*
 !ref/genia/*.py
 !ref/genia/*.json
 !ref/genia/*.md
+
+!ref/terra/
+!ref/terra/*.py
+!ref/terra/*.patch
+!ref/terra/*.md

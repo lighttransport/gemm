@@ -59,7 +59,7 @@ def proportions(positions, source_rest, target_rest):
     return out
 
 
-def contact_metrics(foot_positions, contacts, floor=0.0):
+def contact_metrics(foot_positions, contacts, floor=0.0, *, terrain=None):
     """Contact drift is distance from each stance's first sample, not velocity."""
     feet, mask = np.asarray(foot_positions), np.asarray(contacts, dtype=bool)
     if feet.shape[:2] != mask.shape or feet.shape[-1] != 3 or not np.isfinite(feet).all():
@@ -73,10 +73,17 @@ def contact_metrics(foot_positions, contacts, floor=0.0):
             else:
                 if anchor is None:
                     anchor = feet[i, j].copy()
-                drift.append(float(np.linalg.norm((feet[i, j] - anchor)[[0, 2]])))
+                delta = feet[i, j] - anchor
+                if terrain is None:
+                    distance = np.linalg.norm(delta[[0, 2]])
+                else:
+                    normal = terrain.sample(anchor)[1]
+                    distance = np.linalg.norm(delta - np.dot(delta, normal) * normal)
+                drift.append(float(distance))
     return {"stance_samples": len(drift),
             "stance_drift_p95_m": float(np.percentile(drift, 95)) if drift else None,
-            "ground_penetration_max_m": float(max(0, floor - np.min(feet[..., 1])))}
+            "ground_penetration_max_m": float(max(0, floor - np.min(feet[..., 1]))) if terrain is None else
+            float(max(0, -np.min(terrain.clearance(feet))))}
 
 
 class AvatarFeet:
@@ -130,6 +137,10 @@ class AvatarFeet:
         p, r, _ = fk.forward(fk.bind_params)
         rest = self.vertices(p, r)
         self.floor = float(np.min(rest[:, 1]))
+        # Fixed bind-sole vertices are pose-aware probes. A constant vertical
+        # ankle-to-sole offset is not a valid clearance probe once a foot rotates.
+        self.sole_probes = np.array([indices[np.argmin(rest[indices, 1])]
+            for k in range(4) for indices in [np.flatnonzero(self.labels == k)]])
         np.testing.assert_allclose(rest, vertices[selected], atol=2e-5,
                                    err_msg="foot skin inverse-bind mismatch")
 
@@ -202,21 +213,27 @@ class MHRKinematics:
         return xyz, mats, q
 
     def retarget(self, positions, matrices, contacts, times, *, source_rest, source_rest_matrices,
-                 source_params=None, skin=None):
+                 source_params=None, skin=None, terrain=None):
         """Fit body pose and stance constraints; return full MHR rotation tracks."""
         rest, rest_m, _ = self.forward(self.bind_params)
         target_rest, target_m = rest[self.sites], rest_m[self.sites]
+        source_feet = np.asarray(positions)[:, FEET].copy()
         positions = proportions(positions, source_rest, target_rest)
         # Keep the first horizontal root at the avatar's original location.
         offset = target_rest[0] - positions[0, 0]
         offset[1] = 0
-        positions += offset
+        if terrain is None:
+            positions += offset
         bind_floor = skin.floor if skin is not None else float(np.min(target_rest[FEET, 1]))
         feet_floor = 0.0
         # Site anchors have height above the sole. Calibrate that height once.
         sole_offsets = target_rest[FEET, 1] - bind_floor
         floor_shift = np.min(positions[:, FEET, 1] - sole_offsets) - feet_floor
-        positions[..., 1] -= floor_shift
+        if terrain is None:
+            positions[..., 1] -= floor_shift
+        else:
+            # World contact placement and terrain share the export transform.
+            positions[:, FEET] = source_feet
         orientations = matrices @ np.swapaxes(source_rest_matrices, -1, -2) @ target_m
         roots, rotations, fitted, errors, foot_track = [], [], [], [], []
         previous = self.bind_params.copy()
@@ -232,7 +249,7 @@ class MHRKinematics:
                 if contacts[i, k]:
                     if anchors[k] is None:
                         anchors[k] = target[j].copy()
-                        anchors[k][1] = feet_floor + sole_offsets[k]
+                        anchors[k][1] = (feet_floor if terrain is None else float(terrain.height_at(anchors[k]))) + sole_offsets[k]
                     target[j] = anchors[k]
                 else:
                     anchors[k] = None
@@ -253,28 +270,37 @@ class MHRKinematics:
                 weight = np.ones((len(self.sites), 1))
                 weight[FEET] = 1 + 9 * np.asarray(contacts[i])[:, None]
                 angle = Rotation.from_matrix(np.swapaxes(orientations[i], -1, -2) @ mat[self.sites]).as_rotvec()
-                return np.concatenate([(delta * weight).ravel(), .08 * angle.ravel(),
-                                       .005 * (x[:-3] - previous[self.active])])
+                residuals = [(delta * weight).ravel(), .08 * angle.ravel(),
+                             .005 * (x[:-3] - previous[self.active])]
+                if terrain is not None and skin is not None:
+                    vertices = skin.vertices(xyz, mat)
+                    clearance = terrain.clearance(vertices)
+                    low = np.array([np.min(clearance[skin.labels == k]) for k in range(4)])
+                    residuals.append(10 * np.minimum(low, 0))
+                    residuals.append(3 * np.asarray(contacts[i]) * low)
+                return np.concatenate(residuals)
             x0 = np.r_[previous[self.active], initial_root]
             result = least_squares(residual, x0, max_nfev=60, ftol=1e-5, xtol=1e-5, gtol=1e-5)
             base[self.active] = result.x[:-3]
             xyz, mat, q = self.forward(base, result.x[-3:])
             if skin is not None:
                 vertices = skin.vertices(xyz, mat)
-                skin_minimum = min(skin_minimum, float(vertices[:, 1].min()))
+                skin_minimum = min(skin_minimum, float(vertices[:, 1].min()) if terrain is None else float(terrain.clearance(vertices).min()))
                 skin_track.append(skin.centers(vertices))
             errors.append(float(np.sqrt(np.mean(np.sum((xyz[self.sites] - target)**2, axis=-1)))))
             roots.append(result.x[-3:]); rotations.append(q); fitted.append(base)
             feet = xyz[self.sites][FEET].copy()
             feet[:, 1] -= sole_offsets
+            if terrain is not None and skin is not None:
+                feet = vertices[skin.sole_probes].copy()
             foot_track.append(feet)
             previous = base
-        report = contact_metrics(np.array(foot_track), contacts, feet_floor)
+        report = contact_metrics(np.array(foot_track), contacts, feet_floor, terrain=terrain)
         report["site_fit_rms_m"] = float(np.sqrt(np.mean(np.square(errors))))
         if skin is not None:
-            skinned = contact_metrics(np.array(skin_track), contacts, feet_floor)
+            skinned = contact_metrics(np.array(skin_track), contacts, feet_floor, terrain=terrain)
             report["skin_stance_drift_p95_m"] = skinned["stance_drift_p95_m"]
-            report["skin_ground_penetration_max_m"] = max(0., feet_floor - skin_minimum)
+            report["skin_ground_penetration_max_m"] = max(0., (feet_floor if terrain is None else 0.) - skin_minimum)
         report["accepted"] = (report["stance_samples"] > 0 and report["stance_drift_p95_m"] <= .02
                               and report["ground_penetration_max_m"] <= .01 and report["site_fit_rms_m"] <= .05)
         if skin is not None:

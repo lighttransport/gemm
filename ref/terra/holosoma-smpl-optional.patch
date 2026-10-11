@@ -1,0 +1,14 @@
+--- a/src/holosoma_retargeting/holosoma_retargeting/src/utils.py
++++ b/src/holosoma_retargeting/holosoma_retargeting/src/utils.py
+@@ -10,7 +10,10 @@
+ from pathlib import Path
+ 
+ import numpy as np
+-import smplx  # type: ignore[import-not-found]
++try:
++    import smplx  # optional: licensed reference fitting only
++except ImportError:
++    smplx = None
+ import torch
+ import trimesh
+ from jinja2 import Template

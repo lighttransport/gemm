@@ -355,7 +355,7 @@ class EyeService:
                 base = f"/v1/heads/{hid}/body/motions/{take}/"
                 manifest["urls"] = {key: base + filename for key, filename in
                     (("motion", "motion.json"), ("glb", "motion.glb"), ("baseline", "baseline.json"),
-                     ("baseline_glb", "baseline.glb"), ("evaluation", "evaluation.json"))
+                     ("baseline_glb", "baseline.glb"), ("evaluation", "evaluation.json"), ("terrain", "terrain.json"))
                     if (path.parent / filename).is_file()}
                 out.append(manifest)
             except (ValueError, ServiceError):

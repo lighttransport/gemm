@@ -218,7 +218,9 @@ class App:
                         model_dir=getattr(args, "sam3d_body_model", body_job.MODEL_DIR), mock=args.mock,
                         musclemimic_python=getattr(args, "musclemimic_python", None),
                         musclemimic_assets=getattr(args, "musclemimic_assets", None),
-                        musclemimic_device=getattr(args, "musclemimic_device", "cpu")),
+                        musclemimic_device=getattr(args, "musclemimic_device", "cpu"),
+                        terra_python=getattr(args, "terra_python", None), terra_assets=getattr(args, "terra_assets", None),
+                        terra_device=getattr(args, "terra_device", "cpu")),
             "rig_speech": lambda req, prog, cancel: rig_speech.speech_job(
                 self.service, req, prog, cancel, model=getattr(args, "tts_model", None) or rig_speech.DEFAULT_MODEL,
                 aligner=getattr(args, "aligner", None) or rig_speech.DEFAULT_ALIGNER,
@@ -367,6 +369,14 @@ def make_handler(app: App, quiet: bool = False):
                 if path == "/v1/heads":
                     return self._json(200, {"heads": app.service.list_heads()})
                 if path == "/v1/body/reference-motions":
+                    from urllib.parse import parse_qs, urlsplit
+                    backend = parse_qs(urlsplit(self.path).query).get("backend", ["musclemimic"])[0]
+                    if backend == "terra":
+                        from .body.terra import catalog as terra_catalog
+                        return self._json(200, terra_catalog(getattr(app.args, "terra_assets", None),
+                                                            getattr(app.args, "terra_python", None)))
+                    if backend != "musclemimic":
+                        raise ServiceError("unknown reference motion backend")
                     from .body.musclemimic import catalog
                     return self._json(200, catalog(getattr(app.args, "musclemimic_assets", None),
                                                    getattr(app.args, "musclemimic_python", None)))
@@ -525,6 +535,8 @@ def main(argv=None) -> int:
                     help="local SAM 3D Body checkpoint directory")
     from .body.musclemimic import add_arguments as musclemimic_arguments
     musclemimic_arguments(ap)
+    from .body.terra import add_arguments as terra_arguments
+    terra_arguments(ap)
     ap.add_argument("--sam3-model", default=None,
                     help="optional SAM 3 garment segmentation checkpoint")
     ap.add_argument("--clip-bpe", default=None,
