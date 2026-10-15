@@ -124,6 +124,19 @@ class NativeModelTest(unittest.TestCase):
         np.testing.assert_allclose(zero,np.load(refs/"reference_zero_face_vertices.npy"),atol=5e-3,rtol=0)
         self.assertGreater(float(np.max(np.abs(zero[2:]-vertices[2:]))),.01)
 
+    @unittest.skipUnless(os.environ.get("MHR_TEST_CUDA"), "set MHR_TEST_CUDA=1 for real CUDA inference")
+    def test_native_cuda_coefficients_and_metadata(self):
+        assets=Path(os.environ["MHR_TEST_ASSETS"])
+        refs=Path(os.environ["MHR_TEST_REFS"])
+        params=np.load(refs/"params.npy"); shape=np.load(refs/"shape.npy"); face=np.load(refs/"face.npy")
+        vertices,state,rig,report=mhr.decode(assets,params,shape,face,backend="cuda")
+        self.assertEqual(report["backend"],"cuda")
+        self.assertEqual(report["math"],"cuda_own_fp32")
+        self.assertGreater(report["resident_bytes"],0)
+        np.testing.assert_allclose(vertices,np.load(refs/"reference_vertices.npy"),atol=5e-3,rtol=0)
+        np.testing.assert_allclose(state,np.load(refs/"reference_skeleton.npy"),atol=1e-3,rtol=0)
+        self.assertEqual(len(rig["names"]),127)
+
     def test_runtime_environment_has_no_frameworks(self):
         if os.environ.get("MHR_REQUIRE_FRAMEWORK_FREE"):
             for name in ("torch","onnx","onnxruntime"):

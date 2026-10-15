@@ -72,7 +72,7 @@ static int mhr_cuda_init(mhr_cuda *c, sam3d_body_mhr_assets *a, int device_index
     CU_CHECK(cuDeviceGet(&device, device_index));
     CU_CHECK(cuCtxCreate(&c->context, 0, device));
     if (cu_compile_kernels_ex(&c->module, device, mhr_cuda_source,
-                             "mhr_decode.cu", 0, "mhr_decode", 0)) return -1;
+                             "mhr_decode.cu", 0, "mhr_decode", 0) < 0) return -1;
     CU_CHECK(cuModuleGetFunction(&c->matvec, c->module, "mhr_matvec_f32"));
     CU_CHECK(cuModuleGetFunction(&c->blend, c->module, "mhr_blend"));
     size_t width = S3DM_N_VERTS * 3 * sizeof(float);
