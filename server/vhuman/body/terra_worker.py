@@ -39,12 +39,15 @@ def run(request, installation, work):
     dt = apply_temporal_params(config)
     if abs(dt - .01) > 1e-8:
         raise ValueError("Terra policy must use the supported 100 Hz control rate")
+    infer_support = request.get('terrain','auto') == 'auto'
     if request.get("reference_motion"):
         item = reference(installation, request["reference_motion"])
-        source = decode_source(load_reference(item["path"], installation["mhr_fingerprint"]), Path(request["mhr_assets"]))
+        source = decode_source(load_reference(item["path"], installation["mhr_fingerprint"]), Path(request["mhr_assets"]),
+                               include_sole_vertices=infer_support)
         report = {"source": item, "root_motion": "reference"}
     else:
-        source, report = prepare_video(request["sidecars"], request["times"], Path(request["mhr_assets"]))
+        source, report = prepare_video(request["sidecars"], request["times"], Path(request["mhr_assets"]),
+                                       include_sole_vertices=infer_support)
         report["camera"] = request["camera"]
     np.savez(work / "source-mhr.npz", **{k:v for k,v in source.items() if isinstance(v, np.ndarray)})
     robot_conf = load_robot_conf_file("MyoFullBody")
@@ -79,6 +82,12 @@ def run(request, installation, work):
         chord = rest_p[toe] - rest_p[ankle]
         pitch[side] = float(np.degrees(np.arctan2(chord[2], np.linalg.norm(chord[:2]))))
     supplied = request.get("terrain", "auto")
+    if infer_support:
+        from .terra_support import flat_support_evidence
+        evidence = flat_support_evidence(source)
+        if evidence['qualified']:
+            supplied = 'flat'
+        report['terrain_selection'] = dict(requested='auto', selected=supplied, evidence=evidence)
     if isinstance(supplied, dict):
         supplied = validate_spec(supplied)
         for box in supplied["boxes"]:
@@ -206,6 +215,23 @@ def run(request, installation, work):
                  rest_matrices=rest_mat, **arrays)
     save("reference.npz", reference_frames)
     save("rollout.npz", frames)
+    from .tracking_diagnostics import measure
+    terminal = params.get('terminal_state_params', {})
+    landmark_names = list(LANDMARKS)
+    core = [landmark_names.index(n) for n in terminal.get('core_upper_body_sites',
+            ('upper_body_mimic', 'head_mimic', 'left_shoulder_mimic', 'right_shoulder_mimic'))]
+    included = [i for i, n in enumerate(landmark_names) if n not in (terminal.get('exclude_sites') or ())]
+    with np.load(work/'reference.npz', allow_pickle=False) as reference_track, \
+            np.load(work/'rollout.npz', allow_pickle=False) as rollout_track:
+        errors, tracking = measure(reference_track, rollout_track, core_sites=core, include_sites=included,
+            limits=dict(global_mpjpe_m=terminal.get('mean_site_deviation_threshold', .15),
+                        core_mpjpe_m=terminal.get('core_upper_body_mean_site_deviation_threshold', .15),
+                        root_angle_rad=terminal.get('root_orientation_threshold', 1.)))
+    np.savez(work/'tracking-errors.npz', times=np.arange(len(frames))*dt, **errors)
+    tracking['history_length'] = history
+    tracking['history_reset'] = 'upstream zero history with initial observation in last slot' if history > 1 else 'one observation'
+    tracking['final_info'] = {k: v.item() if hasattr(v, 'item') else v for k, v in info.items()
+                              if np.asarray(v).shape == () and np.asarray(v).dtype.kind in 'bifu'}
     pos = np.array([f["positions"] for f in frames])
     ref = np.array([f["positions"] for f in reference_frames[:len(frames)]])
     report.update(seed=request.get("seed", 0), policy_actions=request.get("policy_actions", "sampled"), termination=reason, completed=reason == "reference_end", frames=len(frames),
@@ -213,7 +239,7 @@ def run(request, installation, work):
                   cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES") if jax.devices()[0].platform == "gpu" else None,
                   relative_site_rms_m=float(np.sqrt(np.mean(((pos-pos[:, :1])-(ref-ref[:, :1]))**2))),
                   root_rms_m=float(np.sqrt(np.mean((pos[:, 0]-ref[:, 0])**2))),
-                  model={"nq": model.nq, "nv": model.nv, "actuators": model.nu},
+                  tracking=tracking, model={"nq": model.nq, "nv": model.nv, "actuators": model.nu},
                   checkpoint_configuration=OmegaConf.to_container(config, resolve=True))
     return report
 

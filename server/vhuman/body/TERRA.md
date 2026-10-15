@@ -145,6 +145,15 @@ rotation is `[x,y,z] -> [x,-z,y]`. Terra boxes use `pos`, `size` (half-extents),
 `yaw`, `pitch` and `name`. Video world motion is estimated, not measured; terrain
 or camera/contact inconsistency rejects the take rather than flattening it.
 
+For `auto`, posed native foot skin provides a conservative flat-floor check.
+Both feet must have at least five consecutive low-speed stance samples, and
+the lowest skin point of each whole foot must remain within 1 cm of the
+calibrated source floor during every qualifying stance. A raised heel with
+toes on the floor therefore does not create a step. Raised supports, ramps
+and insufficient observations retain the ordinary terrain reconstruction.
+The evidence and selected mode are saved as `terrain_selection`; explicit
+terrain requests are unchanged.
+
 Submit the existing `POST /v1/jobs` endpoint with:
 
 ```json
@@ -165,6 +174,14 @@ and activations, and reconstruction/stability/provenance reports. The policy
 runs once, with a recorded sampling seed, stopping on reference completion or
 the first failure. It never resets and stitches episodes or relaxes checkpoint
 tracking thresholds to obtain an accepted result.
+
+`tracking-errors.npz` records synchronous global/core mean site error and root
+orientation error over time. `simulation.json` includes their final values,
+checkpoint limits, initial pose/velocity differences, observation history
+length and terminal information. These are diagnostics only. In particular,
+the core upper-body threshold can terminate an episode while the global
+mean remains below its threshold. Mean and sampled actions can be compared
+with `--policy-actions` using the same reference and seed.
 
 Accepted `motion.json` uses the existing v2 local XYZW rotations and animated
 parent-local `mhr_root`. Its optional `terrain:"terrain.json"` links to transformed

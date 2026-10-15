@@ -64,13 +64,14 @@ def frozen_controls(assets):
     return np.any(abs(transform[:, :204].reshape(127, 7, 204)[:, [0, 1, 2, 6]]) > 1e-12, axis=(0, 1))
 
 
-def decode_source(data, assets):
+def decode_source(data, assets, *, include_sole_vertices=False):
     from scipy.spatial.transform import Rotation
     params, shape, times = data["model_params"], data["identity"], data["times"]
     frozen = frozen_controls(assets)
     if np.max(np.ptp(params[:, frozen], axis=0), initial=0) > 1e-4:
         raise ValueError("MHR segment translations and scales must be fixed for a take")
-    _, states, rig, _ = mhr.decode(assets, params, shape, skeleton_only=True, backend="cpu")
+    posed_vertices, states, rig, _ = mhr.decode(assets, params, shape,
+        skeleton_only=not include_sole_vertices, backend="cpu")
     sites = [rig["names"].index(n) for n in LANDMARKS.values()]
     root = rig["names"].index("mhr_root")
     positions = (states[:, sites, :3] - states[:, root:root+1, :3]) * .01 + data["root_world"][:, None]
@@ -87,10 +88,28 @@ def decode_source(data, assets):
         pitch[side] = float(np.degrees(np.arctan2(chord[1], np.linalg.norm(chord[[0, 2]]))))
     output_times = np.arange(int(times[-1] * 30 + 1e-6) + 1) / 30
     p, q = resample(times, positions, Rotation.from_matrix(matrices.reshape(-1, 3, 3)).as_quat().reshape(-1,17,4), output_times)
-    return {"positions": p, "matrices": Rotation.from_quat(q.reshape(-1,4)).as_matrix().reshape(-1,17,3,3),
+    result = {"positions": p, "matrices": Rotation.from_quat(q.reshape(-1,4)).as_matrix().reshape(-1,17,3,3),
             "rest_positions": rest_p, "rest_matrices": rest_m, "sole_offsets": offsets,
             "neutral_foot_pitch": pitch, "times": output_times,
             "params": np.stack([np.interp(output_times, times, c) for c in params.T], axis=-1)}
+    if include_sole_vertices:
+        selected, sides = [], []
+        neutral_vertices = vertices[0] * .01
+        for side_index, (side, ankle, toe) in enumerate((('l',11,12), ('r',15,16))):
+            leg = [j for j,n in enumerate(rig['names']) if n.startswith(f'mhr_{side}_')
+                   and any(part in n for part in ('lowleg','foot','ball'))]
+            strength = (rig['skin_weights'] * np.isin(rig['joint_indices'],leg)).sum(1)
+            distance = np.linalg.norm(neutral_vertices[:,None] - rest_p[[ankle,toe]],axis=-1)
+            ids = np.flatnonzero((strength > .5) & (distance.min(1) < .20)
+                                & (neutral_vertices[:,1] < rest_p[ankle,1] + .025))
+            if len(ids) < 6:
+                raise ValueError('native MHR source lacks observable foot skin')
+            selected.extend(ids); sides.extend([side_index]*len(ids))
+        world = (posed_vertices[:,selected] - states[:,root:root+1,:3])*.01 + data['root_world'][:,None]
+        flat = world.reshape(len(times),-1)
+        result['sole_vertices'] = np.stack([np.interp(output_times,times,c) for c in flat.T],axis=-1).reshape(-1,len(selected),3)
+        result['sole_sides'] = np.asarray(sides,np.int8)
+    return result
 
 
 def estimate_world_root(relative, camera, times, sole_offsets):
@@ -142,7 +161,7 @@ def estimate_world_root(relative, camera, times, sole_offsets):
                   "ground_datum_shift_m": -source_floor, "stance_samples": int(contact.sum())}
 
 
-def prepare_video(sidecars, times, assets):
+def prepare_video(sidecars, times, assets, *, include_sole_vertices=False):
     import json
     from scipy.spatial.transform import Rotation
     meta = [json.loads(Path(p).read_text()) for p in sidecars]
@@ -151,7 +170,7 @@ def prepare_video(sidecars, times, assets):
     frozen = frozen_controls(assets); params[:, frozen] = np.median(params[:, frozen], axis=0)
     zero = {"model_params": params, "identity": identity, "times": np.asarray(times),
             "root_world": np.zeros((len(times),3)), "mhr_fingerprint": asset_fingerprint(assets)}
-    source = decode_source(validate_source(zero), assets)
+    source = decode_source(validate_source(zero), assets, include_sole_vertices=include_sole_vertices)
     # Work at original timestamps for camera evidence, then use the existing
     # endpoint-bounded resampling for policy/animation tracks.
     _, states, rig, _ = mhr.decode(assets, params, identity, skeleton_only=True, backend="cpu")
@@ -167,6 +186,9 @@ def prepare_video(sidecars, times, assets):
     roots, report = estimate_world_root(relative, camera, times, [source["sole_offsets"][JOINT_NAMES[j]] for j in FEET])
     source["positions"] = source["positions"] @ align.as_matrix().T
     source["positions"] += np.stack([np.interp(source["times"],times,c) for c in roots.T],axis=-1)[:,None]
+    if 'sole_vertices' in source:
+        source['sole_vertices'] = source['sole_vertices'] @ align.as_matrix().T
+        source['sole_vertices'] += np.stack([np.interp(source['times'],times,c) for c in roots.T],axis=-1)[:,None]
     source["matrices"] = align.as_matrix() @ source["matrices"]
     source["rest_positions"] = source["rest_positions"] @ align.as_matrix().T
     source["rest_matrices"] = align.as_matrix() @ source["rest_matrices"]
