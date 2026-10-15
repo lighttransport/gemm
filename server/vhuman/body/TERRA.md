@@ -22,7 +22,9 @@ python3 ref/terra/setup.py --root tmp/terra-runtime --install
 
 The installer stages immutable Terra, MuscleMimic and Holosoma revisions,
 applies the two maintained patches in `ref/terra/`, and installs the upstream
-locked package closure without `smplx`. It uses Python 3.11 and repository-local
+locked package closure without `smplx`, overriding OpenCV to 4.13.0.92 for the
+HOG person detector used by video preflight (OpenCV 5 lacks that Python API).
+The upstream source and lockfile remain unchanged. It uses Python 3.11 and repository-local
 temporary/cache directories. The lockfile selects PyTorch CUDA 12.6 on Linux
 x86-64 even for CPU inference; allow about 8 GB for the environment. It does
 not download any model, policy checkpoint or motion recording.
@@ -91,6 +93,27 @@ The source interval is at most eight seconds and 5–240 samples; the archive
 and its expanded arrays are limited to 4 MiB. World-root positions replace
 decoded root translations. They are not camera translations or parent-local
 animation translations. References must already have a calibrated ground datum.
+
+Existing short BVH recordings with the Mixamo anatomical joint names can be
+converted with the native fixed-identity MHR fitter:
+
+```sh
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+tmp/vhuman-cuda-venv/bin/python -m server.vhuman.body.bvh_reference \
+  --source /path/to/walk.bvh --avatar /path/to/avatar-directory \
+  --mhr-assets /path/to/native/mhr/assets --out tmp/walk-reference \
+  --source-url SOURCE_URL --terms-url TERMS_URL
+```
+
+The importer accepts 5–240 frames spanning at most eight seconds, preserves
+declared Euler channel order and defaults to centimetres (`--unit-scale .01`).
+It records source/output hashes, anatomical mapping, stature scaling and
+contact/skin fitting metrics in `provenance.json`. The BVH importer assumes
+a flat floor and fits pose-aware sole constraints against actual avatar skin.
+Inspect `fitting.accepted`
+and review the motion before registering `reference.npz`. This is an input
+conversion, not a policy rollout or proof of motion quality. Keep recordings
+and derived references outside source control with their source terms.
 
 ```sh
 tmp/terra-runtime/venv/bin/python -m server.vhuman.body.terra_assets add-reference \
