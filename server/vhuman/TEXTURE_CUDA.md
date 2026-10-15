@@ -95,6 +95,12 @@ exact. The bake records `partial_views`, `generated_views` and the source
 base-color hash. This supports a controlled single-view step-count comparison
 without presenting unseen surfaces as generated coverage.
 
+`bake --feather-mm 30` widens the metric blend next to photographed skin;
+the default remains 10 mm. The chosen width is recorded as
+`observed_boundary_feather_mm`. Wider blending can reduce a generated tone
+discontinuity while leaving measured pixels exact; inspect matched views
+because seam energy alone does not establish likeness or whole-head quality.
+
 The local comparison selects raw/original for the complete trial. Reuse its
 already-generated right view and generate only front/left:
 

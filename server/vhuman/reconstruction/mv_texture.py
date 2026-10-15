@@ -211,7 +211,9 @@ def fuse(colors, weights):
 
 
 def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_band=True, band_sigma=4.,
-         exclude_clothing=True, parsing_model=None):
+         exclude_clothing=True, parsing_model=None, feather_mm=10.):
+    if not np.isfinite(feather_mm) or feather_mm <= 0:
+        raise ValueError('photographed-boundary feather must be finite and positive')
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
     info=json.loads((work/backend/'generation.json').read_text())
     for name,digest in info['views'].items():
@@ -368,7 +370,7 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
     both=seen&(support>.05)
     gain=np.median(linear[both],0)/np.maximum(np.median(gen[both],0),1e-6) if both.sum()>500 else np.ones(3)
     gen=np.clip(gen*gain*local_gain(points,linear,gen*gain,both),0,1)
-    blend=skin.unseen_weight(points,seen,distance=.01)*np.clip(support/.05,0,1)
+    blend=skin.unseen_weight(points,seen,distance=feather_mm*.001)*np.clip(support/.05,0,1)
     colour=linear*(1-blend[:,None])+gen*blend[:,None]
     result=base.copy()
     result[valid]=np.uint8(np.clip(linear_to_srgb(colour)*255+.5,0,255))
@@ -383,7 +385,7 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
     Image.fromarray(np.uint8(np.clip(sup*.25,0,1)*255+.5)).save(out/'skin_generated_support.png')
     multi=count>=2
     report=dict(schema='vhuman.synthetic_skin_completion.v1',method='mv_texture',backend=backend,
-        partial_views=partial,generated_views=[v['name'] for v in views],
+        partial_views=partial,generated_views=[v['name'] for v in views],observed_boundary_feather_mm=feather_mm,
         source_geometry_sha256=record['geometry_sha256'],source_basecolor_sha256=sha256(candidate/'skin_basecolor.png'),
         unsupported_surfaces_preserved=partial,work=str(work.resolve()),
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
@@ -550,6 +552,7 @@ def main():
     p.add_argument('--offload-blocks',type=int,default=0,help='GGUF transformer blocks per CPU offload group; 0 keeps DiT resident')
     p.add_argument('--portrait-mode',choices=('raw','matted'),default='matted')
     p.add_argument('--prompt-recipe',choices=('original','bare-skin'),default='bare-skin')
+    p.add_argument('--feather-mm',type=float,default=10.,help='bake blend width beside photographed skin, in millimetres')
     p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--one-band',action='store_true');p.add_argument('--spec',default=DEFAULT_HYBRID);p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
@@ -573,7 +576,7 @@ def main():
         print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,editor,
             **({'steps':a.steps} if a.steps else {})),indent=1))
     if a.stage=='compose':print(json.dumps(compose(a.work,a.spec,a.backend if a.backend.startswith('hybrid') else 'hybrid',require_approved_edits=a.require_approved_edits),indent=1))
-    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band,parsing_model=a.parsing_model),indent=1))
+    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band,parsing_model=a.parsing_model,feather_mm=a.feather_mm),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
 

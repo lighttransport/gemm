@@ -192,7 +192,7 @@ class TextureContinuationTests(unittest.TestCase):
             (source/'generation.json').write_text(json.dumps(info))
             record=dict(candidate=str(candidate),resolution=48,geometry_sha256=manifest['geometry_sha256'])
             with patch.object(mv,'check',return_value=record),patch.object(mv,'conditions',return_value=(frame,views)):
-                report=mv.bake(work,'generated',work/'baked',exclude_clothing=False,delight=False)
+                report=mv.bake(work,'generated',work/'baked',exclude_clothing=False,delight=False,feather_mm=20.)
             result=np.asarray(Image.open(work/'baked/skin_basecolor.png'))
             np.testing.assert_array_equal(result[observed>0],base[observed>0])
             self.assertEqual(report['photographed_texels_changed'],0)
