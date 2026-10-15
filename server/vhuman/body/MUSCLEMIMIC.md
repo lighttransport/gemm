@@ -46,12 +46,20 @@ git clone https://github.com/amathislab/musclemimic tmp/musclemimic-upstream
 git -C tmp/musclemimic-upstream checkout 47b653db2bce25de834360d2ee6b2dd88142bd78
 git clone https://github.com/amathislab/gmr_plus tmp/vhuman-gmr-upstream
 git -C tmp/vhuman-gmr-upstream checkout 1b4eb9864360fa822b1290f34592da6393a4d496
-uv pip install --python tmp/vhuman-musclemimic-py312/bin/python \
-  torch==2.14.1+cpu --index-url https://download.pytorch.org/whl/cpu
-uv pip install --python tmp/vhuman-musclemimic-py312/bin/python \
-  -c server/vhuman/body/musclemimic-constraints.txt \
+uv pip install --python tmp/vhuman-musclemimic-py312/bin/python --no-deps \
+  -r server/vhuman/body/musclemimic-requirements.lock \
+  --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+uv pip install --python tmp/vhuman-musclemimic-py312/bin/python --no-deps \
   -e tmp/musclemimic-upstream -e tmp/vhuman-gmr-upstream
 ```
+
+Use the complete recorded closure rather than resolving current dependencies:
+Mink 1.3.0 metadata requests MuJoCo >=3.10, while this checkpoint requires 3.4.0.
+The lock preserves the tested worker's versions; the constraints file remains
+the registration doctor's critical-version contract. Validate the actual CPU
+policy/retargeting integration after installation. GMR imports the pinned SMPL-X
+Python package, but this workflow does not install or require SMPL model files.
+The separate Terra worker remains free of the `smplx` package.
 
 GMR imports Torch utilities even though this adapter feeds it native MHR
 transforms and requires no SMPL model files. Keep the framework environment

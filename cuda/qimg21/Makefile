@@ -2,6 +2,7 @@ PYTHON ?= ../../tmp/qimg21-ref-venv/bin/python
 CUDA_HOME ?= /usr/local/cuda-13.1
 PYTORCH_CUDA_HOME ?= ../../tmp/cuda130
 PYTORCH_SOURCE ?= ../../tmp/pytorch-src
+# Internal ATen headers live below aten/src in a fresh source checkout.
 FLASH_ATTN_SOURCE ?= ../../tmp/flash-attention-src
 TORCH_INCLUDE ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/torch/include
 CUDNN_ROOT ?= ../../tmp/qimg21-ref-venv/lib/python3.12/site-packages/nvidia/cudnn
@@ -36,7 +37,7 @@ libq21_fast_attention.so: fast_attention_plugin.cu $(PLUGIN_ARCH_STAMP) | verify
 	@test -f $(PYTORCH_SOURCE)/aten/src/ATen/native/transformers/cuda/mem_eff_attention/kernel_forward.h
 	@test -f $(FLASH_ATTN_SOURCE)/csrc/cutlass/include/cutlass/cutlass.h
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
-		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(PYTORCH_SOURCE) -I$(TORCH_INCLUDE) \
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(PYTORCH_SOURCE)/aten/src -I$(PYTORCH_SOURCE) -I$(TORCH_INCLUDE) \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
 
 libq21_fast_flash.so: fast_flash_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sources
@@ -88,7 +89,7 @@ libq21_cutlass_attention.so: cutlass_attention_plugin.cu $(PLUGIN_ARCH_STAMP) | 
 	@test -f $(PYTORCH_SOURCE)/aten/src/ATen/native/transformers/cuda/mem_eff_attention/kernel_forward.h
 	@test -f $(FLASH_ATTN_SOURCE)/csrc/cutlass/include/cutlass/cutlass.h
 	$(CUDA_HOME)/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr --shared -Xcompiler=-fPIC \
-		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(PYTORCH_SOURCE) -I$(TORCH_INCLUDE) \
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -I$(PYTORCH_SOURCE)/aten/src -I$(PYTORCH_SOURCE) -I$(TORCH_INCLUDE) \
 		-I$(FLASH_ATTN_SOURCE)/csrc/cutlass/include -o $@ $<
 
 libq21_flash_attention.so: flash_attention_plugin.cu $(PLUGIN_ARCH_STAMP) | verify-exact-sources

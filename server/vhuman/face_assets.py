@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import urllib.request
@@ -9,7 +10,7 @@ import uuid
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA = Path("/mnt/disk01/data/vhuman")
+DATA = Path(os.environ.get("VHUMAN_DATA_ROOT", "/mnt/disk01/data/vhuman"))
 LEGACY = ROOT / "tmp/vhuman-rig/models"
 PARSING_SHA256 = "0d9bd318e46987c3bdbfacae9e2c0f461cae1c6ac6ea6d43bbe541a91727e33f"
 PARSING_REVISION = "bfcc7d48ea8412d55de406cecf96b65b3ca720b2"

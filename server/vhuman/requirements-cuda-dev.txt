@@ -1,0 +1,32 @@
+# Shared CUDA rig, reconstruction, texture and browser development environment.
+# Keep the reference encoders and Edit-2511 pipeline at their recorded revisions.
+# Same encoder/pipeline pins as cuda/qimg21/reference-requirements.txt. Archive
+# URLs avoid downloading entire Git histories when bootstrapping a fresh node.
+torch==2.14.0+cu130
+torchvision==0.29.0+cu130
+numpy==2.5.3
+Pillow==12.3.0
+safetensors==0.8.0
+accelerate==1.15.0
+qwen-vl-utils==0.0.14
+diffusers @ https://github.com/huggingface/diffusers/archive/80c7ed262aeffbeb43ef13ae04baeb9b84515a69.tar.gz
+transformers @ https://github.com/huggingface/transformers/archive/c587bc884db2c2e31fc2b8102314656b17aa07b1.tar.gz
+scipy==1.18.1
+gguf==0.19.0
+onnxruntime==1.30.0
+opencv-python-headless==5.0.0.93
+timm==1.0.30
+kornia==0.8.3
+kornia-rs==0.2.0
+einops==0.8.2
+flatbuffers==25.12.19
+websockets==17.2
+trimesh==5.1.1
+xatlas==0.0.11
+usd-core==26.8
+OpenEXR==3.4.4
+mapbox-earcut==2.1.0
+psutil==7.2.2
+matplotlib==3.11.2
+easydict==1.13
+click==8.5.0
