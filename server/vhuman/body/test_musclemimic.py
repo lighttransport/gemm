@@ -93,6 +93,36 @@ class BodyPhysicalMotionTest(unittest.TestCase):
         result = proportions(rest[None], rest, target)[0]
         np.testing.assert_allclose(result, target)
 
+    def test_recorded_root_survives_competing_stance_anchors_and_parent_scale(self):
+        fk = MHRKinematics.__new__(MHRKinematics)
+        fk.root = 1
+        fk.sites = np.arange(1, 18)
+        fk.parents = np.r_[-1, 0, np.ones(16, dtype=int)]
+        fk.scales = np.r_[2., np.ones(17)]
+        fk.translations = np.random.default_rng(7).uniform(.1, .3, (18, 3))
+        fk.transform = np.zeros((18, 7, 1)); fk.transform[2, 5, 0] = 1
+        fk.prerot = Rotation.identity(18)
+        fk.bind_params = np.zeros(1); fk.active = np.array([0])
+        rest, matrices, _ = fk.forward(fk.bind_params)
+        times = np.arange(5)/30
+        targets = np.repeat(rest[None, fk.sites], 5, axis=0)
+        targets[:, :, 0] += np.arange(5)[:, None]*.02
+        arguments = dict(source_rest=rest[fk.sites], source_rest_matrices=matrices[fk.sites])
+        rotations = np.repeat(matrices[None, fk.sites], 5, axis=0)
+        contacts = np.ones((5, 4), bool)
+        _, roots, params, fixed = fk.retarget(targets, rotations, contacts, times,
+                                            preserve_root=True, **arguments)
+        world = np.array([fk.forward(p, r)[0][fk.root] for p, r in zip(params, roots)])
+        # The fitter can express the conflicting stance as residual error,
+        # rather than changing the recorded horizontal root trajectory.
+        np.testing.assert_allclose(np.diff(world[:, 0]), .02, atol=1e-12)
+        self.assertTrue(fixed['root_preserved'])
+        self.assertLess(fixed['root_target_max_error_m'], 1e-12)
+        self.assertAlmostEqual(fixed['fitted_root_max_speed_m_s'], .6)
+        _, _, _, fitted = fk.retarget(targets, rotations, contacts, times, **arguments)
+        self.assertFalse(fitted['root_preserved'])
+        self.assertGreater(fitted['root_target_max_error_m'], .01)
+
     def test_stance_drift_resets_on_swing(self):
         feet = np.zeros((5, 1, 3))
         feet[:, 0, 0] = [0, .01, .5, 1., 1.01]

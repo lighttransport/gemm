@@ -213,7 +213,7 @@ class MHRKinematics:
         return xyz, mats, q
 
     def retarget(self, positions, matrices, contacts, times, *, source_rest, source_rest_matrices,
-                 source_params=None, skin=None, terrain=None):
+                 source_params=None, skin=None, terrain=None, preserve_root=False):
         """Fit body pose and stance constraints; return full MHR rotation tracks."""
         rest, rest_m, _ = self.forward(self.bind_params)
         target_rest, target_m = rest[self.sites], rest_m[self.sites]
@@ -263,6 +263,8 @@ class MHRKinematics:
                 ancestor = int(self.parents[ancestor])
             initial_root = parent_rot.T @ (target[0] - parent_pos) / parent_scale
             def residual(x):
+                if preserve_root:
+                    x = np.r_[x, initial_root]
                 p = base.copy()
                 p[self.active] = x[:-3]
                 xyz, mat, _ = self.forward(p, x[-3:])
@@ -279,16 +281,17 @@ class MHRKinematics:
                     residuals.append(10 * np.minimum(low, 0))
                     residuals.append(3 * np.asarray(contacts[i]) * low)
                 return np.concatenate(residuals)
-            x0 = np.r_[previous[self.active], initial_root]
+            x0 = previous[self.active].copy() if preserve_root else np.r_[previous[self.active], initial_root]
             result = least_squares(residual, x0, max_nfev=60, ftol=1e-5, xtol=1e-5, gtol=1e-5)
-            base[self.active] = result.x[:-3]
-            xyz, mat, q = self.forward(base, result.x[-3:])
+            solution = np.r_[result.x, initial_root] if preserve_root else result.x
+            base[self.active] = solution[:-3]
+            xyz, mat, q = self.forward(base, solution[-3:])
             if skin is not None:
                 vertices = skin.vertices(xyz, mat)
                 skin_minimum = min(skin_minimum, float(vertices[:, 1].min()) if terrain is None else float(terrain.clearance(vertices).min()))
                 skin_track.append(skin.centers(vertices))
             errors.append(float(np.sqrt(np.mean(np.sum((xyz[self.sites] - target)**2, axis=-1)))))
-            roots.append(result.x[-3:]); rotations.append(q); fitted.append(base)
+            roots.append(solution[-3:]); rotations.append(q); fitted.append(base)
             feet = xyz[self.sites][FEET].copy()
             feet[:, 1] -= sole_offsets
             if terrain is not None and skin is not None:
@@ -297,6 +300,11 @@ class MHRKinematics:
             previous = base
         report = contact_metrics(np.array(foot_track), contacts, feet_floor, terrain=terrain)
         report["site_fit_rms_m"] = float(np.sqrt(np.mean(np.square(errors))))
+        world_roots = np.array([self.forward(p, r)[0][self.root] for p, r in zip(fitted, roots)])
+        report["root_preserved"] = bool(preserve_root)
+        report["root_target_max_error_m"] = float(np.linalg.norm(world_roots - positions[:, 0], axis=-1).max())
+        report["source_root_max_speed_m_s"] = float(np.linalg.norm(np.gradient(positions[:, 0], times, axis=0), axis=-1).max())
+        report["fitted_root_max_speed_m_s"] = float(np.linalg.norm(np.gradient(world_roots, times, axis=0), axis=-1).max())
         if skin is not None:
             skinned = contact_metrics(np.array(skin_track), contacts, feet_floor, terrain=terrain)
             report["skin_stance_drift_p95_m"] = skinned["stance_drift_p95_m"]

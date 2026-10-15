@@ -13,7 +13,7 @@ from .musclemimic_worker import configure_process, record_episode
 from .terra_assets import read_installation, reference
 
 
-def run(request, installation, work):
+def run(request, installation, work, *, prepared_source=None, source_provenance=None):
     import mujoco
     import jax
     import jax.numpy as jnp
@@ -22,7 +22,7 @@ def run(request, installation, work):
     from musclemimic.algorithms.ppo.inference import ObservationHistoryBuffer
     from musclemimic.runner.eval_utils import load_checkpoint, apply_temporal_params, align_agent_state
     from terra._musclemimic import load_robot_conf_file
-    from terra.prepared import PreparedMotion, fit_prepared_motion
+    from .terra_prepared import PreparedMotion, fit_prepared_motion
     from terra.rl import register_components
     from terra.rl.task_factory import TerraImitationFactory
     from terra.rl.trajectory import install_trajectory_stability
@@ -40,7 +40,12 @@ def run(request, installation, work):
     if abs(dt - .01) > 1e-8:
         raise ValueError("Terra policy must use the supported 100 Hz control rate")
     infer_support = request.get('terrain','auto') == 'auto'
-    if request.get("reference_motion"):
+    if prepared_source is not None:
+        if not source_provenance:
+            raise ValueError('prepared source requires explicit provenance')
+        source = prepared_source
+        report = {"source":source_provenance,"root_motion":"reference"}
+    elif request.get("reference_motion"):
         item = reference(installation, request["reference_motion"])
         source = decode_source(load_reference(item["path"], installation["mhr_fingerprint"]), Path(request["mhr_assets"]),
                                include_sole_vertices=infer_support)
@@ -93,8 +98,12 @@ def run(request, installation, work):
         for box in supplied["boxes"]:
             box["pos"] = (np.array(box["pos"]) * scale + translation).tolist()
             box["size"] = (np.array(box["size"]) * scale).tolist()
-    prepared = PreparedMotion(JOINT_NAMES, positions, rotations, rest_p, rest_r, 30., offsets, pitch)
-    result = fit_prepared_motion(prepared, robot_conf, logging.getLogger("terra"), terrain=supplied)
+    source_fps = float(source.get('fps', 30.))
+    prepared = PreparedMotion(JOINT_NAMES, positions, rotations, rest_p, rest_r, source_fps, offsets, pitch)
+    # Registered references carry an explicit world-root track. Keep that
+    # evidence in the constrained solve instead of fitting relative shape only.
+    result = fit_prepared_motion(prepared, robot_conf, logging.getLogger("terra"), terrain=supplied,
+                                 source_root_weight=1000. if prepared_source is not None or request.get("reference_motion") else 0.)
     from .terra_timing import control_trajectory
     result = control_trajectory(result, model0, robot_conf)
     from terra.contracts import RetargetResult
@@ -107,10 +116,13 @@ def run(request, installation, work):
     (work / "solver-terrain.json").write_text(json.dumps(terrain.to_dict(), indent=2, allow_nan=False))
     from .musclemimic_assets import sha256
     report.update(reconstruction=result.analysis["reconstruction"], stability=result.analysis["stability_check"],
+                  source_root_objective=result.analysis['source_root_objective'],
                   source_to_solver_scale=scale, source_to_solver_translation_m=translation.tolist(), robot_height_m=robot_height,
                   control_clock=result.analysis["control_clock"],
-                  source_time_offset_s=result.analysis["trim_start_frames"] / 30.)
+                  source_time_offset_s=result.analysis["trim_start_frames"] / source_fps)
     report["provenance"] = {"backend": "terra", "revisions": installation["revisions"], "patches": installation["patches"],
+        "source_root_objective":result.analysis['source_root_objective'],
+        "adapter_sha256":{name:sha256(Path(__file__).with_name(name)) for name in ('terra_prepared.py','terra_root.py')},
         "checkpoint_revision": installation["checkpoint_revision"], "checkpoint_terms_url": installation["checkpoint_terms_url"],
         "checkpoint_license_status": installation["checkpoint_license_status"],
         "mhr_fingerprint": installation["mhr_fingerprint"], "source_to_solver_scale": scale,
@@ -292,7 +304,7 @@ def export_tracks(request, work, simulation):
                 source_params = np.stack([np.interp(source_times,source["times"],c) for c in source["params"].T],axis=-1)
             rotations, roots, fitted, report = fk.retarget(positions,matrices,contacts,output_times,
                 source_rest=track["rest_positions"] * scale + offset, source_rest_matrices=track["rest_matrices"],
-                source_params=source_params,skin=skin,terrain=terrain)
+                source_params=source_params,skin=skin,terrain=terrain,preserve_root=True)
         reports[artifact] = report
         target = artifact if artifact == "baseline" else "candidate"
         provenance = {**simulation["provenance"], "physical_simulation": artifact == "motion",

@@ -261,3 +261,50 @@ acceptance criteria. A GPU upgrade alone has not been shown to fix this.
 Private receipts, action/observation traces, diagnostic scripts and the source
 recording provenance are under `tmp/vhuman-3070-next/`; the review entry point
 is `index.html`. Failed runs are retained and no moving take was promoted.
+
+### Source-root tracking and direct BVH continuation
+
+Registered references now add a source-root objective to the constrained
+Myo solve (weight 1000). Estimated video roots retain the previous objective.
+The first-party `terra_prepared.py` adapter reuses the pinned Terra solve,
+collision and stability stages without editing registered upstream sources.
+Reports record the objective and adapter hashes. Native avatar fitting keeps
+the simulated root fixed; incompatible feet remain fitting/contact errors.
+The existing world-root MHR importer remains available, but its intermediate
+pose fit can distort source dynamics and must still pass its own gates.
+
+For an explicit flat-ground BVH, the offline direct path avoids that
+intermediate fit. It calibrates segment lengths and sole offsets to the native
+avatar, preserves the declared source clock, and rejects source stance anchors
+above the existing 20 mm drift limit. It then runs the ordinary constrained
+policy and native avatar/skin acceptance checks:
+
+```sh
+. tmp/vhuman-dev/activate.sh
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 tmp/terra-runtime/venv/bin/python \
+  -m server.vhuman.body.terra_bvh \
+  --source tmp/vhuman-3070-followup/media/bvh/forward-walk.bvh \
+  --avatar tmp/terra-native-review/avatar-varied \
+  --mhr-assets /mnt/disk1/models/sam3d-body/safetensors \
+  --terra-assets tmp/vhuman-3070-followup/body/forward-flat-assets \
+  --out tmp/vhuman-3070-finalpass/walk-repeat \
+  --source-url 'https://github.com/rubenvillegas/cvpr2018nkn#test' \
+  --terms-url 'https://github.com/rubenvillegas/cvpr2018nkn/blob/master/LICENSE' \
+  --policy-actions mean --seed 0
+```
+
+Use a fresh output directory; raw media and derived data remain private.
+The command returns success only for an accepted native motion. On b550 it
+completed 280 snapshots / 2.79 s with the original checkpoint limits unchanged.
+Native motion skin drift was 6.48 mm, maximum skin penetration 0.508 mm,
+anatomical RMS 21.19 mm, and root target error zero. JSON/GLB tracks match.
+The matched direct-BVH baseline without the root objective failed at 0.97 s;
+with the objective it completes. A four-second stationary control also passes.
+
+This is a bounded walking fixture, not general motion-quality certification.
+The standing-to-walking clip still fails the source anchor gate (25.25 mm),
+and its diagnostic policy run remains incomplete. Fixed-root intermediate MHR
+imports also fail their original skeletal stance checks and are not registered.
+The old registered MHR forward reference still fails policy tracking; use the
+validated direct path for this recording. Review stride/hand appearance and
+single-view body texture limitations separately from numerical acceptance.
