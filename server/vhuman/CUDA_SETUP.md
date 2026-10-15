@@ -482,3 +482,40 @@ tmp/terra-runtime/venv/bin/python -m unittest \
 cuda/vhuman/bench_vhuman_deformer_cuda \
   tmp/vhuman-3070-quality/face-full/rig_deformer.safetensors 32
 ```
+
+### Moving tracking, shared texture and USD eyes (2026-10-16)
+
+The USD exporter now preserves masked corneal transmission, IOR and normal
+strength. In matched Blender Cycles renders, eye-region RGB RMSE against GLB
+fell from 63.26 to 14.65 on an 8-bit scale; the white-iris defect is fixed.
+LOD0/1/2 retain all nonmaterial prim attributes, animation and bindings
+(591/510/508 prims checked). Textures resolve and the regenerated USD archive
+validates. The local package is `tmp/vhuman-3070-next/face-usd/rig_usd.zip`.
+
+Moving-policy action traces match upstream deterministic inference exactly.
+Reset/noise, observation refresh, joint-equality and smoothing experiments did
+not produce a complete moving rollout. The platform control completes 0.93 s;
+lateral/forward mean rollouts still stop at 0.16/1.16 s. A newly located
+standing-to-walking recording also fails a direct BVH-to-Myo diagnostic at
+1.36 s, while its MHR import fails the original stance-drift gate. These
+results and the unmodified thresholds are detailed in [body/TERRA.md](body/TERRA.md).
+
+The experimental `qwen_edit_grid` backend generated front/right/back/left in
+one 40-step inference on the 3070. Generation took 1511.35 s (1580.97 s including
+loading), with peak CUDA allocated/reserved memory 1.845/2.354 GiB and host RSS
+47.663 GiB. The raw sheet is more uniform across views but loses realistic
+skin detail and paints pale, patterned stubble; it is not promoted. See
+[TEXTURE_CUDA.md](TEXTURE_CUDA.md) for reproduction and explicit pole inference.
+
+Checks pass 22 existing rig tests plus 19 texture/material tests. The private
+review entry point is `tmp/vhuman-3070-next/index.html`; `summary.json` retains
+the generated-view checks, bake metrics, policy outcomes and package receipts.
+Blackwell `sm_120` execution remains pending replacement of the 3070.
+
+```sh
+. tmp/vhuman-dev/activate.sh
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+"$PYTHON" -m unittest server.vhuman.test_rig -v
+"$PYTHON" -m unittest server.vhuman.test_mv_texture \
+  server.vhuman.test_texture_grid server.vhuman.test_rig_usd_materials -v
+```

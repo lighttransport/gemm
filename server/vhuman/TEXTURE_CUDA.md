@@ -112,6 +112,17 @@ geometry remain unchanged. The receipt distinguishes inferred texels from
 view support. Without this option, partial generations preserve unsupported
 surfaces. Review the six-view bake before promoting a generated material.
 
+The b550 3070 trial (2026-10-16, seed 371) retains the previous material.
+Four-view support covers 68.46% of unseen texels, versus 35.18% for the earlier
+right-only trial, with zero changed photographed texels. The 30 mm feathered
+boundary seam score is 0.02625 for the grid bake (input 0.02620), yet matched
+six-view renders show internal scalp/neck patches and pale patterned stubble.
+The raw sheet also smooths skin into a clay-like appearance. This illustrates
+why the photographed-boundary score cannot establish whole-head consistency
+or realism. Both conservative and inferred-pole variants remain rejected.
+The review and detailed receipts are `tmp/vhuman-3070-next/index.html` and
+`summary.json`; raw images, masks and all four protected composites are retained.
+
 A selected-view generation can also be baked directly with `bake --backend
 NAME`. The baker reads only views declared in its generation receipt and
 requires at least one horizontal view. With an incomplete set, unsupported
