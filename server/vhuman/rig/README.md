@@ -42,6 +42,36 @@ Eyelid coverage continues to use the base-colour alpha channel. This uses
 renderer optics can still differ from glTF. Shader-graph regressions run with
 `python -m unittest server.vhuman.test_rig_usd_materials` when `usd-core` is installed.
 
+For animated Blender imports, use the corrective-range wrapper:
+
+```sh
+. tmp/vhuman-dev/activate.sh
+"$VHUMAN_BLENDER" -b --python-exit-code 1 \
+  --python server/vhuman/rig/blender_usd.py -- \
+  --usd path/to/track.usda --out path/to/new-scene.blend
+```
+
+Use `--gltf path/to/animation.glb` instead of `--usd` for glTF. The wrapper
+expands imported shape-key slider ranges to their preserved animation curves,
+packs textures and refuses to overwrite an existing scene. It does not alter
+curve samples or source exports. Blender 5.2.2 imports clipped some signed
+and greater-than-one ML corrective weights in combined blink/gaze/jaw poses;
+neutral appearance alone did not expose all affected glTF shapes. The wrapper
+rejects curves beyond Blender's hard shape-key range rather than silently
+clipping them. Its evaluated-geometry regressions run inside Blender with
+`--python server/vhuman/test_blender_shape_ranges.py`.
+
+The b550 3070 stress check uses eight combined blink/gaze/jaw samples across
+all three LODs, under diffuse and oblique hard lighting (48 matched image
+pairs). After restoring ranges in both imports, evaluated USD/GLB coordinates
+agree within 0.57 micrometres. The eye-region RGB RMSE is 8.38–13.26 on an
+8-bit scale at 384 pixels / 16 Cycles samples; this measures renderer agreement,
+not anatomical or optical accuracy. Stock imports and corrected comparisons
+remain under `tmp/vhuman-3070-finalpass/eyes/`, with a packed `rig-stress.blend`.
+The clip preserves the source corrective animation; it does not add the native
+runtime's exact contact projection. Extreme lid/anatomy quality remains a
+separate visual review from interchange parity.
+
 ## Face topologies and anatomy
 
 `gnm_v3` is the default for new builds. Its Apache-2.0 model provides the
