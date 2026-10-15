@@ -32,6 +32,16 @@ def condition_size(size):
     plus.VAE_IMAGE_SIZE=size*size
 
 
+def prompt_images(pipe, images):
+    """Match Edit-Plus preprocessing before encoding prompts separately on CPU."""
+    import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus as plus
+    result=[]
+    for image in images:
+        width,height=plus.calculate_dimensions(plus.CONDITION_IMAGE_SIZE,image.width/image.height)
+        result.append(pipe.image_processor.resize(image,height,width))
+    return result
+
+
 def reference_areas(areas):
     """Per-image VAE areas for the next pipeline call (targets keep the output grid; references may be smaller).
 
@@ -103,9 +113,10 @@ class NativeEditor:
             reference_areas([ref_side*ref_side]*(len(images)-1)+[size*size])
         started=time.time();dit0=self.pipe.native.seconds
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
+        conditions=prompt_images(self.pipe,images)
         with torch.no_grad():
-            pos,pos_mask=self.pipe.encode_prompt(prompt=prompt,image=images,device=torch.device('cpu'))
-            neg,neg_mask=self.pipe.encode_prompt(prompt=negative,image=images,device=torch.device('cpu'))
+            pos,pos_mask=self.pipe.encode_prompt(prompt=prompt,image=conditions,device=torch.device('cpu'))
+            neg,neg_mask=self.pipe.encode_prompt(prompt=negative,image=conditions,device=torch.device('cpu'))
         # QIMG_ENCODER_DTYPE=fp32 only changes the encoder arithmetic (Zen 2 has no native BF16); embeddings go back to
         # BF16 so the pipeline sees exactly the dtypes of the identity-verified flow.
         pos,neg=pos.to(torch.bfloat16),neg.to(torch.bfloat16)
@@ -131,7 +142,8 @@ class Editor:
         if offload_blocks<0:raise ValueError('offload_blocks must be nonnegative')
         self.offload_blocks=offload_blocks
         self.metadata=dict(backend='gguf',model_root=str(model_root.resolve()),weights=weights.name,
-                           weights_sha256=sha256(weights),encoder_dtype='float32',offload_blocks=offload_blocks)
+                           weights_sha256=sha256(weights),encoder_dtype='float32',offload_blocks=offload_blocks,
+                           prompt_preprocessing='pipeline_condition_images')
         transformer=QwenImageTransformer2DModel.from_single_file(str(weights),
             quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
             config=str(model_root/'base'),subfolder='transformer',torch_dtype=torch.bfloat16,local_files_only=True)
@@ -165,10 +177,11 @@ class Editor:
         torch=self.torch;started=time.time();condition_size(size)
         torch.cuda.reset_peak_memory_stats()
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
+        conditions=prompt_images(self.pipe,images)
         with torch.no_grad():
             # Encode on CPU (encoder too large to share the GPU with the transformer).
-            pos,pos_mask=self._encode_prompt(prompt,images)
-            neg,neg_mask=self._encode_prompt(negative,images)
+            pos,pos_mask=self._encode_prompt(prompt,conditions)
+            neg,neg_mask=self._encode_prompt(negative,conditions)
         pos,neg=pos.to(torch.bfloat16),neg.to(torch.bfloat16)
         encode=time.time()-started
         print(f'[qwen_edit] prompt encode {encode:.1f}s; starting {steps} denoising steps',flush=True)
@@ -181,6 +194,7 @@ class Editor:
         torch.cuda.synchronize()
         total=time.time()-started
         self.last_metrics=dict(seconds=total,prompt_encode_seconds=encode,
+                               prompt_image_sizes=[list(i.size) for i in conditions],
                                peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                                peak_reserved_bytes=torch.cuda.max_memory_reserved())
         print(f'[qwen_edit] {self.last_metrics}',flush=True)

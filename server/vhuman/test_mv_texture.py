@@ -1,5 +1,6 @@
 """Multiview texture conditioning frames, projection visibility and fusion."""
 import unittest
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -85,6 +86,18 @@ class MultiviewTextureTests(unittest.TestCase):
         o=srgb_to_linear(out[...,1]/255);self.assertGreater(abs(o[60,60]-o[60,63]),.005)   # checker survives
 
 class TextureContinuationTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec('diffusers'), 'diffusers reference environment required')
+    def test_cpu_prompt_images_match_pipeline_condition_resolution(self):
+        from diffusers.image_processor import VaeImageProcessor
+        from .reconstruction.qwen_edit_backend import prompt_images
+        pipe=SimpleNamespace(image_processor=VaeImageProcessor())
+        originals=[Image.new('RGB',(344,408),'red'),Image.new('RGB',(1024,1024),'blue')]
+        prepared=prompt_images(pipe,originals)
+        self.assertEqual([image.size for image in prepared],[(352,416),(384,384)])
+        self.assertEqual([image.size for image in originals],[(344,408),(1024,1024)])
+        self.assertEqual(prepared[0].getpixel((0,0)),(255,0,0))
+        self.assertEqual(prepared[1].getpixel((0,0)),(0,0,255))
+
     def test_nvidia_auto_never_selects_hip_and_paths_are_explicit(self):
         from .reconstruction import qwen_edit_backend as edit
         with patch.dict('sys.modules',{'torch':SimpleNamespace(version=SimpleNamespace(hip=None))}), \
