@@ -219,6 +219,11 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
     if out.exists() and any(out.iterdir()):raise ValueError('bake output must be empty')
     geometry,base,observed=load(candidate)
     frame,views=conditions(candidate,record['resolution'])
+    all_views=len(views)
+    views=[v for v in views if f"view_{v['name']}.png" in info['views']]
+    if not views or not any(v['name'] not in POLAR_VIEWS for v in views):
+        raise ValueError('baking requires at least one declared horizontal generated view')
+    partial=len(views)!=all_views
     valid,points,normals=skin.atlas_surface(geometry,len(base))
     # source='raw': fuse each view's full editor output (<name>/edited.png) instead of the sequential
     # composite view_<name>.png, whose earlier-view regions are re-renders (hard commit seams). 'auto'
@@ -352,8 +357,9 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
                     side=side*amp;detail_gain=amp
                 high=share*high+(1-share)*side
         gen=np.clip(low+high,0,1)
-    gen,support=fill_unsupported(points,gen,support,seen)
-    if unseen is not None and unseen.any():
+    if not partial:
+        gen,support=fill_unsupported(points,gen,support,seen)
+    if not partial and unseen is not None and unseen.any():
         detail_src=work/backend/'back'/'edited.png'
         gen=fill_pole(points,normals,gen,support,seen,unseen,grazing_facing,
                       np.asarray(Image.open(detail_src).convert('RGB')) if detail_src.exists() else None)
@@ -377,7 +383,9 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
     Image.fromarray(np.uint8(np.clip(sup*.25,0,1)*255+.5)).save(out/'skin_generated_support.png')
     multi=count>=2
     report=dict(schema='vhuman.synthetic_skin_completion.v1',method='mv_texture',backend=backend,
-        source_geometry_sha256=record['geometry_sha256'],work=str(work.resolve()),
+        partial_views=partial,generated_views=[v['name'] for v in views],
+        source_geometry_sha256=record['geometry_sha256'],source_basecolor_sha256=sha256(candidate/'skin_basecolor.png'),
+        unsupported_surfaces_preserved=partial,work=str(work.resolve()),
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
         basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
         view_source=('raw edits' if use_raw else 'composites')+f', polar={polar_mode}'+(f', two-band sigma {band_sigma}' if two_band else ''),

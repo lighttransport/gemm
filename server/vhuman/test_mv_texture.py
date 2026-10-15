@@ -198,5 +198,43 @@ class TextureContinuationTests(unittest.TestCase):
             self.assertEqual(report['photographed_texels_changed'],0)
             self.assertEqual(sha256(work/'baked/geometry.npz'),manifest['geometry_sha256'])
 
+    def test_partial_bake_preserves_unseen_surface_and_photographed_pixels(self):
+        from .reconstruction import mv_texture as mv
+        from .reconstruction.observations import sha256
+        with tempfile.TemporaryDirectory() as tmp:
+            work=Path(tmp);candidate=work/'candidate';candidate.mkdir();source=work/'generated';source.mkdir()
+            geometry=sphere(8)
+            geometry['triangles']=geometry['triangles'][:,[0,2,1]]  # outward winding in Y-up
+            uv=np.array([[j/16,1-i/7] for i in range(8) for j in range(16)])
+            triangle_uvs=uv[geometry['triangles']]
+            wraps=np.ptp(triangle_uvs[:,:,0],axis=1)>.5
+            triangle_uvs[wraps,:,0]+=triangle_uvs[wraps,:,0]<.5
+            geometry['triangle_uvs']=triangle_uvs.astype(np.float32)
+            np.savez(candidate/'geometry.npz',**geometry)
+            base=np.full((16,16,3),(130,100,80),np.uint8)
+            observed=np.zeros((16,16),np.uint8);observed[:8]=255
+            Image.fromarray(base).save(candidate/'skin_basecolor.png');Image.fromarray(observed).save(candidate/'skin_coverage.png')
+            Image.new('RGB',(16,16)).save(candidate/'portrait.png')
+            manifest=dict(format='vhuman.reconstruction.v1',face_model='gnm_v3',material={},
+                geometry_sha256=sha256(candidate/'geometry.npz'),portrait_sha256=sha256(candidate/'portrait.png'))
+            (candidate/'manifest.json').write_text(json.dumps(manifest))
+            frame,views=cond.render_conditions(geometry,base/255,observed/255,48)
+            image=source/'view_right.png';Image.new('RGB',(48,48),(170,120,90)).save(image)
+            (source/'generation.json').write_text(json.dumps(dict(generator='test',license='test',views={image.name:sha256(image)})))
+            record=dict(candidate=str(candidate),resolution=48,geometry_sha256=manifest['geometry_sha256'])
+            with patch.object(mv,'check',return_value=record),patch.object(mv,'conditions',return_value=(frame,views)):
+                report=mv.bake(work,'generated',work/'baked',exclude_clothing=False,delight=False)
+            result=np.asarray(Image.open(work/'baked/skin_basecolor.png'))
+            np.testing.assert_array_equal(result[observed>0],base[observed>0])
+            valid,points,normals=mv.skin.atlas_surface(geometry,len(base))
+            right=[v for v in views if v['name']=='right']
+            _,weights=cond.project_views(frame,right,[np.full((48,48,3),170,np.uint8)],points,normals,min_facing=.05)
+            invisible=(weights[0]==0)&(observed[valid]==0)
+            self.assertGreater(int(invisible.sum()),0)
+            np.testing.assert_array_equal(result[valid][invisible],base[valid][invisible])
+            self.assertTrue(report['partial_views'])
+            self.assertEqual(report['generated_views'],['right'])
+            self.assertGreater(report['generated_texels'],0)
+
 
 if __name__=='__main__':unittest.main()

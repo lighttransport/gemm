@@ -86,6 +86,15 @@ sequential generation remains available. Generation folders must be fresh;
 use `--name` to retain all trials. Records include model hash, prompt and
 reference hashes, per-view seed, timing and peak allocated/reserved VRAM.
 
+A selected-view generation can also be baked directly with `bake --backend
+NAME`. The baker reads only views declared in its generation receipt and
+requires at least one horizontal view. With an incomplete set, unsupported
+surface texels retain the candidate's previous base color; completion from
+other views and pole filling are disabled. Photographed texels remain byte
+exact. The bake records `partial_views`, `generated_views` and the source
+base-color hash. This supports a controlled single-view step-count comparison
+without presenting unseen surfaces as generated coverage.
+
 The local comparison selects raw/original for the complete trial. Reuse its
 already-generated right view and generate only front/left:
 
