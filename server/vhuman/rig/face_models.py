@@ -38,6 +38,7 @@ class Source:
     provenance: dict
     eye_centers: np.ndarray | None = None
     expression_names: list[str] | None = None
+    lip_sides: np.ndarray | None = None  # +1 upper, -1 lower, 0 outside lip anatomy
 
 
 def fingerprint(source: Source) -> str:
@@ -169,6 +170,8 @@ def load(name: str, cache: Path | None = None) -> Source:
             vertices = z["template_vertex_positions"][ids].astype(np.float32)
             ib = z["vertex_identity_basis"][:170, ids].astype(np.float32)
             eb = z["expression_basis"][:, ids].astype(np.float32)
+            lip_sides = ((z['vertex_groups'][names.index('upper_lip'), ids] > .5).astype(np.int8)
+                         - (z['vertex_groups'][names.index('lower_lip'), ids] > .5).astype(np.int8))
             if len(eb) != len(z["expression_names"]):
                 raise ValueError("GNM expression basis/name dimension mismatch")
             return Source(name, vertices, tris, uv, ib, eb, {}, exterior[ids],
@@ -177,7 +180,7 @@ def load(name: str, cache: Path | None = None) -> Source:
                            "identity_dim": len(z["vertex_identity_basis"]),
                            "source": "https://huggingface.co/google/gnm-v3"},
                           eye_centers=z["template_joint_positions"][[3, 2]].astype(np.float32),
-                          expression_names=z["expression_names"].tolist())
+                          expression_names=z["expression_names"].tolist(), lip_sides=lip_sides)
     folder = _ict_path(cache)
     vertices, tris, uv = _obj(folder / "generic_neutral_mesh.obj")
     if len(vertices) != 26719:
@@ -255,6 +258,64 @@ def _map_values(values: np.ndarray, ids: np.ndarray, bary: np.ndarray) -> np.nda
     return np.einsum("vj,vjc->vc", bary, values[ids])
 
 
+def native_mouth_curves(src: Source, pos: np.ndarray, samples=33):
+    """Use native lip boundaries, rather than a photographed expression's seam."""
+    from .common import resample_polyline
+    def boundary(triangles):
+        edges = np.sort(np.concatenate([triangles[:, [0, 1]], triangles[:, [1, 2]],
+                                        triangles[:, [2, 0]]]), axis=1)
+        edges, count = np.unique(edges, axis=0, return_counts=True)
+        return edges[count == 1]
+    def chain(edges):
+        neighbors = {}
+        for a, b in edges:
+            neighbors.setdefault(int(a), []).append(int(b))
+            neighbors.setdefault(int(b), []).append(int(a))
+        ends = [j for j, links in neighbors.items() if len(links) == 1]
+        if len(ends) != 2 or any(len(links) > 2 for links in neighbors.values()):
+            raise ValueError('native lip boundary must be one open chain')
+        current = min(ends, key=lambda j: pos[j, 0]); order = [current]
+        previous = None
+        while True:
+            following = [j for j in neighbors[current] if j != previous]
+            if not following:
+                break
+            previous, current = current, following[0]
+            order.append(current)
+            if len(order) > len(neighbors):
+                raise ValueError('native lip boundary contains a cycle')
+        if len(order) != len(neighbors):
+            raise ValueError('disconnected native lip boundary')
+        return resample_polyline(pos[order], samples)
+    if src.lip_sides is None:
+        raise ValueError('native lip anatomy is unavailable')
+    exterior = boundary(src.triangles)
+    inner, outer = [], []
+    for side in (1, -1):
+        mask = src.lip_sides == side
+        opening = exterior[mask[exterior].all(1)]
+        lip_edges = boundary(src.triangles[mask[src.triangles].all(1)])
+        opening_set = set(map(tuple, opening))
+        outside = np.array([e for e in lip_edges if tuple(e) not in opening_set], dtype=np.int32)
+        inner.append(chain(opening)); outer.append(chain(outside))
+    return .5 * (inner[0] + inner[1]), outer[0], outer[1]
+
+
+def _surface_map(points, surface, triangles, source_sides=None, surface_sides=None):
+    ids, bary, distance = _closest_map(points, surface, triangles)
+    if source_sides is not None and surface_sides is not None:
+        for side in (1, -1):
+            selected = source_sides == side
+            labels = surface_sides[triangles] * side
+            allowed = (labels >= 0).all(1) & (labels > 0).any(1)
+            if selected.any():
+                if not allowed.any():
+                    raise ValueError('procedural surface lacks the matching lip anatomy')
+                ids[selected], bary[selected], distance[selected] = _closest_map(
+                    points[selected], surface, triangles[allowed])
+    return ids, bary, distance
+
+
 def _fit_identity(src: Source, target: np.ndarray, *, iterations: int = 3):
     from scipy.spatial import cKDTree
     fit_ids = np.flatnonzero(src.fit_mask)
@@ -322,7 +383,8 @@ def merged_influences(joints, weights, limit=4):
 
 
 def fit_and_transfer(src: Source, proc_pos: np.ndarray, proc_tris: np.ndarray,
-                     proc_shapes: dict, proc_joints: np.ndarray, proc_weights: np.ndarray, *, fitted=None):
+                     proc_shapes: dict, proc_joints: np.ndarray, proc_weights: np.ndarray, *, fitted=None,
+                     proc_lip_sides=None):
     from scipy.spatial import cKDTree
     if fitted is not None:
         pos, scale, R = fitted
@@ -350,7 +412,7 @@ def fit_and_transfer(src: Source, proc_pos: np.ndarray, proc_tris: np.ndarray,
         pos[fit] += correction
         interior = np.flatnonzero(~src.fit_mask)
         pos[interior] += .35 * disp[nearest_fit[interior]].mean(1)
-    ids, bary, error = _closest_map(pos, proc_pos, proc_tris)
+    ids, bary, error = _surface_map(pos, proc_pos, proc_tris, src.lip_sides, proc_lip_sides)
     shapes = {name: _map_values(delta, ids, bary).astype(np.float32)
               for name, delta in proc_shapes.items()}
     if src.name == "ict_facekit_light":
@@ -398,13 +460,23 @@ def fit_and_transfer(src: Source, proc_pos: np.ndarray, proc_tris: np.ndarray,
 
 
 def remap_contacts(viz: dict | None, proc_pos: np.ndarray, model_pos: np.ndarray,
-                   model_tris: np.ndarray) -> dict | None:
+                   model_tris: np.ndarray, *, proc_lip_sides=None, model_lip_sides=None) -> dict | None:
     if not viz:
         return None
     from scipy.spatial import cKDTree
     from . import contacts
     _, near_proc = cKDTree(proc_pos).query(model_pos)
     _, near_model = cKDTree(model_pos).query(proc_pos)
+    if proc_lip_sides is not None and model_lip_sides is not None:
+        # The two neutral lips can touch or cross slightly. A geometric nearest
+        # neighbor can reverse a contact pair even after semantic skin transfer.
+        for side in (1, -1):
+            procedural = np.flatnonzero(proc_lip_sides == side)
+            imported = np.flatnonzero(model_lip_sides == side)
+            if not len(procedural) or not len(imported):
+                raise ValueError('contact transfer lacks matching lip anatomy')
+            near_proc[imported] = procedural[cKDTree(proc_pos[procedural]).query(model_pos[imported])[1]]
+            near_model[procedural] = imported[cKDTree(model_pos[imported]).query(proc_pos[procedural])[1]]
     def region(old):
         return np.flatnonzero(np.isin(near_proc, np.asarray(old, np.int32))).tolist()
     out = {k: v for k, v in viz.items() if k not in

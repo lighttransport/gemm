@@ -11,7 +11,7 @@ import numpy as np
 from . import face_models, meshes, native, gltf, usd
 
 
-def simplify(positions, triangles, spacing, feature_points=None):
+def simplify(positions, triangles, spacing, feature_points=None, vertex_regions=None):
     p,t = np.asarray(positions),np.asarray(triangles)
     e = np.sort(np.concatenate((t[:,[0,1]],t[:,[1,2]],t[:,[2,0]])),axis=1)
     edges,counts = np.unique(e,axis=0,return_counts=True)
@@ -22,6 +22,11 @@ def simplify(positions, triangles, spacing, feature_points=None):
         distance,_ = cKDTree(feature_points).query(p)
         local_spacing[distance<.018] = spacing*.4
     key = np.column_stack((np.floor(p/local_spacing[:,None]).astype(np.int64),local_spacing<spacing))
+    if vertex_regions is not None:
+        regions = np.asarray(vertex_regions)
+        if regions.shape != (len(p),):
+            raise ValueError('LOD vertex regions must match source vertices')
+        key = np.column_stack((key, regions))
     _,group = np.unique(key,axis=0,return_inverse=True)
     # Every boundary vertex remains its own cluster.
     group[boundary] = group.max()+1+np.arange(len(boundary))
@@ -108,10 +113,16 @@ def export(levels, source, pos, shapes, joints, weights, contacts, mouth_parts, 
     for level in levels:
         start=time.perf_counter()
         q,tri,group,keep,row=simplify(pos,source.triangles,.003 if level==1 else .006,
-                                   pos[feature_ids] if len(feature_ids) else None)
+                                   pos[feature_ids] if len(feature_ids) else None,
+                                   vertex_regions=source.lip_sides)
         sh,J,W=transfer(group,shapes,joints,weights)
         uv = cluster_uvs(source.triangles,source.triangle_uvs,group,keep)
-        src=replace(source,vertices=q,triangles=tri,triangle_uvs=uv,fit_mask=np.ones(len(q),bool))
+        lip_sides = None
+        if source.lip_sides is not None:
+            lip_sides = np.zeros(len(q), np.int8)
+            lip_sides[group] = source.lip_sides  # every cluster has one anatomical label
+        src=replace(source,vertices=q,triangles=tri,triangle_uvs=uv,fit_mask=np.ones(len(q),bool),
+                    lip_sides=lip_sides)
         tmpl=face_models.as_template(src)
         split=meshes.unweld(tmpl,q)
         # Preserve source normal detail instead of shading coarse clusters flat.
@@ -127,7 +138,8 @@ def export(levels, source, pos, shapes, joints, weights, contacts, mouth_parts, 
         materials=asset.materials if level==1 else {k:dict(v,images={i:_limit_png(png,1024 if k=='skin' else 512)
             for i,png in v.get('images',{}).items()}) for k,v in asset.materials.items()}
         a=RigAsset(asset.skeleton,parts,materials,asset.rig,asset.info)
-        cv=face_models.remap_contacts(contacts,pos,q,tri) if contacts else None
+        cv=face_models.remap_contacts(contacts,pos,q,tri,proc_lip_sides=source.lip_sides,
+                                     model_lip_sides=lip_sides) if contacts else None
         viz=dict(parts={f'head_{p.name}':dict(vmap=p.vmap.tolist()) for p in split},contacts=cv,
                  welded_vertices=len(q),lod=level)
         (out/f'viz_lod{level}.json').write_text(json.dumps(viz,separators=(',',':')))

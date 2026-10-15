@@ -302,11 +302,21 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         cached = pickle.loads(cache.read_bytes())
         if len(cached[1].get("positions", ())) != tmpl.n:
             cached = None
+        elif fitted_source is not None and src.lip_sides is not None and (
+                cached[0].info.get('mouth_feature_source') != 'native_neutral_lips'
+                or cached[0].info.get('source_geometry_sha256') != manifest['geometry_sha256']):
+            cached = None
     if cached is not None:
         feat, fit = cached
         t = lap("fit_cache", t)
     else:
         feat = features.extract(subj)
+        if fitted_source is not None and src.lip_sides is not None:
+            feat.seam, feat.upper_lip, feat.lower_lip = face_models.native_mouth_curves(src, fitted_source[0])
+            feat.points['mouth_right'], feat.points['mouth_left'] = feat.seam[0].copy(), feat.seam[-1].copy()
+            feat.info.update(mouth_feature_source='native_neutral_lips',
+                             source_geometry_sha256=manifest['geometry_sha256'],
+                             mouth_width_m=float(np.linalg.norm(feat.seam[-1] - feat.seam[0])))
         t = lap("features", t)
         fit = register.fit(tmpl, subj, feat, iters=iters, log=log)
         import pickle
@@ -346,9 +356,15 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     source = None
     if face_model != "procedural":
         source = face_models.load(face_model)
+        lip_sides = np.zeros(tmpl.n, np.int8)
+        lip = (tmpl.group == 2) & (tmpl.sample != 0) & (tmpl.sample != template.MOUTH_HALF)
+        lip_sides[lip] = np.where(F.upper[lip], 1, -1)
         pos, shapes, Jn, W, source_stats = face_models.fit_and_transfer(
-            source, proc_pos, tmpl.tris[tmpl.tri_mat == 0], proc_shapes, proc_Jn, proc_W, fitted=fitted_source)
-        contacts_viz = face_models.remap_contacts(proc_contacts, proc_pos, pos, source.triangles)
+            source, proc_pos, tmpl.tris[tmpl.tri_mat == 0], proc_shapes, proc_Jn, proc_W, fitted=fitted_source,
+            proc_lip_sides=lip_sides)
+        contacts_viz = face_models.remap_contacts(proc_contacts, proc_pos, pos, source.triangles,
+                                                 proc_lip_sides=lip_sides,
+                                                 model_lip_sides=source.lip_sides)
         active_tmpl = face_models.as_template(source)
     else:
         active_tmpl = tmpl

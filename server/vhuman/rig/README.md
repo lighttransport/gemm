@@ -47,6 +47,15 @@ as LOD0; the fitted procedural mouth bag supplies the interior, and the
 existing procedural LOD1/2 provide lower-detail alternatives. `rig.json` and
 `rig_report.json` record the selected source and provenance.
 
+For reconstructed GNM subjects, the procedural scaffold uses the native neutral
+lip boundaries rather than the photographed mouth expression. Upper and lower
+lip labels constrain skinning, shape and contact transfer even when the neutral
+lips touch or cross slightly. Source LOD clustering keeps these anatomical
+regions separate. This prevents upper-lip skin from following the jaw across
+the mouth opening. Older fit caches without the native-lip geometry receipt
+are rebuilt. CUDA contact projection evaluates shared lip pairs in the same
+order as the CPU solver.
+
 Single-view subjects may not contain enough rear-head texture to cover a full
 GNM or ICT atlas. The baker extends measured skin pixels to unobserved UV
 texels and reports `inferred_texels` and `far_texels`; these counts indicate
