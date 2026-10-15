@@ -207,7 +207,17 @@ def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9,
         license='qwen-research',steps=steps,seed=seed,strength=strength,order=list(ORDER),seconds=seconds)
 
 
-def grid(candidate, frame, views, out, *, steps=12, seed=317, strength=.9):
+GRID_EDIT_PROMPT=('Picture 1 is the identity portrait. The LAST picture is a 2 by 2 sheet of four renders of '
+    'that same human head. Top left: front. Top right: right profile. Bottom left: BACK of the head, with '
+    'NO face, eyes, nose or mouth. Bottom right: left profile. Keep this exact sheet layout, all four cameras, '
+    'head silhouettes and gray backgrounds. Fill only the uniform beige skin with realistic, evenly lit skin '
+    'matching the portrait, natural ears and very short, fine salt-and-pepper scalp stubble. Use ONE consistent '
+    'skin tone and short haircut across all four views. No long or wavy hair, no clothing, no accessories. '
+    'Preserve existing textured face details. Diffuse albedo, no cast shadows or bright highlights.')
+
+
+def grid(candidate, frame, views, out, *, steps=12, seed=317, strength=.9, editor=None,
+         portrait_mode='raw', matte_model='/mnt/disk01/models/BiRefNet', cfg=4.):
     out=Path(out);out.mkdir(parents=True,exist_ok=True)
     names=('front','right','back','left');tiles=[next(v for v in views if v['name']==n) for n in names]
     sheet=np.zeros((1024,1024,3),np.uint8);mask=np.zeros((1024,1024),np.uint8)
@@ -216,18 +226,39 @@ def grid(candidate, frame, views, out, *, steps=12, seed=317, strength=.9):
         sheet[y*512:(y+1)*512,x*512:(x+1)*512]=np.asarray(Image.fromarray(v['rgb']).resize((512,512),Image.Resampling.LANCZOS))
         mask[y*512:(y+1)*512,x*512:(x+1)*512]=np.asarray(Image.fromarray(_mask(v)).resize((512,512),Image.Resampling.NEAREST))
     Image.fromarray(sheet).save(out/'grid_input.png');Image.fromarray(mask).save(out/'grid_mask.png')
-    receipt=skin.qwen_generate(out/'grid_edited.png',PROMPT+' The image is a 2x2 sheet of the same head: front, '
-        'right side, back, left side. Keep all four views consistent with each other.',
-        reference=out/'grid_input.png',init_image=out/'grid_input.png',mask=out/'grid_mask.png',
-        steps=steps,seed=seed,strength=strength,resolution=1024)
+    if editor is None:
+        receipt=skin.qwen_generate(out/'grid_edited.png',PROMPT+' The image is a 2x2 sheet of the same head: front, '
+            'right side, back, left side. Keep all four views consistent with each other.',
+            reference=out/'grid_input.png',init_image=out/'grid_input.png',mask=out/'grid_mask.png',
+            steps=steps,seed=seed,strength=strength,resolution=1024)
+        info=dict(generator='Qwen-Image-2.1 2x2 grid',license='qwen-research',steps=steps,seed=seed,
+                  strength=strength,seconds=receipt['seconds'])
+    else:
+        from .observations import sha256
+        from .qwen_edit_backend import LICENSE
+        if portrait_mode not in ('raw','matted'):raise ValueError('unknown portrait mode')
+        portrait=(matted_portrait(candidate,matte_model,strict=True) if portrait_mode=='matted'
+                  else np.asarray(Image.open(Path(candidate)/'portrait.png').convert('RGB')))
+        Image.fromarray(portrait).save(out/'portrait_reference.png')
+        negative=SEQ_NEGATIVE+', long hair, waves, curls, face on the back of the head, changed layout'
+        edited,took=editor([portrait,sheet],GRID_EDIT_PROMPT,steps=steps,seed=seed,cfg=cfg,size=1024,negative=negative)
+        Image.fromarray(edited).save(out/'grid_edited.png')
+        info=dict(generator=editor.generator+' joint four-view grid',license=LICENSE,steps=steps,seed=seed,
+                  cfg=cfg,seconds=took,portrait_mode=portrait_mode,prompt=GRID_EDIT_PROMPT,negative_prompt=negative,
+                  editor=getattr(editor,'metadata',{}),metrics=getattr(editor,'last_metrics',{}),
+                  input_sha256=sha256(out/'grid_input.png'),reference_sha256=sha256(out/'portrait_reference.png'),
+                  edited_sha256=sha256(out/'grid_edited.png'),grid_order=list(names),tile_size=512,
+                  shared_generation=True,chained=False,atlas_feedback=False)
     edited=np.asarray(Image.open(out/'grid_edited.png').convert('RGB'))
     res=views[0]['depth'].shape[0];images={}
     for i,v in enumerate(tiles):
         y,x=divmod(i,2)
         tile=np.asarray(Image.fromarray(edited[y*512:(y+1)*512,x*512:(x+1)*512]).resize((res,res),Image.Resampling.LANCZOS))
+        if editor is not None:
+            folder=out/v['name'];folder.mkdir(exist_ok=True)
+            Image.fromarray(tile).save(folder/'edited.png')
         m=_mask(v)>0;images[v['name']]=np.where(m[...,None],tile,v['rgb'])
-    return [images.get(v['name'],v['rgb']) for v in views],dict(generator='Qwen-Image-2.1 2x2 grid',
-        license='qwen-research',steps=steps,seed=seed,strength=strength,seconds=receipt['seconds'])
+    return [images.get(v['name'],v['rgb']) for v in views],info
 
 
 POLAR_PROMPT=('The LAST picture is a 3D render of the {where} of a bald human head, partly untextured (flat uniform '

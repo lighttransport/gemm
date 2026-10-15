@@ -235,6 +235,22 @@ class TextureContinuationTests(unittest.TestCase):
             self.assertTrue(report['partial_views'])
             self.assertEqual(report['generated_views'],['right'])
             self.assertGreater(report['generated_texels'],0)
+            self.assertEqual(report['inferred_texels'],0)
+            with patch.object(mv,'check',return_value=record),patch.object(mv,'conditions',return_value=(frame,views)):
+                with self.assertRaisesRegex(ValueError,'all four'):
+                    mv.bake(work,'generated',work/'invalid',complete_unseen=True)
+                for name in ('front','back','left'):
+                    Image.new('RGB',(48,48),(170,120,90)).save(source/f'view_{name}.png')
+                (source/'generation.json').write_text(json.dumps(dict(generator='test',license='test',
+                    views={p.name:sha256(p) for p in source.glob('view_*.png')})))
+                completed=mv.bake(work,'generated',work/'completed',exclude_clothing=False,delight=False,
+                                  complete_unseen=True)
+            result=np.asarray(Image.open(work/'completed/skin_basecolor.png'))
+            np.testing.assert_array_equal(result[observed>0],base[observed>0])
+            self.assertTrue(completed['complete_unseen'])
+            self.assertFalse(completed['unsupported_surfaces_preserved'])
+            self.assertGreater(completed['inferred_texels'],0)
+            self.assertEqual(sha256(work/'completed/geometry.npz'),manifest['geometry_sha256'])
 
 
 if __name__=='__main__':unittest.main()

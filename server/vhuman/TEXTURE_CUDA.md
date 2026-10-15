@@ -86,6 +86,32 @@ sequential generation remains available. Generation folders must be fresh;
 use `--name` to retain all trials. Records include model hash, prompt and
 reference hashes, per-view seed, timing and peak allocated/reserved VRAM.
 
+`qwen_edit_grid` offers a single Edit-2511 call for the four horizontal views.
+It places front/right/back/left in a 2×2 sheet with 512-pixel tiles and conditions
+that sheet on the same identity portrait. Raw quadrants are retained for
+inspection and baking; composites restore photographed pixels and backgrounds
+exactly. Shared generation encourages agreement but does not guarantee camera,
+hair or hidden-side identity fidelity. The default is 40 steps. It cannot be
+combined with `--views`, which selects independent edits.
+
+```sh
+# b550 / RTX 3070; use a fresh generation name and empty bake output.
+. tmp/vhuman-dev/activate.sh
+"$PYTHON" -m server.vhuman.reconstruction.mv_texture generate \
+  --work "$WORK" --backend qwen_edit_grid --name joint40 --steps 40 --seed 371 \
+  --portrait-mode raw --edit-backend gguf --edit-model-root "$MODEL" --offload-blocks 1
+"$PYTHON" -m server.vhuman.reconstruction.mv_texture bake \
+  --work "$WORK" --backend joint40 --out "$WORK/bake-joint40" \
+  --source raw --polar skip --feather-mm 30
+```
+
+Only four views are declared as generated. Add `--complete-unseen` to the bake
+to infer unseen poles from these views using nearest colour and world-space
+detail. This requires all four horizontal views; photographed pixels and
+geometry remain unchanged. The receipt distinguishes inferred texels from
+view support. Without this option, partial generations preserve unsupported
+surfaces. Review the six-view bake before promoting a generated material.
+
 A selected-view generation can also be baked directly with `bake --backend
 NAME`. The baker reads only views declared in its generation receipt and
 requires at least one horizontal view. With an incomplete set, unsupported

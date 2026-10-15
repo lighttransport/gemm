@@ -33,7 +33,7 @@ from .reference import srgb_to_linear, linear_to_srgb
 POLAR_VIEWS=('top','bottom')
 FACELESS_VIEWS=('back','top','bottom')
 DEFAULT_HYBRID='front=qwen_edit_seq:raw,right=qwen_edit_seq:raw,left=qwen_edit_seq:raw,back=mvadapter:view,top=mvadapter:view,bottom=mvadapter:view'
-BACKENDS=('mvadapter','qwen_seq','qwen_grid','qwen_edit_seq')
+BACKENDS=('mvadapter','qwen_seq','qwen_grid','qwen_edit_seq','qwen_edit_grid')
 RES=768
 
 
@@ -104,13 +104,17 @@ def generate(work, backend, *, selected_views=None, name=None, edit_backend=None
     elif backend in ('qwen_seq','qwen_grid'):
         from . import mv_qwen
         images,info=(mv_qwen.sequential if backend=='qwen_seq' else mv_qwen.grid)(candidate,frame,views,out,**options)
-    elif backend=='qwen_edit_seq':
+    elif backend in ('qwen_edit_seq','qwen_edit_grid'):
         from . import mv_qwen
         from .qwen_edit_backend import make_editor
         editor_options=dict(backend=edit_backend,offload_blocks=offload_blocks)
         if edit_model_root is not None:editor_options['model_root']=edit_model_root
         if editor is None:editor=make_editor(**editor_options)
-        if selected_views is not None:
+        if backend=='qwen_edit_grid':
+            views=[v for v in views if v['name'] not in POLAR_VIEWS]
+            images,info=mv_qwen.grid(candidate,frame,views,out,editor=editor,portrait_mode=portrait_mode,
+                **({'matte_model':matte_model} if matte_model is not None else {}),**{'steps':40,**options})
+        elif selected_views is not None:
             recipe=dict(portrait_mode=portrait_mode,prompt_recipe=prompt_recipe)
             if matte_model is not None:recipe['matte_model']=matte_model
             images,info=mv_qwen.selected(candidate,views,out,editor,**recipe,**{'steps':12,**options})
@@ -211,7 +215,7 @@ def fuse(colors, weights):
 
 
 def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_band=True, band_sigma=4.,
-         exclude_clothing=True, parsing_model=None, feather_mm=10.):
+         exclude_clothing=True, parsing_model=None, feather_mm=10., complete_unseen=False):
     if not np.isfinite(feather_mm) or feather_mm <= 0:
         raise ValueError('photographed-boundary feather must be finite and positive')
     record=check(work);work,out=Path(work),Path(out);candidate=Path(record['candidate'])
@@ -226,6 +230,8 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
     if not views or not any(v['name'] not in POLAR_VIEWS for v in views):
         raise ValueError('baking requires at least one declared horizontal generated view')
     partial=len(views)!=all_views
+    if complete_unseen and not set(('front','right','back','left')).issubset(v['name'] for v in views):
+        raise ValueError('unseen completion requires all four horizontal generated views')
     valid,points,normals=skin.atlas_surface(geometry,len(base))
     # source='raw': fuse each view's full editor output (<name>/edited.png) instead of the sequential
     # composite view_<name>.png, whose earlier-view regions are re-renders (hard commit seams). 'auto'
@@ -359,9 +365,11 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
                     side=side*amp;detail_gain=amp
                 high=share*high+(1-share)*side
         gen=np.clip(low+high,0,1)
-    if not partial:
+    completion=not partial or complete_unseen
+    inferred=(~seen)&(support<=.05) if completion else np.zeros_like(seen)
+    if completion:
         gen,support=fill_unsupported(points,gen,support,seen)
-    if not partial and unseen is not None and unseen.any():
+    if completion and unseen is not None and unseen.any():
         detail_src=work/backend/'back'/'edited.png'
         gen=fill_pole(points,normals,gen,support,seen,unseen,grazing_facing,
                       np.asarray(Image.open(detail_src).convert('RGB')) if detail_src.exists() else None)
@@ -387,7 +395,8 @@ def bake(work, backend, out, *, delight=True, source='auto', polar='auto', two_b
     report=dict(schema='vhuman.synthetic_skin_completion.v1',method='mv_texture',backend=backend,
         partial_views=partial,generated_views=[v['name'] for v in views],observed_boundary_feather_mm=feather_mm,
         source_geometry_sha256=record['geometry_sha256'],source_basecolor_sha256=sha256(candidate/'skin_basecolor.png'),
-        unsupported_surfaces_preserved=partial,work=str(work.resolve()),
+        unsupported_surfaces_preserved=partial and not complete_unseen,complete_unseen=complete_unseen,
+        inferred_texels=int((inferred&(blend>.01)).sum()),work=str(work.resolve()),
         generator=info['generator'],license=info['license'],synthetic=True,generation=info,
         basecolor_sha256=sha256(out/'skin_basecolor.png'),gain=gain.tolist(),delight=delight_report is not None,
         view_source=('raw edits' if use_raw else 'composites')+f', polar={polar_mode}'+(f', two-band sigma {band_sigma}' if two_band else ''),
@@ -553,6 +562,7 @@ def main():
     p.add_argument('--portrait-mode',choices=('raw','matted'),default='matted')
     p.add_argument('--prompt-recipe',choices=('original','bare-skin'),default='bare-skin')
     p.add_argument('--feather-mm',type=float,default=10.,help='bake blend width beside photographed skin, in millimetres')
+    p.add_argument('--complete-unseen',action='store_true',help='infer unseen poles from all four horizontal views; inferred colour is not an observation')
     p.add_argument('--no-delight',action='store_true');p.add_argument('--source',choices=('auto','raw','composite'),default='auto');p.add_argument('--polar',choices=('auto','skip','composite','raw'),default='auto');p.add_argument('--one-band',action='store_true');p.add_argument('--spec',default=DEFAULT_HYBRID);p.add_argument('--steps',type=int);p.add_argument('--seed',type=int,default=317)
     a=p.parse_args()
     if a.stage=='prepare':print(json.dumps(prepare(a.candidate,a.work),indent=1)[:400])
@@ -576,7 +586,7 @@ def main():
         print(json.dumps(mv_qwen.regen_polar(record['candidate'],frame,views,Path(a.work)/a.backend,editor,
             **({'steps':a.steps} if a.steps else {})),indent=1))
     if a.stage=='compose':print(json.dumps(compose(a.work,a.spec,a.backend if a.backend.startswith('hybrid') else 'hybrid',require_approved_edits=a.require_approved_edits),indent=1))
-    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band,parsing_model=a.parsing_model,feather_mm=a.feather_mm),indent=1))
+    if a.stage=='bake':print(json.dumps(bake(a.work,a.backend,a.out[0],delight=not a.no_delight,source=a.source,polar=a.polar,two_band=not a.one_band,parsing_model=a.parsing_model,feather_mm=a.feather_mm,complete_unseen=a.complete_unseen),indent=1))
     if a.stage=='eval':print(json.dumps(evaluate(a.work,a.out or []),indent=1))
 
 
