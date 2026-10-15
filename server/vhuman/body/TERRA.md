@@ -231,3 +231,33 @@ skin stance drift 1.72 mm, maximum penetration 0.127 mm and site-fitting RMS
 22.1 mm. Both final runs include animated GLB with the paired terrain geometry.
 Walking, real video terrain reconstruction and visual quality still
 need representative review.
+
+### Moving-policy follow-up on b550 / RTX 3070
+
+The 2026-10-16 CPU MuJoCo/JAX diagnostics retained the registered checkpoint,
+100 Hz clock and saved 0.15 m global/core and 1 rad root-angle limits. Mean
+actions matched upstream `make_policy_action_fn(deterministic=True)` exactly
+at every checked step, including the successful 0.93 s platform control.
+The lateral walk still failed at 0.16 s; the forward walk failed at 1.16 s
+on upper-body tracking (0.15152 m core error, 0.12189 m global error).
+
+Removing reset pose/velocity noise, disabling observation noise, refreshing
+MuJoCo derived state before observations, projecting joint equalities and
+smoothing the reference did not produce a complete moving rollout. Those
+experiments remain diagnostic and were not made production defaults. A direct
+BVH-to-Myo fit that bypassed the intermediate MHR fit also failed: 0.97 s for
+the forward walk and 1.36 s for an existing standing-to-walking recording.
+This does not establish whether retargeting, physical feasibility or the
+checkpoint's motion coverage is the principal remaining limitation.
+
+The standing-to-walking MHR import itself failed the unchanged 20 mm stance
+drift gate (24.43 mm skeletal drift; 7.26 mm skin drift). It was not registered
+as an accepted reference. Forward source root speed peaks at 0.958 m/s versus
+1.727 m/s after the current fitting chain, so preserving source dynamics and
+reviewing stance anchors remain useful next investigations. Inverse-dynamics
+residuals and normalized-feature outliers are diagnostic signals, not motion
+acceptance criteria. A GPU upgrade alone has not been shown to fix this.
+
+Private receipts, action/observation traces, diagnostic scripts and the source
+recording provenance are under `tmp/vhuman-3070-next/`; the review entry point
+is `index.html`. Failed runs are retained and no moving take was promoted.
