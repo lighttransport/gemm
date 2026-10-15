@@ -206,7 +206,8 @@ nothing. Every accepted take still requires perceptual review.
 ```sh
 TMPDIR="$PWD/tmp" tmp/terra-runtime/venv/bin/python -m unittest \
   server.vhuman.body.test_terra server.vhuman.body.test_motion \
-  server.vhuman.body.test_musclemimic -v
+  server.vhuman.body.test_musclemimic server.vhuman.body.test_bvh_reference \
+  server.vhuman.body.test_terra_support server.vhuman.body.test_tracking_diagnostics -v
 ```
 
 Portable tests cover reference bounds, camera/contact elevation preservation,

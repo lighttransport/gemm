@@ -382,3 +382,103 @@ or simulated motion is promoted. Remaining work is face mouth-interior quality,
 Edit skin appearance, moving-policy tracking and heel-lift terrain inference;
 it is not blocked by missing
 weights or 3070 memory. Blackwell validation still waits for the GPU replacement.
+
+## RTX 3070 quality fixes, 2026-10-16
+
+The native GNM mouth opening now uses neutral anatomical lip boundaries.
+Semantic upper/lower transfer prevents the slightly crossed neutral lips from
+exchanging skinning or contact assignments, and source LODs retain that split.
+Median upper-lip jaw influence fell from 0.8121 to 0.00390. Matched Blender
+CUDA GLB and USD renders show teeth and the open mouth instead of stretched
+upper-lip skin across the opening. USD eye/cornea material rendering still
+differs from GLB; this change does not establish complete material parity.
+
+Corrective training used 4096 samples, 96 PCA components and 2500 epochs;
+held-out correction error was 0.0078 mm mean / 0.1261 mm p99. The final GLB,
+USD archive and both LODs validate after a fresh export with verified
+unchanged training inputs.
+Twenty-seven named/random poses agree between CPU and CUDA within 1.35e-7 m
+at the existing 2e-6 m tolerance, and eight named poses pass contact checks.
+The new shared-vertex regression fails on the previous CUDA kernel and passes
+after ordering overlapping lip pairs like the CPU solver. With the concurrent
+Edit job active, the 32-frame native benchmark measured 0.867 ms of GPU kernels
+with contacts; this is an execution check, not an isolated speed benchmark.
+
+Terra now records synchronous global/core site and root-angle error traces,
+initial pose/velocity differences, history length and terminal information.
+Fixed-reference sampled/mean comparisons gave these failure times:
+
+| Recording | Sampled | Mean |
+|---|---:|---:|
+| Lateral walk | 0.13 s | 0.13 s |
+| Turn | 0.36 s | 0.50 s |
+| Forward walk, explicit flat floor | 1.88 s | 1.16 s |
+
+Root position and qvel match the reference at reset; joint noise is the saved
+checkpoint default. History length is one. All six runs still fail tracking.
+The mean forward run exceeds the 15 cm core upper-body limit while its global
+mean is 12.19 cm; the other five exceed the global limit. Mean actions do not
+provide a general fix. No acceptance threshold, reset behavior or physics was
+changed to obtain these results.
+
+For automatic terrain, posed whole-foot skin now guards against a heel lift
+being interpreted as a raised step. The lateral walk's false 11.7 cm box is
+removed; its retargeted baseline passes native skin acceptance, but the policy
+still fails at 0.16 s. A source translated onto a real 12 cm platform retains
+automatic box reconstruction (12.30 cm in solver scale), completes 94 policy
+snapshots / 0.93 s and passes native avatar acceptance: skin stance drift
+2.46 mm, penetration 0.143 mm and site fitting RMS 22.31 mm. Flat support is
+selected only when both feet have sustained observable stance and the posed
+skin stays within 1 cm of the calibrated source floor. Raised platforms,
+ramps and insufficient evidence keep the ordinary reconstruction.
+The turning clip also selects flat support and passes baseline fitting, but
+its policy still terminates at 0.36 s. All three corrected-terrain cases have
+matching JSON/GLB joint rotations, timestamps and animated root translations.
+
+The controlled Edit-2511 comparison repeats the independent right view with
+40 steps instead of 12: same 1024-square target, raw portrait, original prompt,
+negative prompt, CFG 4 and seed 318. The 40-step generation completed in
+1496.05 s (55.54 s CPU prompt encoding); the measured run including model
+loading and preparation took 1554.80 s. Peak CUDA allocated/reserved memory
+was 1.84/2.35 GiB and peak host RSS 47.81 GiB. The 3070 therefore runs this
+configuration with one offloaded transformer block and sufficient system RAM.
+Skin and ear detail improve substantially over the flat 12-step raw result;
+scalp hair remains stylized rather than the requested short stubble.
+
+Both step-count bakes preserve all 421,642 protected composite pixels,
+168,661 photographed atlas texels and 428,934 unsupported unobserved atlas
+texels byte-for-byte. Geometry is unchanged. The default 10 mm blend gives
+seam energy 0.026116 at 12 steps and 0.027402 at 40 steps, versus 0.026199 for
+the input. A separate fresh 40-step bake with `--feather-mm 30` reduces that
+score to 0.026320 (within 0.46% of the input), retaining 277,252 generated
+texels. The ordinary 10 mm default is unchanged. The 30 mm option and its
+value are included in the bake receipt. Raw foreground IoU decreases from
+0.9964 to 0.9831 at 40 steps; composite protection remains exact. Matched
+six-view renders still show incomplete scalp coverage, so neither single-view
+material is promoted as a complete whole-head appearance. The independent
+40-step image establishes detail quality and 8 GB execution, not new geometry
+or hidden-side likeness.
+
+Checks passed 22 existing rig tests, four anatomical-lip tests, one CUDA
+shared-contact test, 42 body tests and 14 texture tests (83 total). The private
+review is `tmp/vhuman-3070-quality/index.html`, with machine-readable receipts
+in `summary.json`. Generated appearance and moving-policy results are not
+promoted. Blackwell execution still requires the GPU replacement.
+
+Validation commands from the repository root (logs are retained in the review
+workspace):
+
+```sh
+. tmp/vhuman-dev/activate.sh
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+"$PYTHON" -m unittest server.vhuman.test_rig -v
+VHUMAN_TEST_CUDA=1 "$PYTHON" -m unittest \
+  server.vhuman.test_rig_cuda_contacts server.vhuman.test_rig_lips -v
+"$PYTHON" -m unittest server.vhuman.test_mv_texture -v
+tmp/terra-runtime/venv/bin/python -m unittest \
+  server.vhuman.body.test_terra server.vhuman.body.test_motion \
+  server.vhuman.body.test_musclemimic server.vhuman.body.test_terra_support \
+  server.vhuman.body.test_tracking_diagnostics server.vhuman.body.test_bvh_reference -v
+cuda/vhuman/bench_vhuman_deformer_cuda \
+  tmp/vhuman-3070-quality/face-full/rig_deformer.safetensors 32
+```
