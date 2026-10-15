@@ -87,7 +87,9 @@ The complete MuscleMimic closure is `body/musclemimic-requirements.lock`; its
 critical versions remain checked against `musclemimic-constraints.txt`. It is
 installed without dependency re-resolution because current Mink metadata
 requests a newer MuJoCo than the registered policy supports. The CPU integration
-suite checks the recorded combination. Terra retains its own upstream lock.
+suite checks the recorded combination. Terra retains its own upstream lock,
+with an install-time OpenCV 4.13.0.92 override. All three environments use
+OpenCV 4 for the video preflight HOG detector; OpenCV 5 lacks that Python API.
 
 Built components include CPU/CUDA face inference, landmarks, training and
 deformation; CPU/CUDA MHR decoding and SAM 3D Body inference; native depth;
@@ -297,3 +299,86 @@ MHR_TEST_REFS="$PWD/tmp/vhuman-mhr-cuda-check" MHR_TEST_CUDA=1 \
 ```
 
 The RTX 5060 Ti / `sm_120` checks still require the planned GPU replacement.
+
+## RTX 3070 follow-up, 2026-10-16
+
+The Edit-2511 conditioning failure above was traced to manual CPU prompt
+encoding. It used full-size images instead of the pinned EditPlus pipeline's
+384²-area condition images. Native and GGUF editors now use identical prompt
+image preprocessing while retaining the original VAE image inputs.
+
+The corrected 12-step run generated the intended isolated side head against
+gray, with foreground IoU 0.99625 against the conditioning silhouette. All
+53,767 protected portrait pixels remained byte-identical. Its skin is still
+flat/synthetic and has not been accepted as a replacement appearance. The
+13 texture tests passed, including the preprocessing regression. Overall
+execution took 540.01 seconds, with 488.68 seconds generation and 54.76 seconds
+CPU prompt encoding. Peak Torch allocation/reservation was 1.84/2.35 GiB and
+host RSS 46.73 GiB. Thread settings differ from the earlier run, so timing
+changes are not an isolated preprocessing benchmark. Receipts and images are
+under `tmp/vhuman-3070-followup/edit/`; the measured receipt is
+`tmp/vhuman-3070-followup/edit-conditioned-12.json`.
+
+The existing tr16 motion-retargeting checkout supplied two 60-frame, 30 Hz
+BVH recordings: Claire's `Walk Right` and `Turn 90 Left`. They contain 1.54 m
+travel and a 90° heading change respectively. The bounded importer agrees
+with the pinned GMR reader to 1.8e-15 m on global joint positions. Source and
+derived recordings stay under the ignored follow-up workspace with their
+CC-BY-NC source notice and provenance; no recording is committed.
+
+The full GNM fit converged in 26 evaluations, reducing its objective from
+0.46348 to 0.12703. Complete 17,821-vertex geometry passed finite-value and
+provenance checks. The 600-iteration CUDA rig registration reached 1.481 mm
+mean / 3.022 mm p95 distance. Full corrective training used 4,096 samples,
+96 PCA components and 2,500 epochs on the native CPU backend: held-out mean /
+p99 error was 0.0091 / 0.1493 mm. Rig construction took 1,110.56 seconds.
+
+The resulting 11,909-vertex, 149-morph native package passed the 32-frame
+three-mode CUDA benchmark (maximum error 1.49e-8 m), plus a 27-frame named /
+random-control comparison (maximum error 1.35e-7 m). GLB, USD skeleton and
+USD ZIP checks passed. Eight named poses had no measured eye/sphere/lip
+penetrations above 0.05 mm after exact projection. This does not establish
+continuous clearance. **Visual review failed:** open-jaw and tongue-out
+poses have severely stretched mouth-interior appearance. The fresh rig is a
+diagnostic candidate, not a replacement for the saved contact work. Review
+`tmp/vhuman-3070-followup/face-rig-check.json` and the new rig's `preview.png`.
+
+Moving-reference validation used existing tr16 recordings, without downloading
+motion data. Claire's lateral walk and 90° left turn passed native MHR input
+fitting and Terra baseline export checks. Their sampled-policy episodes
+(`seed=0`, 100 Hz CPU MuJoCo/JAX) stopped with `tracking_failure` after 0.13
+and 0.36 seconds of a 1.86-second reference. Both are rejected. Auto terrain
+inferred a 117 mm support block from the lateral walk's elevated ankle;
+the render retains that failed inference for review. The input BVH carries
+no measured terrain evidence.
+
+AJ's ordinary `Walking.bvh` supplied an additional 87-frame comparison. Its
+initial constant-offset foot fit exceeded the 10 mm skin-penetration gate
+(11.63 mm). The importer now calibrates a flat floor once after segment-length
+retargeting and applies the existing actual-sole constraints. Penetration fell
+to 0.55 mm, skin stance drift was 8.06 mm, and site-fitting RMS was 32.19 mm;
+the unchanged input gates passed. This flat-floor rollout stopped with
+`tracking_failure` after 1.88 of 2.76 seconds. Its baseline avatar export
+passed (skin stance drift 3.56 mm, penetration 0.166 mm, fitting RMS 19.94 mm).
+The simulated candidate additionally failed the 20 mm stance-drift gate at
+23.19 mm; skin-centroid drift was 5.73 mm and penetration 0.523 mm. This take
+is rejected too. No episode was reset/stitched and no threshold was relaxed.
+
+All 60 lateral-walk poses also passed native CPU/CUDA MHR mesh comparison:
+maximum difference 4.58e-5 cm, identical skeleton states, CUDA decode 0.210 s
+versus CPU 21.23 s. These are brief execution timings. Actual baseline and
+candidate JSON/GLB exports are checked for all 127 joint rotations, timestamps
+and animated root translations. Body regression checks passed 38 tests in the
+Terra interpreter; CUDA video/BVH checks passed 23, and MuscleMimic video
+checks passed 19. Both registered-worker doctors still verify. These BVH
+tests do not establish uploaded-video fitting quality or CUDA JAX inference.
+
+Private receipts, animated GLBs, Blender CUDA baseline renders and the review
+index are under `tmp/vhuman-3070-followup/`. `summary.json` records all three
+input fits, policy outcomes and interchange checks; `index.html` links the
+raw/composite edits, face pose sheet, body renders and diagnostic exports.
+No generated appearance, face rig
+or simulated motion is promoted. Remaining work is face mouth-interior quality,
+Edit skin appearance, moving-policy tracking and heel-lift terrain inference;
+it is not blocked by missing
+weights or 3070 memory. Blackwell validation still waits for the GPU replacement.
