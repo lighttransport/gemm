@@ -72,8 +72,9 @@ def main():
                 raise RuntimeError(f"BF16 matmul relative error {relative} exceeds .01")
             report["bf16_relative_l2"] = relative
             subprocess.run(["make", "-C", "cuda/vhuman", "test-training"], check=True)
+            subprocess.run([sys.executable, "-B", "-m", "server.vhuman.test_native_gpu_training",
+                            "--gpu", "-v"], check=True)
             subprocess.run([sys.executable, "-B", "-m", "unittest",
-                            "server.vhuman.test_native_gpu_training",
                             "server.vhuman.test_native_image_training"], check=True)
         from .reconstruction import mv_texture
         work = out / "edit"

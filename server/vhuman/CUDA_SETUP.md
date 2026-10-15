@@ -210,4 +210,90 @@ tmp/terra-runtime/venv/bin/python -B -m server.vhuman.body.terra_worker \
 Use a fresh `--work` directory for each take. Installation/download caches
 were reclaimed after checking that the environments have no runtime links
 into them; model data, source checkouts, receipts and generated scenes remain.
-GPU inference and GPU parity checks have not been run in this setup session.
+GPU checks were deferred during installation; the following section records
+the subsequent execution tests after the GPU was freed.
+
+## b550 GPU execution, 2026-10-16
+
+The RTX 3070 has 8 GiB VRAM and compute capability 8.6. Execution used the
+installed Torch 2.14.0/cu130 environment and CUDA 12.9 native runtime tools.
+
+The two-step Edit-2511 GGUF test completed the conditioning, CPU prompt
+encoding, block-offloaded denoising and 1024-square image decode. End-to-end
+validation took 335.61 seconds; generation took 256.54 seconds, including
+159.02 seconds for CPU prompt encoding. Peak PyTorch allocation was 1.91 GiB,
+reservation 2.43 GiB and host RSS 49.28 GiB. Its image remains noisy at two
+steps; this establishes execution and memory feasibility. Receipts and images
+are under `tmp/edit2511-8gb-smoke-20261016/`.
+
+The matching 12-step run completed in 690.88 seconds; generation took 617.54
+seconds, including 152.36 seconds of CPU prompt encoding. PyTorch GPU peaks
+were unchanged, and host RSS peaked at 49.55 GiB. **Visual quality failed:**
+the raw edit generated an unrelated scene containing people instead of
+completing the isolated head. The composite inherited that scene in unknown
+regions. All 53,767 protected photographed pixels remained byte-identical in
+both runs. This GGUF recipe needs conditioning/quality investigation before
+texture use; no generated image or fresh reconstruction was promoted.
+The full receipt is `tmp/edit2511-8gb-full-20261016/validation.json`.
+
+Native execution checks also passed:
+
+- Repository CUDA GEMM: all four transpose/tail cases, maximum absolute error
+  `2.13e-6` against double accumulation.
+- Six explicitly enabled CUDA training tests, including CPU/CUDA forward,
+  gradient and resident-Adam parity, memory budgets and framework-free export;
+  five native image-training tests.
+- Face deformer: 32 frames, 11,909 vertices and 52 morphs, all three modes;
+  maximum CPU/CUDA vertex difference `7.45e-9 m`.
+- MHR body decoding: CUDA mesh and CPU skeleton-only cases for batches 1/4/5
+  against an independent TorchScript reference. Maximum vertex error was
+  `1.06812e-4 cm`; CUDA model residency was 690,146,892 bytes. The production
+  Python adapter passed the additional real-CUDA regression test.
+- Fresh portrait reconstruction through the production CLI: GNM v3,
+  256-pixel material maps, ten fitting iterations, automatic parsing and no rig
+  rebuild. The reconstruction worker took 43.74 seconds, wrote finite
+  17,821-vertex complete anatomy and passed candidate hash validation. The
+  fitting objective fell from 0.46348 to 0.12702; the bounded fit did not
+  converge and is not an accepted replacement for the saved face candidate.
+
+Native reports and the fresh reconstruction are under
+`tmp/vhuman-cuda-execution-20261016/`; `summary.json` separates successful
+execution from failed visual quality, and `index.html` compares input, raw
+outputs and composite. The body test exposed and fixed a CUDA
+startup error: `cu_compile_kernels_ex` returns a positive SM number on success,
+which MHR had interpreted as failure. The `sm120` validator also now passes
+the explicit `--gpu` switch to the native training suite.
+
+The measured timings describe execution checks; other small validation jobs
+ran during preparation and CPU prompt encoding. Reproduce the native training
+and fresh portrait checks with:
+
+```sh
+. tmp/vhuman-dev/activate.sh
+make -C cuda/vhuman test-training
+"$PYTHON" -B -m server.vhuman.test_native_gpu_training --gpu -v
+"$PYTHON" -B -m unittest server.vhuman.test_native_image_training -v
+"$PYTHON" -B -m server.vhuman.cli --backend cuda \
+  --models-root "$VHUMAN_MODELS_ROOT" --rig-python "$PYTHON" \
+  --work tmp/vhuman-portrait-execution-check portrait-reconstruct \
+  --portrait tmp/vhuman-ear-synth/reconstruction_contact/portrait.png \
+  --face-model gnm_v3 --profile full --res 256 --iterations 10 --no-rig
+```
+
+Reproduce the body oracle and adapter check with fresh output:
+
+```sh
+. tmp/vhuman-dev/activate.sh
+"$PYTHON" -B ref/sam3d-body/verify_native_mhr.py \
+  --model "$VHUMAN_MODELS_ROOT/sam3d-body/dinov3/assets/mhr_model.pt" \
+  --assets "$VHUMAN_MODELS_ROOT/sam3d-body/safetensors" \
+  --runner cuda/sam3d_body/mhr_decode --backend cuda \
+  --pose-sidecar tmp/terra-native-review/avatar-varied/body_mhr.glb.json \
+  --out tmp/vhuman-mhr-cuda-check
+MHR_TEST_ASSETS="$VHUMAN_MODELS_ROOT/sam3d-body/safetensors" \
+MHR_TEST_REFS="$PWD/tmp/vhuman-mhr-cuda-check" MHR_TEST_CUDA=1 \
+  "$PYTHON" -B -m unittest \
+  server.vhuman.body.test_mhr.NativeModelTest.test_native_cuda_coefficients_and_metadata -v
+```
+
+The RTX 5060 Ti / `sm_120` checks still require the planned GPU replacement.
