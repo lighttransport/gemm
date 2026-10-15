@@ -78,15 +78,15 @@ def _material_usd(name, spec, tex_dir: Path, rel: str, tex_prefix: str = "") -> 
              '            def Shader "Surface"', "            {", '                uniform token info:id = "UsdPreviewSurface"']
     tex_nodes = []
 
-    def tex(slot, key, out_type="float3", channel="rgb"):
-        info = pbr.get(slot) if slot in pbr else g.get(slot)
+    def tex(slot, key, out_type="float3", channel="rgb", *, info=None, scale=None, bias=None):
+        info = info if info is not None else (pbr.get(slot) if slot in pbr else g.get(slot))
         if not info or int(info["index"]) not in imgs:
             return None
         fn = f"{tex_prefix}{name}_{slot}.png"
         data = imgs[int(info["index"])]
         (tex_dir / fn).write_bytes(data if isinstance(data, (bytes, bytearray)) else b"")
         node = f"Tex_{slot}"
-        tex_nodes.append((node, f"@{rel}/{fn}@", key))
+        tex_nodes.append((node, f"@{rel}/{fn}@", key, scale, bias))
         return f"</Character/Materials/{name}/{node}.outputs:{channel}>"
 
     c = tex("baseColorTexture", "diffuse")
@@ -117,21 +117,39 @@ def _material_usd(name, spec, tex_dir: Path, rel: str, tex_prefix: str = "") -> 
     n = tex("normalTexture", "normal")
     if n:
         lines.append(f"                normal3f inputs:normal.connect = {n}")
-    if "KHR_materials_transmission" in g.get("extensions", {}):
-        lines.append("                float inputs:opacity = 0.15")
+    transmission = g.get("extensions", {}).get("KHR_materials_transmission")
+    if transmission is not None:
+        # PreviewSurface opacity is the complement of glTF transmission. Keep
+        # the spatial mask: only the cornea is transparent, not the sclera.
+        factor = float(transmission.get("transmissionFactor", 0.))
+        opacity = tex("transmissionTexture", "opacity", channel="r",
+                      info=transmission.get("transmissionTexture"),
+                      scale=(-factor, -factor, -factor, 1), bias=(1, 1, 1, 0))
+        if opacity:
+            lines.append(f"                float inputs:opacity.connect = {opacity}")
+        else:
+            lines.append(f"                float inputs:opacity = {_f(1 - factor)}")
+    ior = g.get("extensions", {}).get("KHR_materials_ior", {}).get("ior")
+    if ior is not None:
+        lines.append(f"                float inputs:ior = {_f(ior)}")
     lines += ["                token outputs:surface", "            }"]
     lines += ['            def Shader "Reader"', "            {", '                uniform token info:id = "UsdPrimvarReader_float2"',
               '                string inputs:varname = "st"', "                float2 outputs:result", "            }"]
-    for node, path, semantic in tex_nodes:
+    for node, path, semantic, scale, bias in tex_nodes:
         is_normal = semantic == "normal"
         lines += [f'            def Shader "{node}"', "            {", '                uniform token info:id = "UsdUVTexture"',
                   f"                asset inputs:file = {path}",
                   f"                float2 inputs:st.connect = </Character/Materials/{name}/Reader.outputs:result>",
-                  f'                token inputs:sourceColorSpace = "{"raw" if semantic in ("normal", "rough") else "auto"}"']
+                  f'                token inputs:sourceColorSpace = "{"raw" if semantic in ("normal", "rough", "opacity") else "auto"}"']
         if is_normal:
-            lines += ["                float4 inputs:scale = (2, 2, 2, 1)", "                float4 inputs:bias = (-1, -1, -1, 0)"]
+            strength = float(g.get('normalTexture', {}).get('scale', 1))
+            lines += [f"                float4 inputs:scale = ({_f(2*strength)}, {_f(2*strength)}, 2, 1)",
+                      f"                float4 inputs:bias = ({_f(-strength)}, {_f(-strength)}, -1, 0)"]
+        elif scale is not None:
+            lines.append("                float4 inputs:scale = " + _vec([scale], 4)[1:-1])
+            lines.append("                float4 inputs:bias = " + _vec([bias], 4)[1:-1])
         lines += ['                token inputs:wrapS = "clamp"', '                token inputs:wrapT = "clamp"',
-                  "                float3 outputs:rgb", "                float outputs:g", "                float outputs:a",
+                  "                float3 outputs:rgb", "                float outputs:r", "                float outputs:g", "                float outputs:a",
                   "            }"]
     lines.append("        }")
     return "\n".join(lines)

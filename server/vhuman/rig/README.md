@@ -33,6 +33,15 @@ Outputs go to `<head>/rig/`: `rig.glb` (web viewer), `rig.usda` + `textures/`
 (and `rig_usd.zip`), `rig.json` (the rig definition), `rig_*.png` maps,
 `preview.png`, `rig_report.json` (fit, bake and timing statistics).
 
+The USD eye materials preserve the glTF corneal transmission mask and IOR.
+The mask's red channel is read as raw data and converted to opacity with
+`1 - transmissionFactor * mask`: sclera stays opaque and the cornea exposes
+the iris. Tangent-space normal strength scales X/Y while retaining Z.
+Eyelid coverage continues to use the base-colour alpha channel. This uses
+[UsdPreviewSurface opacity and texture scale/bias](https://openusd.org/release/spec_usdpreviewsurface.html);
+renderer optics can still differ from glTF. Shader-graph regressions run with
+`python -m unittest server.vhuman.test_rig_usd_materials` when `usd-core` is installed.
+
 ## Face topologies and anatomy
 
 `gnm_v3` is the default for new builds. Its Apache-2.0 model provides the
