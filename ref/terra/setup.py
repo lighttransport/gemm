@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -57,8 +58,9 @@ def main():
         environment = root/"venv"
         if not environment.exists():
             run("uv", "venv", "--python", args.python, environment)
-        # Frozen export retains upstream's package versions. Install the entire
-        # enumerated closure without dependency resolution, excluding SMPL and
+        # Frozen export retains upstream's package versions. OpenCV 4 retains
+        # the HOG person detector required by our video input preflight.
+        # Install the enumerated closure without dependency resolution, excluding SMPL and
         # replacing source packages with the patched, pinned local checkouts.
         requirements = root/"requirements.txt"
         command = ["uv", "export", "--frozen", "--no-hashes", "--no-emit-project",
@@ -67,12 +69,15 @@ def main():
         if args.cuda:
             command.extend(["--extra", "cuda"])
         run(*command, cwd=root/"terra", stdout=subprocess.DEVNULL)
+        requirements.write_text(re.sub(r'(?m)^opencv-python==[^;\s]+',
+            'opencv-python==4.13.0.92', requirements.read_text()))
         python = environment/"bin/python"
         run("uv", "pip", "install", "--python", python, "--no-deps", "-r", requirements,
             "--extra-index-url", "https://download.pytorch.org/whl/cu126", "--index-strategy", "unsafe-best-match")
         for path in (root/"musclemimic",root/"holosoma/src/holosoma_retargeting",root/"terra"):
             run("uv", "pip", "install", "--python", python, "--no-deps", "-e", path)
-        run(python, "-c", "import importlib.util; assert importlib.util.find_spec('smplx') is None; from terra.prepared import PreparedMotion")
+        run(python, "-c", "import importlib.util,cv2; assert importlib.util.find_spec('smplx') is None; "
+            "assert hasattr(cv2,'HOGDescriptor'); from terra.prepared import PreparedMotion")
     print(root)
 
 

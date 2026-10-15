@@ -100,6 +100,8 @@ def check_camera(frames, boxes):
 def person_boxes(frames):
     """Conservative single-person preflight; ambiguous detections are rejected."""
     import cv2
+    if not hasattr(cv2, 'HOGDescriptor'):
+        raise ValueError('person preflight requires the pinned OpenCV 4 worker environment')
     detector = cv2.HOGDescriptor()
     detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
     result = []

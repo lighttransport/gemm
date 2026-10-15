@@ -187,8 +187,9 @@ class Setup:
                  "--index-strategy", "unsafe-best-match")
         for name in ("vhuman-rig-venv", "vhuman-texture-venv", "qimg21-ref-venv"):
             self.link(ROOT / "tmp" / name, self.python.parent.parent)
-        self.run(self.python, "-B", "-c", "import torch,diffusers,transformers,pxr,onnxruntime,xatlas; "
+        self.run(self.python, "-B", "-c", "import torch,diffusers,transformers,pxr,onnxruntime,xatlas,cv2; "
                  "assert torch.version.cuda and not torch.version.hip; "
+                 "assert hasattr(cv2,'HOGDescriptor'); "
                  "print(torch.__version__, diffusers.__version__, transformers.__version__)")
         for name in ("musclemimic-upstream", "vhuman-gmr-upstream"):
             self.checkout(ROOT / "tmp" / name, *SOURCES[name])

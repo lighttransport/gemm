@@ -157,7 +157,7 @@ nvidia-nvtx==13.0.85
     # via cuda-toolkit
 onnxruntime==1.30.0
     # via -r server/vhuman/requirements-cuda-dev.txt
-opencv-python-headless==5.0.0.93
+opencv-python-headless==4.13.0.92
     # via -r server/vhuman/requirements-cuda-dev.txt
 openexr==3.4.4
     # via -r server/vhuman/requirements-cuda-dev.txt

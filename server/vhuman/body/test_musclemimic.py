@@ -180,6 +180,18 @@ class BodyPhysicalMotionTest(unittest.TestCase):
             self.assertGreater(np.ptp(np.diff(times)), .02)
             self.assertTrue(np.all(np.diff(times) > 0))
 
+    def test_person_preflight_requires_supported_opencv(self):
+        from .musclemimic_video import person_boxes
+        with patch.dict(sys.modules, {"cv2": SimpleNamespace()}):
+            with self.assertRaisesRegex(ValueError, "pinned OpenCV 4"):
+                person_boxes([])
+
+    def test_worker_opencv_has_person_detector(self):
+        import cv2
+        detector = cv2.HOGDescriptor()
+        detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self.assertEqual(detector.winSize, (64, 128))
+
     def test_camera_gate_rejects_accumulated_pan_and_blank_background(self):
         import cv2
         from .musclemimic_video import check_camera

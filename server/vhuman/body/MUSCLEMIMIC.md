@@ -57,8 +57,10 @@ Use the complete recorded closure rather than resolving current dependencies:
 Mink 1.3.0 metadata requests MuJoCo >=3.10, while this checkpoint requires 3.4.0.
 The lock preserves the tested worker's versions; the constraints file remains
 the registration doctor's critical-version contract. Validate the actual CPU
-policy/retargeting integration after installation. GMR imports the pinned SMPL-X
-Python package, but this workflow does not install or require SMPL model files.
+policy/retargeting integration after installation. OpenCV is pinned to 4.13.0.92
+because video preflight requires its HOG person detector; OpenCV 5 removed the
+Python API. GMR imports the pinned SMPL-X Python package, but this workflow
+does not install or require SMPL model files.
 The separate Terra worker remains free of the `smplx` package.
 
 GMR imports Torch utilities even though this adapter feeds it native MHR

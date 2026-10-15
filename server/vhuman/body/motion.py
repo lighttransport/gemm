@@ -141,7 +141,7 @@ def _bbox(image: Path) -> tuple[int, int, int, int]:
                 pad = .08 * max(bw, bh)
                 return (max(0, int((x - pad) / scale)), max(0, int((y - pad) / scale)),
                         min(w, int((x + bw + pad) / scale)), min(h, int((y + bh + pad) / scale)))
-    except (ImportError, OSError):
+    except (ImportError, OSError, AttributeError):
         pass
     return 0, 0, w, h
 
