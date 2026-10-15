@@ -629,3 +629,54 @@ more denoising updates; H3 frame counts are `5 + 17*n` through 124.
 `audit.json` checks all 40 movies' frame counts and rates, fixed identity,
 coefficient bounds, and reprojection of the saved mesh vertices. `gnm_schema.json`
 provides the original GNM parameter names and mesh units.
+
+## GPU comparison baselines
+
+Run the latency and playback commands sequentially on an idle GPU. Both refuse
+an existing output directory. They save asset/source SHA-256 receipts, machine
+and driver versions, raw samples, and NVML memory, temperature, clocks and power
+at 100 ms intervals. Allocated VRAM includes the desktop and excludes the
+separately recorded driver reservation; peaks are sampled, not allocator
+high-water marks. No GPU clocks or power limits are changed.
+
+```sh
+. tmp/vhuman-dev/activate.sh
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+"$PYTHON" -m server.vhuman.rig.benchmark \
+  --package tmp/vhuman-3070-quality/face-full/rig_deformer.safetensors \
+  --out tmp/vhuman-gpu-comparison/native --seconds 3
+"$PYTHON" -m server.vhuman.rig.playback_benchmark --three "$VHUMAN_THREE" \
+  --asset face_lod0 tmp/vhuman-3070-finalpass/eyes/rig_stress.glb \
+  --asset face_lod1 tmp/vhuman-3070-finalpass/eyes/rig_lod1_stress.glb \
+  --asset face_lod2 tmp/vhuman-3070-finalpass/eyes/rig_lod2_stress.glb \
+  --asset walking tmp/vhuman-3070-finalpass/walk-final/motion.glb \
+  --asset repaired_skin tmp/vhuman-3070-baseline/surface/head.glb \
+  --turntable repaired_skin --out tmp/vhuman-gpu-comparison/playback \
+  --seconds 60 --warmup 5
+```
+
+The native benchmark builds the existing AVX2/CUDA library without Torch,
+checks every timed batch frame against CPU evaluation, warms each case, then
+measures three seconds each of batch sizes 1 and 32, with/without host readback,
+for ML plus contacts, ML only, and linear deformation. Timed inputs are fixed
+seeded arrays saved as `controls.npy`. Wall latency covers the preallocated
+ctypes call, host rig, transfers and GPU completion; CUDA event kernel time is
+reported separately. This measures the synchronous ABI, not asynchronous
+`vh_gpu_submit` or rendering.
+
+Playback uses local Three.js and hardware NVIDIA ANGLE/Vulkan at 1280 x 720,
+DPR 1, antialiasing and fixed PBR studio lighting. Each asset loops for one
+minute after five seconds of warmup. Frame intervals, CPU render submission,
+asynchronous GPU timers, five-second memory windows and screenshots are
+retained. A single empty-page reload handles Chromium's initial Vulkan
+command-buffer replacement, with the startup error retained. Context loss,
+backgrounding, GPU timer disjoint events and console errors invalidate a
+measured run. The camera frames skinned surfaces across the whole clip while
+leaving static terrain out of the framing bounds. Geometry, material and
+skeleton texture resources are disposed between assets.
+
+Exported GLB playback evaluates joint/morph tracks and has no native exact
+contact projection. It does not measure Terra policy inference, USD playback,
+physical phones, offline reconstruction or image generation. Browser frame
+rates can be limited by requestAnimationFrame/display scheduling; compare GPU
+timer and latency distributions as well as FPS after replacing the GPU.

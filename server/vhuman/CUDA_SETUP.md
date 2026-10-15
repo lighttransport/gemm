@@ -554,3 +554,62 @@ skipped; real policy/native-avatar acceptance is checked separately above.
 The review is `tmp/vhuman-3070-finalpass/index.html`, with detailed receipts in
 `summary.json`. Data and generated assets remain private under ignored `tmp/`.
 Blackwell `sm_120` execution still requires the GPU replacement.
+
+### Isolated pre-upgrade runtime baseline
+
+The retained 3070 baseline uses the corrected full face rig (11,909 native
+vertices, 149 morphs), three combined blink/gaze/jaw GLB LODs, the accepted
+walking clip, and a GLB of the selected repaired skin. The skin export preserves
+its base-color pixels exactly. Assets, native sources, compiler flags, seeded
+controls, driver and browser versions are hash-bound in the private receipts.
+No concurrent GPU jobs run during either measurement.
+
+Hardware/settings: RTX 3070 8 GiB / `sm_86`, existing 115 W power limit,
+NVIDIA 580.178.04, NVRTC 12.9, GCC 13.3, Ryzen 9 3950X. No clocks or power settings
+are changed. Each native case has 16 warmups and at least three seconds of
+samples. Single-frame timings, including host rig, upload, synchronization and
+readback, are:
+
+| Deformation | Wall p50 | Wall p95 | GPU kernel p50 |
+| --- | ---: | ---: | ---: |
+| ML + four contact iterations | 0.897 ms | 0.916 ms | 0.840 ms |
+| ML only | 0.145 ms | 0.156 ms | 0.089 ms |
+| Linear only | 0.131 ms | 0.138 ms | 0.089 ms |
+
+The ML/contact 32-frame batch takes 1.539 ms median including readback, or
+1.012 ms with device-resident output. CPU/CUDA parity across all three modes
+and both batch sizes is within `1.49e-8 m`. Sampled allocated VRAM peaks at
+273.3 MiB for the native process plus desktop, 197.9 MiB above its idle baseline.
+Driver/firmware reservation is recorded separately; this is NVML sampling at
+100 ms, not an allocator high-water mark. Initialization may reuse the existing
+NVRTC kernel cache and is recorded separately from warmed call latency.
+
+Five sequential 60-second hardware playbacks (five-second warmup each) sustain
+60.00 display FPS at 1280 x 720, DPR 1 and antialiasing in Chromium 155 /
+NVIDIA ANGLE Vulkan with Three.js r163. All frame-interval p95 values are
+16.7 ms. FPS is browser/display limited, so the GPU timer measurements below
+are retained for the upgrade comparison:
+
+| Playback asset | GPU p50 | GPU p95 | Peak allocated VRAM |
+| --- | ---: | ---: | ---: |
+| Face stress LOD0 | 3.680 ms | 4.035 ms | 1272.8 MiB |
+| Face stress LOD1 | 4.146 ms | 4.371 ms | 1244.7 MiB |
+| Face stress LOD2 | 3.261 ms | 3.480 ms | 1191.9 MiB |
+| Walking, full-body framing | 0.784 ms | 0.792 ms | 1028.6 MiB |
+| Repaired skin turntable | 0.073 ms | 0.079 ms | 274.6 MiB |
+
+The camera frames the animated avatar rather than the terrain. A single
+empty-page retry resolves Chromium's initial Vulkan context replacement and
+is recorded; there are no context losses, disjoint timers or console errors
+during measurement. Every asset releases its geometry, material and skeleton
+resources, returning to zero geometries/programs and two shared renderer
+textures. After browser exit the device returns to 76 MiB / 0% utilization.
+This measures exported GLB animation/PBR rendering; native exact contacts,
+Terra policy inference and USD playback are separate workloads.
+
+Reproduction and timing scopes are documented in
+[rig/README.md](rig/README.md#gpu-comparison-baselines). The private review is
+`tmp/vhuman-3070-baseline/index.html`, with `summary.json`, raw `native-final/`
+and `playback-final/` receipts, and `repeat.py` to verify retained asset hashes
+and rerun the same workloads after the GPU swap. `sm_120` execution remains
+pending replacement hardware.
