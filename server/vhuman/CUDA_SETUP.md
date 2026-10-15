@@ -519,3 +519,38 @@ export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 "$PYTHON" -m unittest server.vhuman.test_mv_texture \
   server.vhuman.test_texture_grid server.vhuman.test_rig_usd_materials -v
 ```
+
+### Source-root walking, animated interchange and retained surface repair
+
+The next 3070 continuation completes a reproducible direct-BVH walking fixture
+through the constrained Terra policy and native avatar acceptance. The
+source-root objective preserves the measured trajectory in the solve; native
+export retains the simulated root exactly. The final command completes 280
+snapshots / 2.79 s, with 6.48 mm skin stance drift, 0.508 mm penetration and
+21.19 mm anatomical RMS under the original limits. JSON/GLB tracks match.
+The four-second stationary hold and raised-platform control also complete.
+The old intermediate MHR forward reference and standing-to-walking source
+remain rejected. See [body/TERRA.md](body/TERRA.md) for the direct command,
+root-objective provenance and scope of this bounded validation.
+
+Combined blink/gaze/jaw stress exposed Blender shape-key slider clipping in
+both USD and GLB imports. The animation curves preserve signed weights, but
+their evaluated ranges needed expansion. The new import wrapper preserves
+curve samples, packs the scene and frames its actual animation interval.
+After correction, all three LODs agree within 0.57 micrometres across eight
+samples and two lighting/camera settings (48 matched pairs). Eye material
+rendering remains approximate; export parity does not certify lid anatomy or
+native exact contacts. See [rig/README.md](rig/README.md).
+
+The retained surface material receives a conservative tone correction with
+21.12% lower internal tone-jump p95 and 3.84% lower boundary seam score. All
+168,661 photographed texels and geometry/support/normal/ORM files remain exact.
+The stronger comparison and matched five-view Blender renders are retained;
+scalp hair remains incomplete. See [BLENDER_TEXTURE.md](BLENDER_TEXTURE.md).
+
+This continuation passes 58 tests: 46 body, four USD material, two Blender
+shape-range and six surface-texture tests. Two optional body fixtures are
+skipped; real policy/native-avatar acceptance is checked separately above.
+The review is `tmp/vhuman-3070-finalpass/index.html`, with detailed receipts in
+`summary.json`. Data and generated assets remain private under ignored `tmp/`.
+Blackwell `sm_120` execution still requires the GPU replacement.

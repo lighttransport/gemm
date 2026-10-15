@@ -64,6 +64,10 @@ def main():
     else:
         bpy.ops.import_scene.gltf(filepath=str(source.resolve()))
     report = restore_shape_ranges(bpy.context.scene.objects)
+    intervals = [action.frame_range for action in bpy.data.actions if action.users]
+    if intervals:
+        bpy.context.scene.frame_start = math.floor(min(v[0] for v in intervals))
+        bpy.context.scene.frame_end = math.ceil(max(v[1] for v in intervals))
     bpy.context.scene.frame_set(bpy.context.scene.frame_start)
     for image in bpy.data.images:
         if image.source == 'FILE' and not image.packed_file:
@@ -71,6 +75,7 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(args.out.resolve()))
     report.update(source=str(source.resolve()), source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                  frame_range=[bpy.context.scene.frame_start, bpy.context.scene.frame_end],
                   blender=bpy.app.version_string)
     args.out.with_suffix('.validation.json').write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps(dict(changed_shapes=report['changed_shapes'], out=str(args.out))))

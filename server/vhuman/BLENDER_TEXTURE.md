@@ -180,6 +180,46 @@ Backgrounding or context loss invalidates the run. Speech requires a secure
 context and is outside this local rendering test; HTTPS is needed for speech
 on a LAN device. Actual mobile performance remains pending a device receipt.
 
+## b550 / RTX 3070 retained-material continuation (2026-10-16)
+
+The current `tmp/vhuman-ear-synth/reconstruction_contact` material was audited
+on its exact fitted geometry and refined without new image generation.
+The preferred conservative result is `tmp/vhuman-3070-finalpass/texture-gentle`;
+the original remains unchanged. Strength 24 / prior 0.15 is retained as a
+comparison, while the selected solve uses strength 8 / prior 0.3.
+
+| Material | Boundary seam | Internal tone-jump p95 | Photographed texels changed |
+| --- | ---: | ---: | ---: |
+| Retained source | 0.02619890 | 0.02412674 | 0 |
+| Selected gentle correction | 0.02519309 | 0.01903052 | 0 |
+| Strong comparison | 0.02370389 | 0.01788374 | 0 |
+
+The internal diagnostic compares smoothed linear-RGB colours at 5,937 pairs
+of normal-compatible surface samples about 6 mm apart, over 10 mm away from
+photographed skin. The selected material reduces its p95 by 21.12%, and the
+boundary seam by 3.84%. These measure tone continuity, not recovered likeness
+or hair accuracy. Matched five-view Cycles renders retain the gentler broad
+tone; scalp hair and single-view reflectance ambiguity remain incomplete.
+
+All 168,661 photographed texels are exact. Geometry, portrait, normal, ORM,
+coverage, confidence and generated-support files remain byte-identical. Every
+Blender USD round trip preserves triangles, UVs and texture pixels exactly;
+maximum coordinate error is 7.45e-9 m. Packed scenes, USD, matched renders,
+hash receipts and the selection are under `tmp/vhuman-3070-finalpass/`.
+
+```sh
+. tmp/vhuman-dev/activate.sh
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 "$PYTHON" \
+  -m server.vhuman.reconstruction.blender_texture \
+  --candidate tmp/vhuman-ear-synth/reconstruction_contact \
+  --out tmp/texture-repeat-audit --blender "$VHUMAN_BLENDER" --device CUDA
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 "$PYTHON" \
+  -m server.vhuman.reconstruction.surface_texture \
+  --candidate tmp/vhuman-ear-synth/reconstruction_contact \
+  --audit tmp/texture-repeat-audit --out tmp/texture-repeat-gentle \
+  --strength 8 --prior .3
+```
+
 ## Local skin color cleanup
 
 For spatially localized pale/cyan texture artifacts, use explicit ellipsoidal
