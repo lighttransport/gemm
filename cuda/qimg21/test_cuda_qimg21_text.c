@@ -596,6 +596,9 @@ int main(int argc, char **argv) {
     TEXT_PHASE("open checkpoint + embed tokens");
     r = cuda_qimg_init(0, 1);
     if (!r) goto done;
+    if (!r->cublaslt_ctx && cublasewCreate(&r->cublaslt_ctx, r->stream)) {
+        fprintf(stderr, "text: BF16 cuBLAS initialization failed\n"); goto done;
+    }
     TEXT_PHASE("CUDA init");
     if (strcmp(attention_mode, "custom")) {
         const char *plugin_path = !strcmp(attention_mode, "flash-exact")
@@ -740,7 +743,8 @@ int main(int argc, char **argv) {
            cuMemcpyHtoD(visual_rows_d,visual_rows,(size_t)visual_count*sizeof(int)))goto done;
     }
     if(dump_dir && mkdir(dump_dir,0755) && errno!=EEXIST)goto done;
-    #define CHECK(call) do { if((call)!=0)goto done; } while(0)
+    #define CHECK(call) do { int check_status=(int)(call); if(check_status) { \
+        fprintf(stderr,"text: %s failed (%d) at line %d\n",#call,check_status,__LINE__); goto done; } } while(0)
     TEXT_PHASE("buffers + RoPE table");
     double t_layers = text_seconds();
     #define NAME(suffix) snprintf(name,sizeof(name),"model.language_model.layers.%d.%s",l,suffix)

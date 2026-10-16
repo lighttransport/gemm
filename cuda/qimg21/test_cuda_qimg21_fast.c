@@ -1420,13 +1420,18 @@ inputs_done:;
     GETF(qk_norm_rope, "qk_norm_rope"); GETF(swiglu, "swiglu");
     GETF(norm_mod_q8, "norm_mod_q8"); GETF(quant_rows, "quant_rows"); GETF(dequant, "dequant");
 #ifndef Q21F_HIP
-    /* Block-scaled FP4 MMA needs the architecture-specific target (sm_120a). */
-    REQ(cu_compile_kernels_ex(&rt.fp4_module, rt.device, q21f_fp4_src, "qimg21_fast_fp4.cu", verbose, "fast-fp4",
-                              CU_COMPILE_ARCH_A) >= 0, "FP4 kernel compile failed");
-    CK(cuModuleGetFunction(&rt.fp4_act, rt.fp4_module, "fp4_act"));
-    CK(cuModuleGetFunction(&rt.w4a4_bf16, rt.fp4_module, "w4a4_bf16"));
-    CK(cuModuleGetFunction(&rt.fp4_rowmax, rt.fp4_module, "fp4_rowmax"));
-    CK(cuModuleGetFunction(&rt.fp4_act_cl, rt.fp4_module, "fp4_act_cl"));
+    /* INT8/BF16 runs must not compile optional Blackwell-only instructions. */
+    if (int8_weights == 2) {
+        int fp4_major = 0;
+        CK(cuDeviceGetAttribute(&fp4_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, rt.device));
+        REQ(fp4_major >= 12, "NVFP4 needs sm_120 or newer; use the INT8 low8 preset on this device");
+        REQ(cu_compile_kernels_ex(&rt.fp4_module, rt.device, q21f_fp4_src, "qimg21_fast_fp4.cu", verbose, "fast-fp4",
+                                  CU_COMPILE_ARCH_A) >= 0, "FP4 kernel compile failed");
+        CK(cuModuleGetFunction(&rt.fp4_act, rt.fp4_module, "fp4_act"));
+        CK(cuModuleGetFunction(&rt.w4a4_bf16, rt.fp4_module, "w4a4_bf16"));
+        CK(cuModuleGetFunction(&rt.fp4_rowmax, rt.fp4_module, "fp4_rowmax"));
+        CK(cuModuleGetFunction(&rt.fp4_act_cl, rt.fp4_module, "fp4_act_cl"));
+    }
     if (int8_weights == 2 && fp4_cutlass) {
         rt.fp4_plugin = dlopen("cuda/qimg21/libq21_fast_fp4.so", RTLD_NOW | RTLD_LOCAL);
         REQ(rt.fp4_plugin, "cannot load CUTLASS FP4 plugin: %s (use --fp4-gemm omma)", dlerror());

@@ -134,12 +134,17 @@ static int q21_cudnn_vae_conv2d_impl(float *output, const float *input,
     __nv_bfloat16 *xb = nullptr, *wb = nullptr, *yb = nullptr, *bb = nullptr;
     void *workspace = nullptr;
     int rc = 1, returned = 0;
+    int device = 0, major = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) return 1;
+    const int pinned_backend = major >= 12;
     int source_h=h,source_w=w,conv_h=h+2*pad,conv_w=w+2*pad;
-    int channels_last=kh==3&&((ci==4)||(ci==96&&co==96&&conv_h==1026&&stride==1));
+    int channels_last=pinned_backend&&kh==3&&((ci==4)||(ci==96&&co==96&&conv_h==1026&&stride==1));
     size_t source_n=(size_t)ci*h*w,xn=(size_t)ci*conv_h*conv_w;
     size_t wn = (size_t)co*ci*kh*kw, yn = (size_t)co*oh*ow;
     size_t workspace_bytes = 0;
     cudnnConvolutionFwdAlgoPerf_t perf[8];
+    int selected = -1;
     float alpha = 1.0f, beta = 0.0f;
 
     if (cudaMalloc(&xb,xn*sizeof(*xb)) != cudaSuccess ||
@@ -154,7 +159,7 @@ static int q21_cudnn_vae_conv2d_impl(float *output, const float *input,
     f32_to_bf16<<<(co+255)/256,256,0,stream>>>(bb,bias,(size_t)co);
     if (cudaGetLastError() != cudaSuccess) goto done;
     CCHK(cudnnCreate(&handle)); CCHK(cudnnSetStream(handle,stream));
-    if ((kh==1 && kw==1 && stride==1 && pad==0) || (kh==3 && kw==3)) {
+    if (pinned_backend && ((kh==1 && kw==1 && stride==1 && pad==0) || (kh==3 && kw==3))) {
         if(q21_backend_conv(handle,yb,xb,wb,ci,conv_h,conv_w,co,kh,kw,
                             stride,oh,ow))goto done;
         if(channels_last) bf16_nhwc_to_f32_nchw_bias<<<(yn+255)/256,256,0,stream>>>(output,yb,bb,co,oh*ow);
@@ -170,11 +175,14 @@ static int q21_cudnn_vae_conv2d_impl(float *output, const float *input,
                                          CUDNN_CROSS_CORRELATION,CUDNN_DATA_FLOAT));
     CCHK(cudnnSetConvolutionMathType(cd,CUDNN_TENSOR_OP_MATH));
     CCHK(cudnnGetConvolutionForwardAlgorithm_v7(handle,xd,wd,cd,yd,8,&returned,perf));
-    if (returned < 1 || perf[0].status != CUDNN_STATUS_SUCCESS) goto done;
+    for (int i=0;i<returned;i++)
+        if (perf[i].status==CUDNN_STATUS_SUCCESS && perf[i].determinism==CUDNN_DETERMINISTIC &&
+            perf[i].memory<=256u*1024u*1024u) { selected=i;break; }
+    if (selected<0) { fprintf(stderr,"q21_cudnn_vae: no bounded deterministic BF16 convolution\n");goto done; }
     CCHK(cudnnGetConvolutionForwardWorkspaceSize(handle,xd,wd,cd,yd,
-                                                  perf[0].algo,&workspace_bytes));
+                                                  perf[selected].algo,&workspace_bytes));
     if (workspace_bytes && cudaMalloc(&workspace,workspace_bytes) != cudaSuccess) goto done;
-    CCHK(cudnnConvolutionForward(handle,&alpha,xd,xb,wd,wb,cd,perf[0].algo,
+    CCHK(cudnnConvolutionForward(handle,&alpha,xd,xb,wd,wb,cd,perf[selected].algo,
                                   workspace,workspace_bytes,&beta,yd,yb));
     bf16_to_f32_bias<<<(yn+255)/256,256,0,stream>>>(output,yb,bb,co,oh*ow);
     rc = cudaGetLastError() == cudaSuccess ? 0 : 1;

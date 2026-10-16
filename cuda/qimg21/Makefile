@@ -110,11 +110,12 @@ libq21_cudnn_vae.so: cudnn_vae_plugin.cu $(PLUGIN_ARCH_STAMP)
 		-L$(CUDNN_ROOT)/lib -Xlinker -rpath -Xlinker $(abspath $(CUDNN_ROOT)/lib) \
 		-o $@ $< -l:libcudnn.so.9
 
-libq21_gelu.so: gelu_plugin.cu $(PLUGIN_ARCH_STAMP)
+libq21_gelu.so: gelu_plugin.cu $(PLUGIN_ARCH_STAMP) Makefile
 	@test -x $(PYTORCH_CUDA_HOME)/bin/nvcc || \
 		(echo "missing pinned PyTorch CUDA compiler: $(PYTORCH_CUDA_HOME)/bin/nvcc" >&2; exit 1)
 	$(PYTORCH_CUDA_HOME)/bin/nvcc -O3 -std=c++17 --shared --cudart shared -Xcompiler=-fPIC \
-		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -L$(PYTORCH_CUDA_HOME)/lib -o $@ $<
+		-gencode arch=$(CUDA_COMPUTE),code=$(GPU_ARCH) -L$(PYTORCH_CUDA_HOME)/lib \
+		-Xlinker -rpath -Xlinker $(abspath $(PYTORCH_CUDA_HOME)/lib) -o $@ $<
 
 qwen21_rope_freqs.npy: export_rope_frequencies.py
 	$(PYTHON) $< --out $@
@@ -136,6 +137,13 @@ test_cuda_qimg21_vae: test_cuda_qimg21_vae.c ../qimg/cuda_qimg_runner.h ../../cu
 		-ldl -lm -lpthread
 
 native-vae: test_cuda_qimg21_vae test_cuda_qimg21_vae_encode
+
+# These executables include the shared runtime through the native runner.
+test_cuda_qimg21_native test_cuda_qimg21_fast test_cuda_qimg21_text test_cuda_qimg21_vision test_cuda_qimg21_vae test_cuda_qimg21_vae_encode: ../qimg/cuda_qimg_runner.h ../cuda_fp8_mma_kernels.h
+
+test_cuda_qimg21_runtime: test_cuda_qimg21_runtime.c ../qimg/cuda_qimg_runner.h ../cuda_fp8_mma_kernels.h ../../cuda/cuew.c ../../cuda/cublasew.c
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \
+		-o $@ $< ../../cuda/cuew.c ../../cuda/cublasew.c -ldl -lm -lpthread
 
 test_cuda_qimg21_vae_encode: test_cuda_qimg21_vae_encode.c test_cuda_qimg21_vae.c ../qimg/cuda_qimg_runner.h libq21_cudnn_vae.so libq21_cutlass_attention.so ../../common/stb_image.h ../../common/stb_image_resize2.h ../../common/stb_image_write.h ../../cuda/cuew.c ../../cuda/cublasew.c
 	$(CC) -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -I../../common -I../../cuda -I../qimg \

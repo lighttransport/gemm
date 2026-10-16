@@ -231,7 +231,7 @@ int main(int argc, char **argv) {
     const char *merged_out = NULL, *deepstack_dir = NULL;
     const char *attention_mode = "flash";
     const char *flash_plugin_path = "cuda/qimg21/libq21_flash_attention.so";
-    const char *patch_projection = "cudnn-engine23";
+    const char *patch_projection = "auto";
     const char *layer_norm_mode = "nvcc-pytorch";
     int h = 0, w = 0, max_blocks = 0, block_index = 0;
     for (int i = 1; i < argc; i++) {
@@ -263,7 +263,7 @@ int main(int argc, char **argv) {
         block_index + max_blocks > 27 ||
         (strcmp(attention_mode, "math") && strcmp(attention_mode, "cutlass") &&
          strcmp(attention_mode, "flash")) ||
-        (strcmp(patch_projection, "cublas") && strcmp(patch_projection, "cudnn-engine23")) ||
+        (strcmp(patch_projection, "auto") && strcmp(patch_projection, "cublas") && strcmp(patch_projection, "cudnn-engine23")) ||
         (strcmp(layer_norm_mode, "nvcc") && strcmp(layer_norm_mode, "nvcc-pytorch") &&
          strcmp(layer_norm_mode, "nvcc-pytorch-bf16") &&
          strcmp(layer_norm_mode, "nvrtc"))) {
@@ -273,7 +273,7 @@ int main(int argc, char **argv) {
                         "[--norm1-override NORM.npy] "
                         "[--norm2-override NORM.npy] "
                         "[--flash-plugin PLUGIN.so] "
-                        "[--pixels-out PATCHES.npy] [--patch-projection cublas|cudnn-engine23] "
+                        "[--pixels-out PATCHES.npy] [--patch-projection auto|cublas|cudnn-engine23] "
                         "--out OUTPUT.npy\n", argv[0]);
         return 2;
     }
@@ -307,6 +307,11 @@ int main(int argc, char **argv) {
         shards.n++;
     }
     cuda_qimg_runner *r = cuda_qimg_init(0, 1);
+    if (r && !strcmp(patch_projection, "auto"))
+        patch_projection = r->sm_version >= 120 ? "cudnn-engine23" : "cublas";
+    if (r && !r->cublaslt_ctx && cublasewCreate(&r->cublaslt_ctx, r->stream)) {
+        fprintf(stderr, "vision: BF16 cuBLAS initialization failed\n"); cuda_qimg_free(r); return 1;
+    }
     CUmodule module = NULL;
     CUfunction add_pos = NULL, layer_norm = NULL;
     CUfunction linear_epilogue = NULL, bf16_epilogue = NULL, vision_rope = NULL, vision_attn = NULL;

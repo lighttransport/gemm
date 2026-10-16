@@ -253,6 +253,7 @@ static const char *qimg_kernel_src =
 /* On-device F32 -> FP8 e4m3 encoder for VAE conv weights. Flattens
  * [co, ci*kh*kw] to [pad_co, n_in_pad] with trailing rows / cols zeroed.
  * Grid: (ceil(n_in_pad/32), ceil(pad_co/8)); Block: (32, 8). */
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ void vae_f32_to_fp8_padded(unsigned char *__restrict__ out,\n"
 "    const float *__restrict__ inp, int co, int n_in, int pad_co, int n_in_pad) {\n"
 "    int k = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -273,6 +274,7 @@ static const char *qimg_kernel_src =
 "    }\n"
 "    out[(long)c * n_in_pad + k] = bits;\n"
 "}\n"
+"#endif\n"
 "\n"
 /* Tiled im2col for VAE conv2d->GEMM path. Input [ci, H, W] row-major,
  * output [chunk_n_tok, n_in_pad] row-major where n_in_pad = ceil(ci*kh*kw
@@ -1177,6 +1179,7 @@ static const char *qimg_kernel_src =
 "    }\n"
 "}\n"
 "\n"
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ void quant_f32_to_fp8_e4m3(unsigned char *Y, const float *X,\n"
 "                                       const float *d_x_scale, int n) {\n"
 "    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;\n"
@@ -1189,6 +1192,7 @@ static const char *qimg_kernel_src =
 "    Y[i] = (unsigned char)(packed & 0xff);\n"
 "    if (i + 1 < n) Y[i + 1] = (unsigned char)((packed >> 8) & 0xff);\n"
 "}\n"
+"#endif\n"
 "\n"
 /* bf16_to_f32_add_bias: read BF16 Y_in, write F32 Y_out + optional bias.
  * Y_in: row-major [n_tok, n_out] bf16 (2B). bias: F32 [n_out] or NULL. */
@@ -1262,6 +1266,7 @@ static const char *qimg_kernel_src =
 "\n"
 /* Quantize BF16 → FP8 e4m3 using a per-tensor scale (1 elem / thread; uses
  * cvt.rn.satfinite.e4m3x2 like the F32 path but reads BF16 input). */
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ void quant_bf16_to_fp8_e4m3(unsigned char *Y, const unsigned short *X,\n"
 "                                        const float *d_scale, int n) {\n"
 "    int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -1283,6 +1288,7 @@ static const char *qimg_kernel_src =
 "    Y[idx] = (unsigned char)(packed & 0xff);\n"
 "    if (idx + 1 < n) Y[idx+1] = (unsigned char)((packed >> 8) & 0xff);\n"
 "}\n"
+"#endif\n"
 "\n"
 "}\n"; /* close extern "C" from cuda_kernels_common_src */
 

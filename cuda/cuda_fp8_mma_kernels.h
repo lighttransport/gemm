@@ -352,11 +352,11 @@ static const char *fp8_mma_kernels_src =
  * smem while MMAs run on the current tile -- the GPU's load/store units and
  * tensor-core pipes run concurrently.
  *
- * Requires sm_80+ (cp.async). Requires n_in % 32 == 0, n_out % 256 == 0,
+ * Requires sm_89+ (FP8 MMA and cp.async). Requires n_in % 32 == 0, n_out % 256 == 0,
  * and n_tok >= 16 -- non-conforming shapes fall back to gemm_fp8_scaled_f32.
  * Signature matches the baseline so the runner can swap 1:1 at dispatch.
  * ============================================================================ */
-"#if __CUDA_ARCH__ >= 800\n"
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ __launch_bounds__(128, 5)\n"
 "void gemm_fp8_scaled_f32_pipe(float *Y, const unsigned char *W, const float *X,\n"
 "                               const float *bias, int n_out, int n_in, int n_tok,\n"
@@ -569,7 +569,7 @@ static const char *fp8_mma_kernels_src =
  * shared memory at kernel entry so any lane can read any row's scale at
  * writeback time without strided global loads.
  * ============================================================================ */
-"#if __CUDA_ARCH__ >= 800\n"
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ __launch_bounds__(128, 5)\n"
 "void gemm_fp8_pipe_perrow_f32(float *Y, const unsigned char *W, const float *X,\n"
 "                               const float *bias, int n_out, int n_in, int n_tok,\n"
@@ -771,7 +771,7 @@ static const char *fp8_mma_kernels_src =
  * Same gate as the MTILE=2 perrow: n_in % 32 == 0, n_out % 256 == 0, n_tok >= 16.
  * Falls back to perrow MTILE=2 / per-tensor pipe / LUT for non-conforming shapes.
  * ============================================================================ */
-"#if __CUDA_ARCH__ >= 800\n"
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ __launch_bounds__(128, 3)\n"
 "void gemm_fp8_pipe_perrow_mt4_f32(float *Y, const unsigned char *W, const float *X,\n"
 "                                   const float *bias, int n_out, int n_in, int n_tok,\n"
@@ -973,7 +973,7 @@ static const char *fp8_mma_kernels_src =
  * per-tensor outlier crush that breaks DiT attention QKV/out + MLP fc1/fc2.
  * Loads 256 W-scales into smem at kernel start (1 KB extra; total ~19.5 KB).
  * ============================================================================ */
-"#if __CUDA_ARCH__ >= 800\n"
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ __launch_bounds__(128, 3)\n"
 "void gemm_fp8_pipe_perrow_mt4_wpr_f32(float *Y, const unsigned char *W, const float *X,\n"
 "                                       const float *bias, int n_out, int n_in, int n_tok,\n"
@@ -1188,7 +1188,7 @@ static const char *fp8_mma_kernels_src =
  *   - 1 kernel launch instead of 3 (~50us saved x 60 blocks x 2 streams)
  *   - L2 X reuse across QKV (X is read once instead of 3x)
  * ============================================================================ */
-"#if __CUDA_ARCH__ >= 800\n"
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ __launch_bounds__(128, 3)\n"
 "void gemm_fp8_pipe_perrow_mt4_concat3_f32(\n"
 "        float *Yq, float *Yk, float *Yv,\n"
@@ -1606,6 +1606,7 @@ static const char *fp8_mma_kernels_src =
 "    }\n"
 "}\n"
 
+"#if __CUDA_ARCH__ >= 890\n"
 "__global__ void quantize_to_fp8_e4m3(unsigned char *out, float *out_scale,\n"
 "                                      const float *in, const float *max_buf, int n) {\n"
 "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -1643,6 +1644,8 @@ static const char *fp8_mma_kernels_src =
 "        dst[c] = (unsigned char)(pair & 0xFF);\n"
 "    }\n"
 "}\n"
+
+"#endif\n"
 
 /* ============================================================================
  * FP8 Flash Attention (mma.sync m16n8k32 e4m3, sm_89+).
