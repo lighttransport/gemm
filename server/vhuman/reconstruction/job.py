@@ -67,6 +67,8 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
         cmd.extend(['--gaussians',str(count)])
     if direct:
         cmd.extend(['--portrait',str(image)])
+    if request.get('generated_input'):
+        cmd.extend(['--generated-input', str(request['generated_input'])])
     tail = []
     try:
         if cancel.is_set():
@@ -82,10 +84,13 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
                                     env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1',OPENBLAS_NUM_THREADS='4',OMP_NUM_THREADS='4'))
             stop = threading.Event()
             def watch():
+                cancelled_at = None
                 while not stop.wait(.25):
                     if cancel.is_set() and proc.poll() is None:
+                        import time
+                        cancelled_at = cancelled_at or time.monotonic()
                         try:
-                            os.killpg(proc.pid,signal.SIGTERM)
+                            os.killpg(proc.pid, signal.SIGKILL if time.monotonic()-cancelled_at > 3 else signal.SIGTERM)
                         except ProcessLookupError:
                             pass
             watcher = threading.Thread(target=watch,daemon=True)
@@ -108,8 +113,15 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
             raise gpu.Cancelled('cancelled')
         if rc:
             raise RuntimeError('reconstruction failed: '+' | '.join(tail[-5:]))
+        baseline_id = run_id
+        review = None
+        review_path = folder/'reconstruction'/run_id/'multiview_review.json'
+        if review_path.is_file():
+            review = json.loads(review_path.read_text())
+            run_id = review['selected_run_id']
         if direct:
-            meta = dict(id=hid,subject='direct portrait',source='user portrait + statistical face model',
+            meta = dict(id=hid,subject=request.get('subject') or 'direct portrait',
+                        source='Qwen-Image 2.1 synthetic inputs' if request.get('generated_input') else 'user portrait + statistical face model',
                         reconstruction_run=run_id)
             (folder/'head.json').write_text(json.dumps(meta,indent=2))
             folder.replace(service.work/'heads'/hid)
@@ -118,8 +130,21 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
             raise gpu.Cancelled('cancelled')
         progress(1.,'candidate ready')
         base = f'/v1/heads/{hid}/reconstruction/{run_id}/'
-        return dict(id=hid,run_id=run_id,manifest_url=base+'manifest.json',glb_url=base+'rig/rig.glb' if (folder/'reconstruction'/run_id/'rig/rig.glb').is_file() else None,
+        result = dict(id=hid,run_id=run_id,manifest_url=base+'manifest.json',glb_url=base+'rig/rig.glb' if (folder/'reconstruction'/run_id/'rig/rig.glb').is_file() else None,
                     viewer_url=f'/rig?head={hid}&reconstruction={run_id}' if (folder/'reconstruction'/run_id/'rig/rig.glb').is_file() else None)
+        if review:
+            result.update(multiview=review,
+                          baseline_manifest_url=f'/v1/heads/{hid}/reconstruction/{baseline_id}/manifest.json',
+                          baseline_viewer_url=f'/rig?head={hid}&reconstruction={baseline_id}'
+                          if (folder/'reconstruction'/baseline_id/'rig/rig.glb').is_file() else None)
+        if request.get('session_id'):
+            from .. import portrait
+            sid = request['session_id']
+            with service._lock('portrait-'+sid):
+                doc = portrait.load(service, sid)
+                doc['reconstructions'].append(dict(result, revision=request['revision']))
+                portrait._save(portrait._root(service, sid), doc)
+        return result
     except BaseException:
         shutil.rmtree(folder/'reconstruction'/f'.{run_id}.partial',ignore_errors=True)
         shutil.rmtree(folder/'reconstruction'/run_id,ignore_errors=True)

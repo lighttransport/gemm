@@ -176,7 +176,11 @@ def write(asset, out: Path, subj=None, name: str = "rig.usda") -> dict:
     end = frames[-1][0]
     L = ["#usda 1.0", "(", '    defaultPrim = "Character"', "    metersPerUnit = 1", '    upAxis = "Y"',
          f"    startTimeCode = 0", f"    endTimeCode = {end}", f"    timeCodesPerSecond = {FPS}", "    customLayerData = {",
-         '        string generator = "vhuman rig (server/vhuman/rig)"', "    }", ")", ""]
+         '        string generator = "vhuman rig (server/vhuman/rig)"']
+    if asset.rig.get('input_provenance'):
+        provenance = json.dumps(asset.rig['input_provenance'], separators=(',', ':'))
+        L.append('        string vhumanGeneratedInput = '+json.dumps(provenance))
+    L += ["    }", ")", ""]
     names_arr = "[" + ", ".join(f'"{n}"' for n in blend_only) + "]"
     L += ['def SkelRoot "Character" (', '    prepend apiSchemas = ["SkelBindingAPI"]', "    customData = {",
           "        dictionary vchar = {", f"            string[] controlNames = {names_arr}",

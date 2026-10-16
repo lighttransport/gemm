@@ -127,6 +127,8 @@ def write(asset, out_path) -> dict:
         stats["morph_targets"] += len(tnames)
     b.doc["asset"]["extras"] = {"rig": asset.info.get("rig_name", "rig.json"),
                                   "units": "metres", "frame": "+Y up, face +Z"}
+    if asset.rig.get('input_provenance'):
+        b.doc['asset']['extras']['vhuman_generated_input'] = asset.rig['input_provenance']
     size = b.write(out_path)
     stats["bytes"] = size
     return stats

@@ -119,7 +119,23 @@ def availability(python=None, mock=False) -> dict:
         return {"available": False, "reason": "the native Qwen-Image 2.1 runner or its weights are missing"}
     if not python or not Path(python).exists():
         return {"available": False, "reason": "no --qwen-python interpreter (it needs torch)"}
-    return {"available": True, "backend": "native-rocm" if gpu.backend() == "rocm" else "native"}
+    package = gpu.model_path('qimg-21-fast/int8-smooth-a0.6')
+    try:
+        manifest = json.loads((package/'manifest.json').read_text())
+        if manifest.get('kind') != 'int8-smooth':
+            raise ValueError('expected smooth INT8 package')
+        if (package/'blocks.bin').stat().st_size < manifest['blocks']*manifest['blob_bytes']:
+            raise ValueError('truncated INT8 blocks.bin')
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        return {'available': False, 'reason': 'Qwen INT8 package missing or invalid: '+str(exc)}
+    if gpu.backend() == 'cuda':
+        for name in ('fast_flash', 'cutlass_attention', 'flash_attention', 'cudnn_patch', 'cudnn_vae', 'gelu'):
+            if not (QIMG21/f'libq21_{name}.so').is_file():
+                return {'available': False, 'reason': f'build cuda/qimg21/libq21_{name}.so for this GPU'}
+    return {"available": True, "backend": "native-rocm" if gpu.backend() == "rocm" else "native",
+            'profiles': {'low8': {'min_free_mib': gpu.QWEN_LOW8_MIN_FREE_MIB, 'budget_mib': 7168,
+                                 'attention': 'flash' if gpu.backend() == 'cuda' else 'sage'},
+                         'fast12': {'min_free_mib': gpu.QWEN_MIN_FREE_MIB}}}
 
 
 def native_available():
@@ -131,14 +147,15 @@ def native_available():
                for name in ("fast", "text", "vision", "vae", "vae_encode")) and gpu.model_path("qimg-21").is_dir()
 
 
-def make_backend(python=None, mock=False, preset="fast12"):
+def make_backend(python=None, mock=False, preset="fast12", cancel=None):
     _import_qimg21()
     if mock:
         return SyntheticIrisBackend()
     from qimg21_i23d.native import NativeBackend
     if preset not in ("fast12", "low8"):
         raise ValueError("qwen_preset must be fast12 or low8")
-    return NativeBackend(model=gpu.model_path("qimg-21"), python=python, preset=preset,
+    return NativeBackend(model=gpu.model_path("qimg-21"), python=python, preset=preset, cancel=cancel,
+                         attention='flash' if gpu.backend() == 'cuda' else None,
                          resident=preset != "low8", backend=gpu.backend(), device=gpu.device_index(),
                          quant_package=gpu.model_path("qimg-21-fast/int8-smooth-a0.6"))
 

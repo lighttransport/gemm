@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -113,12 +114,12 @@ class NativeBackend:
     name = "native"
     max_references = 1
     OPTIONS = ("model", "preset", "attention", "condition_resolution", "cache_dir", "keep_work",
-               "resident_socket", "resident_vae_socket", "python", "resident", "exact_prompts", "backend", "device", "quant_package")
+               "resident_socket", "resident_vae_socket", "python", "resident", "exact_prompts", "backend", "device", "quant_package", "cancel")
 
     def __init__(self, model=DEFAULT_MODEL, preset: str | None = "fast12", attention: str | None = None,
                  condition_resolution: int = 1024, cache_dir=None, keep_work: bool = False,
                  resident_socket=None, resident_vae_socket=None, python=None, resident: bool = True,
-                 exact_prompts: bool = False, backend: str = "cuda", device: int = 0, quant_package=None):
+                 exact_prompts: bool = False, backend: str = "cuda", device: int = 0, quant_package=None, cancel=None):
         if preset is not None and preset not in PRESET_WEIGHTS:
             raise BackendError(f"preset must be one of {', '.join(PRESET_WEIGHTS)}, got {preset!r}")
         if attention is not None and attention not in ATTENTION:
@@ -130,6 +131,7 @@ class NativeBackend:
         if backend == "rocm" and preset == "low8-fp4":
             raise BackendError("low8-fp4 is CUDA only")
         self.backend, self.device = backend, device
+        self.cancel = cancel
         self.name = "native-rocm" if backend == "rocm" else "native"
         directory = ROOT / "rdna4/qimg21" if backend == "rocm" else HERE
         prefix = "test_hip_" if backend == "rocm" else "test_cuda_"
@@ -391,8 +393,35 @@ class NativeBackend:
             env["LD_LIBRARY_PATH"] = "/opt/rocm/core/lib:" + env.get("LD_LIBRARY_PATH", "")
         try:
             with log.open("w") as stream:
-                code = subprocess.run(self.command(request, work, sockets, prompt_batch) + extra, cwd=ROOT,
-                                      stdout=stream, stderr=subprocess.STDOUT, env=env).returncode
+                proc = subprocess.Popen(self.command(request, work, sockets, prompt_batch) + extra, cwd=ROOT,
+                                        stdout=stream, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                try:
+                    while True:
+                        if self.cancel is not None and self.cancel.is_set():
+                            # The driver and all its stage workers inherit this process group.
+                            try:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                proc.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            proc.wait()
+                            raise InterruptedError('native generation cancelled')
+                        try:
+                            code = proc.wait(timeout=.2)
+                            break
+                        except subprocess.TimeoutExpired:
+                            pass
+                finally:
+                    if proc.poll() is None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
             text = log.read_text(errors="replace")
             if code:
                 raise BackendError(f"native generation failed ({code}): {text[-3000:]}")

@@ -78,7 +78,7 @@ head height or move the model's sockets. This is a neutral initialization.
 
 
 def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterations=80, surface_prior=None,
-        freeze_pose=False, expression_groups=None, seed=None):
+        freeze_pose=False, expression_groups=None, seed=None, fixed_pose_views=()):
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation
     from scipy.spatial import cKDTree
@@ -154,7 +154,7 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
             weights = np.sqrt([a[3] for a in anchors[j]])[:, None]
             residual.extend(((pixels-target)*weights/3).reshape(-1))
             residual.extend(np.minimum(depth-.02, 0)*1000)
-            residual.extend(expression*3)  # strong nuisance expression prior
+            residual.extend(expression*(12 if views[j].get('synthetic') else 3))
             residual.extend(trans*100)
             residual.extend(pose_rotation*.5)
             if silhouettes[j] is not None:
@@ -185,16 +185,19 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
             lo[off+6:off+6+ne],hi[off+6:off+6+ne] = 0,1
     # Camera/pose first, then shared identity and expression.
     pose_ids = np.array([ni+j*(6+ne)+k for j in range(ng) for k in range(6)], int)
+    fixed_groups = {group_index[i] for i in fixed_pose_views}
+    fixed_ids = np.array([ni+j*(6+ne)+k for j in fixed_groups for k in range(6)], int)
+    variable_pose_ids = np.setdiff1d(pose_ids, fixed_ids)
     def pose_fun(y):
         xx = x.copy()
-        xx[pose_ids] = y
+        xx[variable_pose_ids] = y
         return objective(xx)
-    if not freeze_pose:
-        pose = least_squares(pose_fun, x[pose_ids], bounds=(lo[pose_ids], hi[pose_ids]),
+    if not freeze_pose and len(variable_pose_ids):
+        pose = least_squares(pose_fun, x[variable_pose_ids], bounds=(lo[variable_pose_ids], hi[variable_pose_ids]),
                              loss='soft_l1', max_nfev=iterations)
-        x[pose_ids] = pose.x
+        x[variable_pose_ids] = pose.x
     before = float(np.mean(objective(np.zeros(count))**2))
-    active=np.setdiff1d(np.arange(count),pose_ids) if freeze_pose else np.arange(count)
+    active=np.setdiff1d(np.arange(count),pose_ids if freeze_pose else fixed_ids)
     if not len(active):raise ValueError('no free shape parameters with fixed pose')
     def active_objective(parameters):
         full=x.copy();full[active]=parameters;return objective(full)
@@ -239,6 +242,7 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
                   pose_rotations=[split(x,j)[3].tolist() for j in range(nv)],
                   pose_translations=[split(x,j)[1].tolist() for j in range(nv)],
                   pose_calibration='fixed' if freeze_pose else 'estimated nuisance pose',expression_groups=groups,
+                  fixed_pose_views=list(fixed_pose_views),
                   anchors=[{a[0]: a[1].tolist() for a in v} for v in anchors], safe_step=factor,
                   correspondence='topology-pinned anatomy with explicit annotation overrides' if anatomical else 'provisional projected nearest vertex',
                   silhouettes=['mask distance field' if s is not None else 'convex support or absent' for s in silhouettes],
@@ -269,7 +273,8 @@ def fit_staged(source, initial, views, **kwargs):
         return fit(source,initial,views,**kwargs)
     stages=[32,64]
     camera_rot=[Camera.from_dict(v['camera']).rotation for v in views]
-    if len(views)>=3 and max(np.linalg.norm(r-camera_rot[0]) for r in camera_rot)>.25:
+    independent = not any(v.get('synthetic') or v.get('camera_kind') == 'estimated' for v in views)
+    if independent and len(views)>=3 and max(np.linalg.norm(r-camera_rot[0]) for r in camera_rot)>.25:
         stages.append(170)
     def validation(captured,cameras):
         errors=[]
@@ -283,8 +288,9 @@ def fit_staged(source, initial, views, **kwargs):
                 errors.append(np.linalg.norm(projected[0]-row[2]))
         return float(np.mean(errors)) if errors else float('inf')
     accepted=None;accepted_error=float('inf');history=[]
+    initial_seed = kwargs.pop('seed', None)
     for modes in stages:
-        result=fit(source,initial,train,max_modes=modes,seed=accepted[3] if accepted else None,**kwargs)
+        result=fit(source,initial,train,max_modes=modes,seed=accepted[3] if accepted else initial_seed,**kwargs)
         error=validation(result[1],result[2])
         take=accepted is None or error<accepted_error*.995
         history.append(dict(modes=modes,withheld_landmark_error_px=error,accepted=take))

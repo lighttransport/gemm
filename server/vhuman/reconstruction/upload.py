@@ -33,16 +33,22 @@ def server_request(service, request, *, direct=False):
     from ..service import ServiceError
     from ..rig.face_models import MODEL_CACHE
     req=dict(request)
-    if any(k in req for k in ('portrait','observations','depth_installation')):
+    if any(k in req for k in ('portrait','observations','depth_installation','generated_input')):
         raise ServiceError('local file paths are available only through the CLI')
     if direct:
-        uid=req.pop('portrait_upload_id',None)
-        if not isinstance(uid,str) or len(uid)!=24 or not all(c in '0123456789abcdef' for c in uid):
-            raise ServiceError('valid portrait_upload_id required')
-        portrait=service.work/'portrait_uploads'/f'{uid}.png'
-        if not portrait.is_file():
-            raise ServiceError('portrait upload missing')
-        req['portrait']=str(portrait)
+        if req.get('session_id'):
+            if 'portrait_upload_id' in req:
+                raise ServiceError('choose a portrait session or an upload, not both')
+            from ..portrait import snapshot
+            req.update(snapshot(service, req))
+        else:
+            uid=req.pop('portrait_upload_id',None)
+            if not isinstance(uid,str) or len(uid)!=24 or not all(c in '0123456789abcdef' for c in uid):
+                raise ServiceError('valid portrait_upload_id required')
+            portrait=service.work/'portrait_uploads'/f'{uid}.png'
+            if not portrait.is_file():
+                raise ServiceError('portrait upload missing')
+            req['portrait']=str(portrait)
     if req.pop('depth',False):
         req['depth_installation']=str(MODEL_CACHE/'depth-anything-v2-small')
     return req

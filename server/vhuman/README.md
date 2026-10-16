@@ -89,6 +89,103 @@ See [validation commands](../../ref/hunyuan_video15/README.md).
 
 ## Image-guided reconstruction candidates
 
+### Portrait and multiview workspace
+
+Open `/head` for **Portrait → Review views → Reconstruct**. Generate a neutral
+1024×1024 Qwen-Image 2.1 portrait, approve it, then generate either individual
+1024×1024 views or a joint 1024×1024 sheet with four 512×512 panels. The angles
+are the person's left/right three-quarter and profile views (±45°/±90°).
+Every request uses the approved original portrait as its sole reference.
+Inspect images side by side, choose a version per angle, approve the selected
+views, and download PNGs or the input bundle. Regenerating the front preserves
+history but clears approval and makes its old views stale. The advanced
+Pixal3D/3D viewer loads only when requested, avoiding an idle WebGL allocation.
+Generated angles and side-view exposure can drift; inspect the actual images
+and regenerate or exclude unsuitable views before reconstruction.
+
+The default **8 GB streaming** mode uses native INT8 `low8`, a 7168 MiB
+denoiser budget, and FlashAttention on CUDA (including the RTX 3070). Admission
+requires 7680 MiB free; competing GPU work is reported before model loading.
+Encoders, denoiser, VAE and reconstruction run sequentially. CPU scratch,
+images and metadata stay under the configured work directory or repository
+`tmp/`; model weights remain under `--models-root` (default `/mnt/disk1/models`).
+
+RTX 3070 8 GiB measurements on 2026-10-16, at a 115 W power limit, 24 steps,
+CFG 4 and the default streaming profile:
+
+| Image job | Elapsed time | Whole-device peak, including reserved memory |
+| --- | --- | --- |
+| 1024×1024 portrait, two identities | 64–70 s | 7169 MiB (7.00 GiB) |
+| Four independent 1024×1024 views, two identities | 407–409 s | 7297 MiB (7.13 GiB) |
+| 1024×1024 joint sheet, two identities, four 512×512 panels | 99–100 s | 7325 MiB (7.15 GiB) |
+
+NVML was sampled every 100 ms; these are sampled peaks, not allocator high-water
+marks. The desktop and driver reservation are included. Image jobs returned
+device memory to idle after completion. Workers were fresh but disk/prompt
+caches were retained; these are not empty-cache cold-start timings.
+The front-protection integration check
+also preserved all 265,521 front-supported texture texels byte for byte.
+All four multiview reconstructions passed the frontal gate. Including the
+front baseline, joint fit and both rig exports, they took 569–800 s per case.
+The same-seed warm portrait repeat was byte-identical. Real GPU cancellation
+stopped the job in 0.20 s and returned device memory to idle in 1.36 s, with
+no published portrait or partial native files remaining.
+
+Experimental multiview reconstruction keeps a front-only GNM baseline and
+estimates side cameras from visible anatomical landmarks with robust PnP.
+Requested angles seed the fit; they are not calibration. Side views that
+fail pose/visibility checks are reported. Shared identity uses at most 64
+modes, the fitted front camera is fixed, and withheld frontal landmark error
+must stay within the baseline plus max(2 pixels at 1024 resolution, 10%).
+Unsafe or inconsistent fits retain the baseline. Front-supported texture
+pixels are protected byte for byte on the final geometry; side views fill
+unseen skin, with separate generated-support and front-protection maps.
+Generated inputs and estimated cameras remain marked synthetic throughout.
+Rig JSON, GLB asset metadata and USD layer data retain the generated-input
+hashes, parameters and source image licenses alongside the rig definition.
+The rig editor links to both candidates for review; no existing accepted rig
+or trained deformer is replaced.
+
+HTTP interfaces use the existing `/v1/jobs` queue with `portrait_generate`,
+`portrait_views` (`method: individual|sheet`) and `portrait_reconstruct`.
+Generated-input reconstruction supplies `session_id`, `revision`, and
+`view_ids`; the existing `portrait_upload_id` interface is also supported.
+`GET /v1/portrait-sessions[/ID]` lists or retrieves saved sessions;
+`POST /v1/portrait-sessions/ID/review` stores `revision`, `portrait_reviewed`
+and `view_ids`. Only approved inputs from the current revision are accepted.
+`GET /v1/portrait-sessions/ID/bundle.zip` exports the current front, approved
+side views, their source sheets where applicable, and matching metadata.
+File URLs are allowlisted and reconstruction snapshots verify input hashes;
+remote callers cannot provide local paths.
+
+Run the CPU/HTTP/browser checks and the real CUDA execution test with:
+
+```sh
+. tmp/vhuman-dev/activate.sh
+"$PYTHON" -m unittest \
+  server.vhuman.test_portrait_workspace server.vhuman.test_portrait_browser \
+  server.vhuman.test_head server.vhuman.test_reconstruction \
+  server.vhuman.test_dev_setup server.vhuman.test_app server.vhuman.test_runtime \
+  server.vhuman.test_rig_usd_materials -v
+make -C cuda/qimg21 test_cuda_qimg21_runtime
+./cuda/qimg21/test_cuda_qimg21_runtime
+"$PYTHON" -m server.vhuman.validate_portrait --check-only
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 "$PYTHON" -m server.vhuman.validate_portrait
+# After the full run, verify cancellation with an actual allocated model:
+"$PYTHON" -m server.vhuman.validate_portrait --cancel-only
+```
+
+The real test requires an idle device and exercises two identities, both view
+methods, reconstruction, and an identical-seed warm repeat. It records NVML
+memory and elapsed times under `tmp/portrait-validation/`, and writes
+`review.html` for visual inspection. `--images-only` limits coverage to image
+generation. `--resume --work DIR` reuses successful jobs after an interrupted
+validation run. `--cancel-only` cancels after GPU allocation and checks that
+memory returns, temporary workers are cleaned up, and no portrait is published.
+Execution success alone does not certify identity or visual quality.
+
+### Existing reconstruction commands
+
 Refine a fitted head without replacing its accepted rig:
 
 ```sh

@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 LOCK_PATH = ROOT / "tmp/pixal3d/device-locks/cuda-0.lock"
 QWEN_MIN_FREE_MIB = 12288      # Qwen-Image 2.1 fast12 at 1024^2: measured peak ~14.6 GB (study run)
+QWEN_LOW8_MIN_FREE_MIB = 7680 # 7168 MiB process budget plus 512 MiB headroom on an idle 8 GiB card
 PIXAL3D_MIN_FREE_MIB = 7680    # Pixal3D native, 7168 MiB budget + headroom
 _CONFIG = contextvars.ContextVar("vhuman_gpu", default=("auto", 0, Path("/mnt/disk1/models")))
 

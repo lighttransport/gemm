@@ -368,14 +368,15 @@ class Setup:
         self.run(*make, "-C", ROOT / "cpu/pixal3d")
         self.run(*make, "-C", ROOT / "cuda/pixal3d", "GPU_ARCH=" + self.args.gpu_arch,
                  "CUDA_PATH=" + str(self.args.cuda_home))
-        targets = ["native-exact", "test_cuda_qimg21_fast", "libq21_fast_attention.so",
+        targets = ["native-exact", "native-text-exact", "test_cuda_qimg21_vision", "native-vae",
+                   "test_cuda_qimg21_fast", "libq21_fast_attention.so",
                    "libq21_fast_flash.so", "libq21_fast_int8.so"]
         if self.args.gpu_arch != "sm_80":
             targets += ["libq21_fast_sage.so"]
         if self.args.gpu_arch == "sm_120":
             targets += ["libq21_fast_fp4.so"]
         self.run(*make, "-C", ROOT / "cuda/qimg21", "GPU_ARCH=" + self.args.gpu_arch,
-                 "CUDA_HOME=" + str(self.args.cuda_home), *targets)
+                 "CUDA_HOME=" + str(self.args.cuda_home), "PYTHON=" + str(self.python), *targets)
         self.run(*make, "-C", ROOT / "vulkan/vhuman", "GLSLC=" + str(ROOT / "tmp/vhuman-tools/bin/glslc"))
         self.emotion()
 

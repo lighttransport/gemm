@@ -89,7 +89,8 @@ def direct_seed(image, out, model):
 def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
         res=512, iterations=80, build_rig=False, rig_iters=80, depth_installation=None,
         gaussian_count=0, run_id=None, roughness=.55, f0=.028, detail_um=0., spatial_materials=False, auto_exclusions=False,
-        occlusion_mode='manual', texture_res=None):
+        occlusion_mode='manual', texture_res=None, input_provenance=None, fit_seed=None,
+        fixed_pose_views=(), protect_front=False, front_gate=None):
     folder = Path(folder)
     if occlusion_mode not in ('auto','manual'):
         raise ValueError('occlusion mode must be auto or manual')
@@ -117,6 +118,8 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
                 v['image_path'] = v['image']
         cams = []
         for v in doc['views']:
+            if input_provenance:
+                v['synthetic'] = True
             if 'camera' not in v:
                 if len(doc['views'])>1:
                     raise ValueError('additional views require calibrated H-frame cameras')
@@ -133,7 +136,10 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
         report = dict(status='geometry held at surface initialization')
         if profile in ('geometry','full'):
             neutral,captured,cams,report = fitting.fit_staged(src,initial,doc['views'],scale=scale,rotation=rotation,iterations=iterations,
-                                                                         surface_prior=(subject.positions,subject.normals))
+                surface_prior=(subject.positions,subject.normals), seed=fit_seed, fixed_pose_views=fixed_pose_views)
+        if front_gate:
+            from .multiview import check_front
+            report['front_consistency'] = check_front(captured[0], cams[0], doc['views'][0], front_gate)
         exclusions=[]
         if auto_exclusions:
             from .occlusion import bake_masks
@@ -229,7 +235,8 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
                 expression_dim=full.expression_dim,unsupported_identity_modes='eye and tooth parameters remain neutral priors')
         np.savez_compressed(staging/'geometry.npz',neutral=neutral,captured=captured,
                             triangles=src.triangles,triangle_uvs=src.triangle_uvs,scale=scale,rotation=rotation,**anatomy)
-        material = materials.bake_portrait(captured,src.triangles,src.triangle_uvs,doc['views'],cams,staging,res=texture_res,roughness=roughness,f0=f0,spatial_materials=spatial_materials)
+        material = materials.bake_portrait(captured,src.triangles,src.triangle_uvs,doc['views'],cams,staging,res=texture_res,roughness=roughness,f0=f0,spatial_materials=spatial_materials,
+                                          protect_front=protect_front)
         if detail_um:
             from .detail import atlas
             normal,detail=atlas(neutral,src.triangles,src.triangle_uvs,res,detail_um)
@@ -250,6 +257,7 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
                         portrait_sha256=observations.sha256(subject.portrait),
                         topology_sha256=fitting.topology_hash(src.triangles),geometry_sha256=observations.sha256(staging/'geometry.npz'),geometry=report,material=material,
                         depth=depth_report,gaussians=gaussian_count,
+                        input_provenance=input_provenance,
                         auto_exclusions=exclusions,
                         parsing=parsing_reports,
                         deformation='rest geometry changed: prior compact soft deformer invalid; rebuild required',
@@ -279,6 +287,7 @@ def main():
     ap.add_argument('--rig',action='store_true')
     ap.add_argument('--run-id')
     ap.add_argument('--portrait')
+    ap.add_argument('--generated-input', type=Path, help='server-created, reviewed synthetic input bundle')
     ap.add_argument('--depth-installation')
     ap.add_argument('--gaussians',type=int,default=0)
     ap.add_argument('--roughness',type=float,default=.55)
@@ -290,9 +299,14 @@ def main():
     a = ap.parse_args()
     if a.portrait:
         direct_seed(Path(a.portrait),Path(a.folder),a.face_model)
-    result = run(a.folder,observation_file=a.observations,profile=a.profile,face_model=a.face_model,
+    options = dict(observation_file=a.observations,profile=a.profile,face_model=a.face_model,
                  res=a.res,texture_res=a.texture_res,iterations=a.iterations,build_rig=a.rig,depth_installation=a.depth_installation,
                  gaussian_count=a.gaussians,run_id=a.run_id,roughness=a.roughness,f0=a.f0,detail_um=a.detail_um,spatial_materials=a.spatial_materials,auto_exclusions=a.auto_exclusions,occlusion_mode=a.occlusion_mode)
+    if a.generated_input:
+        from .multiview import run_generated
+        result = run_generated(Path(a.folder), a.generated_input, **options)
+    else:
+        result = run(a.folder, **options)
     print(json.dumps(result))
 
 if __name__=='__main__':

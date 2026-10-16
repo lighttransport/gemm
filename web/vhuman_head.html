@@ -16,6 +16,7 @@
 <style>
 :root{--bg:#0d1014;--panel:#151a20;--line:#252d36;--text:#e3e8ee;--muted:#8b97a5;--accent:#6fc2a8;--warn:#e7a15b;--bad:#e07474}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 header{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline;padding:14px 20px;border-bottom:1px solid var(--line)}
 header h1{margin:0;font-size:19px;font-weight:600}
@@ -60,19 +61,103 @@ td:first-child{color:var(--muted);width:44%}
 a.dl{color:var(--accent);margin-right:14px;font-size:13px}
 @media(max-width:900px){.layout{grid-template-columns:1fr}.viewer{height:440px}}
 @media(max-width:520px){.images{grid-template-columns:1fr}.row{grid-template-columns:1fr 1fr}}
+.portrait-workspace{max-width:1500px;margin:auto;padding:24px 20px 8px}
+.portrait-top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+.portrait-top h2{margin:0;font-size:24px;font-weight:550;letter-spacing:-.03em}
+.portrait-top p{margin:5px 0;color:var(--muted);max-width:680px}
+.portrait-session{display:flex;align-items:center;gap:8px}.portrait-session select{max-width:280px}
+.portrait-steps{display:flex;gap:8px;margin:0 0 18px;padding:0;list-style:none;flex-wrap:wrap}
+.portrait-steps li{border:1px solid var(--line);border-radius:30px;padding:6px 14px;color:var(--muted);font-size:12px}
+.portrait-steps li.active{color:var(--accent);border-color:var(--accent);background:#6fc2a80b}
+.portrait-grid{display:grid;grid-template-columns:300px minmax(0,1fr);gap:18px}
+.portrait-controls .card{padding:18px}.portrait-controls summary{cursor:pointer;color:var(--muted);font-size:12px}
+.portrait-controls input[type=number]{font-variant-numeric:tabular-nums}
+.portrait-pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,.8fr);gap:18px}
+.portrait-hero{margin:0;position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#10151b;aspect-ratio:1}
+.portrait-hero>img{width:100%;height:100%;object-fit:contain;cursor:zoom-in}
+.portrait-hero>p{position:absolute;inset:20%;display:grid;place-items:center;text-align:center;color:var(--muted);pointer-events:none}
+.portrait-hero figcaption{position:absolute;bottom:10px;left:10px;background:#0d1014d9;border-radius:6px;padding:5px 9px;font-size:12px}
+.portrait-review{padding:18px 0}.portrait-review h3{font-size:18px;font-weight:500;margin:0 0 10px}
+.portrait-review p{color:var(--muted);max-width:440px;font-size:13px}
+.portrait-check{display:flex;align-items:flex-start;gap:9px;color:var(--text);font-size:13px;line-height:1.5}
+.portrait-check input{width:auto;margin-top:4px;accent-color:var(--accent)}
+.portrait-section{margin-top:22px;padding-top:20px;border-top:1px solid var(--line)}
+.portrait-section h3{font-size:18px;font-weight:500;margin:0 0 6px}
+.portrait-methods{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:12px 0}
+.portrait-methods label{display:flex;align-items:center;gap:6px;margin:0;color:var(--text)}
+.portrait-methods input{width:auto;accent-color:var(--accent)}
+.portrait-views{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.portrait-view{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;min-width:0}
+.portrait-view.approved{border-color:var(--accent)}
+.portrait-view img{width:100%;aspect-ratio:1;object-fit:contain;border-radius:8px;background:#10151b;cursor:zoom-in}
+.portrait-placeholder{aspect-ratio:1;display:grid;place-items:center;color:var(--muted);background:#10151b;border-radius:8px;font-size:12px}
+.portrait-view h4{margin:9px 0 2px;font-weight:500;font-size:13px}
+.portrait-view button{width:100%;font-size:12px;margin-top:8px;padding:6px}
+.portrait-view select{font-size:11px;padding:5px;margin:5px 0}
+.portrait-view a{font-size:12px;color:var(--accent)}
+.portrait-sheets{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.portrait-sheets button{font-size:12px}.portrait-status{display:flex;gap:8px;align-items:center;margin-top:12px}
+.portrait-status .msg{flex:1;overflow-wrap:anywhere}.portrait-status button{font-size:12px}
+.portrait-result{border:1px solid var(--line);padding:12px;border-radius:10px;margin:10px 0;overflow-wrap:anywhere}
+.portrait-result a{display:inline-block;color:var(--accent);margin-right:16px}
+.portrait-lightbox{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:14px;width:min(1200px,95vw);max-height:95vh}
+.portrait-lightbox::backdrop{background:#000c}.portrait-lightbox .images img{max-height:75vh;object-fit:contain}
+.portrait-lightbox button{float:right;margin-bottom:10px}
+.portrait-history{display:flex;gap:8px;overflow:auto;margin-top:10px}.portrait-history button{flex:0 0 65px;padding:4px}.portrait-history img{width:56px;display:block}
+.legacy-title{max-width:1500px;margin:28px auto 0;padding:0 20px;color:var(--muted);font-size:13px;font-weight:500}
+@media(max-width:1100px){.portrait-views{grid-template-columns:repeat(2,minmax(0,1fr))}.portrait-pair{grid-template-columns:1fr}.portrait-review{padding:0}}
+@media(max-width:760px){.portrait-grid{grid-template-columns:1fr}.portrait-controls{display:grid;grid-template-columns:1fr}.portrait-session{width:100%}.portrait-session select{max-width:none}}
 </style>
 </head>
 <body>
 <header>
   <h1>Virtual Human Head</h1>
-  <span class="sub">Qwen-Image 2.1 portrait → Pixal3D head → fitted analytic eyes</span>
+  <span class="sub">Qwen-Image 2.1 · portrait inputs and face reconstruction</span>
   <a href="/">eye editor →</a>
   <span class="health" id="health">…</span>
 </header>
-<div class="layout">
+<section class="portrait-workspace" aria-label="Portrait and multiview workspace">
+  <div class="portrait-top">
+    <div><h2>Build a face, one view at a time.</h2><p>Generate a neutral portrait, review the same person from several angles, then reconstruct the face.</p></div>
+    <div class="portrait-session"><select id="portrait-sessions" aria-label="Portrait session"><option value="">New portrait session</option></select><button id="portrait-new">New face</button></div>
+  </div>
+  <ol class="portrait-steps" aria-label="Workflow"><li id="portrait-step-1" class="active">1 · Portrait</li><li id="portrait-step-2">2 · Review views</li><li id="portrait-step-3">3 · Reconstruct</li></ol>
+  <div class="portrait-grid">
+    <aside class="portrait-controls">
+      <div class="card">
+        <h2>Describe the person</h2>
+        <label for="portrait-subject">Appearance</label><textarea id="portrait-subject" maxlength="400">a 30-year-old woman with light olive skin, short dark brown hair tied back, hazel eyes</textarea>
+        <p class="msg">Neutral expression, natural skin, even light and a clear view of the whole head are included.</p>
+        <div class="row"><div><label for="portrait-seed">Seed</label><input id="portrait-seed" type="number" min="0" max="4294967295" value="11"></div><div><label for="portrait-steps">Steps</label><input id="portrait-steps" type="number" min="1" max="100" value="24"></div></div>
+        <label for="portrait-memory">Memory mode</label><select id="portrait-memory"><option value="low8">8 GB · streaming</option><option value="fast12">Larger GPU · resident</option></select>
+        <p id="portrait-gpu" class="msg" role="status">Checking image generation…</p><button id="portrait-refresh">Refresh GPU status</button>
+        <button id="portrait-generate" class="primary" disabled>Generate portrait</button>
+        <p class="msg">Regeneration keeps earlier images. A new front portrait requires a new review of its views.</p>
+      </div>
+      <div class="card"><h2>This session</h2><p id="portrait-lineage" class="msg">Your portrait and views will appear here.</p><a id="portrait-bundle" class="dl" hidden>Download selected inputs ↓</a><div id="portrait-history" class="portrait-history"></div></div>
+    </aside>
+    <div>
+      <div class="portrait-pair">
+        <figure class="portrait-hero"><img id="portrait-image" hidden alt="Frontal reference portrait"><p id="portrait-empty">Start with a front portrait.<br>It will anchor every generated view.</p><figcaption id="portrait-caption" hidden></figcaption></figure>
+        <div class="portrait-review"><h3>Your identity anchor</h3><p>Check the eyes, lips, hairline and face shape before continuing. Click any image to compare it at full size.</p><label class="portrait-check"><input id="portrait-approved" type="checkbox" disabled><span>I reviewed this portrait. Use it as the reference for every angle.</span></label><p class="msg">Generated views can vary. Select the ones that preserve this person’s features.</p><div class="progress" role="progressbar" aria-label="Current job" aria-valuemin="0" aria-valuemax="100" id="portrait-progress"><div id="portrait-bar"></div></div><div class="portrait-status"><p id="portrait-message" class="msg" role="status" aria-live="polite"></p><button id="portrait-cancel" hidden>Cancel</button></div></div>
+      </div>
+      <section class="portrait-section" aria-labelledby="portrait-views-title"><h3 id="portrait-views-title">Four angles. One reference.</h3><p class="msg">The original front portrait stays unchanged. Left and right refer to the person’s own sides.</p>
+        <div class="portrait-methods"><label><input name="portrait-method" type="radio" value="individual" checked>Individual · 1024 px each</label><label><input name="portrait-method" type="radio" value="sheet">Joint sheet · 512 px per view</label><button id="portrait-generate-views" disabled>Generate four views</button></div>
+        <div id="portrait-views" class="portrait-views"></div><div id="portrait-sheets" class="portrait-sheets"></div>
+      </section>
+      <section class="portrait-section" aria-labelledby="portrait-reconstruct-title"><h3 id="portrait-reconstruct-title">Ready for a 3D face?</h3><p class="msg">The front portrait is always included. Experimental multiview fitting estimates cameras and uses approved side views to fill unseen skin while preserving front-visible texture.</p>
+        <details><summary>Reconstruction settings</summary><div class="row"><div><label for="portrait-fit-res">Fit resolution</label><select id="portrait-fit-res"><option>256</option><option selected>512</option><option>1024</option></select></div><div><label for="portrait-texture-res">Texture resolution</label><select id="portrait-texture-res"><option>512</option><option selected>1024</option><option>2048</option></select></div><div><label for="portrait-fit-iters">Iterations</label><input id="portrait-fit-iters" type="number" min="10" max="300" value="80"></div></div></details>
+        <div class="tools"><button id="portrait-reconstruct-front" disabled>Reconstruct front only</button><button id="portrait-reconstruct-views" disabled>Reconstruct selected views</button></div><p id="portrait-selection" class="msg">Approve the front portrait to continue.</p><div id="portrait-results"></div>
+      </section>
+    </div>
+  </div>
+</section>
+<dialog id="portrait-lightbox" class="portrait-lightbox"><button id="portrait-close-compare">Close</button><div class="images"><figure><img id="portrait-compare-front" alt="Frontal identity anchor"><figcaption>Front reference</figcaption></figure><figure><img id="portrait-compare-view" alt="Selected generated view"><figcaption id="portrait-compare-label"></figcaption></figure></div></dialog>
+<div class="legacy-title"><button id="enable-head-editor">Open existing heads and advanced 3D editor</button><button id="reload-without-head-editor" hidden>Reload without 3D viewer</button><p class="msg">Load the 3D viewer when needed. Image generation works without it.</p></div>
+<div class="layout" id="advanced-head-editor" hidden>
   <aside>
     <div class="card">
-      <h2>Generate</h2>
+      <details><summary>Generate a complete Pixal3D head</summary>
       <label for="subject">Person</label>
       <textarea id="subject">a 30-year-old woman with light olive skin, short dark brown hair tied back, hazel eyes</textarea>
       <div class="row">
@@ -80,7 +165,7 @@ a.dl{color:var(--accent);margin-right:14px;font-size:13px}
         <div><label for="quality">Quality</label><select id="quality"><option>preview</option><option selected>standard</option><option>high</option></select></div>
         <div><label for="fov">FOV °</label><input id="fov" type="number" min="8" max="60" value="20"></div>
       </div>
-      <label for="qwen-preset">Qwen memory</label><select id="qwen-preset"><option value="fast12">Fast · 12 GiB free</option><option value="low8">Streaming · 8 GiB free</option></select>
+      <label for="qwen-preset">Qwen memory</label><select id="qwen-preset"><option value="low8">8 GB · streaming (7.5 GiB free)</option><option value="fast12">Fast · 12 GiB free</option></select>
       <label for="iris-source">Iris detail</label>
       <select id="iris-source"><option value="portrait">Generate for this portrait</option><option value="library">Match existing library</option></select>
       <details style="margin-top:12px"><summary>Skin textures</summary>
@@ -115,6 +200,7 @@ a.dl{color:var(--accent);margin-right:14px;font-size:13px}
       <button class="primary" id="go">Generate head (≈ 4–5 min)</button>
       <div class="progress"><div id="bar"></div></div>
       <div class="msg" id="msg"></div>
+      </details>
     </div>
     <div class="card">
       <h2>Heads</h2>
@@ -158,370 +244,23 @@ a.dl{color:var(--accent);margin-right:14px;font-size:13px}
   </main>
 </div>
 <script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { SkinRenderer } from '/vhuman_skin_shader.js';
-import * as Eye from '/vhuman_eye_shader.js';
-
-const $ = (id) => document.getElementById(id);
-const state = { heads: [], current: null, job: null, model: null };
-window.__headState = state;
-
-async function api(path, body) {
-  const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
-  const r = await fetch(path, opts);
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || r.statusText);
-  return data;
-}
-
-// ---- viewer
-const viewer = $('viewer');
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-renderer.toneMapping = THREE.NeutralToneMapping;
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-viewer.prepend(renderer.domElement);
-const skinRenderer = new SkinRenderer(renderer);
-window.__skinRenderer = skinRenderer;
-const scene = new THREE.Scene();
-const skinControl = document.createElement('label');
-skinControl.style.cssText='position:absolute;right:12px;bottom:12px;z-index:3;background:#171c24;padding:8px;border-radius:8px';
-skinControl.innerHTML='<input type="checkbox" style="width:auto"> Skin scattering <span></span>';
-const skinToggle=skinControl.querySelector('input'), skinTiming=skinControl.querySelector('span');
-skinToggle.disabled=!skinRenderer.supported;
-skinControl.title=skinRenderer.status;
-renderer.domElement.parentElement.append(skinControl);
-skinToggle.onchange=()=>{skinRenderer.enabled=skinToggle.checked; render();};
-setInterval(()=>{skinTiming.textContent=skinRenderer.enabled?`${skinRenderer.ms.toFixed(1)} ms CPU`:'';},1000);
-
-const pmrem = new THREE.PMREMGenerator(renderer);
-const roomEnv = pmrem.fromScene(new RoomEnvironment(renderer), 0.03).texture;
-const key = new THREE.DirectionalLight(0xffffff, 1.2);
-key.position.set(-1.2, 1.4, -2.0);
-scene.add(key);
-// The eye shader's studio (softboxes + sky, optics.uniforms), turned to face
-// the head (it looks along -Z); as an environment it lights the head too.
-const studio = Eye.makeStudioUniforms();
-let studioEnv = null, geometry = null;
-function buildStudioEnv(g) {
-  Eye.applyStudio(studio, g, Math.PI);
-  const envScene = new THREE.Scene();
-  const bg = new THREE.Mesh(new THREE.SphereGeometry(10, 64, 32), Eye.makeBackgroundMaterial(studio, { raw: true }));
-  envScene.add(bg);
-  if (studioEnv) studioEnv.dispose();
-  studioEnv = pmrem.fromScene(envScene, 0.0).texture;
-  bg.geometry.dispose(); bg.material.dispose();
-}
-function applyLighting() {
-  const useStudio = $('studio').checked && studioEnv;
-  scene.environment = useStudio ? studioEnv : roomEnv;
-  key.visible = !useStudio;
-  render();
-}
-const camera = new THREE.PerspectiveCamera(22, 1, 0.005, 20);
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.addEventListener('change', render);
-Object.assign(state, { render: () => render(), camera, controls });   // for tests and debugging
-let eyeCenter = new THREE.Vector3(), headCenter = new THREE.Vector3(), headSize = 1;
-function resize() {
-  const w = viewer.clientWidth, h = viewer.clientHeight;
-  renderer.setSize(w, h, false);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
-  render();
-}
-function render() { skinRenderer.render(scene, camera); }
-window.addEventListener('resize', resize);
-
-function setView(name) {
-  // The face looks along -Z (Pixal3D's GLB frame).
-  const d = headSize * 3.4;
-  const dirs = { front: [0, 0, -1], three: [-0.6, 0.05, -0.8], profile: [-1, 0, -0.02] };
-  if (name === 'eyes') {
-    controls.target.copy(eyeCenter);
-    camera.position.copy(eyeCenter).add(new THREE.Vector3(-0.08, 0.02, -1).normalize().multiplyScalar(headSize * 0.8));
-  } else {
-    controls.target.copy(headCenter);
-    camera.position.copy(headCenter).add(new THREE.Vector3(...dirs[name]).normalize().multiplyScalar(d));
-  }
-  controls.update();
-  render();
-}
-document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
-$('exposure').addEventListener('input', () => {
-  renderer.toneMappingExposure = +$('exposure').value;
-  studio.uExposure.value = +$('exposure').value;      // the eye shader tone-maps itself (the same Neutral curve)
-  render();
-});
-for (const id of ['show-head', 'show-eyes', 'analytic']) $(id).addEventListener('change', applyVisibility);
-$('studio').addEventListener('change', applyLighting);
-const shellMaterials = new WeakMap();
-function applyLidShadow() {
-  const strength = +$('lid-shadow').value;
-  $('lid-shadow-value').value = strength.toFixed(2);
-  state.model?.traverse((o) => {
-    if (!o.isMesh || !/^eye_(left|right)_eyeshell$/.test(o.name)) return;
-    for (const mat of (Array.isArray(o.material) ? o.material : [o.material])) {
-      if (!shellMaterials.has(mat)) shellMaterials.set(mat, { opacity: mat.opacity, depthWrite: mat.depthWrite });
-      const base = shellMaterials.get(mat);
-      mat.opacity = base.opacity * strength;
-      // A fully transparent shell must not occlude other translucent layers.
-      mat.depthWrite = strength > 0 && base.depthWrite;
-    }
-  });
-  render();
-}
-$('lid-shadow').addEventListener('input', applyLidShadow);
-function applyVisibility() {
-  if (!state.model) return;
-  state.model.traverse((o) => {
-    if (!o.isMesh) return;
-    const isEye = /eye_/.test(o.name) || /eye_/.test(o.parent?.name || '');
-    let on = isEye ? $('show-eyes').checked : $('show-head').checked;
-    // analytic: the shader proxies replace the GLB's eyeball and iris meshes (the eyeshells stay)
-    const analytic = $('analytic').checked && state.eyesAnalytic;
-    if (/^eye_(left|right)_(shell|iris)$/.test(o.name)) on = on && !analytic;
-    if (o.userData.analyticEye) on = on && analytic;
-    o.visible = on;
-  });
-  $('vlabel').textContent = $('analytic').checked && state.eyesAnalytic
-    ? 'GLB head · analytic eye shader (ray-traced refraction)' : 'GLB · head + portable eyes (KHR transmission cornea)';
-  render();
-}
-
-const loader = new GLTFLoader();
-let headLoadGeneration = 0;
-async function loadHead(h) {
-  const generation = ++headLoadGeneration;
-  window.__headReady = false;
-  state.current = h;
-  $('apply-skin').disabled = false;
-  $('video-go').disabled = !videoAvailable || !!videoJob;
-  refreshVideos(h.id);
-  document.querySelectorAll('.head').forEach((el) => el.classList.toggle('sel', el.dataset.id === h.id));
-  $('empty').textContent = 'loading…';
-  $('empty').style.display = 'flex';
-  $('portrait').src = h.urls.portrait || '';
-  $('landmarks').src = h.urls.landmarks || '';
-  $('dl-glb').href = h.urls.head_eyes || '#';
-  $('dl-pixal').href = h.urls.pixal3d || '#';
-  $('dl-fit').href = h.urls.fit || '#';
-  $('skin-downloads').replaceChildren(...['skin_basecolor', 'skin_normal', 'skin_orm', 'skin_mask', 'skin'].filter(n => h.urls[n]).map(n => {
-    const a = document.createElement('a'); a.className = 'dl'; a.href = h.urls[n]; a.download = ''; a.textContent = n.replaceAll('_', ' '); return a;
-  }));
-  const f = h.fit || {};
-  const rows = [
-    ['person', h.subject || '—'], ['seed / quality', `${h.seed ?? '—'} / ${h.quality || '—'}`],
-    ['scale (mesh units per m)', f.units_per_m?.toFixed(3)], ['head+bust height', f.head_height_m ? (f.head_height_m * 100).toFixed(1) + ' cm' : '—'],
-    ['IPD vs iris-width scale', f.k_ipd ? `${f.k_ipd.toFixed(3)} vs ${f.k_iris.toFixed(3)}` : '—'],
-    ['skin textures', h.skin ? `${h.skin.resolution.join(' × ')} · ${h.skin.seconds.toFixed(1)} s` : 'source texture'],
-    ['iris plate', h.plate || 'procedural'], ['iris source', h.iris?.source || 'library'], ['total time', h.seconds ? h.seconds.toFixed(1) + ' s' : '—'],
-  ];
-  $('facts').replaceChildren(...rows.map(([k, v]) => { const tr = document.createElement('tr'); tr.innerHTML = '<td></td><td></td>'; tr.children[0].textContent = k; tr.children[1].textContent = v ?? '—'; return tr; }));
-  if (state.model) { scene.remove(state.model); state.model = null; }
-  if (!h.urls.head_eyes) { $('empty').textContent = 'no GLB'; return; }
-  const gltf = await loader.loadAsync(h.urls.head_eyes);
-  if (generation !== headLoadGeneration) return;
-  state.model = gltf.scene;
-  skinRenderer.unitsPerM=h.fit?.units_per_m||1;
+const button = document.getElementById('enable-head-editor');
+button.addEventListener('click', async () => {
+  button.disabled = true;
+  button.textContent = 'Loading head editor…';
   try {
-    const mask=await new THREE.TextureLoader().loadAsync(`/v1/heads/${h.id}/skin_mask.png`);
-    mask.flipY=false;mask.colorSpace=THREE.NoColorSpace;
-    state.model.traverse(o=>{if(o.isMesh)for(const m of [].concat(o.material))if(m.name==='head')m.userData.skinMask=mask;});
-  }catch(_){} // imported legacy heads can lack a authored skin mask
-  scene.add(state.model);
-  const box = new THREE.Box3().setFromObject(state.model);
-  box.getCenter(headCenter);
-  headSize = box.getSize(new THREE.Vector3()).length() * 0.5;
-  const eyes = [];
-  state.model.traverse((o) => { if (/^eye_(left|right)$/.test(o.name)) eyes.push(o.getWorldPosition(new THREE.Vector3())); });
-  if (eyes.length) eyeCenter = eyes.reduce((a, b) => a.add(b), new THREE.Vector3()).multiplyScalar(1 / eyes.length);
-  state.eyesAnalytic = false;
-  try { await addAnalyticEyes(h, state.model); } catch (e) { console.error('analytic eyes:', e); }
-  if (generation !== headLoadGeneration) return;
-  $('empty').style.display = 'none';
-  applyLidShadow();
-  applyVisibility();
-  setView('front');
-  window.__headReady = true;
-}
-
-// The analytic eyes: per eye, the fit's parameters (its side) and iris plate
-// -> /v1/eye/textures -> a shader proxy under the GLB's eye node.
-async function addAnalyticEyes(h, model) {
-  if (!h.urls.fit) return;
-  const rec = await fetch(h.urls.fit).then((r) => r.json());
-  if (state.model !== model) return;
-  const detail = rec.plate ? { source: 'plate', id: rec.plate } : { source: 'procedural' };
-  const made = [];
-  for (const side of ['right', 'left']) {
-    const node = model.getObjectByName(`eye_${side}`);
-    if (!node || !rec.eye_params) continue;
-    const params = JSON.parse(JSON.stringify(rec.eye_params));
-    params.optics.side = side;
-    const resp = await api('/v1/eye/textures', { params, res: 1024, detail });
-    const g = resp.uniforms;
-    if (!geometry) { geometry = g; buildStudioEnv(g); applyLighting(); }
-    const mat = Eye.makeEyeMaterial(studio);
-    Eye.applyEyeGeometry(mat, g);
-    Eye.applyEyeParams(mat, params, g);
-    Eye.bindEyeTextures(mat, await Eye.loadEyeTextures(resp, { anisotropy: renderer.capabilities.getMaxAnisotropy() }));
-    const proxy = Eye.makeEyeProxy(mat, g, { followNode: true });
-    proxy.name = `eye_${side}_analytic`;
-    proxy.userData.analyticEye = true;
-    made.push([node, proxy]);
-  }
-  if (state.model !== model) return;               // another head was picked meanwhile
-  for (const [node, proxy] of made) node.add(proxy);
-  state.eyesAnalytic = made.length > 0;
-}
-
-// ---- heads list and jobs
-async function refreshHeads(selectId) {
-  const { heads } = await api('/v1/heads');
-  state.heads = heads;
-  const box = $('heads');
-  if (!heads.length) { box.innerHTML = '<span class="msg">none yet</span>'; return; }
-  box.replaceChildren(...heads.map((h) => {
-    const el = document.createElement('div');
-    el.className = 'head';
-    el.dataset.id = h.id;
-    const img = document.createElement('img'); img.src = h.urls.portrait || ''; img.alt = '';
-    const txt = document.createElement('div');
-    const b = document.createElement('b'); b.textContent = h.subject || h.id;
-    const s = document.createElement('span'); s.textContent = `${h.id} · ${h.quality || ''}${h.seconds ? ' · ' + Math.round(h.seconds) + ' s' : ''}`;
-    txt.append(b, s);
-    el.append(img, txt);
-    el.addEventListener('click', () => loadHead(h));
-    return el;
-  }));
-  const pick = heads.find((h) => h.id === selectId) || (!state.current && heads[0]);
-  if (pick) loadHead(pick);
-}
-
-const skinRegions = Object.fromEntries(['scalp', 'forehead', 'nose', 'under_eye', 'cheeks', 'lips', 'chin', 'ears'].map(r => [r, {redness: 0, saturation: 0, lightness: 0}]));
-$('skin-region').replaceChildren(...Object.keys(skinRegions).map(r => { const o = document.createElement('option'); o.value = r; o.textContent = r.replace('_', ' '); return o; }));
-$('skin-region').value = 'cheeks';
-$('skin-region').addEventListener('change', () => { for (const k of ['redness', 'saturation', 'lightness']) $('skin-' + k).value = skinRegions[$('skin-region').value][k]; });
-for (const k of ['redness', 'saturation', 'lightness']) $('skin-' + k).addEventListener('input', () => { skinRegions[$('skin-region').value][k] = +$('skin-' + k).value; });
-function skinParams() {
-  return {enabled: $('skin-enabled').checked, tone_u: +$('skin-tone-u').value, tone_v: +$('skin-tone-v').value,
-    tone_strength: +$('skin-tone-strength').value, delight_strength: +$('skin-delight').value,
-    roughness: +$('skin-roughness').value, pore_strength: +$('skin-pores').value,
-    seed: +$('seed').value, freckles: {density: +$('skin-freckles').value, strength: +$('skin-freckle-strength').value,
-      saturation: +$('skin-freckle-saturation').value, tone_shift: +$('skin-freckle-tone').value, mask: $('skin-freckle-mask').value}, regions: skinRegions};
-}
-$('apply-skin').addEventListener('click', async () => {
-  if (!state.current) return;
-  $('apply-skin').disabled = true; $('go').disabled = true; $('msg').className = 'msg';
-  try {
-    const job = await api('/v1/jobs', {kind: 'head_skin', head_id: state.current.id, skin: skinParams()});
-    state.job = job.id; poll(job.id);
-  } catch (e) { $('msg').className = 'msg bad'; $('msg').textContent = e.message; $('apply-skin').disabled = false; $('go').disabled = false; }
-});
-$('go').addEventListener('click', async () => {
-  $('go').disabled = true; $('apply-skin').disabled = true;
-  $('msg').className = 'msg';
-  try {
-    const job = await api('/v1/jobs', { kind: 'head', subject: $('subject').value, seed: +$('seed').value,
-                                        quality: $('quality').value, fov: +$('fov').value, iris_source: $('iris-source').value, qwen_preset: $('qwen-preset').value, skin: skinParams() });
-    state.job = job.id;
-    poll(job.id);
-  } catch (e) { $('msg').className = 'msg bad'; $('msg').textContent = e.message; $('go').disabled = false; $('apply-skin').disabled = !state.current; }
-});
-async function poll(id) {
-  const j = await api(`/v1/jobs/${id}`);
-  $('bar').style.width = `${Math.round((j.progress || 0) * 100)}%`;
-  $('msg').textContent = j.state === 'failed' ? j.error : `${j.state} · ${j.message || ''}`;
-  if (j.state === 'failed') $('msg').className = 'msg bad';
-  if (['done', 'failed', 'cancelled'].includes(j.state)) {
-    $('go').disabled = false; $('apply-skin').disabled = !state.current;
-    if (j.state === 'done') refreshHeads(j.result.id);
-    return;
-  }
-  setTimeout(() => poll(id), 1500);
-}
-
-let videoAvailable = false, videoJob = null;
-async function refreshVideos(headId) {
-  const result = await api(`/v1/heads/${headId}/videos`);
-  if (state.current?.id !== headId) return;
-  $('video-clips').replaceChildren();
-  for (const clip of result.videos) {
-    const label = document.createElement('p');
-    label.textContent = `${clip.request.expression || 'video'} · ${clip.backend}`;
-    const player = document.createElement('video');
-    player.controls = true; player.playsInline = true; player.preload = 'metadata';
-    player.src = clip.url; player.poster = clip.poster; player.style.width = '100%';
-    $('video-clips').append(label, player);
-  }
-}
-async function pollVideo(id, headId) {
-  if (videoJob !== id) return;
-  try {
-    const job = await api(`/v1/jobs/${id}`);
-    $('video-msg').textContent = job.state === 'failed' ? job.error : `${job.state} · ${job.message}`;
-    if (['done', 'failed', 'cancelled'].includes(job.state)) {
-      videoJob = null; $('video-cancel').disabled = true;
-      $('video-go').disabled = !videoAvailable || !state.current;
-      if (job.state === 'done') {
-        try { await refreshVideos(headId); }
-        catch (error) { $('video-msg').textContent = error.message; }
-      }
-      return;
-    }
-    setTimeout(() => pollVideo(id, headId), 1500);
+    const editor = await import('/vhuman_head_editor.js');
+    document.getElementById('advanced-head-editor').hidden = false;
+    editor.initializeHeadEditor();
+    button.hidden = true;
+    document.getElementById('reload-without-head-editor').hidden = false;
   } catch (error) {
-    $('video-msg').textContent = error.message;
-    setTimeout(() => pollVideo(id, headId), 3000);
-  }
-}
-$('video-go').addEventListener('click', async () => {
-  if (!state.current || videoJob) return;
-  const headId = state.current.id;
-  videoJob = 'submitting';
-  $('video-go').disabled = true;
-  try {
-    const job = await api('/v1/jobs', {kind: 'video_generate',
-      head_id: headId, expression: $('video-expression').value, preset: $('video-preset').value,
-      frames: Number($('video-frames').value), seed: Number($('seed').value), prompt: $('video-prompt').value});
-    videoJob = job.id; $('video-cancel').disabled = false;
-    pollVideo(job.id, headId);
-  } catch (error) {
-    videoJob = null;
-    $('video-msg').textContent = error.message;
-    $('video-go').disabled = !videoAvailable || !state.current;
+    button.textContent = '3D viewer unavailable · reload to retry';
+    document.getElementById('advanced-head-editor').hidden = true;
   }
 });
-$('video-cancel').addEventListener('click', async () => {
-  if (videoJob) {
-    try { await api(`/v1/jobs/${videoJob}/cancel`, {}); }
-    catch (error) { $('video-msg').textContent = error.message; }
-  }
-});
-
-api('/health').then((h) => {
-  videoAvailable = !!h.video?.available;
-  const previousPreset = $('video-preset').value, previousFrames = Number($('video-frames').value);
-  $('video-preset').replaceChildren(...(h.video?.presets || []).map(preset =>
-    new Option(({quality: 'Quality', fast12: 'Fast · 12 steps', fast5: 'Fast · 5 steps'})[preset] || preset, preset)));
-  if (h.video?.presets?.includes(previousPreset)) $('video-preset').value = previousPreset;
-  $('video-frames').replaceChildren(...(h.video?.frames || []).map(frames =>
-    new Option(`${frames} frames · ${(frames / (h.video?.fps || 24)).toFixed(2)} seconds`, String(frames))));
-  $('video-frames').value = String(h.video?.frames?.includes(previousFrames) ? previousFrames : h.video?.default_frames);
-  $('video-go').disabled = !videoAvailable || !state.current;
-  if (!videoAvailable) $('video-msg').textContent = 'Video backend needs model setup and experimental enablement.';
-  else if (h.video.mock) $('video-msg').textContent = 'Mock mode: static portrait clip.';
-  else if (h.video.identity_conditioned === false) $('video-msg').textContent = 'H3 generates from text. The portrait does not condition the video; identity needs review.';
-  else $('video-msg').textContent = 'Experimental video backend; quality and memory fit are unverified.';
-  const g = h.gpu ? `${h.gpu.name} · ${h.gpu.free_mib} MiB free` : 'no GPU';
-  $('health').textContent = `${g} · Qwen ${h.qwen.available ? 'ready' : 'n/a'} · Pixal3D ${h.pixal3d.available ? 'ready' : 'n/a'}`;
-}).catch(() => {});
-resize();
-refreshHeads();
+document.getElementById('reload-without-head-editor').onclick = () => location.reload();
 </script>
+<script type="module" src="/vhuman_portrait.js"></script>
 </body>
 </html>

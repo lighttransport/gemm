@@ -173,7 +173,7 @@ class App:
     def __init__(self, args):
         self.args = args
         self.service = EyeService(Path(args.work))
-        from . import qwen, baseline, video
+        from . import qwen, baseline, video, portrait
         from .head import pipeline as head_pipeline
         from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue, soft_deformer, video_fit
         from .body import job as body_job, motion as body_motion
@@ -188,6 +188,8 @@ class App:
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
         handlers = {
+            'portrait_generate': lambda req, prog, cancel: portrait.generate_job(self.service, req, prog, cancel, **self.qwen_opts),
+            'portrait_views': lambda req, prog, cancel: portrait.views_job(self.service, req, prog, cancel, **self.qwen_opts),
             "genia_validate": lambda req, prog, cancel: genia_job.validate_job(self.service, req, prog, cancel),
             "genia_reconstruct": lambda req, prog, cancel: genia_job.reconstruct_job(self.service, req, prog, cancel),
             "video_generate": lambda req, prog, cancel: video.video_job(self.service, req, prog, cancel,
@@ -368,6 +370,20 @@ def make_handler(app: App, quiet: bool = False):
                                       {"Cache-Control": "no-cache"})
                 if path == "/v1/heads":
                     return self._json(200, {"heads": app.service.list_heads()})
+                if path == '/v1/portrait-sessions':
+                    from . import portrait
+                    return self._json(200, {'sessions': portrait.listing(app.service)})
+                if path.startswith('/v1/portrait-sessions/'):
+                    from . import portrait
+                    sid, _, tail = path[len('/v1/portrait-sessions/'):].partition('/')
+                    if not tail:
+                        return self._json(200, portrait.public(portrait.load(app.service, sid)))
+                    if tail == 'bundle.zip':
+                        return self._send(200, portrait.bundle(app.service, sid), 'application/zip',
+                                          {'Content-Disposition': 'attachment; filename="face-inputs.zip"'})
+                    if tail.startswith('files/'):
+                        return self._file(portrait.artifact(app.service, sid, tail[6:]), immutable=True)
+                    return self._error(404, 'no such portrait artifact')
                 if path == "/v1/body/reference-motions":
                     from urllib.parse import parse_qs, urlsplit
                     backend = parse_qs(urlsplit(self.path).query).get("backend", ["musclemimic"])[0]
@@ -380,7 +396,7 @@ def make_handler(app: App, quiet: bool = False):
                     from .body.musclemimic import catalog
                     return self._json(200, catalog(getattr(app.args, "musclemimic_assets", None),
                                                    getattr(app.args, "musclemimic_python", None)))
-                if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js"):
+                if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js", '/vhuman_portrait.js', '/vhuman_head_editor.js'):
                     return self._file(ROOT / "web" / path[1:])
                 if path.startswith("/v1/heads/") and "/videos" in path:
                     from . import video
@@ -452,6 +468,10 @@ def make_handler(app: App, quiet: bool = False):
         def do_POST(self):
             path = self.path.split("?", 1)[0]
             try:
+                if path.startswith('/v1/portrait-sessions/') and path.endswith('/review'):
+                    from . import portrait
+                    sid = path[len('/v1/portrait-sessions/'):-len('/review')]
+                    return self._json(200, portrait.review(app.service, sid, self._body()))
                 if path == "/v1/genia/uploads":
                     from .genia.upload import upload, MAX_UPLOAD
                     length = int(self.headers.get("Content-Length") or 0)

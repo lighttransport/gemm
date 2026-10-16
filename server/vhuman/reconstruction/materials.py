@@ -117,7 +117,8 @@ def fuse_samples(colors,confidence):
         downweighted_observations=int(((robust<confidence*.8)&(confidence>.1)).sum()))
 
 
-def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=512, roughness=.55, f0=.028, spatial_materials=False):
+def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=512, roughness=.55, f0=.028, spatial_materials=False,
+                  protect_front=False):
     if not .08<=roughness<=1. or not .005<=f0<=.04:
         raise ValueError("roughness must be .08..1; F0 .005...04")
     from scipy.ndimage import distance_transform_edt
@@ -225,6 +226,33 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
         spec[~covered]=spec[nearest[0][~covered],nearest[1][~covered]]
     confidence = np.zeros((res,res),np.uint8)
     confidence[yy,xx] = np.uint8(np.clip(weight,0,1)*255)
+    front_report = None
+    if protect_front:
+        # Bake the same final geometry from the anchor alone. Restore its source
+        # texels AFTER fusion, completion and seam cleanup, byte for byte.
+        import shutil
+        front_dir = out/'.front-material'
+        try:
+            front_report = bake_portrait(vertices[:1] if vertices.ndim == 3 else vertices,
+                triangles, triangle_uvs, views[:1], cameras[:1], front_dir, res=res,
+                roughness=roughness, f0=f0)
+            with Image.open(front_dir/'skin_coverage.png') as image:
+                front_mask = np.asarray(image)>0
+            with Image.open(front_dir/'skin_basecolor.png') as image:
+                front_color = np.asarray(image)
+            with Image.open(front_dir/'skin_confidence.png') as image:
+                front_confidence = np.asarray(image)
+            generated = observed & ~front_mask
+            base[front_mask] = front_color[front_mask]
+            observed = front_mask
+            confidence[:] = front_confidence
+            Image.fromarray(np.uint8(generated)*255).save(out/'skin_generated_support.png')
+            Image.fromarray(np.uint8(front_mask)*255).save(out/'skin_front_protected.png')
+            front_report = dict(policy='front protected; side views fill unseen skin only',
+                                protected_texels=int(front_mask.sum()), generated_texels=int(generated.sum()),
+                                front_preserved=True, evidence='synthetic generated images, not captured scan data')
+        finally:
+            shutil.rmtree(front_dir, ignore_errors=True)
     completion_map=np.zeros((res,res),np.uint8)
     completion_map[yy,xx]=np.uint8(completion_confidence*255+.5)
     for name, data in [('completion_confidence',completion_map),('basecolor',base),('orm',orm),('normal',normal),('specular',spec),
@@ -241,7 +269,11 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
                     status='authored profile, not measured anatomy'),
                     observed_texels=int(observed.sum()),covered_texels=int(covered.sum()),
                     completion=completion_report,seam_cleanup=seam_report,
+                    synthetic_inputs=front_report,
                     limitations=['single-view lighting/albedo ambiguity','bounded low-detail completion; no hidden detail recovery',
                                  'pores/wrinkles are separate authored detail; no material predictor'])
+    if protect_front:
+        manifest['maps'].update(generated_support='skin_generated_support.png', front_protected='skin_front_protected.png')
+        manifest['semantics']['coverage'] = 'anchor image support only; generated side support has its own map'
     (out/'skin_material.json').write_text(json.dumps(manifest,indent=2))
     return manifest

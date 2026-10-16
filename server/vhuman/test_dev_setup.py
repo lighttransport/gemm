@@ -70,6 +70,8 @@ class DevSetupTest(unittest.TestCase):
         self.assertNotIn("libq21_fast_sage.so", arguments)
         self.assertNotIn("libq21_fast_fp4.so", arguments)
         self.assertIn("libq21_fast_int8.so", arguments)
+        for target in ('native-text-exact', 'test_cuda_qimg21_vision', 'native-vae'):
+            self.assertIn(target, arguments)
         self.assertIn("GPU_ARCH=sm_80", arguments)
 
     def test_blackwell_build_enables_plugins(self):

@@ -425,6 +425,9 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
     rig = rig_definition(skel, shape_names)
     from ..reconstruction.provenance import portrait_record
     rig['portrait_provenance'] = portrait_record(subj.portrait)
+    if reconstruction is not None and manifest.get('input_provenance'):
+        rig['input_provenance'] = manifest['input_provenance']
+        rig['license_scope'] = 'rig definition; input_provenance records source image licenses'
     rig["face_model"] = face_model
     if source is not None and source.name == 'gnm_v3':
         from .gnm_expression import project

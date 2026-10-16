@@ -146,7 +146,7 @@ def head_job(service, request: dict, progress, cancel, python=None, mock: bool =
     eyes, tried = None, []
     plates = service.list_plates()
     iris_info = {"requested": iris_source, "source": "library"}
-    with gpu.device_session(8192 if preset == "low8" else gpu.QWEN_MIN_FREE_MIB, cancel, lock_path=lock, check_memory=not mock):
+    with gpu.device_session(gpu.QWEN_LOW8_MIN_FREE_MIB if preset == "low8" else gpu.QWEN_MIN_FREE_MIB, cancel, lock_path=lock, check_memory=not mock):
         backend = qwen.make_backend(python, mock, preset=preset) if (not mock or iris_source == "portrait") else None
         try:
             for k in range(max(1, attempts)):

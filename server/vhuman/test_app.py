@@ -98,7 +98,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 202)
         job = self.wait_job(json.loads(body)["id"])
         self.assertEqual(job["state"], "failed")
-        self.assertIn("frames", job["error"])
+        self.assertRegex(job["error"], r"\bframes?\b")
 
     def test_genia_prepared_upload_and_capability_gate(self):
         import io
