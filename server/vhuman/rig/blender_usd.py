@@ -28,11 +28,15 @@ def restore_shape_ranges(objects):
             block = keys.key_blocks.get(json.loads(match[1]))
             if block is None or not curve.keyframe_points:
                 continue
-            values = [float(p.co.y) for p in curve.keyframe_points]
-            # Cubic curves stay inside their control-point hull. USD's sampled
-            # linear curves need only their actual key values.
-            values += [float(h.y) for p in curve.keyframe_points if p.interpolation == 'BEZIER'
-                       for h in (p.handle_left, p.handle_right)]
+            points = list(curve.keyframe_points)
+            values = [float(p.co.y) for p in points]
+            # A segment's starting key selects its interpolation. Its Bezier
+            # hull includes the next key's incoming handle, even when that key
+            # starts a linear/constant segment. Unused endpoint handles do not
+            # bound the curve.
+            for left, right in zip(points, points[1:]):
+                if left.interpolation == 'BEZIER':
+                    values.extend((float(left.handle_right.y), float(right.handle_left.y)))
             if not all(math.isfinite(v) for v in values):
                 raise ValueError('nonfinite corrective curve: '+block.name)
             lo = min(block.slider_min, min(values)); hi = max(block.slider_max, max(values))
