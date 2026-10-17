@@ -14,9 +14,9 @@ The displacement is then smoothed over the contact vertices' mesh graph
 edge, and the projection runs once more, so the result stays exact.
 Thresholds are rest-relative, as in the training contacts (mldeformer): a
 vertex never ends closer than at rest or than the margin, whichever is smaller.
-Every vertex belongs to at most one eye, one lip set and one pair, so each
-phase is independent per vertex: the C, CUDA, Vulkan and JS versions run the
-same arithmetic in the same order.
+Eye and lip sets are unique per vertex. Pairs may share vertices after source
+topology transfer, so their Gauss-Seidel updates run serially in recorded order
+in the C, CUDA, Vulkan, NumPy and JS implementations.
 
 Tensors (package prefix "contact."; metres, bind space):
     eye_ids (Ne,) eye_joint (Ne,) eye_center (Ne, 3) eye_thr (Ne,)
@@ -138,11 +138,12 @@ def _solve(x, t, g, iterations):
         m = d < t["contact.eye_thr"]
         any_move |= bool(m.any())
         x[ei[m]] = ec[m] + v[m] * (t["contact.eye_thr"][m] / np.maximum(d[m], 1e-12))[:, None]
-        sep = (x[pu] - x[pl]) @ up
-        dl = np.maximum(fl - sep, 0.0) * 0.5
-        any_move |= bool((dl > 0).any())
-        x[pu] += dl[:, None] * up
-        x[pl] -= dl[:, None] * up
+        for u, l, floor in zip(pu, pl, fl):
+            dl = float(floor) - (x[u] - x[l]) @ up
+            if dl > 0:
+                any_move = True
+                x[u] += .5 * dl * up
+                x[l] -= .5 * dl * up
         q = x[lip]
         active = np.ones(len(lip), bool)          # per vertex: passes until one pushes nothing
         for _ in range(SPHERE_PASSES):            # (overlapping spheres push into each other)

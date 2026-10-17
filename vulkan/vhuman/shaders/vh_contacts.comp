@@ -46,7 +46,8 @@ void solve(int S, int X, int tid) {
     }
     memoryBarrierBuffer();
     barrier();
-    for (int p = tid; p < pc.np; p += 256) {
+    // Transferred pairs can share vertices: match CPU/CUDA Gauss-Seidel order.
+    if (tid == 0) for (int p = 0; p < pc.np; ++p) {
       int u = X + ints[pc.o_pair_u + p] * 3, l = X + ints[pc.o_pair_l + p] * 3;
       float sep = (x[u] - x[l]) * U.x + (x[u + 1] - x[l + 1]) * U.y + (x[u + 2] - x[l + 2]) * U.z;
       float dl = flt[pc.o_pair_floor + p] - sep;

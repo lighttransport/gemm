@@ -4,6 +4,7 @@ import queue
 import signal
 import subprocess
 import threading
+import time
 
 from . import gpu
 
@@ -26,7 +27,7 @@ def _stop_group(proc):
         proc.wait()
 
 
-def run(command, cancel, on_line, *, cwd, env):
+def run(command, cancel, on_line, *, cwd, env, timeout=None):
     if cancel.is_set():
         raise gpu.Cancelled('cancelled')
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -53,10 +54,15 @@ def run(command, cancel, on_line, *, cwd, env):
 
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    def check_stop():
+        if cancel.is_set():
+            raise gpu.Cancelled('cancelled')
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(command, timeout)
     try:
         while True:
-            if cancel.is_set():
-                raise gpu.Cancelled('cancelled')
+            check_stop()
             try:
                 line = lines.get(timeout=.1)
             except queue.Empty:
@@ -67,8 +73,8 @@ def run(command, cancel, on_line, *, cwd, env):
                 raise line
             on_line(line.rstrip())
         while proc.poll() is None:
-            if cancel.wait(.1):
-                raise gpu.Cancelled('cancelled')
+            check_stop()
+            cancel.wait(.1)
         return proc.wait()
     except BaseException:
         _stop_group(proc)

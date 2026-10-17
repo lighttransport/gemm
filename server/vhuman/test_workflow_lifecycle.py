@@ -1,6 +1,8 @@
 """Regression coverage for cancellation, rig publication and concurrent uploads."""
 from concurrent.futures import ThreadPoolExecutor
 import io
+import hashlib
+import json
 import os
 from pathlib import Path
 import signal
@@ -40,7 +42,21 @@ class WorkflowTests(unittest.TestCase):
     def test_progress_exception_also_kills_worker_group(self):
         self._worker_cleanup(cancel=False)
 
-    def _worker_cleanup(self, *, cancel):
+    def test_body_cancellation_cleans_up_descendants(self):
+        self._worker_cleanup(cancel=True, runner='body')
+
+    def test_speech_cancellation_cleans_up_descendants(self):
+        self._worker_cleanup(cancel=True, runner='speech')
+
+    def test_timeout_kills_descendant_holding_stdout_after_parent_exit(self):
+        child = "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)"
+        command = [sys.executable, '-c',
+                   'import subprocess,sys; subprocess.Popen([sys.executable,"-c",sys.argv[1]])', child]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            process.run(command, threading.Event(), lambda _: None, cwd=ROOT,
+                        env=dict(os.environ), timeout=.4)
+
+    def _worker_cleanup(self, *, cancel, runner=None):
         child = self.root/'child.py'
         child.write_text("import signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
                          "print('ready',flush=True)\ntime.sleep(60)\n")
@@ -64,8 +80,17 @@ class WorkflowTests(unittest.TestCase):
 
         def work():
             try:
-                process.run([sys.executable, '-u', '-c', code, str(child)], event,
-                            on_line, cwd=ROOT, env=dict(os.environ))
+                cmd = [sys.executable, '-u', '-c', code, str(child)]
+                if runner:
+                    from .body.job import _run as body_run
+                    from .rig.speech import _run as speech_run
+                    threading.Timer(.4, event.set).start()
+                    if runner == 'body':
+                        body_run(cmd, event)
+                    else:
+                        speech_run(cmd, event, lambda *_: None)
+                else:
+                    process.run(cmd, event, on_line, cwd=ROOT, env=dict(os.environ))
             except Exception as exc:
                 errors.append(exc)
 
@@ -87,6 +112,86 @@ class WorkflowTests(unittest.TestCase):
                     except ProcessLookupError:
                         pass
                 thread.join(5)
+
+    def _body_rebuild(self, fail_publication=False, cancel_assembly=False):
+        from .body import job
+        rig = self._head(False)
+        (rig/'features.json').write_text('{}')
+        body = rig.parent/'body'
+        take = body/'motions/012345abcdef'
+        take.mkdir(parents=True)
+        (body/'avatar.json').write_text('old avatar')
+        (body/'avatar.glb').write_bytes(b'old glb')
+        manifest = {'id': take.name, 'avatar_sha256': hashlib.sha256(b'old avatar').hexdigest()[:16]}
+        (take/'manifest.json').write_text(json.dumps(manifest))
+        (take/'motion.json').write_bytes(b'keep motion')
+        self.assertFalse(self.service.list_motions('abc')[0]['avatar_stale'])
+
+        def assemble(cmd, *args, **kwargs):
+            out = Path(cmd[cmd.index('--out')+1])
+            (out/'body_report.json').write_text('{}')
+            (out/'avatar.json').write_text('new avatar')
+            (out/'avatar.glb').write_bytes(b'new glb')
+            if cancel_assembly:
+                args[0].set()
+
+        rename = Path.rename
+        def publish(path, target):
+            if fail_publication and path.name.startswith('.body-') and target == body:
+                # Allow restoration of the saved package.
+                if not path.name.startswith('.body-previous-'):
+                    raise OSError('publication failed')
+            return rename(path, target)
+
+        with gpu.execution('cpu'), patch.object(job.gpu, 'gpu_status', return_value=None), \
+                patch.object(job, 'availability', return_value={'available': True}), \
+                patch.object(job, '_generate_image', return_value={'bbox': [0, 0, 1, 1]}), \
+                patch.object(job, '_sam_body', return_value={}), \
+                patch.object(job, '_pixal', return_value={}), \
+                patch.object(job, '_garments', return_value=[]), \
+                patch.object(job, '_run', side_effect=assemble), patch.object(Path, 'rename', publish):
+            call = lambda: job.body_job(self.service, {'head_id': 'abc'}, lambda *_: None,
+                                       threading.Event(), mock=True)
+            if cancel_assembly:
+                with self.assertRaises(gpu.Cancelled):
+                    call()
+            elif fail_publication:
+                with self.assertRaisesRegex(OSError, 'publication failed'):
+                    call()
+            else:
+                call()
+        self.assertEqual((take/'motion.json').read_bytes(), b'keep motion')
+        kept_old = fail_publication or cancel_assembly
+        self.assertEqual(self.service.list_motions('abc')[0]['avatar_stale'], not kept_old)
+        self.assertEqual((body/'avatar.json').read_text(), 'old avatar' if kept_old else 'new avatar')
+        self.assertFalse(list(body.parent.glob('.body-*')))
+
+    def test_body_rebuild_preserves_motion_downloads_and_marks_stale(self):
+        self._body_rebuild()
+        self.assertEqual(self.service.body_file('abc', 'motions/012345abcdef/motion.json').read_bytes(), b'keep motion')
+
+    def test_body_publication_failure_restores_motions(self):
+        self._body_rebuild(fail_publication=True)
+
+    def test_body_cancelled_after_assembly_preserves_avatar_and_motions(self):
+        self._body_rebuild(cancel_assembly=True)
+
+    def test_motion_staleness_checks_geometry_and_body_metadata(self):
+        self._body_rebuild()
+        body = self.root/'heads/abc/body'
+        manifest = body/'motions/012345abcdef/manifest.json'
+        record = json.loads(manifest.read_text())
+        record['avatar_sha256'] = hashlib.sha256((body/'avatar.json').read_bytes()).hexdigest()
+        record['avatar_glb_sha256'] = hashlib.sha256((body/'avatar.glb').read_bytes()).hexdigest()
+        (body/'body_mhr.glb.json').write_text('{}')
+        record['body_meta_sha256'] = hashlib.sha256(b'{}').hexdigest()
+        manifest.write_text(json.dumps(record))
+        self.assertFalse(self.service.list_motions('abc')[0]['avatar_stale'])
+        for filename in ('avatar.glb', 'body_mhr.glb.json'):
+            with self.subTest(filename=filename):
+                path = body/filename; old = path.read_bytes(); path.write_bytes(b'changed')
+                self.assertTrue(self.service.list_motions('abc')[0]['avatar_stale'])
+                path.write_bytes(old)
 
     def _head(self, candidate):
         head = self.root/'heads'/'abc'

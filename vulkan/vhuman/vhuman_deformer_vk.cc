@@ -1,6 +1,9 @@
 #include "vhuman_deformer_vk.h"
 
 #include <chrono>
+#include <climits>
+#include <new>
+#include <stdexcept>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -116,10 +119,16 @@ int vh_vk_memory_flags(const vh_vk *g) { return (g->bar_inputs ? 1 : 0) | (g->ca
 
 static bool ensure(vh_vk *g, size_t frames) {
     if (frames <= g->cap) return true;
+    g->cap = 0;
     auto &r = g->runner;
     for (auto *b : {&g->w, &g->skin, &g->out, &g->stage, &g->c_scr})
         if (b->buffer) { r.destroyBuffer(*b); *b = {}; }
     size_t cap = frames < 64 ? 64 : frames;
+    size_t scratch = vh_deformer_prepare_scratch(g->d, 1);
+    size_t nc = g->ct_pc[21] ? (size_t)g->ct_pc[21] : 1;
+    if (cap > INT_MAX || cap > SIZE_MAX / 4 / g->M || cap > SIZE_MAX / 48 / g->J ||
+        cap > SIZE_MAX / 12 / g->V || cap > SIZE_MAX / 24 / nc ||
+        (scratch && cap > (SIZE_MAX / 4 - 1) / scratch)) return false;
     VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     VkBufferUsageFlags use = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     // per-frame inputs: device-local + host-visible (resizable BAR) when available,
@@ -137,17 +146,22 @@ static bool ensure(vh_vk *g, size_t frames) {
                          g->stage) ||
           ((g->cached_readback = false), r.createStagingBuffer(cap * g->V * 12, g->stage))))
         return false;
-    g->hw.resize(cap * g->M);
-    g->hskin.resize(cap * g->J * 12);
-    g->hscratch.resize(vh_deformer_prepare_scratch(g->d, cap) + 1);
-    g->cap = cap;
+    try {
+        g->hw.resize(cap * g->M);
+        g->hskin.resize(cap * g->J * 12);
+        g->hscratch.resize(cap * scratch + 1);
+    } catch (const std::bad_alloc &) { return false;
+    } catch (const std::length_error &) { return false; }
     if (g->has_ct && !(r.createDeviceLocalBuffer(cap * (size_t)(g->ct_pc[21] ? g->ct_pc[21] : 1) * 24, g->c_scr) &&
                        r.updateDescriptorSet(g->pipe_ct, {g->out, g->skin, g->c_ints, g->c_flts, g->c_scr})))
         return false;
-    return r.updateDescriptorSet(g->pipe, {g->rest, g->morph, g->sj, g->sw, g->w, g->skin, g->out});
+    if (!r.updateDescriptorSet(g->pipe, {g->rest, g->morph, g->sj, g->sw, g->w, g->skin, g->out})) return false;
+    g->cap = cap;
+    return true;
 }
 
 int vh_vk_eval_batch(vh_vk *g, const float *controls, size_t frames, int use_ml, float *out, double *ms4) {
+    if (!g || !controls || frames > INT_MAX) return -1;
     if (!frames) return 0;
     if (!ensure(g, frames)) return -1;
     auto &r = g->runner;

@@ -1,6 +1,7 @@
 #include "vhuman_deformer.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,11 +40,47 @@ struct vh_deformer {
 };
 
 static const void *tensor(st_context *s, const char *name, const char *dtype, int nd, size_t *shape) {
+    memset(shape, 0, (size_t)nd * sizeof(*shape));
     int i = safetensors_find(s, name);
     if (i < 0 || strcmp(safetensors_dtype(s, i), dtype) || safetensors_ndims(s, i) != nd) return NULL;
     const uint64_t *sh = safetensors_shape(s, i);
-    for (int k = 0; k < nd; ++k) shape[k] = (size_t)sh[k];
-    return safetensors_data(s, i);
+    size_t count = 1;
+    for (int k = 0; k < nd; ++k) {
+        if (sh[k] > INT_MAX || (sh[k] && count > SIZE_MAX / sh[k])) return NULL;
+        shape[k] = (size_t)sh[k];
+        count *= shape[k];
+    }
+    const st_tensor_info *t = &s->tensors[i];
+    if (s->data_offset > s->map_size || t->offset % 4 || count > SIZE_MAX / 4 || t->nbytes != count * 4 ||
+        t->offset > s->map_size - s->data_offset || t->nbytes > s->map_size - s->data_offset - t->offset) return NULL;
+    const void *p = safetensors_data(s, i);
+    /* Integer classification remains effective in the CPU fast-math build. */
+    if (!strcmp(dtype, "F32"))
+        for (size_t k = 0; k < count; ++k) {
+            uint32_t bits;
+            memcpy(&bits, (const char *)p + k*4, 4);
+            if ((bits & 0x7f800000u) == 0x7f800000u) return NULL;
+        }
+    return p;
+}
+
+static const void *tensor_exact(st_context *s, const char *name, const char *dtype, int nd, const size_t *want) {
+    size_t sh[3];
+    const void *p = tensor(s, name, dtype, nd, sh);
+    for (int k = 0; k < nd; ++k) if (sh[k] != want[k]) return NULL;
+    return p;
+}
+
+static int indices_valid(const int32_t *ids, size_t n, size_t bound, int unique) {
+    unsigned char *seen = unique ? calloc(bound, 1) : NULL;
+    if (unique && !seen) return 0;
+    int ok = 1;
+    for (size_t i = 0; i < n; ++i) {
+        if (ids[i] < 0 || (size_t)ids[i] >= bound || (seen && seen[ids[i]])) { ok = 0; break; }
+        if (seen) seen[ids[i]] = 1;
+    }
+    free(seen);
+    return ok;
 }
 
 vh_deformer *vh_deformer_load(const char *path) {
@@ -53,73 +90,119 @@ vh_deformer *vh_deformer_load(const char *path) {
     if (!d) { safetensors_close(s); return NULL; }
     d->st = s;
     size_t sh[3];
-    int ok = 1;
-#define GET(field, name, dt, nd) do { d->field = tensor(s, name, dt, nd, sh); ok = ok && d->field; } while (0)
+#define GET(field, name, dt, nd) do { d->field = tensor(s, name, dt, nd, sh); if (!d->field) goto invalid; } while (0)
+#define EXACT(field, name, dt, nd, ...) do { \
+    d->field = tensor_exact(s, name, dt, nd, (size_t[]){__VA_ARGS__}); if (!d->field) goto invalid; \
+} while (0)
     GET(range, "controls.range", "F32", 2); d->C = sh[0];
+    if (!d->C || d->C > 512 || sh[1] != 2) goto invalid;
     GET(jm, "joints.matrix", "F32", 2); d->I = sh[1]; d->J = sh[0] / ATTR;
-    GET(parent, "joints.parent", "I32", 1);
-    GET(rest_t, "joints.rest_t", "F32", 2);
-    GET(rest_R, "joints.rest_R", "F32", 3);
-    GET(inv_bind, "joints.inv_bind", "F32", 3);
+    if (!d->J || d->J > 64 || sh[0] % ATTR || d->I < d->C || d->I > 512) goto invalid;
+    EXACT(parent, "joints.parent", "I32", 1, d->J);
+    EXACT(rest_t, "joints.rest_t", "F32", 2, d->J, 3);
+    EXACT(rest_R, "joints.rest_R", "F32", 3, d->J, 3, 3);
+    EXACT(inv_bind, "joints.inv_bind", "F32", 3, d->J, 4, 4);
     GET(src, "shapes.src", "I32", 1); d->B = sh[0];
     GET(morph, "morph", "F32", 3); d->M = sh[0]; d->V = sh[1];
-    GET(rest, "rest", "F32", 2);
-    GET(sj, "skin.joints", "I32", 2);
-    GET(sw, "skin.weights", "F32", 2);
+    if (!d->M || !d->V || d->V > INT_MAX / 3 || sh[2] != 3) goto invalid;
+    EXACT(rest, "rest", "F32", 2, d->V, 3);
+    EXACT(sj, "skin.joints", "I32", 2, d->V, 4);
+    EXACT(sw, "skin.weights", "F32", 2, d->V, 4);
+    for (size_t j = 0; j < d->J; ++j) if (d->parent[j] < -1 || d->parent[j] >= (int32_t)j) goto invalid;
+    for (size_t i = 0; i < d->C; ++i) if (d->range[2*i] > d->range[2*i+1]) goto invalid;
+    if (!indices_valid(d->src, d->B, d->I, 0) || !indices_valid(d->sj, d->V*4, d->J, 0)) goto invalid;
+    for (size_t v = 0; v < d->V; ++v) {
+        float sum = 0;
+        for (int k = 0; k < 4; ++k) {
+            float w = d->sw[v*4+k];
+            if (w < 0 || w > 1.0001f) goto invalid;
+            sum += w;
+        }
+        if (fabsf(sum-1) > 1e-4f) goto invalid;
+    }
     d->P = d->I - d->C;
     if (d->P) {
         GET(corr_in, "corr.inputs", "I32", 2); d->corr_k = sh[1];
-        GET(corr_w, "corr.weight", "F32", 1);
+        if (sh[0] != d->P || !d->corr_k || d->corr_k > d->I) goto invalid;
+        EXACT(corr_w, "corr.weight", "F32", 1, d->P);
+        for (size_t p = 0; p < d->P; ++p)
+            for (size_t k = 0; k < d->corr_k; ++k) {
+                int32_t i = d->corr_in[p*d->corr_k+k];
+                if (i < -1 || i >= (int32_t)(d->C+p)) goto invalid;
+            }
     }
-#undef GET
-    d->w1 = tensor(s, "ml.fc1.weight", "F32", 2, sh);
-    if (d->w1) {
+    if (safetensors_find(s, "ml.fc1.weight") >= 0) {
+        GET(w1, "ml.fc1.weight", "F32", 2);
         d->H = sh[0];
-        d->ml_in = sh[1];                            /* controls, or controls + correctives */
-        ok = ok && d->ml_in <= d->I;
-        d->b1 = tensor(s, "ml.fc1.bias", "F32", 1, sh);
-        d->w2 = tensor(s, "ml.fc2.weight", "F32", 2, sh); d->K = sh[0];
-        d->b2 = tensor(s, "ml.fc2.bias", "F32", 1, sh);
-        d->imean = tensor(s, "ml.input.mean", "F32", 1, sh);
-        d->iscale = tensor(s, "ml.input.scale", "F32", 1, sh);
-        d->omean = tensor(s, "ml.output.mean", "F32", 1, sh);
-        d->oscale = tensor(s, "ml.output.scale", "F32", 1, sh);
-        ok = ok && d->b1 && d->w2 && d->b2 && d->imean && d->iscale && d->omean && d->oscale
-             && d->M == d->B + 1 + d->K;
+        d->ml_in = sh[1];
+        if (!d->H || !d->ml_in || d->ml_in > d->I) goto invalid;
+        EXACT(b1, "ml.fc1.bias", "F32", 1, d->H);
+        GET(w2, "ml.fc2.weight", "F32", 2); d->K = sh[0];
+        if (!d->K || sh[1] != d->H || d->M != d->B+1+d->K) goto invalid;
+        EXACT(b2, "ml.fc2.bias", "F32", 1, d->K);
+        EXACT(imean, "ml.input.mean", "F32", 1, d->ml_in);
+        EXACT(iscale, "ml.input.scale", "F32", 1, d->ml_in);
+        EXACT(omean, "ml.output.mean", "F32", 1, d->K);
+        EXACT(oscale, "ml.output.scale", "F32", 1, d->K);
+        for (size_t k = 0; k < d->K; ++k) if (d->oscale[k] == 0) goto invalid;
     } else {
-        ok = ok && d->M == d->B;
+        if (d->M != d->B) goto invalid;
+    }
+    for (int i = 0; i < s->n_tensors; ++i) {
+        const char *name = safetensors_name(s, i);
+        if ((!strncmp(name, "ml.", 3) && !d->w1) ||
+            (!strncmp(name, "contact.", 8) && safetensors_find(s, "contact.eye_ids") < 0)) goto invalid;
     }
     {
         size_t a[3];
         vh_contacts *c = &d->ct;
-        c->eye_ids = tensor(s, "contact.eye_ids", "I32", 1, a);
-        if (c->eye_ids) {
+#define CT(field, name, dt, nd, ...) do { \
+    c->field = tensor_exact(s, "contact." name, dt, nd, (size_t[]){__VA_ARGS__}); if (!c->field) goto invalid; \
+} while (0)
+        if (safetensors_find(s, "contact.eye_ids") >= 0) {
+            c->eye_ids = tensor(s, "contact.eye_ids", "I32", 1, a);
+            if (!c->eye_ids) goto invalid;
             c->ne = a[0];
-            c->eye_joint = tensor(s, "contact.eye_joint", "I32", 1, a);
-            c->eye_center = tensor(s, "contact.eye_center", "F32", 2, a);
-            c->eye_thr = tensor(s, "contact.eye_thr", "F32", 1, a);
-            c->lip_ids = tensor(s, "contact.lip_ids", "I32", 1, a); c->nl = a[0];
-            c->sph_center = tensor(s, "contact.sph_center", "F32", 2, a); c->ns = a[0];
-            c->sph_joint = tensor(s, "contact.sph_joint", "I32", 2, a);
-            c->sph_weight = tensor(s, "contact.sph_weight", "F32", 2, a);
-            c->sph_thr = tensor(s, "contact.sph_thr", "F32", 2, a);
-            c->pair_u = tensor(s, "contact.pair_u", "I32", 1, a); c->np = a[0];
-            c->pair_l = tensor(s, "contact.pair_l", "I32", 1, a);
-            c->pair_floor = tensor(s, "contact.pair_floor", "F32", 1, a);
-            c->up_joints = tensor(s, "contact.up_joints", "I32", 1, a);
-            c->verts = tensor(s, "contact.verts", "I32", 1, a);
-            if (c->verts) {
+            CT(eye_joint, "eye_joint", "I32", 1, c->ne);
+            CT(eye_center, "eye_center", "F32", 2, c->ne, 3);
+            CT(eye_thr, "eye_thr", "F32", 1, c->ne);
+            c->lip_ids = tensor(s, "contact.lip_ids", "I32", 1, a); if (!c->lip_ids) goto invalid; c->nl = a[0];
+            c->sph_center = tensor(s, "contact.sph_center", "F32", 2, a); if (!c->sph_center || a[1] != 3) goto invalid; c->ns = a[0];
+            if (c->ns > 512) goto invalid;
+            CT(sph_joint, "sph_joint", "I32", 2, c->ns, 2);
+            CT(sph_weight, "sph_weight", "F32", 2, c->ns, 2);
+            CT(sph_thr, "sph_thr", "F32", 2, c->nl, c->ns);
+            c->pair_u = tensor(s, "contact.pair_u", "I32", 1, a); if (!c->pair_u) goto invalid; c->np = a[0];
+            CT(pair_l, "pair_l", "I32", 1, c->np);
+            CT(pair_floor, "pair_floor", "F32", 1, c->np);
+            CT(up_joints, "up_joints", "I32", 1, 2);
+            if (!indices_valid(c->eye_ids, c->ne, d->V, 1) || !indices_valid(c->eye_joint, c->ne, d->J, 0) ||
+                !indices_valid(c->lip_ids, c->nl, d->V, 1) || !indices_valid(c->sph_joint, c->ns*2, d->J, 0) ||
+                !indices_valid(c->pair_u, c->np, d->V, 0) || !indices_valid(c->pair_l, c->np, d->V, 0) ||
+                !indices_valid(c->up_joints, 2, d->J, 0)) goto invalid;
+            for (size_t i = 0; i < c->ne; ++i) if (c->eye_thr[i] < 0) goto invalid;
+            for (size_t i = 0; i < c->nl*c->ns; ++i) if (c->sph_thr[i] < 0) goto invalid;
+            for (size_t i = 0; i < c->ns; ++i)
+                if (c->sph_weight[2*i] < 0 || c->sph_weight[2*i+1] < 0 ||
+                    fabsf(c->sph_weight[2*i]+c->sph_weight[2*i+1]-1) > 1e-4f) goto invalid;
+            if (safetensors_find(s, "contact.verts") >= 0) {
+                c->verts = tensor(s, "contact.verts", "I32", 1, a); if (!c->verts) goto invalid;
                 c->nc = a[0];
-                c->nbr_ptr = tensor(s, "contact.nbr_ptr", "I32", 1, a);
+                CT(nbr_ptr, "nbr_ptr", "I32", 1, c->nc+1);
                 c->nbr_idx = tensor(s, "contact.nbr_idx", "I32", 1, a);
-                if (!c->nbr_ptr || !c->nbr_idx) c->verts = NULL, c->nc = 0;
+                if (!c->nbr_idx || c->nbr_ptr[0] != 0 || c->nbr_ptr[c->nc] != (int32_t)a[0] ||
+                    !indices_valid(c->verts, c->nc, d->V, 1) || !indices_valid(c->nbr_idx, a[0], c->nc, 0)) goto invalid;
+                for (size_t i = 0; i < c->nc; ++i) if (c->nbr_ptr[i] < 0 || c->nbr_ptr[i] > c->nbr_ptr[i+1]) goto invalid;
+            } else if (safetensors_find(s, "contact.nbr_ptr") >= 0 || safetensors_find(s, "contact.nbr_idx") >= 0) {
+                goto invalid;
             }
-            d->has_ct = c->eye_joint && c->eye_center && c->eye_thr && c->lip_ids && c->sph_center && c->sph_joint &&
-                        c->sph_weight && c->sph_thr && c->pair_u && c->pair_l && c->pair_floor && c->up_joints;
-            d->ct_iters = d->has_ct ? 4 : 0;
+            d->has_ct = 1;
+            d->ct_iters = 4;
         }
+#undef CT
     }
-    if (!ok || d->J > 64 || d->I > 512) { vh_deformer_free(d); return NULL; }
+#undef GET
+#undef EXACT
     if (d->w1) {
         d->w1t = malloc(sizeof(float) * d->H * d->ml_in);
         d->w2t = malloc(sizeof(float) * d->K * d->H);
@@ -146,6 +229,9 @@ vh_deformer *vh_deformer_load(const char *path) {
         return NULL;
     }
     return d;
+invalid:
+    vh_deformer_free(d);
+    return NULL;
 }
 
 void vh_deformer_free(vh_deformer *d) {

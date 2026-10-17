@@ -11,8 +11,6 @@ import math
 import os
 import random
 import shutil
-import subprocess
-import threading
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
@@ -327,27 +325,14 @@ def write_lightrig(frames: list[dict], path: Path) -> None:
 
 
 def _run(cmd: list[str], cancel, progress) -> None:
+    from ..process import run
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", str(min(16, os.cpu_count() or 16)))
-    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-    stop = threading.Event()
-
-    def watch():
-        while not stop.wait(.2):
-            if cancel.is_set() and proc.poll() is None:
-                proc.terminate()
-
-    watcher = threading.Thread(target=watch, daemon=True)
-    watcher.start()
     tail = []
-    try:
-        for line in proc.stdout:
-            tail = (tail + [line.strip()])[-8:]
-        rc = proc.wait()
-    finally:
-        stop.set()
-        watcher.join(timeout=1)
-        proc.stdout.close()
+    def on_line(line):
+        tail.append(line)
+        del tail[:-8]
+    rc = run(cmd, cancel, on_line, cwd=ROOT, env=env, timeout=2400)
     if cancel.is_set():
         raise gpu.Cancelled("cancelled")
     if rc:

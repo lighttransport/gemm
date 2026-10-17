@@ -1787,7 +1787,7 @@ async function loadMotions(headId, selectId = null) {
   state.motions = data.motions;
   const select = $('body-motion-select');
   select.replaceChildren(new Option('select a fit', ''));
-  for (const m of data.motions) select.add(new Option(`${m.kind}${m.status ? ' · ' + m.status : ''} · ${m.frames} frame${m.frames === 1 ? '' : 's'} · ${m.id}`, m.id));
+  for (const m of data.motions) select.add(new Option(`${m.kind}${m.avatar_stale ? ' · avatar changed' : ''}${m.status ? ' · ' + m.status : ''} · ${m.frames} frame${m.frames === 1 ? '' : 's'} · ${m.id}`, m.id));
   const chosen = selectId || state.bodyMotionId;
   if (chosen && data.motions.some((m) => m.id === chosen)) { select.value = chosen; await selectMotion(chosen); }
   else if (state.bodyMotionId) await selectMotion('');
@@ -1857,6 +1857,14 @@ async function selectMotion(id) {
   const glbUrl = baseline ? m.urls.baseline_glb : m.urls.glb;
   $('body-motion-report').hidden = !m.urls.evaluation;
   if (m.urls.evaluation) $('body-motion-report').href = m.urls.evaluation;
+  if (m.avatar_stale) {
+    state.bodyMotion = null; state.bodyMotionTime = 0;
+    for (const [name, url] of [['body-motion-glb', glbUrl], ['body-motion-json', motionUrl]]) {
+      const link = $(name); link.hidden = !url; if (url) link.href = url;
+    }
+    $('body-motion-msg').textContent = 'Avatar changed since this motion was fitted. Download it for review or fit it again for this avatar.';
+    applyRig(); return;
+  }
   if (!motionUrl) {
     state.bodyMotion = null; state.bodyMotionTime = 0;
     $('body-motion-glb').hidden = $('body-motion-json').hidden = true;

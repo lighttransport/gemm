@@ -7,9 +7,7 @@ import math
 import os
 import re
 import shutil
-import signal
 import subprocess
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -66,42 +64,16 @@ def availability(model_dir=MODEL_DIR, rig_python=None, mock=False) -> dict:
 
 def _run(cmd: list[str], cancel, *, cwd=ROOT, timeout=2400) -> str:
     from ..runtime import python_command
-    proc = subprocess.Popen(python_command(cmd), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, start_new_session=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    from ..process import run
     lines = []
-    stop = threading.Event()
-    def watch():
-        deadline = time.monotonic() + timeout
-        while not stop.wait(.25):
-            if proc.poll() is not None:
-                return
-            if cancel.is_set():
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                return
-            if time.monotonic() >= deadline:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                return
-    threading.Thread(target=watch, daemon=True).start()
+    def on_line(line):
+        lines.append(line)
+        del lines[:-40]
     try:
-        for line in proc.stdout:
-            lines.append(line.rstrip())
-            lines = lines[-40:]
-        code = proc.wait()
-    finally:
-        stop.set()
-        proc.stdout.close()
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+        code = run(python_command(cmd), cancel, on_line, cwd=cwd,
+                   env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"), timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f'{Path(cmd[0]).name} timed out after {timeout:g}s') from exc
     if cancel.is_set():
         raise gpu.Cancelled("cancelled")
     if code:
@@ -364,13 +336,19 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
                                 "clip_bpe": str(clip_bpe) if names else None}
         report["total_seconds"] = round(time.perf_counter() - started, 2)
         (out / "body_report.json").write_text(json.dumps(report, indent=1, default=float))
+        if cancel.is_set():
+            raise gpu.Cancelled('cancelled')
         published = head / "body"
         previous = head / (".body-previous-" + uuid.uuid4().hex[:8])
         if published.exists():
             published.rename(previous)
         try:
+            if (previous/'motions').exists():
+                (previous/'motions').rename(out/'motions')
             out.rename(published)
-        except Exception:
+        except BaseException:
+            if (out/'motions').exists() and previous.exists():
+                (out/'motions').rename(previous/'motions')
             if previous.exists():
                 previous.rename(published)
             raise

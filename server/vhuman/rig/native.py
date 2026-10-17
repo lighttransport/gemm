@@ -89,6 +89,7 @@ def build_library(out_dir: Path) -> Path:
 
 class Native:
     def __init__(self, lib_path, package):
+        self.h = None
         self.lib = ctypes.CDLL(str(lib_path))
         L = self.lib
         L.vh_deformer_load.restype = ctypes.c_void_p
@@ -118,16 +119,31 @@ class Native:
         return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
     def set_contact_iterations(self, n: int):
+        self._check_open()
+        if type(n) is not int or not 0 <= n <= np.iinfo(np.int32).max:
+            raise ValueError('contact iterations must be a nonnegative int32')
         self.lib.vh_deformer_set_contact_iterations(self.h, int(n))
 
-    def eval(self, controls: np.ndarray, use_ml: bool = True) -> np.ndarray:
+    def _check_open(self):
+        if not self.h:
+            raise RuntimeError('native rig is closed')
+
+    def _controls(self, controls, *, batch=False):
+        self._check_open()
         x = np.ascontiguousarray(controls, np.float32)
+        if (x.ndim != (2 if batch else 1) or x.shape[-1] != self.C or
+                not np.isfinite(x).all() or (batch and len(x) > np.iinfo(np.int32).max)):
+            raise ValueError('expected finite controls shaped (frames, C)' if batch else 'expected finite controls shaped (C,)')
+        return x
+
+    def eval(self, controls: np.ndarray, use_ml: bool = True) -> np.ndarray:
+        x = self._controls(controls)
         out = np.zeros((self.V, 3), np.float32)
         self.lib.vh_deformer_eval(self.h, self._p(x), int(use_ml), self._p(out))
         return out
 
     def eval_batch(self, controls: np.ndarray, use_ml: bool = True) -> np.ndarray:
-        x = np.ascontiguousarray(controls, np.float32)
+        x = self._controls(controls, batch=True)
         F = len(x)
         scratch = np.zeros(self.lib.vh_deformer_batch_scratch(self.h, F), np.float32)
         out = np.zeros((F, self.V, 3), np.float32)
@@ -178,7 +194,9 @@ class NativeGPU(Native):
             raise RuntimeError("no compatible GPU device or driver")
 
     def eval_gpu(self, controls: np.ndarray, use_ml: bool = True) -> tuple[np.ndarray, list]:
-        x = np.ascontiguousarray(controls, np.float32)
+        x = self._controls(controls, batch=True)
+        if not self.g:
+            raise RuntimeError('GPU rig is closed')
         out = np.zeros((len(x), self.V, 3), np.float32)
         ms = (ctypes.c_double * 4)()
         if self.lib.vh_gpu_eval_batch(self.g, self._p(x), len(x), int(use_ml), self._p(out), ms):
@@ -220,7 +238,9 @@ class NativeVK(Native):
             raise RuntimeError("no Vulkan device")
 
     def eval_gpu(self, controls: np.ndarray, use_ml: bool = True) -> tuple[np.ndarray, list]:
-        x = np.ascontiguousarray(controls, np.float32)
+        x = self._controls(controls, batch=True)
+        if not self.g:
+            raise RuntimeError('Vulkan rig is closed')
         out = np.zeros((len(x), self.V, 3), np.float32)
         ms = (ctypes.c_double * 4)()
         if self.lib.vh_vk_eval_batch(self.g, self._p(x), len(x), int(use_ml), self._p(out), ms):

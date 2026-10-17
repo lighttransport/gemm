@@ -345,13 +345,32 @@ class EyeService:
         return path
 
     def list_motions(self, hid: str) -> list[dict]:
-        self.body_file(hid, "avatar.json")
+        avatar = self.body_file(hid, "avatar.json")
+        current = hashlib.sha256(avatar.read_bytes()).hexdigest()
         root = self.work / "heads" / hid / "body" / "motions"
+        hashes = {}
+        def artifact_hash(filename):
+            if filename not in hashes:
+                target = avatar.parent/filename
+                digest = hashlib.sha256()
+                if target.is_file():
+                    with target.open('rb') as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                            digest.update(chunk)
+                    hashes[filename] = digest.hexdigest()
+                else:
+                    hashes[filename] = None
+            return hashes[filename]
         out = []
         for path in sorted(root.glob("*/manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 take = path.parent.name
                 manifest = json.loads(self.body_file(hid, f"motions/{take}/manifest.json").read_text())
+                expected = manifest.get('avatar_sha256')
+                manifest['avatar_stale'] = not isinstance(expected, str) or expected not in (current, current[:16])
+                for key, filename in (('avatar_glb_sha256', 'avatar.glb'), ('body_meta_sha256', 'body_mhr.glb.json')):
+                    if manifest.get(key):
+                        manifest['avatar_stale'] |= artifact_hash(filename) != manifest[key]
                 base = f"/v1/heads/{hid}/body/motions/{take}/"
                 manifest["urls"] = {key: base + filename for key, filename in
                     (("motion", "motion.json"), ("glb", "motion.glb"), ("baseline", "baseline.json"),

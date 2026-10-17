@@ -1,6 +1,7 @@
 #include "vhuman_deformer_cuda.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -171,6 +172,14 @@ static double now_ms(void) {
     return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
 }
 
+static CUdeviceptr upload_checked(const void *data, size_t bytes) {
+    CUdeviceptr p = 0;
+    /* Empty contact arrays need a valid allocation, but no host bytes read. */
+    if (cuMemAlloc(&p, bytes ? bytes : 4) != CUDA_SUCCESS) return 0;
+    if (bytes && (!data || cuMemcpyHtoD(p, data, bytes) != CUDA_SUCCESS)) { CU_FREE(p); }
+    return p;
+}
+
 static vh_gpu *create_impl(vh_deformer *d, int device, uintptr_t stream, int shared, int verbose) {
 #ifdef VHUMAN_WITH_HIP
     /* The HIP batch backend owns its context. Borrowing a PyTorch primary
@@ -211,38 +220,45 @@ static vh_gpu *create_impl(vh_deformer *d, int device, uintptr_t stream, int sha
     else if (cuStreamCreate(&g->stream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) { vh_gpu_free(g); return NULL; }
     if (cuEventCreate(&g->upload_ready, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) { vh_gpu_free(g); return NULL; }
     const vh_contacts *c = vh_deformer_contacts(d);
-    if (c && c->ns <= 512 && cuModuleGetFunction(&g->fn_ct, g->mod, "vh_contacts") == CUDA_SUCCESS) {
-        g->c_eye_ids = cu_upload_raw(c->eye_ids, c->ne * 4);
-        g->c_eye_joint = cu_upload_raw(c->eye_joint, c->ne * 4);
-        g->c_eye_center = cu_upload_raw(c->eye_center, c->ne * 12);
-        g->c_eye_thr = cu_upload_raw(c->eye_thr, c->ne * 4);
-        g->c_lip_ids = cu_upload_raw(c->lip_ids, c->nl * 4);
-        g->c_sph_center = cu_upload_raw(c->sph_center, c->ns * 12);
-        g->c_sph_joint = cu_upload_raw(c->sph_joint, c->ns * 8);
-        g->c_sph_weight = cu_upload_raw(c->sph_weight, c->ns * 8);
-        float *thr_t = malloc(c->nl * c->ns * 4);          /* transposed to (T, L) */
+    if (c) {
+        if (c->ns > 512 || cuModuleGetFunction(&g->fn_ct, g->mod, "vh_contacts") != CUDA_SUCCESS) {
+            vh_gpu_free(g); return NULL;
+        }
+        g->c_eye_ids = upload_checked(c->eye_ids, c->ne * 4);
+        g->c_eye_joint = upload_checked(c->eye_joint, c->ne * 4);
+        g->c_eye_center = upload_checked(c->eye_center, c->ne * 12);
+        g->c_eye_thr = upload_checked(c->eye_thr, c->ne * 4);
+        g->c_lip_ids = upload_checked(c->lip_ids, c->nl * 4);
+        g->c_sph_center = upload_checked(c->sph_center, c->ns * 12);
+        g->c_sph_joint = upload_checked(c->sph_joint, c->ns * 8);
+        g->c_sph_weight = upload_checked(c->sph_weight, c->ns * 8);
+        float *thr_t = malloc(c->nl && c->ns ? c->nl * c->ns * 4 : 4);          /* transposed to (T, L) */
         if (thr_t) {
             for (size_t l = 0; l < c->nl; ++l)
                 for (size_t t = 0; t < c->ns; ++t) thr_t[t * c->nl + l] = c->sph_thr[l * c->ns + t];
-            g->c_sph_thr = cu_upload_raw(thr_t, c->nl * c->ns * 4);
+            g->c_sph_thr = upload_checked(thr_t, c->nl * c->ns * 4);
             free(thr_t);
         }
-        g->c_pair_u = cu_upload_raw(c->pair_u, c->np * 4);
-        g->c_pair_l = cu_upload_raw(c->pair_l, c->np * 4);
-        g->c_pair_floor = cu_upload_raw(c->pair_floor, c->np * 4);
+        g->c_pair_u = upload_checked(c->pair_u, c->np * 4);
+        g->c_pair_l = upload_checked(c->pair_l, c->np * 4);
+        g->c_pair_floor = upload_checked(c->pair_floor, c->np * 4);
         if (c->nc) {
             g->nc = (int)c->nc;
-            g->c_verts = cu_upload_raw(c->verts, c->nc * 4);
-            g->c_nbr_ptr = cu_upload_raw(c->nbr_ptr, (c->nc + 1) * 4);
-            g->c_nbr_idx = cu_upload_raw(c->nbr_idx, (size_t)c->nbr_ptr[c->nc] * 4 + 4);
+            g->c_verts = upload_checked(c->verts, c->nc * 4);
+            g->c_nbr_ptr = upload_checked(c->nbr_ptr, (c->nc + 1) * 4);
+            g->c_nbr_idx = upload_checked(c->nbr_idx, (size_t)c->nbr_ptr[c->nc] * 4);
         }
+        if (!g->c_eye_ids || !g->c_eye_joint || !g->c_eye_center || !g->c_eye_thr || !g->c_lip_ids ||
+            !g->c_sph_center || !g->c_sph_joint || !g->c_sph_weight || !g->c_sph_thr ||
+            !g->c_pair_u || !g->c_pair_l || !g->c_pair_floor ||
+            (c->nc && (!g->c_verts || !g->c_nbr_ptr || !g->c_nbr_idx))) { vh_gpu_free(g); return NULL; }
         g->has_ct = 1;
     }
     size_t n3 = g->V * 3;
-    g->rest = cu_upload_raw(vh_deformer_rest(d), n3 * 4);
-    g->morph = cu_upload_raw(vh_deformer_morph(d), g->M * n3 * 4);
-    g->sj = cu_upload_raw(vh_deformer_skin_joints(d), g->V * 16);
-    g->sw = cu_upload_raw(vh_deformer_skin_weights(d), g->V * 16);
+    g->rest = upload_checked(vh_deformer_rest(d), n3 * 4);
+    g->morph = upload_checked(vh_deformer_morph(d), g->M * n3 * 4);
+    g->sj = upload_checked(vh_deformer_skin_joints(d), g->V * 16);
+    g->sw = upload_checked(vh_deformer_skin_weights(d), g->V * 16);
     if (!g->rest || !g->morph || !g->sj || !g->sw) { vh_gpu_free(g); return NULL; }
     return g;
 }
@@ -257,40 +273,56 @@ const char *vh_gpu_name(const vh_gpu *g) { return g->name; }
 
 static int ensure(vh_gpu *g, size_t frames) {
     if (frames <= g->cap_frames) return 0;
-    cuStreamSynchronize(g->stream);
+    if (cuStreamSynchronize(g->stream) != CUDA_SUCCESS) return -1;
+    g->cap_frames = 0;
+    g->upload_pending = 0;
     CU_FREE(g->w); CU_FREE(g->skin); CU_FREE(g->out); CU_FREE(g->c_scratch);
     if (g->h_w) { cuMemFreeHost(g->h_w); g->h_w = NULL; }
     if (g->h_skin) { cuMemFreeHost(g->h_skin); g->h_skin = NULL; }
     size_t cap = frames < 64 ? 64 : frames;
+    size_t scratch = vh_deformer_prepare_scratch(g->d, 1);
+    if (cap > INT_MAX || cap > SIZE_MAX / 4 / g->M || cap > SIZE_MAX / 48 / g->J ||
+        cap > SIZE_MAX / 12 / g->V || (g->nc && cap > SIZE_MAX / 24 / (size_t)g->nc) ||
+        (scratch && cap > (SIZE_MAX / 4 - 1) / scratch)) return -1;
     if (cuMemAlloc(&g->w, cap * g->M * 4) != CUDA_SUCCESS || cuMemAlloc(&g->skin, cap * g->J * 48) != CUDA_SUCCESS ||
-        cuMemAlloc(&g->out, cap * g->V * 12) != CUDA_SUCCESS) return -1;
-    if (g->nc && cuMemAlloc(&g->c_scratch, cap * (size_t)g->nc * 24) != CUDA_SUCCESS) return -1;
+        cuMemAlloc(&g->out, cap * g->V * 12) != CUDA_SUCCESS) goto failed;
+    if (g->nc && cuMemAlloc(&g->c_scratch, cap * (size_t)g->nc * 24) != CUDA_SUCCESS) goto failed;
     if (cuMemAllocHost((void **)&g->h_w, cap * g->M * 4) != CUDA_SUCCESS ||
-        cuMemAllocHost((void **)&g->h_skin, cap * g->J * 48) != CUDA_SUCCESS) return -1;
+        cuMemAllocHost((void **)&g->h_skin, cap * g->J * 48) != CUDA_SUCCESS) goto failed;
     free(g->h_scratch);
-    g->h_scratch = malloc(vh_deformer_prepare_scratch(g->d, cap) * 4 + 4);
+    g->h_scratch = malloc(cap * scratch * 4 + 4);
 
-    if (!g->h_w || !g->h_skin || !g->h_scratch) return -1;
+    if (!g->h_w || !g->h_skin || !g->h_scratch) goto failed;
     g->cap_frames = cap;
     return 0;
+failed:
+    CU_FREE(g->w); CU_FREE(g->skin); CU_FREE(g->out); CU_FREE(g->c_scratch);
+    if (g->h_w) { cuMemFreeHost(g->h_w); g->h_w = NULL; }
+    if (g->h_skin) { cuMemFreeHost(g->h_skin); g->h_skin = NULL; }
+    return -1;
 }
 
 static int eval_impl(vh_gpu *g, const float *controls, size_t frames, int use_ml, float *out, double *ms4, int async) {
+    if (!g || !controls || frames > INT_MAX) return -1;
     if (!frames) return 0;
-    cuCtxSetCurrent(g->ctx);
+    if (cuCtxSetCurrent(g->ctx) != CUDA_SUCCESS) return -2;
     if (ensure(g, frames)) return -1;
     if (g->upload_pending && cuEventSynchronize(g->upload_ready) != CUDA_SUCCESS) return -2;
     double t0 = now_ms();
     vh_deformer_prepare_batch(g->d, controls, frames, use_ml, g->h_w, g->h_skin, g->h_scratch);
     double t1 = now_ms();
     if (cuMemcpyHtoDAsync(g->w, g->h_w, frames * g->M * 4, g->stream) != CUDA_SUCCESS ||
-        cuMemcpyHtoDAsync(g->skin, g->h_skin, frames * g->J * 48, g->stream) != CUDA_SUCCESS) return -2;
-    cuEventRecord(g->upload_ready, g->stream);
+        cuMemcpyHtoDAsync(g->skin, g->h_skin, frames * g->J * 48, g->stream) != CUDA_SUCCESS) {
+        cuStreamSynchronize(g->stream); return -2;
+    }
+    if (cuEventRecord(g->upload_ready, g->stream) != CUDA_SUCCESS) {
+        cuStreamSynchronize(g->stream); return -2;
+    }
     g->upload_pending = 1;
     CUevent e0 = NULL, e1 = NULL;
     if (!async) {
-        cuEventCreate(&e0, 0); cuEventCreate(&e1, 0);
-        cuStreamSynchronize(g->stream);
+        if (cuEventCreate(&e0, 0) != CUDA_SUCCESS || cuEventCreate(&e1, 0) != CUDA_SUCCESS ||
+            cuStreamSynchronize(g->stream) != CUDA_SUCCESS) goto failed;
     }
     double t2 = now_ms();
     int V = (int)g->V, M = (int)g->M, J = (int)g->J, F = (int)frames;
@@ -298,7 +330,7 @@ static int eval_impl(vh_gpu *g, const float *controls, size_t frames, int use_ml
     unsigned block = 128;
     unsigned gx = (unsigned)((g->V + block - 1) / block), gy = (unsigned)((frames + FRAMES_PER_THREAD - 1) / FRAMES_PER_THREAD);
     unsigned smem = (unsigned)(FRAMES_PER_THREAD * (g->M + g->J * 12) * 4);
-    if (!async) cuEventRecord(e0, g->stream);
+    if (!async && cuEventRecord(e0, g->stream) != CUDA_SUCCESS) goto failed;
     CUresult r = cuLaunchKernel(g->fn, gx, gy, 1, block, 1, 1, smem, g->stream, args, NULL);
     int iters = vh_deformer_contact_iterations(g->d);
     if (g->has_ct && iters > 0) {
@@ -311,16 +343,16 @@ static int eval_impl(vh_gpu *g, const float *controls, size_t frames, int use_ml
                          &g->c_verts, &g->c_nbr_ptr, &g->c_nbr_idx, &g->nc, &smooth, &g->c_scratch};
         if (r == CUDA_SUCCESS) r = cuLaunchKernel(g->fn_ct, (unsigned)frames, 1, 1, 256, 1, 1, 0, g->stream, cargs, NULL);
     }
-    if (async) return r == CUDA_SUCCESS ? 0 : -2;
-    cuEventRecord(e1, g->stream);
-    cuEventSynchronize(e1);
+    if (r != CUDA_SUCCESS) goto failed;
+    if (async) return 0;
+    if (cuEventRecord(e1, g->stream) != CUDA_SUCCESS || cuEventSynchronize(e1) != CUDA_SUCCESS) goto failed;
     float kms = 0;
-    cuEventElapsedTime(&kms, e0, e1);
+    if (cuEventElapsedTime(&kms, e0, e1) != CUDA_SUCCESS) goto failed;
     cuEventDestroy(e0);
     cuEventDestroy(e1);
-    if (r != CUDA_SUCCESS) return -2;
+    e0 = e1 = NULL;
     double t3 = now_ms();
-    if (out) cuMemcpyDtoH(out, g->out, frames * g->V * 12);
+    if (out && cuMemcpyDtoH(out, g->out, frames * g->V * 12) != CUDA_SUCCESS) goto failed;
     double t4 = now_ms();
     if (ms4) {
         ms4[0] = t1 - t0;
@@ -329,6 +361,11 @@ static int eval_impl(vh_gpu *g, const float *controls, size_t frames, int use_ml
         ms4[3] = t4 - t3;
     }
     return 0;
+failed:
+    if (e0) cuEventDestroy(e0);
+    if (e1) cuEventDestroy(e1);
+    cuStreamSynchronize(g->stream);
+    return -2;
 }
 
 int vh_gpu_eval_batch(vh_gpu *g, const float *controls, size_t frames, int use_ml, float *out, double *ms4) {

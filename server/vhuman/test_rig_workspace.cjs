@@ -62,9 +62,27 @@ async function staleRigResource(stage) {
   c.state.current={id:'B'}; await c.loadRig(c.state.current); pending.resolve(); await a;
   assert.equal(c.state.rig.def.id,'B',stage); assert.ok(c.state.vizData.url.includes('/B/'),stage);
 }
+async function staleBodyMotion() {
+  let applied=0;
+  const c=context({clearBodyTerrain(){},applyRig(){applied++;},
+    api(){throw Error('stale motion must not be loaded');}});
+  Object.assign(c.state,{bodyMotion:{old:true},bodyMotionPlaying:true,motions:[{
+    id:'motion',avatar_stale:true,urls:{motion:'/motion.json',glb:'/motion.glb',evaluation:'/evaluation.json'}
+  }]});
+  vm.runInContext(source('async function selectMotion(', "$('body-motion-baseline').addEventListener"),c);
+  await c.selectMotion('motion');
+  assert.equal(c.state.bodyMotion,null);
+  assert.equal(c.state.bodyMotionPlaying,false);
+  assert.equal(c.$('body-motion-json').href,'/motion.json');
+  assert.equal(c.$('body-motion-json').hidden,false);
+  assert.equal(c.$('body-motion-report').href,'/evaluation.json');
+  assert.match(c.$('body-motion-msg').textContent,/Avatar changed/);
+  assert.equal(applied,1);
+}
 (async()=>{
   const script=html.slice(html.indexOf('<script type="module">')+22,html.lastIndexOf('</script>'));
   new Function(script.replace(/^import .*$/gm,''));
   await headSelectionRace(); await candidateActions(); await staleRigResource('viz'); await staleRigResource('model');
-  console.log('rig workspace: 4 regression scenarios passed');
+  await staleBodyMotion();
+  console.log('rig workspace: 5 regression scenarios passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});
