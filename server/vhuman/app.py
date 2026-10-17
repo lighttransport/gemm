@@ -188,8 +188,11 @@ class App:
         self.body_job = body_job
         self.gpu = gpu
         self.qwen_opts = {"python": args.qwen_python, "mock": args.mock}
+        self.portrait_opts = dict(self.qwen_opts,
+            klein3_model=getattr(args, 'klein3_model', None),
+            klein3_python=getattr(args, 'klein3_python', None))
         handlers = {
-            'portrait_generate': lambda req, prog, cancel: portrait.generate_job(self.service, req, prog, cancel, **self.qwen_opts),
+            'portrait_generate': lambda req, prog, cancel: portrait.generate_job(self.service, req, prog, cancel, **self.portrait_opts),
             'portrait_views': lambda req, prog, cancel: portrait.views_job(self.service, req, prog, cancel, **self.qwen_opts),
             "genia_validate": lambda req, prog, cancel: genia_job.validate_job(self.service, req, prog, cancel),
             "genia_reconstruct": lambda req, prog, cancel: genia_job.reconstruct_job(self.service, req, prog, cancel),
@@ -254,13 +257,14 @@ class App:
             return self._health()
 
     def _health(self) -> dict:
-        from . import baseline, qwen, video
+        from . import baseline, qwen, video, portrait_generators
         from .genia import job as genia_job
         return {"video": video.availability(getattr(self.args, "video_model", None),
                     getattr(self.args, "video_runner", None), mock=self.args.mock,
                     allow_experimental=getattr(self.args, "video_experimental", False),
                     backend=getattr(self.args, "video_backend", "repo")),
                 "ok": True, "backend": gpu.backend(), "device": gpu.device_index(), "gpu": self.gpu.gpu_status(), "qwen": qwen.availability(**self.qwen_opts),
+                "portrait_generators": portrait_generators.availability(**self.portrait_opts),
                 "genia": genia_job.availability(),
                 "pixal3d": baseline.availability(mock=self.args.mock), "plates": len(self.service.list_plates()),
                 "rig": self.rig_job.availability(getattr(self.args, "rig_python", None)),
@@ -548,6 +552,9 @@ def main(argv=None) -> int:
     default_py = ROOT / "tmp/qimg21-ref-venv/bin/python"
     ap.add_argument("--qwen-python", default=None,
                     help="interpreter for cuda/qimg21/native_generate.py (needs torch)")
+    from .portrait_generators import KLEIN_MODEL, KLEIN_PYTHON
+    ap.add_argument('--klein3-model', default=str(KLEIN_MODEL))
+    ap.add_argument('--klein3-python', default=str(KLEIN_PYTHON), help='CPU-only Klein3 prompt encoder interpreter')
     ap.add_argument("--mock", action="store_true", help="mock Qwen and Pixal3D (no GPU)")
     default_rig = ROOT / "tmp/vhuman-rig-venv/bin/python"
     ap.add_argument("--rig-python", default=None,

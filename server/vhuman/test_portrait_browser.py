@@ -28,7 +28,8 @@ class PortraitBrowserTests(unittest.TestCase):
             work = Path(temp)
             app = App(SimpleNamespace(work=str(work/'work'), mock=True, qwen_python=sys.executable,
                        rig_python=sys.executable, inference_backend='cpu', device=0, models_root='/mnt/disk1/models'))
-            app.health = lambda: dict(qwen=dict(available=True, backend='mock'), gpu=None, video={}, pixal3d={})
+            app.health = lambda: dict(qwen=dict(available=True, backend='mock'), gpu=None, video={}, pixal3d={},
+                portrait_generators={m: dict(available=True, backend='mock') for m in ('qwen-image21', 'klein3')})
             handler = make_handler(app, quiet=True)
             three = Path(os.environ.get('VHUMAN_THREE', ROOT/'tmp/vhuman-dev/tools/three/package'))
             class LocalHandler(handler):
@@ -71,6 +72,10 @@ class PortraitBrowserTests(unittest.TestCase):
                 cdp.wait_for('window.__portraitReady === true')
                 cdp.wait_for("!document.getElementById('portrait-generate').disabled")
                 click = lambda selector: cdp.evaluate(f'document.querySelector({json.dumps(selector)}).click()')
+                self.assertEqual(cdp.evaluate("document.getElementById('portrait-model').value"), 'qwen-image21')
+                cdp.evaluate("document.getElementById('portrait-model').value='klein3'; document.getElementById('portrait-model').dispatchEvent(new Event('change'))")
+                cdp.wait_for("document.getElementById('portrait-steps').value === '16'")
+                self.assertEqual(cdp.evaluate("document.getElementById('portrait-view-steps').value"), '24')
                 click('#portrait-generate')
                 cdp.wait_for("!document.getElementById('portrait-image').hidden && !document.getElementById('portrait-approved').disabled")
                 self.assertTrue(cdp.evaluate("document.getElementById('portrait-generate-views').disabled"))
@@ -90,6 +95,8 @@ class PortraitBrowserTests(unittest.TestCase):
                 cdp.call('Page.navigate', dict(url=url))
                 cdp.wait_for('window.__portraitReady === true')
                 self.assertTrue(cdp.evaluate("document.getElementById('portrait-approved').checked"))
+                self.assertEqual(cdp.evaluate("document.getElementById('portrait-model').value"), 'klein3')
+                self.assertEqual(cdp.evaluate("document.getElementById('portrait-steps').value"), '16')
                 self.assertEqual(cdp.evaluate("document.querySelectorAll('#portrait-views img').length"), 4)
                 screenshot = cdp.call('Page.captureScreenshot', {'format': 'png', 'captureBeyondViewport': True})
                 (SCRATCH/'portrait-editor-desktop.png').write_bytes(base64.b64decode(screenshot['data']))
@@ -97,7 +104,9 @@ class PortraitBrowserTests(unittest.TestCase):
                 self.assertTrue(cdp.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
                 screenshot = cdp.call('Page.captureScreenshot', {'format': 'png', 'captureBeyondViewport': True})
                 (SCRATCH/'portrait-editor-mobile.png').write_bytes(base64.b64decode(screenshot['data']))
-                # A regenerated anchor cannot silently reuse old approved views.
+                # Switching generators must invalidate approval just like a new seed.
+                cdp.evaluate("document.getElementById('portrait-model').value='qwen-image21'; document.getElementById('portrait-model').dispatchEvent(new Event('change'))")
+                cdp.wait_for("document.getElementById('portrait-steps').value === '24' && !document.getElementById('portrait-generate').disabled")
                 click('#portrait-generate')
                 cdp.wait_for("document.querySelectorAll('#portrait-history button').length === 2 && !document.getElementById('portrait-approved').disabled")
                 self.assertFalse(cdp.evaluate("document.getElementById('portrait-approved').checked"))

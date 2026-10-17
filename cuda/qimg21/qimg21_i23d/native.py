@@ -36,6 +36,7 @@ ROOT = HERE.parents[1]                              # repo root
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from server.model_paths import MODELS_ROOT
+from server.rocm_runtime import library_path as rocm_library_path
 
 DEFAULT_MODEL = MODELS_ROOT / "qimg-21"
 FAST = HERE / "test_cuda_qimg21_fast"
@@ -85,7 +86,7 @@ class _Resident:
         self.directory.mkdir(parents=True, exist_ok=True)
         with self.log.open("w") as stream:
             env = dict(os.environ)
-            env["LD_LIBRARY_PATH"] = "/opt/rocm/core/lib:" + env.get("LD_LIBRARY_PATH", "") if "test_hip_" in command[0] else env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = rocm_library_path() + ":" + env.get("LD_LIBRARY_PATH", "") if "test_hip_" in command[0] else env.get("LD_LIBRARY_PATH", "")
             temp = ROOT / "tmp/qimg21-runtime"
             temp.mkdir(parents=True, exist_ok=True)
             env["TMPDIR"] = str(temp)
@@ -311,7 +312,7 @@ class NativeBackend:
                                             [str(self.vae), "--serve", str(self._vae.socket), "--model",
                                              str(self.model / "vae"), "--conv", "cudnn", "--tf32"])
             if seconds:
-                timings.append({"label": "start resident self.vae decoder", "seconds": round(seconds, 3)})
+                timings.append({"label": "start resident VAE decoder", "seconds": round(seconds, 3)})
         return (str(fast) if fast else None), (str(vae) if vae else None), timings
 
     @staticmethod
@@ -394,7 +395,7 @@ class NativeBackend:
         env = {**os.environ, "QIMG21_PYTHON": self.python, "TMPDIR": str(ROOT / "tmp/qimg21-runtime")}
         Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
         if self.backend == "rocm":
-            env["LD_LIBRARY_PATH"] = "/opt/rocm/core/lib:" + env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = rocm_library_path() + ":" + env.get("LD_LIBRARY_PATH", "")
         try:
             with log.open("w") as stream:
                 proc = subprocess.Popen(self.command(request, work, sockets, prompt_batch) + extra, cwd=ROOT,

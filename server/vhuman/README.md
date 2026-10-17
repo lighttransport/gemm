@@ -97,10 +97,29 @@ See [validation commands](../../ref/hunyuan_video15/README.md).
 ### Portrait and multiview workspace
 
 Open `/head` for **Portrait → Review views → Reconstruct**. Generate a neutral
-1024×1024 Qwen-Image 2.1 portrait, approve it, then generate either individual
+1024×1024 portrait with **Qwen-Image 2.1** (default) or **Klein3** (native ROCm),
+approve it, then generate either individual
 1024×1024 views or a joint 1024×1024 sheet with four 512×512 panels. The angles
 are the person's left/right three-quarter and profile views (±45°/±90°).
 Every request uses the approved original portrait as its sole reference.
+Side views always use Qwen-Image 2.1, including when their front reference was
+created by Klein3. Front steps are kept separately per model (Qwen 24, Klein3 16);
+side-view steps default to 24. Switching models to regenerate a front creates a
+new revision and requires review again. Existing sessions remain Qwen sessions.
+Klein3 uses FP8 native DiT inference, a CPU Qwen3-VL prompt encoder and native
+F32 VAE decoding; it produces a real 1024×1024 RGB PNG. It does not use Qwen's
+CFG, negative prompt or streaming preset. Its admission gate requires 9216 MiB
+free, and the native stages retain a 1024 MiB reserve.
+
+Configure local weights and the isolated CPU encoder with `--klein3-model DIR`
+and `--klein3-python PYTHON`. Defaults use `/mnt/nvme02/model/flux3-klein` and
+`tmp/flux3-text-venv` (resolved through shared environment storage).
+`portrait_generate` accepts `portrait_model: qwen-image21|klein3`; omission keeps
+Qwen behavior. `/health.portrait_generators` reports independent availability,
+reasons, step defaults, capabilities and memory requirements. Each front revision
+records its actual model and execution settings; mixed-model input provenance is
+retained in reconstructed rig JSON, GLB and USD.
+
 Inspect images side by side, choose a version per angle, approve the selected
 views, and download PNGs or the input bundle. Regenerating the front preserves
 history but clears approval and makes its old views stale. The advanced

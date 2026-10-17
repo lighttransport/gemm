@@ -15,6 +15,7 @@ import sys
 import tempfile
 import tracemalloc
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -744,6 +745,21 @@ class NativeBackendCommandTest(Tmp):
     def flag(self, cmd, name):
         return cmd[cmd.index(name) + 1] if name in cmd else None
 
+    def test_rocm_driver_uses_complete_library_set(self):
+        from qimg21_i23d import native
+        backend = self.NativeBackend(backend='rocm', resident=False)
+        try:
+            with patch.object(native, 'rocm_library_path', return_value='/complete/rocm/lib'), \
+                 patch.object(backend, 'command', return_value=['native-driver']), \
+                 patch.object(native.subprocess, 'Popen') as launch:
+                launch.return_value.wait.return_value = 0
+                launch.return_value.poll.return_value = 0
+                backend._run(GenRequest(prompt='portrait', out=self.dir/'o.png'), [])
+                self.assertEqual(launch.call_args.kwargs['env']['LD_LIBRARY_PATH'].split(':')[0],
+                                 '/complete/rocm/lib')
+        finally:
+            backend.close()
+
     def test_text_to_image_stays_plain(self):
         cmd = self.NativeBackend().command(GenRequest(prompt="apple", out=self.dir / "o.png"), self.dir)
         for flag in ("--image", "--init-image", "--mask", "--strength", "--native-attention",
@@ -815,12 +831,18 @@ class NativeResidentTest(Tmp):
         fake.write_text('#!/bin/sh\necho "$@" >> "$(dirname "$0")/calls.txt"\n'
                         'echo "fast: serving fake"\necho "qimg21-vae: serving fake"\nexec sleep 60\n')
         fake.chmod(0o755)
-        self.saved = native.FAST, native.VAE
-        native.FAST = native.VAE = fake
+        # Backend/device selection now owns the executable paths per instance.
+        # Replacing legacy module constants no longer substitutes these workers.
+        initialize = native.NativeBackend.__init__
+        def fake_initialize(backend, *args, **kwargs):
+            initialize(backend, *args, **kwargs)
+            backend.fast = backend.vae = fake
+        worker_patch = patch.object(native.NativeBackend, '__init__', fake_initialize)
+        worker_patch.start()
+        self.addCleanup(worker_patch.stop)
         self.ref = self.write("ref.png", object_image(1024, 1024))
 
     def tearDown(self):
-        self.native.FAST, self.native.VAE = self.saved
         super().tearDown()
 
     def calls(self):

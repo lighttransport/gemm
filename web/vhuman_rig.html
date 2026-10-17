@@ -1194,7 +1194,7 @@ async function loadTake(take) {
 }
 async function loadTakes(headId, selectId) {
   const gen = ++speechLoadGen;
-  const data = await api(`/v1/heads/${headId}/rig/takes`);
+  const data = state.candidate ? {takes: []} : await api(`/v1/heads/${headId}/rig/takes`);
   if (gen !== speechLoadGen || state.current?.id !== headId) return;
   const select = $('speech-takes');
   select.replaceChildren();
@@ -1435,7 +1435,7 @@ requestAnimationFrame(tick);
 // ---- loading ------------------------------------------------------------------------------
 const loader = new GLTFLoader();
 let loadGen = 0;
-$('reconstruction').onchange=async()=>{state.candidate=$('reconstruction').value||null;await loadRig(state.current);};
+$('reconstruction').onchange=async()=>{state.candidate=$('reconstruction').value||null;showFacts(state.current);await loadRig(state.current);await loadTakes(state.current.id);};
 $('refine-portrait').onclick=async()=>{
   if(!state.current)return;
   $('refine-portrait').disabled=true;
@@ -1609,7 +1609,7 @@ async function loadRig(h) {
   $('body-motion-tools').hidden = !avatar;
 }
 function showFacts(h) {
-  const r = h.rig;
+  const r = state.candidate ? state.candidates?.find(c => c.id === state.candidate)?.rig : h.rig;
   const rows = [];
   if (r) {
     const rep = r.report || {};

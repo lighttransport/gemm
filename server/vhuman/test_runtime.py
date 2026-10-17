@@ -8,6 +8,11 @@ from types import SimpleNamespace
 from . import gpu, runtime
 
 class RuntimeTest(unittest.TestCase):
+    def test_rocm_library_set_includes_the_smi_abi_required_by_torch(self):
+        from .rocm_runtime import library_path
+        with patch.object(Path, 'is_file', lambda p: str(p).startswith('/opt/rocm/core-10.0/')):
+            self.assertEqual(library_path(), '/opt/rocm/core-10.0/lib')
+
     def test_torch_rocm_uses_configured_ordinal_and_rejects_missing_device(self):
         cuda = SimpleNamespace(is_available=lambda: True, device_count=lambda: 2, set_device=Mock())
         torch = SimpleNamespace(cuda=cuda, version=SimpleNamespace(hip="7.14"))
@@ -32,7 +37,8 @@ class RuntimeTest(unittest.TestCase):
                          qwen_python=None, rig_python='/explicit/python')
         with gpu.execution('cpu'), patch.object(Path, 'exists', return_value=True):
             runtime.configure_args(args)
-            self.assertEqual(args.qwen_python, str(gpu.ROOT / 'tmp/vhuman-rocm-venv/bin/python'))
+            self.assertEqual(Path(args.qwen_python).resolve(),
+                             (gpu.ROOT / 'tmp/vhuman-rocm-venv/bin/python').resolve())
             self.assertEqual(args.rig_python, '/explicit/python')
             self.assertEqual(args.sam3d_body_model, str(gpu.model_path('sam3d-body')))
 

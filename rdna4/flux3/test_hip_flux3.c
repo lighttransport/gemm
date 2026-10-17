@@ -2,6 +2,7 @@
 #include "../flux2/hip_flux2_runner.h"
 #include "../rocew.h"
 #include "hip_flux3_runner.h"
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -18,6 +19,16 @@ static int integer(const char *s, int min, int max) {
         exit(2);
     }
     return (int)v;
+}
+static uint32_t seed_value(const char *s) {
+    char *end;
+    errno = 0;
+    unsigned long long value = strtoull(s, &end, 10);
+    if (!*s || *s == '-' || *end || errno || value > UINT32_MAX) {
+        fprintf(stderr, "seed must be a uint32: %s\n", s);
+        exit(2);
+    }
+    return (uint32_t)value;
 }
 static float time_value(const char *s) {
     char *end;
@@ -197,7 +208,8 @@ int main(int argc, char **argv) {
     const char *dir = "/mnt/nvme02/model/flux3-klein", *dit = NULL, *vae = NULL, *textfile = NULL,
                *latfile = NULL, *condfile = NULL, *condidsfile = NULL, *dump = NULL,
                *dump_rgb = NULL, *trace_dir = NULL, *output = "flux3.ppm";
-    int width = 256, height = 256, steps = 16, seed = 42, device = 0, reserve = 1024, nt = 0,
+    uint32_t seed = 42;
+    int width = 256, height = 256, steps = 16, device = 0, reserve = 1024, nt = 0,
         nc = 0, selftest = 0, one = 0, no_vae = 0, vae_only = 0, vae_wmma = 0, verbose = 1;
     float t = 1, target = 0;
 #define ARG(name) !strcmp(argv[i], name)
@@ -228,7 +240,7 @@ int main(int argc, char **argv) {
         else if (ARG("--steps"))
             steps = integer(VALUE(), 1, 1000);
         else if (ARG("--seed"))
-            seed = integer(VALUE(), 0, INT_MAX);
+            seed = seed_value(VALUE());
         else if (ARG("--device"))
             device = integer(VALUE(), 0, 127);
         else if (ARG("--reserve-mib"))
@@ -318,7 +330,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nt; i++)
         ti[i * 4 + 3] = i;
     if (!latfile) {
-        rng_state = (unsigned)seed + 1;
+        rng_state = (uint64_t)seed + 1;
         for (size_t j = 0; j < count; j++)
             image[j] = bf16_round(gaussian());
     }

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """CPU Qwen3-VL prompt encoding followed by native ROCm FLUX3 DiT/VAE."""
 import argparse
-import json
+import fcntl
+import tempfile
+if __package__:
+    from .prompt_cache import identity, key, cached, publish
+else:
+    from prompt_cache import identity, key, cached, publish
 import os
 from pathlib import Path
 import subprocess
@@ -27,13 +32,17 @@ def main():
     state = root / "tmp" / "flux3"
     state.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("TMPDIR", str(root / "tmp"))
-    import hashlib
-    key = hashlib.sha256((str(args.model_dir.resolve()) + "\0" + args.prompt).encode()).hexdigest()[:24]
-    features = state / (key + ".f32")
-    if not features.exists() or not features.with_suffix(".f32.json").exists():
-        subprocess.run([sys.executable, str(here / "prepare_text.py"), "--model-dir", str(args.model_dir),
-                        "--prompt", args.prompt, "--output", str(features), "--threads", str(args.threads)], check=True)
-    manifest = json.loads(features.with_suffix(".f32.json").read_text())
+    descriptor = identity(args.model_dir, args.prompt, args.threads)
+    features = state / (key(descriptor) + ".f32")
+    with features.with_suffix('.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        manifest = cached(features, descriptor)
+        if manifest is None:
+            with tempfile.TemporaryDirectory(prefix='text-', dir=state) as directory:
+                prepared = Path(directory)/'text.f32'
+                subprocess.run([sys.executable, str(here / "prepare_text.py"), "--model-dir", str(args.model_dir),
+                                "--prompt", args.prompt, "--output", str(prepared), "--threads", str(args.threads)], check=True)
+                manifest = publish(prepared, features, descriptor)
     subprocess.run(["make", "-C", str(here)], check=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run([str(here / "test_hip_flux3"), "--model-dir", str(args.model_dir),

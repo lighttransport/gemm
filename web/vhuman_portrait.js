@@ -1,7 +1,7 @@
 // Portrait review is independent of the optional Three.js head viewer.
 const $ = id => document.getElementById(id);
 const angles = [[45, 'Left three-quarter'], [-45, 'Right three-quarter'], [90, 'Left profile'], [-90, 'Right profile']];
-const state = {session: null, sessions: [], job: null, starting: false, saving: false, health: null, candidates: {}};
+const state = {session: null, sessions: [], job: null, starting: false, saving: false, health: null, candidates: {}, model: 'qwen-image21', steps: {'qwen-image21': 24, klein3: 16}};
 const pendingKey = 'vhuman.portrait.pending.v1', sessionKey = 'vhuman.portrait.session.v1';
 const busy = () => !!(state.job || state.starting || state.saving);
 const el = (tag, text, cls) => {
@@ -28,11 +28,27 @@ function remember(key, value) {
   try { value === null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch { /* private browsing */ }
 }
 function recall(key) { try { return localStorage.getItem(key); } catch { return null; } }
-function generationReady() {
+function generator(views = false) {
   const h = state.health;
-  if (!h?.qwen?.available) return false;
-  if (h.qwen.backend === 'mock') return true;
-  return (h.gpu?.free_mib || 0) >= ($('portrait-memory').value === 'low8' ? 7680 : 12288);
+  const model = views ? 'qwen-image21' : $('portrait-model').value;
+  return h?.portrait_generators?.[model] || (model === 'qwen-image21' ? h?.qwen : null);
+}
+function minimumMemory(views = false) {
+  return (views || $('portrait-model').value === 'qwen-image21') ?
+    ($('portrait-memory').value === 'low8' ? 7680 : 12288) : (generator()?.min_free_mib || 9216);
+}
+function generationReady(views = false) {
+  const g = generator(views);
+  return !!g?.available && (g.backend === 'mock' || (state.health?.gpu?.free_mib || 0) >= minimumMemory(views));
+}
+function restoreParameters(p) {
+  for (const row of state.session?.portraits || []) state.steps[row.portrait_model || 'qwen-image21'] = row.steps;
+  const model = p?.portrait_model || 'qwen-image21';
+  $('portrait-model').value = model;
+  state.model = model;
+  $('portrait-seed').value = p?.seed ?? 11;
+  $('portrait-steps').value = p?.steps ?? state.steps[model];
+  if (p?.preset === 'low8' || p?.preset === 'fast12') $('portrait-memory').value = p.preset;
 }
 function compare(url, label) {
   const front = state.session?.portraits.find(p => p.id === state.session.active_revision);
@@ -41,24 +57,30 @@ function compare(url, label) {
   $('portrait-compare-label').textContent = label;
   $('portrait-lightbox').showModal();
 }
-function parameters() {
-  for (const id of ['portrait-subject', 'portrait-seed', 'portrait-steps']) {
+function parameters(views = false) {
+  const stepId = views ? 'portrait-view-steps' : 'portrait-steps';
+  for (const id of ['portrait-subject', 'portrait-seed', stepId]) {
     if (!$(id).reportValidity()) throw Error('Check the portrait settings.');
   }
-  return {seed: Number($('portrait-seed').value), steps: Number($('portrait-steps').value), qwen_preset: $('portrait-memory').value};
+  const result = {seed: Number($('portrait-seed').value), steps: Number($(stepId).value)};
+  if (views || $('portrait-model').value === 'qwen-image21') result.qwen_preset = $('portrait-memory').value;
+  if (!views) result.portrait_model = $('portrait-model').value;
+  return result;
 }
 function controls() {
   const doc = state.session, approved = !!doc?.selection.portrait_reviewed, locked = busy();
   $('portrait-generate').disabled = locked || !generationReady();
-  $('portrait-generate-views').disabled = locked || !approved || !generationReady();
+  $('portrait-generate-views').disabled = locked || !approved || !generationReady(true);
   $('portrait-approved').disabled = locked || !doc;
   $('portrait-reconstruct-front').disabled = locked || !approved;
   $('portrait-reconstruct-views').disabled = locked || !approved || !doc?.selection.view_ids.length;
   $('portrait-new').disabled = locked;
   $('portrait-sessions').disabled = locked;
   $('portrait-memory').disabled = locked;
+  $('portrait-model').disabled = locked;
+  $('portrait-view-steps').disabled = locked;
   for (const node of $('portrait-views').querySelectorAll('input,select,button')) {
-    node.disabled = locked || !approved || (node.tagName === 'BUTTON' && !generationReady());
+    node.disabled = locked || !approved || (node.tagName === 'BUTTON' && !generationReady(true));
   }
   $('portrait-cancel').hidden = !state.job;
   for (let i = 1; i <= 3; i++) $('portrait-step-'+i).classList.toggle('active', i === (!approved ? 1 : doc.selection.view_ids.length ? 3 : 2));
@@ -75,7 +97,7 @@ function render() {
   $('portrait-caption').hidden = !front;
   if (front) {
     $('portrait-image').src = front.url;
-    $('portrait-caption').textContent = `Front · ${front.size.join(' × ')} · seed ${front.seed}`;
+    $('portrait-caption').textContent = `${front.model || 'Qwen-Image 2.1'} · ${front.size.join(' × ')} · seed ${front.seed}`;
     $('portrait-image').onclick = () => compare(front.url, 'Current front portrait');
   } else $('portrait-image').removeAttribute('src');
   $('portrait-lineage').textContent = doc ? `${doc.portraits.length} portrait revision${doc.portraits.length === 1 ? '' : 's'} · ${doc.view_runs.filter(r => !r.stale).length} current view runs` : 'Your portrait and views will appear here.';
@@ -83,8 +105,8 @@ function render() {
   if (doc) $('portrait-bundle').href = doc.bundle_url;
   $('portrait-history').replaceChildren(...(doc?.portraits || []).slice().reverse().map(p => {
     const button = el('button');
-    button.title = `Earlier portrait · seed ${p.seed} · click to inspect`;
-    const img = el('img'); img.src = p.url; img.alt = `Portrait seed ${p.seed}`;
+    button.title = `${p.model || 'Qwen-Image 2.1'} · seed ${p.seed} · click to inspect`;
+    const img = el('img'); img.src = p.url; img.alt = `${p.model || 'Qwen-Image 2.1'} portrait seed ${p.seed}`;
     button.append(img); button.onclick = () => compare(p.url, `Portrait history · seed ${p.seed}`);
     return button;
   }));
@@ -166,10 +188,16 @@ async function refreshSessions(selectId = state.session?.id) {
 async function refreshHealth() {
   try {
     state.health = await api('/health');
-    const h = state.health, mock = h.qwen?.backend === 'mock';
-    $('health').textContent = mock ? 'Mock preview' : !h.qwen?.available ? 'Image generator needs setup' : generationReady() ? 'Image generator ready' : 'GPU busy';
+    const h = state.health, g = generator(), mock = g?.backend === 'mock';
+    $('health').textContent = mock ? 'Mock preview' : !g?.available ? 'Portrait generator needs setup' : generationReady() ? 'Portrait generator ready' : 'GPU busy';
     $('portrait-memory').querySelector('[value="fast12"]').disabled = !mock && (h.gpu?.free_mib || 0) < 12288;
-    $('portrait-gpu').textContent = mock ? 'Mock mode · synthetic test images' : !h.qwen?.available ? h.qwen?.reason || 'Image generator needs setup.' : `${h.gpu?.name || 'GPU'} · ${((h.gpu?.free_mib || 0)/1024).toFixed(1)} GiB free. ${generationReady() ? 'Ready to generate.' : 'Generation needs '+($('portrait-memory').value === 'low8' ? '7.5' : '12')+' GiB free. Free the GPU, then retry.'}`;
+    for (const option of $('portrait-model').options) {
+      const ready = h.portrait_generators?.[option.value];
+      option.disabled = !!ready && !ready.available;
+    }
+    $('portrait-gpu').textContent = mock ? 'Mock mode · synthetic test images' : !g?.available ? g?.reason || 'Portrait generator needs setup.' : `${h.gpu?.name || 'GPU'} · ${((h.gpu?.free_mib || 0)/1024).toFixed(1)} GiB free. ${generationReady() ? 'Ready to generate.' : 'Generation needs '+(minimumMemory()/1024).toFixed(1)+' GiB free. Free the GPU, then retry.'}`;
+    const views = generator(true);
+    $('portrait-views-status').textContent = !views?.available ? `Side views unavailable: ${views?.reason || 'Qwen needs setup.'}` : generationReady(true) ? 'Side-view generator ready.' : `Side views need ${(minimumMemory(true)/1024).toFixed(1)} GiB free.`;
     controls();
   } catch (error) { $('portrait-gpu').textContent = error.message; }
 }
@@ -213,7 +241,7 @@ async function poll(id) {
 }
 async function generateViews(method, selectedAngles) {
   try {
-    await startJob({kind: 'portrait_views', ...parameters(), session_id: state.session.id,
+    await startJob({kind: 'portrait_views', ...parameters(true), session_id: state.session.id,
       revision: state.session.active_revision, method, ...(selectedAngles ? {angles: selectedAngles} : {})});
   } catch (error) { message(error.message, true); }
 }
@@ -236,28 +264,36 @@ $('portrait-reconstruct-front').onclick = () => reconstruct(false);
 $('portrait-reconstruct-views').onclick = () => reconstruct(true);
 $('portrait-refresh').onclick = refreshHealth;
 $('portrait-memory').onchange = refreshHealth;
+$('portrait-model').onchange = () => {
+  state.steps[state.model] = Number($('portrait-steps').value);
+  state.model = $('portrait-model').value;
+  $('portrait-steps').value = state.steps[state.model];
+  refreshHealth();
+};
 $('portrait-cancel').onclick = async () => {
   try { if (state.job) await api(`/v1/jobs/${state.job}/cancel`, {}); }
   catch (error) { message(error.message, true); }
 };
 $('portrait-new').onclick = () => {
-  state.session = null; state.candidates = {}; remember(sessionKey, null); render(); message('Ready for a new face.');
+  state.session = null; state.candidates = {}; restoreParameters(null); remember(sessionKey, null); render(); message('Ready for a new face.');
 };
 $('portrait-sessions').onchange = async () => {
   state.candidates = {};
   await refreshSessions($('portrait-sessions').value);
   const d = state.session, p = d?.portraits.find(p => p.id === d.active_revision);
   if (d) $('portrait-subject').value = d.subject;
-  if (p) { $('portrait-seed').value = p.seed; $('portrait-steps').value = p.steps; }
+  restoreParameters(p);
+  await refreshHealth();
 };
 $('portrait-close-compare').onclick = () => $('portrait-lightbox').close();
 render();
-Promise.all([refreshSessions(recall(sessionKey)), refreshHealth()]).then(() => {
+Promise.all([refreshSessions(recall(sessionKey)), refreshHealth()]).then(async () => {
   const d = state.session;
   if (d) {
     $('portrait-subject').value = d.subject;
     const p = d.portraits.find(p => p.id === d.active_revision);
-    $('portrait-seed').value = p.seed; $('portrait-steps').value = p.steps;
+    restoreParameters(p);
+    await refreshHealth();
   }
   const pending = recall(pendingKey);
   if (pending) { state.job = pending; controls(); poll(pending); }

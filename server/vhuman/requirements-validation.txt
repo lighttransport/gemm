@@ -1,3 +1,4 @@
 # Optional geometry and RGB EXR round-trip validation dependencies.
 -r requirements-remesh.txt
 OpenEXR==3.4.4
+usd-core==26.8

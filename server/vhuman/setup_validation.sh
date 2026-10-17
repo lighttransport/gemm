@@ -21,7 +21,8 @@ python="$venv/bin/python"
 export TMPDIR="$root/tmp/vhuman-runtime"
 export UV_CACHE_DIR="$(python3 "$root/server/python_env.py" cache)"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$root/tmp/vhuman-cache}"
-export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+rocm_lib=$(PYTHONPATH="$root" python3 -B -m server.vhuman.rocm_runtime)
+export LD_LIBRARY_PATH="$rocm_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mkdir -p "$TMPDIR" "$UV_CACHE_DIR" "$XDG_CACHE_HOME" "$tools"
 tools=$(CDPATH= cd -- "$tools" && pwd)
 "$python" -B vulkan/tools/setup_glslc.py --prefix "$tools" --jobs "$jobs"

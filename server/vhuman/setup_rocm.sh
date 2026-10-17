@@ -1,13 +1,20 @@
 #!/bin/sh
 # Isolated ROCm interpreter in shared storage; scratch stays in the repository.
 set -eu
+env_only=0
+case "${1:-}" in
+    --env-only) env_only=1 ;;
+    '') ;;
+    *) echo 'Usage: setup_rocm.sh [--env-only]' >&2; exit 2 ;;
+esac
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 export TMPDIR="$root/tmp/vhuman-rocm-tmp"
 export UV_CACHE_DIR="$(python3 "$root/server/python_env.py" cache)"
 mkdir -p "$TMPDIR" "$UV_CACHE_DIR"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$root/tmp/vhuman-cache}"
 mkdir -p "$XDG_CACHE_HOME"
-export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+rocm_lib=$(PYTHONPATH="$root" python3 -B -m server.vhuman.rocm_runtime)
+export LD_LIBRARY_PATH="$rocm_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 venv=$(python3 "$root/server/python_env.py" venv "$root/tmp/vhuman-rocm-venv" --link)
 python="$venv/bin/python"
 if [ ! -x "$python" ]; then uv venv --python 3.12 "$venv"; fi
@@ -22,8 +29,10 @@ uv pip install --python "$python" \
  'pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6' \
  'diffusers @ git+https://github.com/huggingface/diffusers@80c7ed262aeffbeb43ef13ae04baeb9b84515a69' \
  'transformers @ git+https://github.com/huggingface/transformers@c587bc884db2c2e31fc2b8102314656b17aa07b1'
+uv pip install --python "$python" -r "$root/server/vhuman/requirements-face-parsing.txt"
 "$python" -B -c 'import torch; assert torch.version.hip, "expected a ROCm PyTorch build"; print(torch.__version__, torch.version.hip)'
 
+[ "$env_only" -eq 0 ] || exit 0
 cd "$root"
 "$python" -B cuda/qimg21/export_text_rope.py --out rdna4/qimg21/qwen21_text_rope.npy
 "$python" -B cuda/qimg21/export_vision_rope.py --out rdna4/qimg21/qwen21_vision_rope.npy

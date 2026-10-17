@@ -7,7 +7,7 @@ from server.model_paths import MODELS_ROOT
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def audit(models_root=MODELS_ROOT):
+def audit(models_root=MODELS_ROOT, klein3_model='/mnt/nvme02/model/flux3-klein'):
     models = Path(models_root)
     required = {
         'qwen-image-2.1': models / 'qimg-21/model_index.json',
@@ -38,7 +38,22 @@ def audit(models_root=MODELS_ROOT):
     }
     def describe(paths):
         return {key: {'path': str(path), 'present': path.exists()} for key, path in paths.items()}
+    klein = Path(klein3_model)
+    stages = {
+        'qwen-portraits': [required['qwen-image-2.1'], required['qwen-int8']],
+        'klein3-portraits': [klein/'variants/fp8r/model.safetensors',
+                            klein/'vae/diffusion_pytorch_model.safetensors',
+                            klein/'text_encoder/model.safetensors.index.json'],
+        'portrait-reconstruction': [required['gnm'], optional['video-face-landmarks'],
+                                    models/'vhuman-rig-models/face-parsing/resnet18.onnx'],
+        'pixal3d': [required['pixal3d'], required['dinov3']],
+        'native-camera': [required['moge2-native'], required['moge2-backbone'], required['moge2-heads']],
+        'body-rig': [required['mhr-rig'], required['mhr-rig-manifest']],
+    }
     return {'models_root': str(models), 'required': describe(required), 'optional': describe(optional),
+            'stages': {key: {'ready': all(p.exists() for p in paths),
+                             'missing': [str(p) for p in paths if not p.exists()]}
+                       for key, paths in stages.items()},
             'missing_required': [str(p) for p in required.values() if not p.exists()],
             'missing_optional': [str(p) for p in optional.values() if not p.exists()]}
 
@@ -46,8 +61,9 @@ def audit(models_root=MODELS_ROOT):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--models-root', type=Path, default=MODELS_ROOT)
+    parser.add_argument('--klein3-model', type=Path, default=Path('/mnt/nvme02/model/flux3-klein'))
     args = parser.parse_args()
-    result = audit(args.models_root)
+    result = audit(args.models_root, args.klein3_model)
     print(json.dumps(result, indent=2))
     return bool(result['missing_required'])
 

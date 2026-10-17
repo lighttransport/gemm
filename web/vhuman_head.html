@@ -112,7 +112,7 @@ a.dl{color:var(--accent);margin-right:14px;font-size:13px}
 <body>
 <header>
   <h1>Virtual Human Head</h1>
-  <span class="sub">Qwen-Image 2.1 · portrait inputs and face reconstruction</span>
+  <span class="sub">Klein3 / Qwen-Image 2.1 · portrait inputs and face reconstruction</span>
   <a href="/">eye editor →</a>
   <span class="health" id="health">…</span>
 </header>
@@ -126,10 +126,11 @@ a.dl{color:var(--accent);margin-right:14px;font-size:13px}
     <aside class="portrait-controls">
       <div class="card">
         <h2>Describe the person</h2>
+        <label for="portrait-model">Portrait generator</label><select id="portrait-model"><option value="qwen-image21">Qwen-Image 2.1</option><option value="klein3">Klein3 · ROCm</option></select>
         <label for="portrait-subject">Appearance</label><textarea id="portrait-subject" maxlength="400">a 30-year-old woman with light olive skin, short dark brown hair tied back, hazel eyes</textarea>
         <p class="msg">Neutral expression, natural skin, even light and a clear view of the whole head are included.</p>
         <div class="row"><div><label for="portrait-seed">Seed</label><input id="portrait-seed" type="number" min="0" max="4294967295" value="11"></div><div><label for="portrait-steps">Steps</label><input id="portrait-steps" type="number" min="1" max="100" value="24"></div></div>
-        <label for="portrait-memory">Memory mode</label><select id="portrait-memory"><option value="low8">8 GB · streaming</option><option value="fast12">Larger GPU · resident</option></select>
+        <label for="portrait-memory">Qwen memory mode · portrait / side views</label><select id="portrait-memory"><option value="low8">8 GB · streaming</option><option value="fast12">Larger GPU · resident</option></select>
         <p id="portrait-gpu" class="msg" role="status">Checking image generation…</p><button id="portrait-refresh">Refresh GPU status</button>
         <button id="portrait-generate" class="primary" disabled>Generate portrait</button>
         <p class="msg">Regeneration keeps earlier images. A new front portrait requires a new review of its views.</p>
@@ -142,7 +143,7 @@ a.dl{color:var(--accent);margin-right:14px;font-size:13px}
         <div class="portrait-review"><h3>Your identity anchor</h3><p>Check the eyes, lips, hairline and face shape before continuing. Click any image to compare it at full size.</p><label class="portrait-check"><input id="portrait-approved" type="checkbox" disabled><span>I reviewed this portrait. Use it as the reference for every angle.</span></label><p class="msg">Generated views can vary. Select the ones that preserve this person’s features.</p><div class="progress" role="progressbar" aria-label="Current job" aria-valuemin="0" aria-valuemax="100" id="portrait-progress"><div id="portrait-bar"></div></div><div class="portrait-status"><p id="portrait-message" class="msg" role="status" aria-live="polite"></p><button id="portrait-cancel" hidden>Cancel</button></div></div>
       </div>
       <section class="portrait-section" aria-labelledby="portrait-views-title"><h3 id="portrait-views-title">Four angles. One reference.</h3><p class="msg">The original front portrait stays unchanged. Left and right refer to the person’s own sides.</p>
-        <div class="portrait-methods"><label><input name="portrait-method" type="radio" value="individual" checked>Individual · 1024 px each</label><label><input name="portrait-method" type="radio" value="sheet">Joint sheet · 512 px per view</label><button id="portrait-generate-views" disabled>Generate four views</button></div>
+        <p class="msg">Side views use Qwen-Image 2.1 with the approved front portrait as their reference.</p><p id="portrait-views-status" class="msg" role="status"></p><label for="portrait-view-steps">Side-view steps</label><input id="portrait-view-steps" type="number" min="1" max="100" value="24"><div class="portrait-methods"><label><input name="portrait-method" type="radio" value="individual" checked>Individual · 1024 px each</label><label><input name="portrait-method" type="radio" value="sheet">Joint sheet · 512 px per view</label><button id="portrait-generate-views" disabled>Generate four views</button></div>
         <div id="portrait-views" class="portrait-views"></div><div id="portrait-sheets" class="portrait-sheets"></div>
       </section>
       <section class="portrait-section" aria-labelledby="portrait-reconstruct-title"><h3 id="portrait-reconstruct-title">Ready for a 3D face?</h3><p class="msg">The front portrait is always included. Experimental multiview fitting estimates cameras and uses approved side views to fill unseen skin while preserving front-visible texture.</p>

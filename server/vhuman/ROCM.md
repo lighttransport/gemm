@@ -1,10 +1,91 @@
 # Virtual humans on RX 9070 XT
 
 The vhuman workflow and the Qwen/Pixal3D demos support native ROCm on RDNA4
-(`gfx1201`, wave32). The default model root is `/mnt/disk1/models`.
+(`gfx1201`, wave32). The default model root is the checkout's NVMe `models/`
+directory, falling back to `/mnt/disk1/models` on other storage.
 Backend selection, device selection, Python subprocesses and device locks are
 shared across the workflow. CPU geometry, texture baking, export and browser
 playback remain portable.
+
+## Threadripper 1950X / RX 9070 XT portrait setup
+
+The current checkout uses shared Python environments under
+`/mnt/nvme01/venvs/gemm`, with compatibility links in repo `tmp/`. Weights default
+to `/mnt/nvme02/models`; Klein3 currently uses `/mnt/nvme02/model/flux3-klein`.
+The pinned ROCm 7.2.2 PyTorch wheel needs `librocm_smi64.so.1`. The launcher and
+Python subprocess wrapper choose a complete installed library set; on this host
+that is `/opt/rocm/core-10.0/lib`, while the active `core` alternative omits that
+ABI. System ROCm alternatives are left intact.
+
+```sh
+sh server/vhuman/setup_rocm.sh  # --env-only refreshes Python without preparing sources/assets
+sh rdna4/flux3/setup.sh
+make -C rdna4/flux3
+make -C rdna4/qimg21 all fast rocew-probe
+make -C rdna4/vhuman
+make -C cpu/vhuman libvhuman_training.so libvhuman_landmarks.so
+# Checksums are verified; valid existing GNM/MediaPipe assets are reused.
+tmp/vhuman-rocm-venv/bin/python -B -m server.vhuman.face_assets
+sh server/vhuman/run.sh --backend rocm --device 0 --models-root /mnt/nvme02/models
+```
+
+Open `/head` and choose **Qwen-Image 2.1** or **Klein3** for the front portrait.
+Reference-based side views continue through Qwen. Each generator has independent
+readiness and memory admission. The audit's `stages` field separates portrait
+reconstruction readiness from optional native-camera and body-rig assets;
+a whole-workflow audit can still return nonzero for those other missing stages.
+
+For repeatable validation, use the pinned USD SDK from
+`requirements-validation.txt` and a fresh work directory:
+
+```sh
+export TMPDIR="$PWD/tmp/vhuman-runtime"
+export LD_LIBRARY_PATH="$(python3 -B -m server.vhuman.rocm_runtime)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 tmp/vhuman-rocm-venv/bin/python -B \
+  -m server.vhuman.validate_portrait --backend rocm --suite bounded \
+  --portrait-models qwen-image21 klein3 --work tmp/portrait-rocm-validation
+# Add --check-only for preflight, --resume to retain completed jobs,
+# or --cancel-only to verify real GPU cancellation for the selected models.
+```
+
+The bounded suite generates and repeats each front, creates a Qwen joint sheet
+from the Klein3 front, then reconstructs a GNM front baseline plus a guarded
+multiview candidate and exports its rig. Side-view rejection preserves the
+baseline and is reported separately. The report and `review.html` retain images,
+parameters, timing, PCI-matched AMD VRAM samples and source hashes. AMD telemetry
+uses whole-device sysfs VRAM usage, sampled every 100 ms; it is not a per-process
+allocator high-water mark. CUDA's existing full 8 GiB suite remains the default.
+Neither validator stops competing GPU work. Inspect images and exports before
+claiming visual quality.
+
+### Current host check (2026-10-18)
+
+The restored environment imports Torch `2.11.0+rocm7.2.2` and detects the RX 9070
+XT. Klein3's CPU encoder (`torch 2.14.1+cpu`, Transformers 5.8.1) exported the
+160-token portrait prompt. Native Klein3 BF16/FP8 GEMM, attention and RoPE
+self-tests pass. The affected workflow run passed 94 tests with one optional
+skip; the focused portrait/runtime/USD run passed 36 without skips. The final
+switch/cache/browser checks passed 16 tests, and the native Qwen worker/runtime
+checks passed 16. Mixed Klein3/Qwen provenance round-trips through GLB and USD.
+
+A fresh GNM reconstruction from the existing head-framed portrait completed at
+fit resolution 512, 80 iterations and texture resolution 1024, exporting 15 GLB
+meshes and a valid 64-file USD archive. Its 32-frame native HIP deformer matched
+CPU exactly on the tested linear, ML and contact modes. These are execution
+checks using an existing portrait, not validation of a newly generated identity.
+The exported candidate also loads in Chrome under Xvfb/SwiftShader at desktop
+and narrow widths, without console errors. Candidate metadata/downloads now use
+the selected rig; candidate-only heads no longer request absent accepted-rig
+speech takes. These browser checks do not measure hardware rendering speed.
+An earlier tilted grayscale fixture failed rig assembly with “too few surface hits”;
+that failed run remains recorded rather than being counted as a pass.
+
+Full 1024-square image generation, same-seed repeats and real GPU cancellation
+are **pending**: a competing workload leaves about 2 GiB free, below the Qwen
+7680 MiB and Klein3 9216 MiB admission thresholds. The user confirmed that the
+GPU will not be available soon. No competing process was stopped. Receipts,
+failed and successful logs, environment freeze and browser images are retained
+under `tmp/vhuman-klein3-check/`; use the bounded command above once memory is free.
 
 ## Setup and launch
 
@@ -41,9 +122,9 @@ Build products, caches and temporary files use repository `tmp/` directories.
 Always create a directory before setting `TMPDIR`: a nonexistent directory
 causes COMGR to report invalid kernel images during PyTorch kernel loading.
 
-The isolated environment is `tmp/vhuman-rocm-venv`. On this machine that path,
-`tmp/uv-cache`, public rig assets and validation artifacts are symlinks to
-`/mnt/disk1/vhuman-rocm/` to preserve root filesystem space. Existing model
+The isolated environment is `tmp/vhuman-rocm-venv`. Earlier installations placed that path,
+`tmp/uv-cache`, public rig assets and validation artifacts under
+`/mnt/disk1/vhuman-rocm/`; the current NVMe host uses the shared storage above. Existing model
 weights were not copied or changed. Allow several GB for the environment,
 compiler caches and generated rigs.
 
@@ -125,7 +206,7 @@ machine these are disk1-backed symlinks. Launchers default `XDG_CACHE_HOME` to
 the task cache, preserving an explicit user override and avoiding new global
 compiler-cache growth on the nearly full root filesystem.
 
-## Validation on this machine
+## Earlier ROCm validation
 
 These are bounded smoke tests, not quality or production throughput benchmarks.
 Artifacts and exact runner output are in `tmp/rocm-validation/`.

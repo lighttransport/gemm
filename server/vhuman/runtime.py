@@ -65,9 +65,11 @@ def main():
     parser.add_argument("--models-root", required=True)
     parser.add_argument("--module", required=True)
     args, rest = parser.parse_known_args()
-    if args.inference_backend == "rocm" and "/opt/rocm/core/lib" not in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+    from .rocm_runtime import library_path
+    rocm_lib = library_path()
+    if args.inference_backend == "rocm" and os.environ.get("LD_LIBRARY_PATH", "").split(":")[0] != rocm_lib:
         env = dict(os.environ)
-        env["LD_LIBRARY_PATH"] = "/opt/rocm/core/lib:" + env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = rocm_lib + ":" + env.get("LD_LIBRARY_PATH", "")
         os.execve(sys.executable, [sys.executable, "-m", "server.vhuman.runtime", *sys.argv[1:]], env)
     configure_args(args)
     sys.argv = [args.module, *rest]

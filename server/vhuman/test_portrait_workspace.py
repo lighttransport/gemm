@@ -297,7 +297,11 @@ class ExportProvenanceTests(unittest.TestCase):
         definition = _toy_rig()
         provenance = dict(format='vhuman.generated_face_inputs.v1', synthetic=True,
                           subject='quoted "identity" with Unicode: \u9854',
-                          views=[dict(sha256='a'*64, license='qwen-research')])
+                          views=[dict(sha256='a'*64, portrait_model='klein3',
+                                      license='FLUX Kommunity License v.1.0 (model)',
+                                      generation=dict(checkpoint=dict(sha256='c'*64))),
+                                 dict(sha256='b'*64, generation=dict(model='Qwen-Image 2.1',
+                                      license='qwen-research'))])
         definition['input_provenance'] = provenance
         asset = SimpleNamespace(rig=definition, skeleton=dict(joints=definition['joints']),
                                 parts=[], materials={}, info={})
@@ -310,6 +314,14 @@ class ExportProvenanceTests(unittest.TestCase):
             layer = Sdf.Layer.FindOrOpen(str(folder/'rig.usda'))
             self.assertIsNotNone(layer)
             self.assertEqual(json.loads(layer.customLayerData['vhumanGeneratedInput']), provenance)
+            from .validate_portrait import verify_exports
+            (folder/'rig.json').write_text(json.dumps(definition))
+            usd.package(folder)
+            self.assertIn('rig.usda', verify_exports(folder))
+            definition['input_provenance'] = dict(provenance, subject='different person')
+            (folder/'rig.json').write_text(json.dumps(definition))
+            with self.assertRaisesRegex(RuntimeError, 'GLB input provenance'):
+                verify_exports(folder)
 
 
 class HTTPTests(unittest.TestCase):

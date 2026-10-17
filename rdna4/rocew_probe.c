@@ -19,8 +19,12 @@ int main(int argc, char **argv) {
             if (*s < 32) printf("\\u%04x", *s);
             else { if (*s == '"' || *s == '\\') putchar('\\'); putchar(*s); }
         }
-        printf("\",\"arch\":\"%s\",\"free_mib\":%zu,\"total_mib\":%zu}\n",
-               p.gcnArchName, free_bytes >> 20, total_bytes >> 20);
+        char pci[64] = {0};
+        if (hipDeviceGetPCIBusId && hipDeviceGetPCIBusId(pci, sizeof(pci), (int)device)) pci[0] = 0;
+        /* HIP supplies a hexadecimal PCI address; do not emit unexpected bytes. */
+        if (strspn(pci, "0123456789abcdefABCDEF:.") != strlen(pci)) pci[0] = 0;
+        printf("\",\"arch\":\"%s\",\"pci_bus_id\":\"%s\",\"free_mib\":%zu,\"total_mib\":%zu}\n",
+               p.gcnArchName, pci, free_bytes >> 20, total_bytes >> 20);
         return 0;
     }
     if (argc != 1) return 2;

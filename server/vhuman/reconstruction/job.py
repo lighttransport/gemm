@@ -121,7 +121,7 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
             run_id = review['selected_run_id']
         if direct:
             meta = dict(id=hid,subject=request.get('subject') or 'direct portrait',
-                        source='Qwen-Image 2.1 synthetic inputs' if request.get('generated_input') else 'user portrait + statistical face model',
+                        source='synthetic portrait inputs (see input provenance)' if request.get('generated_input') else 'user portrait + statistical face model',
                         reconstruction_run=run_id)
             (folder/'head.json').write_text(json.dumps(meta,indent=2))
             folder.replace(service.work/'heads'/hid)

@@ -1,4 +1,4 @@
-"""Reviewed, revisioned Qwen portrait inputs, independent of reconstructed heads."""
+"""Reviewed, revisioned synthetic portrait inputs, independent of reconstructed heads."""
 from __future__ import annotations
 
 import copy
@@ -13,7 +13,7 @@ import zipfile
 
 from PIL import Image
 
-from . import gpu, qwen
+from . import gpu, qwen, portrait_generators as generators
 from .service import ServiceError
 
 FORMAT = 'vhuman.portrait_session.v1'
@@ -159,7 +159,8 @@ def snapshot(service, request):
         if any(v['id'] not in selection['view_ids'] for v in views):
             raise ServiceError('review selected views before reconstruction')
         portrait = next(p for p in doc['portraits'] if p['id'] == rev)
-        run_fields = ('id', 'method', 'reference_sha256', 'steps', 'cfg', 'negative_prompt',
+        run_fields = ('id', 'method', 'reference_sha256', 'steps', 'cfg', 'negative_prompt', 'backend',
+                      'portrait_model', 'generation',
                       'preset', 'attention', 'condition_resolution', 'model', 'license', 'synthetic')
         origins = {v['id']: {k: run[k] for k in run_fields if k in run}
                    for run in doc['view_runs'] for v in run['views']}
@@ -187,8 +188,8 @@ def snapshot(service, request):
             raise
 
 
-def _parameters(request):
-    seed, steps = request.get('seed', 11), request.get('steps', 24)
+def _parameters(request, default_steps=24):
+    seed, steps = request.get('seed', 11), request.get('steps', default_steps)
     if type(seed) is not int or not 0 <= seed < 2**32 or type(steps) is not int or not 1 <= steps <= 100:
         raise ServiceError('seed must be a uint32; steps must be 1..100')
     preset = request.get('qwen_preset', 'low8')
@@ -209,8 +210,10 @@ def _check(cancel):
         raise gpu.Cancelled('portrait generation cancelled')
 
 
-def generate_job(service, request, progress, cancel, *, python=None, mock=False):
-    seed, steps, preset = _parameters(request)
+def generate_job(service, request, progress, cancel, *, python=None, mock=False,
+                 klein3_model=None, klein3_python=None):
+    model = generators.validate(request.get('portrait_model', 'qwen-image21'))
+    seed, steps, preset = _parameters(request, 16 if model == 'klein3' else 24)
     subject = ' '.join(str(request.get('subject', '')).split())
     if not subject or len(subject) > 400:
         raise ServiceError('describe the person in 1..400 characters')
@@ -228,23 +231,32 @@ def generate_job(service, request, progress, cancel, *, python=None, mock=False)
         try:
             _check(cancel)
             if not mock:
-                ready = qwen.availability(python=python)
+                ready = generators.availability(python=python, klein3_model=klein3_model,
+                                                klein3_python=klein3_python)[model]
                 if not ready['available']:
                     raise ServiceError(ready['reason'])
+            minimum = generators.KLEIN_MIN_FREE_MIB if model == 'klein3' else (
+                gpu.QWEN_LOW8_MIN_FREE_MIB if preset == 'low8' else gpu.QWEN_MIN_FREE_MIB)
             progress(.02, 'waiting for image generation device')
-            with gpu.device_session(gpu.QWEN_LOW8_MIN_FREE_MIB if preset == 'low8' else gpu.QWEN_MIN_FREE_MIB,
-                                    cancel, check_memory=not mock):
+            generation = {}
+            with gpu.device_session(minimum, cancel, check_memory=not mock):
                 prompt = PORTRAIT.format(subject=subject)
-                progress(.1, 'Qwen-Image 2.1: front portrait')
+                progress(.1, ('Klein3' if model == 'klein3' else 'Qwen-Image 2.1')+': front portrait')
                 if mock:
                     from .head.pipeline import mock_portrait
                     mock_portrait(staging/'portrait.png', seed)
+                elif model == 'klein3':
+                    generation = generators.generate_klein(service, staging/'portrait.png', prompt, seed,
+                        steps, cancel, progress, model=klein3_model, python=klein3_python)
                 else:
                     backend = qwen.make_backend(python, preset=preset, cancel=cancel)
                     qwen._import_qimg21()
                     from qimg21_i23d.backends import GenRequest
-                    backend.generate(GenRequest(prompt, staging/'portrait.png', width=1024, height=1024,
-                                                steps=steps, seed=seed, negative_prompt=NEGATIVE))
+                    result = backend.generate(GenRequest(prompt, staging/'portrait.png', width=1024, height=1024,
+                                                         steps=steps, seed=seed, negative_prompt=NEGATIVE))
+                    generation = dict(details=result.details,
+                        checkpoint=generators.receipt(gpu.model_path('qimg-21-fast/int8-smooth-a0.6/blocks.bin')),
+                        package_manifest=generators.receipt(gpu.model_path('qimg-21-fast/int8-smooth-a0.6/manifest.json')))
                 if backend:
                     backend.close()
                     backend = None
@@ -252,10 +264,16 @@ def generate_job(service, request, progress, cancel, *, python=None, mock=False)
             final = root/'portraits'/revision
             staging.replace(final)
             row = _record(final/'portrait.png', root, id=revision, seed=seed, steps=steps,
-                          prompt=prompt, negative_prompt=NEGATIVE, cfg=4., preset=preset,
-                          attention='mock' if mock else 'flash' if gpu.backend() == 'cuda' else 'sage',
-                          license=qwen.LICENSE, synthetic=True, model='Qwen-Image 2.1', created=time.time(),
-                          seconds=round(time.perf_counter()-started, 2))
+                          prompt=prompt, portrait_model=model, generation=generation,
+                          negative_prompt=NEGATIVE if model == 'qwen-image21' else None,
+                          cfg=4. if model == 'qwen-image21' else None,
+                          preset=preset if model == 'qwen-image21' else 'fp8',
+                          attention='mock' if mock else 'native' if model == 'klein3' else
+                                    'flash' if gpu.backend() == 'cuda' else 'sage',
+                          backend='mock' if mock else gpu.backend(),
+                          license=generators.KLEIN_LICENSE if model == 'klein3' else qwen.LICENSE,
+                          synthetic=True, model='FLUX 3 Image Klein' if model == 'klein3' else 'Qwen-Image 2.1',
+                          created=time.time(), seconds=round(time.perf_counter()-started, 2))
             doc = load(service, sid) if (root/'session.json').exists() else dict(
                 format=FORMAT, id=sid, created=time.time(), portraits=[], view_runs=[], reconstructions=[])
             doc.update(subject=subject, active_revision=revision,
@@ -273,6 +291,8 @@ def generate_job(service, request, progress, cancel, *, python=None, mock=False)
 
 
 def views_job(service, request, progress, cancel, *, python=None, mock=False):
+    if request.get('portrait_model', 'qwen-image21') != 'qwen-image21':
+        raise ServiceError('side views require Qwen-Image 2.1')
     seed, steps, preset = _parameters(request)
     sid = _id(request.get('session_id'))
     method = request.get('method', 'individual')
@@ -357,6 +377,10 @@ def views_job(service, request, progress, cancel, *, python=None, mock=False):
             staging.replace(final)
             records = [_record(final/f"{r['yaw_deg']}.png", root, **r) for r in records]
             run = dict(id=rid, revision=revision, reference_sha256=front['sha256'], method=method,
+                       portrait_model='qwen-image21', backend='mock' if mock else gpu.backend(),
+                       generation={} if mock else dict(
+                           checkpoint=generators.receipt(gpu.model_path('qimg-21-fast/int8-smooth-a0.6/blocks.bin')),
+                           package_manifest=generators.receipt(gpu.model_path('qimg-21-fast/int8-smooth-a0.6/manifest.json'))),
                        steps=steps, cfg=4., negative_prompt=NEGATIVE, preset=preset, views=records,
                        attention='mock' if mock else 'flash' if gpu.backend() == 'cuda' else 'sage',
                        condition_resolution=1024, model='Qwen-Image 2.1', license=qwen.LICENSE,
