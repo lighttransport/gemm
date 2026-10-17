@@ -9,20 +9,25 @@ import urllib.request
 import uuid
 import zipfile
 
+from server.model_paths import MODELS_ROOT
+
 ROOT = Path(__file__).resolve().parents[2]
-DATA = Path(os.environ.get("VHUMAN_DATA_ROOT", "/mnt/disk01/data/vhuman"))
+DATA = Path(os.environ.get("VHUMAN_DATA_ROOT", str(MODELS_ROOT / "vhuman-rig-models")))
 LEGACY = ROOT / "tmp/vhuman-rig/models"
 PARSING_SHA256 = "0d9bd318e46987c3bdbfacae9e2c0f461cae1c6ac6ea6d43bbe541a91727e33f"
 PARSING_REVISION = "bfcc7d48ea8412d55de406cecf96b65b3ca720b2"
 
 
 def asset_path(name, root=DATA):
-    relative = {"gnm": "gnm-v3/gnm_head.npz", "mediapipe": "mediapipe/face_landmarker.task",
+    relative = {"gnm": "gnm-v3/gnm_head.npz", "mediapipe": "face_landmarker.task",
                 "parsing": "face-parsing/resnet18.onnx"}[name]
     path = Path(root) / relative
-    if path.is_file() or name == "parsing" or Path(root) != DATA:
+    if path.is_file() or name == "parsing":
         return path
-    return LEGACY / ("face_landmarker.task" if name == "mediapipe" else relative)
+    # Existing --data-root installations used a mediapipe/ subdirectory.
+    if name == "mediapipe" and (Path(root) / "mediapipe/face_landmarker.task").is_file():
+        return Path(root) / "mediapipe/face_landmarker.task"
+    return path
 
 
 def sha256(path):
@@ -38,7 +43,7 @@ def fetch(root=DATA):
         ("gnm-v3/gnm_head.npz", GNM_SHA256,
          f"https://huggingface.co/google/gnm-v3/resolve/{GNM_REVISION}/v3_0/gnm_head.npz",
          GNM_REVISION, "Apache-2.0", LEGACY / "gnm-v3/gnm_head.npz"),
-        ("mediapipe/face_landmarker.task", TASK_SHA256,
+        ("face_landmarker.task", TASK_SHA256,
          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
          "float16/1", "Apache-2.0", LEGACY / "face_landmarker.task"),
         ("face-parsing/resnet18.onnx", PARSING_SHA256,
@@ -66,7 +71,7 @@ def fetch(root=DATA):
         receipt["files"][relative] = {"sha256": digest, "bytes": target.stat().st_size,
                                        "source": url, "revision": revision, "license": license_name}
         print(f"Verified {target}", flush=True)
-    task = root / "mediapipe/face_landmarker.task"
+    task = root / "face_landmarker.task"
     with zipfile.ZipFile(task) as archive:
         for name in MODELS:
             data = archive.read(name + ".tflite")

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import html
 import json
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 import sys
 import threading
 import time
@@ -33,7 +34,7 @@ SUBJECTS = (
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work', type=Path, default=ROOT/'tmp/portrait-validation'/datetime.now().strftime('%Y%m%d-%H%M%S'))
-    parser.add_argument('--models-root', default='/mnt/disk1/models')
+    parser.add_argument('--models-root', default=str(MODELS_ROOT))
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--check-only', action='store_true')
     parser.add_argument('--images-only', action='store_true', help='skip reconstruction; report generation coverage only')

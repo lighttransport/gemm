@@ -157,11 +157,11 @@ sh server/vhuman/realtime/run.sh collect-motion --rig "$RIG" --model "$MODEL" \
   --sentences server/vhuman/realtime/examples/japanese_motion_sentences.json \
   --output tmp/vhuman-realtime/motion-corpus-v2 --threads 4
 sh server/vhuman/realtime/run.sh train-motion --manifest tmp/vhuman-realtime/motion-corpus-v2/manifest.json \
-  --output tmp/vhuman-realtime/motion-v3.pt --epochs 150 --threads 4
+  --output /mnt/nvme02/models/vhuman/realtime/motion-v3.pt --epochs 150 --threads 4
 sh server/vhuman/realtime/run.sh evaluate-motion --manifest tmp/vhuman-realtime/motion-corpus-v2/manifest.json \
-  --checkpoint tmp/vhuman-realtime/motion-v3.pt --output tmp/vhuman-realtime/motion-v3-evaluation.json
+  --checkpoint /mnt/nvme02/models/vhuman/realtime/motion-v3.pt --output tmp/vhuman-realtime/motion-v3-evaluation.json
 sh server/vhuman/realtime/run.sh live --rig "$RIG" --model "$MODEL" --revision "$REV" \
-  --avatar tmp/vhuman-realtime/clean-neutral-avatar-v3.npz --adapter tmp/vhuman-realtime/motion-v3.pt \
+  --avatar tmp/vhuman-realtime/clean-neutral-avatar-v3.npz --adapter /mnt/nvme02/models/vhuman/realtime/motion-v3.pt \
   --text 'こんにちは。今日は、このアバターの動きと音声の同期を確認します。' \
   --sink offline --resident --tts-threads 4 --max-frames 256 --diagnostic \
   --video tmp/vhuman-realtime/improved.mp4

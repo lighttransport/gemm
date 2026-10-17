@@ -9,6 +9,7 @@ grid: the four horizontal views tiled 2x2 and edited in one 1024px call, so the
   generator sees all of them jointly; top and bottom keep the projected state.
 """
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 import json
 import os
 import time
@@ -59,7 +60,7 @@ def _foreground_alpha(img, model):
     return np.asarray(Image.fromarray(np.uint8(pred*255)).resize(img.size),float)/255
 
 
-def matted_portrait(candidate, model='/mnt/disk01/models/BiRefNet', *, strict=False):
+def matted_portrait(candidate, model=f'{MODELS_ROOT}/BiRefNet', *, strict=False):
     """Portrait reference without its photo context: BiRefNet foreground (keeps hair), cut just below the chin
     (face mask) to drop clothing, on 50% gray. The raw photo's background and shirt leaked into edits."""
     candidate=Path(candidate)
@@ -90,7 +91,7 @@ def matted_portrait(candidate, model='/mnt/disk01/models/BiRefNet', *, strict=Fa
 
 
 def selected(candidate, views, out, editor, *, steps=12, seed=317, cfg=4.,
-             portrait_mode='matted', prompt_recipe='bare-skin', matte_model='/mnt/disk01/models/BiRefNet'):
+             portrait_mode='matted', prompt_recipe='bare-skin', matte_model=f'{MODELS_ROOT}/BiRefNet'):
     """Independent edits of fixed conditions; seed offsets retain the canonical view order."""
     from .observations import sha256
     from .qwen_edit_backend import LICENSE
@@ -147,7 +148,7 @@ def _commit(atlas, known, geometry, frame, view, image, valid, points, normals):
 
 
 def sequential(candidate, frame, views, out, *, steps=12, seed=317, strength=.9, editor=None,
-               matte_model='/mnt/disk01/models/BiRefNet'):
+               matte_model=f'{MODELS_ROOT}/BiRefNet'):
     """editor: optional qwen_edit_backend.Editor (Apache-2.0 Edit-2511) instead of Qwen-Image-2.1."""
     candidate,out=Path(candidate),Path(out)
     with np.load(candidate/'geometry.npz',allow_pickle=False) as z:geometry=dict(z)
@@ -217,7 +218,7 @@ GRID_EDIT_PROMPT=('Picture 1 is the identity portrait. The LAST picture is a 2 b
 
 
 def grid(candidate, frame, views, out, *, steps=12, seed=317, strength=.9, editor=None,
-         portrait_mode='raw', matte_model='/mnt/disk01/models/BiRefNet', cfg=4.):
+         portrait_mode='raw', matte_model=f'{MODELS_ROOT}/BiRefNet', cfg=4.):
     out=Path(out);out.mkdir(parents=True,exist_ok=True)
     names=('front','right','back','left');tiles=[next(v for v in views if v['name']==n) for n in names]
     sheet=np.zeros((1024,1024,3),np.uint8);mask=np.zeros((1024,1024),np.uint8)

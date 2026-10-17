@@ -1,6 +1,7 @@
 """Explicit video model adapters; no implicit model or hardware fallback."""
 import json
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 
 BACKENDS = ("repo", "legacy", "wan", "h3", "h3-fl2va", "hv15-rocm")
 
@@ -11,7 +12,7 @@ class WanBackend:
     hardware = "rocm"
     identity_conditioned = True
     manages_device_lock = True
-    default_model = Path("/mnt/disk01/models/wan22")
+    default_model = MODELS_ROOT / "wan22"
 
     def __init__(self):
         from cuda.hunyuan_video15_native import generate
@@ -67,7 +68,7 @@ class Hv15RocmBackend:
     hardware = "rocm"
     identity_conditioned = True
     manages_device_lock = True
-    default_model = Path("/mnt/disk01/models/hv15")
+    default_model = MODELS_ROOT / "hv15"
 
     def __init__(self):
         from cuda.hunyuan_video15_native import generate
@@ -101,7 +102,7 @@ class H3Backend:
     identity_conditioned = True
     variant = 'ref2va'
     manages_device_lock = True
-    default_model = Path("/mnt/disk01/models/h3/weights")
+    default_model = MODELS_ROOT / "h3/weights"
 
     def __init__(self):
         from rdna4.minimax_h3 import generate

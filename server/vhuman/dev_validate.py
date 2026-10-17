@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 import resource
 import subprocess
 import sys
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("edit8", "sm120"))
-    parser.add_argument("--models-root", type=Path, default=Path("/mnt/disk1/models"))
+    parser.add_argument("--models-root", type=Path, default=MODELS_ROOT)
     parser.add_argument("--candidate", type=Path, default=ROOT / "tmp/vhuman-ear-synth/reconstruction_contact")
     parser.add_argument("--out", type=Path, required=True, help="fresh output directory")
     parser.add_argument("--steps", type=int, default=2)

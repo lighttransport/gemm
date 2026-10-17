@@ -150,7 +150,7 @@ alignment/jaw chroma trials are unselected. Read their audits before repeating.
   or `b550:~/work/gemm/pixal3d/tmp` into `/mnt/nvme02/models`, using
   `/mnt/nvme01/models` if disk space requires. Check space and existing files
   before copying; these locations/network operations may require escalation.
-- Pinned GNM: `tmp/vhuman-rig/models/gnm-v3/gnm_head.npz`.
+- Pinned GNM: `/mnt/nvme02/models/vhuman-rig-models/gnm-v3/gnm_head.npz`.
 - Browser build uses `EM_CACHE="$PWD/tmp/vhuman-texture-5060ti/emscripten-cache"`
   and Three.js `tmp/vhuman-texture-5060ti/vendor/package` (0.163.0).
 - Follow repository AGENTS.md. No sub-agents are authorized by this handoff.

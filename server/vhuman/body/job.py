@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -20,9 +21,9 @@ from PIL import Image, ImageDraw
 from .. import baseline, gpu, qwen
 from ..service import ROOT
 
-MODEL_DIR = Path("/mnt/disk1/models/sam3d-body")
-SAM3_MODEL = Path("/mnt/disk1/models/sam3/sam3.model.safetensors")
-CLIP_BPE = Path("/mnt/disk1/models/clip-bpe")
+MODEL_DIR = MODELS_ROOT / "sam3d-body"
+SAM3_MODEL = MODELS_ROOT / "sam3/sam3.model.safetensors"
+CLIP_BPE = MODELS_ROOT / "clip-bpe"
 DEFAULT_RIG_PYTHON = ROOT / "tmp/vhuman-rig-venv/bin/python"
 FILES = ("body_image.png", "body_image_raw.png", "body_mhr.glb", "body_mhr.glb.json",
          "pixal3d_full.glb", "body_basecolor.png", "avatar.glb", "avatar.usda", "avatar_usd.zip",

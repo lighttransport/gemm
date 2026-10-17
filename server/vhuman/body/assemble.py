@@ -17,6 +17,7 @@ import shutil
 import struct
 import time
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 
 import numpy as np
 from PIL import Image
@@ -26,7 +27,7 @@ from ..rig import gltf, usd
 from ..rig.build import ExportPart, RigAsset
 from ..rig.common import normalize, quat_from_matrix, vertex_normals
 
-DEFAULT_HEAD = Path("/mnt/disk1/models/sam3d-body/safetensors/sam3d_body_mhr_head.safetensors")
+DEFAULT_HEAD = MODELS_ROOT / "sam3d-body/safetensors/sam3d_body_mhr_head.safetensors"
 FLIP_CAMERA = np.array([1.0, -1.0, -1.0])
 FLIP_PIXAL = np.array([-1.0, 1.0, -1.0])
 

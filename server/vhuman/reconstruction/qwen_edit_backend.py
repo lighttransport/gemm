@@ -10,13 +10,14 @@ target view must be the LAST image; a 512^2 output reproduces only the top-left 
 condition grid (verified on the right view: 512 zooms, 1024 is pixel-aligned).
 """
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 import hashlib
 import time
 
 import numpy as np
 from PIL import Image
 
-ROOT=Path('/mnt/disk01/models/qwen-image-edit-2511')
+ROOT=MODELS_ROOT / 'qwen-image-edit-2511'
 GGUF=ROOT/'qwen-image-edit-2511-Q4_K_M.gguf'
 LICENSE='apache-2.0'
 GENERATOR='Qwen-Image-Edit-2511 Q4_K_M (diffusers GGUF)'

@@ -10,7 +10,7 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
-models="$root/tmp/vhuman-rig/models"
+models=$(PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'from server.model_paths import MODELS_ROOT; print(MODELS_ROOT / "vhuman-rig-models")')
 lightgeom="$root/third_party/LightGeom"
 build=1
 teacher_only=0

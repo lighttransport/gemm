@@ -24,7 +24,8 @@ The CUDA denoiser selector also offers the fast runner's presets
 `low8` (INT8, under 8 GB), `low8-fp4` (NVFP4), `fast12` (INT8, everything
 resident, about 11 GB) and `accurate` (BF16, bit-identical to the parity
 harness). Build them with `make -C cuda/qimg21 fast`. The INT8 and NVFP4
-packages default to `/mnt/nvme01/models/qimg-21-fast/`; override them with
+packages default to the checkout volume's `models/qimg-21-fast/`
+(`/mnt/nvme02/models/qimg-21-fast/` here); override them with
 `--int8-package` and `--nvfp4-package`. The API field is `preset`, CUDA only,
 and `GET /api/health` reports which presets are available.
 

@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -21,7 +22,9 @@ class DevSetupTest(unittest.TestCase):
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
         args = argparse.Namespace(ssh_identity=None, source_host=None, source_repo="repo",
-                                  jobs=2, gpu_arch="sm_80", cuda_home=Path("/cuda"), data_root=root / "assets")
+                                  jobs=2, gpu_arch="sm_80", cuda_home=Path("/cuda"), data_root=root / "assets",
+                                  models_root=root / "models", shared_models_root=None,
+                                  source_models='/source-models')
         self.setup = dev_setup.Setup(args)
 
     def test_installation_masks_gpu_and_keeps_caches_local(self):
@@ -62,6 +65,25 @@ class DevSetupTest(unittest.TestCase):
         self.setup.link(path, target)
         self.assertFalse(path.readlink().is_absolute())
         self.assertEqual(path.resolve(), target.resolve())
+
+    def test_source_import_prefers_canonical_with_legacy_fallback(self):
+        with patch.object(self.setup, 'remote', return_value=''):
+            self.assertEqual(self.setup.source_model('vhuman/mm-fullbody-base', 'tmp/old'),
+                             '/source-models/vhuman/mm-fullbody-base')
+        with patch.object(self.setup, 'remote', side_effect=subprocess.CalledProcessError(1, 'test')), \
+             patch.object(self.setup, 'source_root', return_value='/source-repo'):
+            self.assertEqual(self.setup.source_model('vhuman/mm-fullbody-base', 'tmp/old'),
+                             '/source-repo/tmp/old')
+
+    def test_assets_use_model_storage_and_preserve_the_old_alias(self):
+        data = self.setup.args.data_root
+        for name in ('gnm-v3', 'ict-facekit', 'depth-anything-v2-small'):
+            (data / name).mkdir(parents=True)
+        with patch.object(self.setup, 'run'):
+            self.setup.assets()
+            self.setup.assets()
+        self.assertEqual((dev_setup.ROOT / 'tmp/vhuman-rig/models').resolve(), data)
+        self.assertEqual((self.setup.args.models_root / 'vhuman-rig-models').resolve(), data)
 
     def test_ampere_excludes_fp8_and_fp4_plugins(self):
         with patch.object(self.setup, "run") as run, patch.object(self.setup, "checkout"):

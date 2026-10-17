@@ -48,9 +48,9 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(gpu.device_index(),0)
 
     def test_explicit_backend_and_validation(self):
-        with gpu.execution('cpu', 0, '/mnt/disk1/models'):
+        with gpu.execution('cpu', 0, '/configured/models'):
             self.assertIsNone(gpu.gpu_status())
-            self.assertEqual(gpu.model_path('qimg-21'),Path('/mnt/disk1/models/qimg-21').resolve())
+            self.assertEqual(gpu.model_path('qimg-21'),Path('/configured/models/qimg-21'))
         for backend,device in [('vulkan',0),('rocm',-1),('rocm',True)]:
             with self.assertRaises(ValueError): gpu.configure(backend,device)
 

@@ -18,6 +18,9 @@ import subprocess
 import sys
 import urllib.request
 
+from server.model_paths import MODELS_ROOT
+from .relocate_models import link_shared_models, relocate_models
+
 ROOT = Path(__file__).resolve().parents[2]
 PHASES = ("envs", "assets", "tools", "build", "register", "scenes", "browser", "check")
 BLENDER = "blender-5.2.2-linux-x64"
@@ -65,6 +68,7 @@ class Setup:
             HF_HOME=str(self.state / "cache/huggingface"),
             EM_CACHE=str(self.state / "cache/emscripten"),
             VHUMAN_DATA_ROOT=str(args.data_root),
+            VHUMAN_MODELS_ROOT=str(args.models_root),
             PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu",
             MUJOCO_GL="egl", UV_HTTP_TIMEOUT="300", UV_LINK_MODE="hardlink",
             CMAKE_BUILD_PARALLEL_LEVEL=str(args.jobs),
@@ -91,6 +95,15 @@ class Setup:
             if not self.remote_root.startswith("/"):
                 raise ValueError("source repository did not resolve to an absolute path")
         return self.remote_root
+
+    def source_model(self, relative, legacy):
+        """Prefer canonical source storage; accept pre-migration source nodes."""
+        path = self.args.source_models + "/" + relative
+        try:
+            self.remote("test", "-e", path)
+        except subprocess.CalledProcessError:
+            return self.source_root() + "/" + legacy
+        return path
 
     def transfer(self, source, target, *, directory=True, excludes=()):
         if shutil.disk_usage(target.parent if target.parent.exists() else self.state).free < 6 << 30:
@@ -210,6 +223,9 @@ class Setup:
     def assets(self):
         models, data = self.args.models_root, self.args.data_root
         models.mkdir(parents=True, exist_ok=True)
+        relocate_models(ROOT, models, apply=True)
+        if self.args.shared_models_root:
+            link_shared_models(self.args.shared_models_root, models, apply=True)
         data.mkdir(parents=True, exist_ok=True)
         if self.args.source_host:
             source = self.source_root()
@@ -220,12 +236,16 @@ class Setup:
             self.imported_file(self.args.source_models + "/qwen-image-edit-2511/qwen-image-edit-2511-Q4_K_M.gguf",
                                models / "qwen-image-edit-2511/qwen-image-edit-2511-Q4_K_M.gguf")
             for name in ("ict-facekit", "depth-anything-v2-small"):
-                self.transfer(source + "/tmp/vhuman-rig/models/" + name, models / "vhuman" / name)
+                self.transfer(self.source_model("vhuman-rig-models/" + name,
+                                                "tmp/vhuman-rig/models/" + name), data / name)
             self.directory(ROOT / "tmp/vhuman-emotion")
-            self.imported_file(source + "/tmp/vhuman-emotion/sensevoice-small-q8.gguf",
-                               ROOT / "tmp/vhuman-emotion/sensevoice-small-q8.gguf")
-            self.transfer(source + "/tmp/vhuman-musclemimic-checkpoint", models / "vhuman/mm-fullbody-base")
-            self.transfer(source + "/tmp/terra-policy/TERRA-4B", models / "vhuman/TERRA-4B")
+            self.imported_file(self.source_model("vhuman/sensevoice-small-q8.gguf",
+                                                 "tmp/vhuman-emotion/sensevoice-small-q8.gguf"),
+                               models / "vhuman/sensevoice-small-q8.gguf")
+            self.transfer(self.source_model("vhuman/mm-fullbody-base", "tmp/vhuman-musclemimic-checkpoint"),
+                          models / "vhuman/mm-fullbody-base")
+            self.transfer(self.source_model("vhuman/TERRA-4B", "tmp/terra-policy/TERRA-4B"),
+                          models / "vhuman/TERRA-4B")
             for name in ("vhuman-ear-synth", "vhuman-contact-tone", "vhuman-mouth-contact",
                          "vhuman-mouth-gi", "vhuman-mouth-occlusion", "terra-native-review"):
                 self.transfer(source + "/tmp/" + name, ROOT / "tmp" / name,
@@ -241,14 +261,13 @@ class Setup:
         self.run(self.python, "-B", "-m", "server.vhuman.face_assets", "--root", data)
         rig = ROOT / "tmp/vhuman-rig"
         self.directory(rig)
-        (rig / "models").mkdir(exist_ok=True)
         for name in ("gnm-v3", "ict-facekit", "depth-anything-v2-small"):
-            target = data / name if name == "gnm-v3" else models / "vhuman" / name
+            target = data / name
             if not target.exists():
                 raise ValueError("Required face installation missing: " + str(target))
-            self.link(rig / "models" / name, target)
-        self.link(rig / "models/face_landmarker.task", data / "mediapipe/face_landmarker.task")
-        self.link(rig / "models/native-face-v1", data / "mediapipe/native-face-v1")
+        self.link(rig / "models", data)
+        if models / "vhuman-rig-models" != data:
+            self.link(models / "vhuman-rig-models", data)
         moge = models / "moge-2-vitl/native"
         if not (moge / "native.json").is_file():
             self.run(self.python, "-B", ROOT / "ref/vhuman/moge_reference.py", "--checkpoint",
@@ -519,8 +538,9 @@ class Setup:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phases", nargs="+", choices=PHASES + ("emotion",), default=list(PHASES))
-    parser.add_argument("--models-root", type=Path, default=Path("/mnt/disk1/models"))
-    parser.add_argument("--data-root", type=Path, default=Path("/mnt/disk01/data/vhuman"))
+    parser.add_argument("--models-root", type=Path, default=MODELS_ROOT)
+    parser.add_argument("--shared-models-root", type=Path, help="alias local weights from another volume instead of copying")
+    parser.add_argument("--data-root", type=Path, help="face assets; defaults to MODELS_ROOT/vhuman-rig-models")
     parser.add_argument("--gpu-arch", choices=("sm_80", "sm_89", "sm_120"), default="sm_80")
     parser.add_argument("--cuda-home", type=Path, default=Path("/usr/local/cuda-12.9"))
     parser.add_argument("--source-host")
@@ -531,12 +551,16 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--refresh-lock", action="store_true", help="resolve requirements into tmp/ for review instead of using the committed CUDA lock")
     args = parser.parse_args()
+    if args.data_root is None:
+        args.data_root = args.models_root / "vhuman-rig-models"
     if args.jobs < 1 or args.jobs > 32:
         parser.error("--jobs must be between 1 and 32")
     if args.source_host and not re.fullmatch(r"[a-zA-Z0-9_.@-]+", args.source_host):
         parser.error("invalid SSH host")
     for key in ("models_root", "data_root", "cuda_home"):
         setattr(args, key, getattr(args, key).expanduser().absolute())
+    if args.shared_models_root:
+        args.shared_models_root = args.shared_models_root.expanduser().absolute()
     if any(phase in args.phases for phase in ("build", "emotion")) and not (args.cuda_home / "bin/nvcc").is_file():
         parser.error("select an installed full CUDA toolkit with --cuda-home")
     os.chdir(ROOT)

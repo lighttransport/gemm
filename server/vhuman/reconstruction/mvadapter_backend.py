@@ -5,6 +5,7 @@ Weights: adapter Apache-2.0; SDXL base CreativeML OpenRAIL++-M (use-restricted,
 evaluation baseline only, not a permissive shipping path).
 """
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 import sys
 import time
 
@@ -12,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 ROOT=Path(__file__).resolve().parents[3]
-MODELS=Path('/mnt/disk01/models')
+MODELS=MODELS_ROOT
 LICENSE='openrail++-m (SDXL base) + apache-2.0 (MV-Adapter)'
 GENERATOR='MV-Adapter ig2mv SDXL'
 

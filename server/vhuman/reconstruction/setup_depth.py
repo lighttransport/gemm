@@ -10,6 +10,7 @@ import subprocess
 import urllib.request
 from pathlib import Path
 from .observations import sha256
+from ..rig.face_models import MODEL_CACHE
 
 
 def main():
@@ -17,7 +18,7 @@ def main():
     ap.add_argument('--code-revision',default='a561b849ebae10a6f5ef49e26c83cbbcd36c71bf')
     ap.add_argument('--weight-revision',default='03876f8651c73a60fe4c2c48294e09fcb6838fcf')
     ap.add_argument('--weight-sha256',default='715fade13be8f229f8a70cc02066f656f2423a59effd0579197bbf57860e1378')
-    ap.add_argument('--out',default='tmp/vhuman-rig/models/depth-anything-v2-small')
+    ap.add_argument('--out',default=str(MODEL_CACHE / 'depth-anything-v2-small'))
     ap.add_argument('--export-python',help='optional offline Torch/safetensors/OpenCV interpreter for native export')
     a = ap.parse_args()
     for revision in (a.code_revision,a.weight_revision):

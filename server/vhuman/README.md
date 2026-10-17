@@ -822,8 +822,8 @@ with Torch, safetensors, NumPy and OpenCV:
 
 ```sh
 python ref/da2/export_reference.py \
-  --installation tmp/vhuman-rig/models/depth-anything-v2-small \
-  --out tmp/vhuman-rig/models/depth-anything-v2-small/native
+  --installation /mnt/nvme02/models/vhuman-rig-models/depth-anything-v2-small \
+  --out /mnt/nvme02/models/vhuman-rig-models/depth-anything-v2-small/native
 make -C cpu/da2 da2_depth test_da2_ops
 make -C cuda/da2 da2_depth test_da2_ops
 cpu/da2/test_da2_ops
@@ -857,12 +857,12 @@ Generate and validate independent intermediate/output references:
 ```sh
 # Offline export/reference interpreter:
 python ref/da2/export_reference.py \
-  --installation tmp/vhuman-rig/models/depth-anything-v2-small \
+  --installation /mnt/nvme02/models/vhuman-rig-models/depth-anything-v2-small \
   --out tmp/da2-reference --image /path/to/portrait.png
 # Native runtime interpreter: NumPy + OpenCV, no frameworks.
 python ref/da2/verify_native.py --fixture tmp/da2-reference \
   --runner cpu/da2/da2_depth
-DA2_TEST_INSTALLATION=tmp/vhuman-rig/models/depth-anything-v2-small \
+DA2_TEST_INSTALLATION=/mnt/nvme02/models/vhuman-rig-models/depth-anything-v2-small \
 DA2_TEST_FIXTURE=tmp/da2-reference DA2_REQUIRE_FRAMEWORK_FREE=1 \
   python -m unittest server.vhuman.test_depth_native server.vhuman.test_reconstruction
 ```
@@ -993,7 +993,7 @@ existing trained motion checkpoints once using a Torch-capable interpreter:
 python ref/vhuman/moge_reference.py \
   --checkpoint /path/to/moge-2-vitl/model.pt --out tmp/vhuman-native/moge-native
 python -m server.vhuman.realtime.src.animation.export_native \
-  tmp/vhuman-realtime/motion-v3.pt
+  /mnt/nvme02/models/vhuman/realtime/motion-v3.pt
 ```
 
 MoGe export writes `dinov2.safetensors`, `heads.safetensors` and a hashed
@@ -1048,7 +1048,7 @@ python ref/vhuman/verify_images.py --fixture tmp/vhuman-native/moge-native
 # For GPU comparisons add --backend cuda --runner cuda/vhuman/vhuman_models.
 # Torch reference + native comparison for the two small models:
 python ref/vhuman/verify_small_models.py --cues /path/to/trained-cues \
-  --motion tmp/vhuman-realtime/motion-v3.pt --out tmp/vhuman-native/small-models
+  --motion /mnt/nvme02/models/vhuman/realtime/motion-v3.pt --out tmp/vhuman-native/small-models
 
 python -m unittest server.vhuman.test_native_models server.vhuman.test_reconstruction
 python -m unittest server.pixal3d.test_app server.pixal3d.test_i23d_studio

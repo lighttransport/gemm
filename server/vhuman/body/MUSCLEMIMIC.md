@@ -80,7 +80,7 @@ after reviewing its terms. Register it with the isolated interpreter:
 tmp/vhuman-musclemimic-py312/bin/python -m server.vhuman.body.musclemimic_assets register \
   --assets tmp/vhuman-musclemimic-assets \
   --upstream tmp/musclemimic-upstream --gmr tmp/vhuman-gmr-upstream \
-  --checkpoint tmp/vhuman-musclemimic-checkpoint \
+  --checkpoint /mnt/nvme02/models/vhuman/mm-fullbody-base \
   --checkpoint-revision 0e308c82bee9bd8192e6e205ed70cca377831cd5 \
   --accept-research-terms
 tmp/vhuman-musclemimic-py312/bin/python -m server.vhuman.body.musclemimic_assets doctor \

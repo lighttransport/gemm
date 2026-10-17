@@ -3,7 +3,7 @@
 The procedural rig remains the animation correspondence scaffold. Its fitted
 surface, controls and skinning are transferred onto the selected source's own
 vertices/UVs; GNM PCA or ICT authored shapes inform the exported controls.
-Weights are cached outside tracked source, under tmp/vhuman-rig/models.
+Weights live outside tracked source, under models/vhuman-rig-models.
 """
 from __future__ import annotations
 
@@ -15,10 +15,12 @@ from pathlib import Path
 
 import numpy as np
 
+from server.model_paths import MODELS_ROOT
+
 from . import bake, template
 
 ROOT = Path(__file__).resolve().parents[3]
-MODEL_CACHE = ROOT / "tmp/vhuman-rig/models"
+MODEL_CACHE = MODELS_ROOT / "vhuman-rig-models"
 GNM_SHA256 = "61d78bbfb4ad8e0b38495804a4caef3214d3df00f8c3f68761e63b41ce3747eb"
 GNM_REVISION = "c01e90d298d82301f9fd18f54806be751775cb7c"
 ICT_REVISION = "da5f95a607f5e6b37755b38d3385d7f2853732e5"

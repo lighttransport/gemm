@@ -1,11 +1,12 @@
 """Explicit inference configuration and Python subprocess entry point."""
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 from . import gpu
 
 def add_arguments(parser):
     parser.add_argument("--backend", dest="inference_backend", choices=("auto", "cpu", "cuda", "rocm"), default="auto")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--models-root", default="/mnt/disk1/models")
+    parser.add_argument("--models-root", default=str(MODELS_ROOT))
 
 def configure_args(args):
     import os
@@ -16,7 +17,7 @@ def configure_args(args):
     cache = os.environ.setdefault("XDG_CACHE_HOME", str(root / "tmp/vhuman-cache"))
     Path(cache).mkdir(parents=True, exist_ok=True)
     gpu.configure(getattr(args, "inference_backend", "auto"), getattr(args, "device", 0),
-                  getattr(args, "models_root", "/mnt/disk1/models"))
+                  getattr(args, "models_root", str(MODELS_ROOT)))
     for key, relative in (("sam3d_body_model", "sam3d-body"), ("sam3_model", "sam3/sam3.model.safetensors"),
                           ("clip_bpe", "clip-bpe"), ("tts_model", "speech/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
                           ("aligner", "speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors")):

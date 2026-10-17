@@ -16,6 +16,7 @@ import threading
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 
 import numpy as np
 
@@ -24,8 +25,8 @@ from ..service import ROOT
 from . import rigdef, usd
 
 SPEECH = ROOT / "speech"
-DEFAULT_MODEL = Path("/mnt/disk1/models/speech/Qwen3-TTS-12Hz-1.7B-CustomVoice")
-DEFAULT_ALIGNER = Path("/mnt/disk1/models/speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors")
+DEFAULT_MODEL = MODELS_ROOT / "speech/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+DEFAULT_ALIGNER = MODELS_ROOT / "speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors"
 FPS = 30
 VISEMES = ("sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou")
 TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "animation.usda", "lightrig.txt",

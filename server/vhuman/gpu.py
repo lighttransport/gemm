@@ -16,16 +16,17 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCK_PATH = ROOT / "tmp/pixal3d/device-locks/cuda-0.lock"
 QWEN_MIN_FREE_MIB = 12288      # Qwen-Image 2.1 fast12 at 1024^2: measured peak ~14.6 GB (study run)
 QWEN_LOW8_MIN_FREE_MIB = 7680 # 7168 MiB process budget plus 512 MiB headroom on an idle 8 GiB card
 PIXAL3D_MIN_FREE_MIB = 7680    # Pixal3D native, 7168 MiB budget + headroom
-_CONFIG = contextvars.ContextVar("vhuman_gpu", default=("auto", 0, Path("/mnt/disk1/models")))
+_CONFIG = contextvars.ContextVar("vhuman_gpu", default=("auto", 0, MODELS_ROOT))
 
 
-def configure(backend="auto", device=0, models_root="/mnt/disk1/models"):
+def configure(backend="auto", device=0, models_root=str(MODELS_ROOT)):
     if backend not in ("auto", "cpu", "cuda", "rocm"):
         raise ValueError("backend must be auto, cpu, cuda or rocm")
     if isinstance(device, bool) or not isinstance(device, int) or device < 0:
@@ -50,7 +51,7 @@ def backend():
 
 
 @contextmanager
-def execution(selected="auto", device=0, models_root="/mnt/disk1/models"):
+def execution(selected="auto", device=0, models_root=str(MODELS_ROOT)):
     token = configure(selected, device, models_root)
     try:
         resolved = backend()

@@ -6,6 +6,7 @@ Wan I2V supplies a temporal consistency gate, never a measured observation.
 import argparse
 import json
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 import shutil
 import sys
 
@@ -30,7 +31,7 @@ def write_json(path, value):
 
 def qwen_generate(out, prompt, *, reference=None, mask=None, init_image=None, steps=20, seed=317,
                   strength=None, cfg=1., negative_prompt='', resolution=512,
-                  model='/mnt/disk01/models/qimg-21', package='/mnt/disk01/models/qimg-21-fast/int8-smooth-a0.6'):
+                  model=f'{MODELS_ROOT}/qimg-21', package=f'{MODELS_ROOT}/qimg-21-fast/int8-smooth-a0.6'):
     """Use the installed HIP backend, releasing it before video generation."""
     from .. import gpu
     from ..qwen import _import_qimg21

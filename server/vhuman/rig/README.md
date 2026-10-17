@@ -6,7 +6,7 @@ template skeleton (neck, head, jaw, eyes, upper/lower teeth, a 4-joint
 tongue), procedural teeth/gums/tongue, skin weights, 52 expression shapes plus
 correctives, a linear rig evaluator, and skinned glTF / UsdSkel exports.
 The rig code is repository authored. GNM v3 and ICT-FaceKit Light assets are
-downloaded separately into the ignored `tmp/vhuman-rig/models/` cache.
+downloaded separately into the checkout volume's `models/vhuman-rig-models/` directory.
 
 ```sh
 # rig interpreter (numpy, Pillow, scipy, PyTorch; CUDA optional)
@@ -517,9 +517,10 @@ curl -fL -o tmp/vhuman-emotion/funasr-llamacpp-linux-x64-avx2.tar.gz \
   https://github.com/modelscope/FunASR/releases/download/runtime-llamacpp-v0.2.6/funasr-llamacpp-linux-x64-avx2.tar.gz
 echo 'aaebc5470f846ce915200b35d6e9f9bd0a0d3ed399d39e49bdeb7a1f1782bc70  tmp/vhuman-emotion/funasr-llamacpp-linux-x64-avx2.tar.gz' | sha256sum -c -
 tar -xzf tmp/vhuman-emotion/funasr-llamacpp-linux-x64-avx2.tar.gz -C tmp/vhuman-emotion/runtime
-curl -fL -o tmp/vhuman-emotion/sensevoice-small-q8.gguf \
+mkdir -p /mnt/nvme02/models/vhuman
+curl -fL -o /mnt/nvme02/models/vhuman/sensevoice-small-q8.gguf \
   https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/90c1c61912018b70ada0fcc024ea24aca62f2e63/sensevoice-small-q8.gguf
-echo '4ae45c94422de949b387e2e0fb10d7e14e4c42c69db30c3444ecc7d4b844b7c5  tmp/vhuman-emotion/sensevoice-small-q8.gguf' | sha256sum -c -
+echo '4ae45c94422de949b387e2e0fb10d7e14e4c42c69db30c3444ecc7d4b844b7c5  /mnt/nvme02/models/vhuman/sensevoice-small-q8.gguf' | sha256sum -c -
 python3 -m server.vhuman.cli --work tmp/vhuman-independent rig-speech \
   --head <id> --source-take <take-id> --auto-emotion
 ```

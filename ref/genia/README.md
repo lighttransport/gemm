@@ -32,10 +32,10 @@ interpreter (the tool writes F32 safetensors without an extra serializer depende
 
 ```sh
 tmp/vhuman-musclemimic-py312/bin/python ref/genia/export_conditioning.py \
-  --checkpoints /mnt/nvme01/models/sam3d/checkpoints
+  --checkpoints /mnt/nvme02/models/sam3d/checkpoints
 ```
 
-Output defaults to `tmp/genia-native-models/`; an existing export is not overwritten.
+Output defaults to `MODELS_ROOT/genia/native/` (`/mnt/nvme02/models/genia/native/` here); an existing export is not overwritten.
 Its manifest records source/output hashes, dimensions and comparisons with SS.
 All 11 shared tensors in the local SS/SLAT checkpoints differ, so substituting
 the already-converted SS fuser would produce the wrong conditioning.

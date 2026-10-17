@@ -6,12 +6,13 @@ same contract as Qwen-Image-Edit-2511 in qwen_edit_backend: 1024^2 output, targe
 16 GB: DiT weights stored fp8 with bf16 compute (layerwise casting); Qwen3-VL encoder on the CPU.
 """
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 import time
 
 import numpy as np
 from PIL import Image
 
-MODEL=Path('/mnt/disk01/models/qimg-21')
+MODEL=MODELS_ROOT / 'qimg-21'
 LICENSE='qwen-research'
 GENERATOR='Qwen-Image-2.1 multi-reference edit (diffusers, fp8-stored weights)'
 

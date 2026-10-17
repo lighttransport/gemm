@@ -21,8 +21,9 @@ PENDING = ("four_stream_conditioning", "fixed_shape_pose_sampling", "entropy_sha
 
 def availability():
     model = gpu.model_path("sam3d")
-    missing = [str(model / "safetensors" / name) for name in CONVERTED
-               if not (model / "safetensors" / name).is_file()]
+    files = [gpu.model_path("genia/native") / name if name == "sam3d_slat_cond_fuser.safetensors"
+             else model / "safetensors" / name for name in CONVERTED]
+    missing = [str(path) for path in files if not path.is_file()]
     selected = gpu.backend()
     library = ROOT / "cuda/genia/libgenia_cuda.so"
     return {"available": False, "revision": RELEASE, "model_dir": str(model),

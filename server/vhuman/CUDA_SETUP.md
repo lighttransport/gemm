@@ -46,6 +46,40 @@ ROCm cache symlinks and the nearly full root filesystem. Necessary broken
 symlinks are preserved under `tmp/vhuman-dev/backups/` before repair.
 Existing environments or directories are never replaced by aliases.
 
+Weights default to the `models/` directory on the NVMe volume containing the
+resolved checkout: `/mnt/nvme02/models` for this worktree. `--models-root` or
+`VHUMAN_MODELS_ROOT` overrides that default. Face assets default to
+`MODELS_ROOT/vhuman-rig-models`; `--data-root` remains an explicit face-asset
+override. Corpus downloads and generated avatars remain separate from weights.
+
+To migrate the reusable weights from an existing checkout, preview first and
+then apply the same-volume moves:
+
+```sh
+python3 -m server.vhuman.relocate_models --shared-models-root /mnt/nvme01/models
+python3 -m server.vhuman.relocate_models --shared-models-root /mnt/nvme01/models --apply
+```
+
+This relocates the MuscleMimic/Terra checkpoints, GenIA conditioning export,
+realtime motion checkpoints and tokenizer. Existing external rig/emotion
+weights and large shared models receive aliases; no multi-GB copy is made.
+Compatibility links preserve saved scripts and provenance paths. Conflicting
+installations are refused. The setup `assets` phase also migrates local tmp
+weights; `--shared-models-root` optionally exposes already-installed models
+from another local volume. Environments, sources, subject-specific deformers,
+run outputs and diagnostic fixtures stay in `tmp/`.
+
+Canonical reusable model locations on this node:
+
+| Location under `/mnt/nvme02/models/` | Contents |
+| --- | --- |
+| `vhuman/mm-fullbody-base` | Complete MuscleMimic Orbax checkpoint |
+| `vhuman/TERRA-4B` | Complete Terra checkpoint and metadata |
+| `vhuman/realtime` | Motion `.pt`/native packages and FLUX tokenizer |
+| `vhuman/sensevoice-small-q8.gguf` | Shared emotion-model alias |
+| `vhuman-rig-models` | Shared GNM, ICT, MediaPipe and depth assets |
+| `genia/native` | SLAT conditioning export and checksum manifest |
+
 Phases can be resumed independently:
 
 ```sh

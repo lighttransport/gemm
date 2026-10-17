@@ -36,15 +36,17 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.model_paths import MODELS_ROOT
+
 from server.vhuman.native_models import moge_ready
 from server.qwen_image21.app import Demo as QwenImage21Demo
 from server.pixal3d.i23d import Studio as I23DStudio, StudioCancelled
 
-DEFAULT_MODEL_DIR = Path("/mnt/disk1/models/Pixal3D")
-DEFAULT_DINOV3 = Path("/mnt/disk1/models/dinov3-vitl16/model.safetensors")
+DEFAULT_MODEL_DIR = MODELS_ROOT / "Pixal3D"
+DEFAULT_DINOV3 = MODELS_ROOT / "dinov3-vitl16/model.safetensors"
 DEFAULT_NAF = ROOT / "ref/pixal3d/weights/naf_release.safetensors"
-DEFAULT_RMBG = Path("/mnt/disk1/models/RMBG-2.0")
-DEFAULT_MOGE = Path("/mnt/disk1/models/moge-2-vitl/model.pt")
+DEFAULT_RMBG = MODELS_ROOT / "RMBG-2.0"
+DEFAULT_MOGE = MODELS_ROOT / "moge-2-vitl/model.pt"
 MAX_BODY_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_GLB_BYTES = 256 * 1024 * 1024
@@ -513,8 +515,8 @@ class PixalServer:
         self.preview_script = ROOT / "ref/pixal3d/preview_glb.py"
         self.preview_renderer = ROOT / "ref/pixal3d/.cache/preview_render"
         self.qwen_image = QwenImage21Demo(
-            Path(getattr(args, "qwen_model", "/mnt/disk1/models/qimg-21")),
-            Path(getattr(args, "qwen_quant_package", ROOT / "tmp/qimg21-int8-package")),
+            Path(getattr(args, "qwen_model", f"{MODELS_ROOT}/qimg-21")),
+            Path(getattr(args, "qwen_quant_package", MODELS_ROOT / "qimg21-int8-package")),
             Path(getattr(args, "qwen_python", ROOT / "tmp/qimg21-ref-venv/bin/python")),
             self.work_dir / "qwen-image21",
             Path(getattr(args, "qwen_native", ROOT / "cuda/qimg21/test_cuda_qimg21_native")),
@@ -531,7 +533,7 @@ class PixalServer:
             backend = "cuda" if backend == "cpu" else backend
             python = self.qwen_image.python_rocm if backend == "rocm" else self.qwen_image.python
             return NativeBackend(model=self.qwen_image.model, python=python, backend=backend,
-                                 device=getattr(args, "device", 0), quant_package=Path("/mnt/disk1/models/qimg-21-fast/int8-smooth-a0.6"))
+                                 device=getattr(args, "device", 0), quant_package=MODELS_ROOT / "qimg-21-fast/int8-smooth-a0.6")
         self.i23d = I23DStudio(
             self.work_dir / "i23d", backend_factory=image_model, backend=getattr(args, "backend", "cuda"),
             native_options={"binary": self.binary, "model_dir": self.model_dir, "dinov3": self.dinov3,
@@ -1866,8 +1868,8 @@ def main() -> None:
     p.add_argument("--device-lock-dir", default=str(ROOT / "tmp/pixal3d/device-locks"))
     p.add_argument("--i23d-idle", type=float, default=600,
                    help="seconds before an idle Text/Image to 3D studio releases its resident image model")
-    p.add_argument("--qwen-model", default="/mnt/disk1/models/qimg-21")
-    p.add_argument("--qwen-quant-package", default=str(ROOT / "tmp/qimg21-int8-package"))
+    p.add_argument("--qwen-model", default=f"{MODELS_ROOT}/qimg-21")
+    p.add_argument("--qwen-quant-package", default=str(MODELS_ROOT / "qimg21-int8-package"))
     p.add_argument("--qwen-python", default=str(ROOT / "tmp/qimg21-ref-venv/bin/python"))
     p.add_argument("--qwen-native", default=str(ROOT / "cuda/qimg21/test_cuda_qimg21_native"))
     p.add_argument("--qwen-python-rocm", default=str(ROOT / "tmp/vhuman-rocm-venv/bin/python"))

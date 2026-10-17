@@ -33,10 +33,14 @@ from .backends import BackendError, GenRequest, GenResult
 
 HERE = Path(__file__).resolve().parents[1]          # cuda/qimg21
 ROOT = HERE.parents[1]                              # repo root
-DEFAULT_MODEL = Path("/mnt/disk1/models/qimg-21")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from server.model_paths import MODELS_ROOT
+
+DEFAULT_MODEL = MODELS_ROOT / "qimg-21"
 FAST = HERE / "test_cuda_qimg21_fast"
-PACKAGES = {"int8": "/mnt/disk1/models/qimg-21-fast/int8-smooth-a0.6",
-            "nvfp4": "/mnt/nvme01/models/qimg-21-fast/nvfp4-svd-a0.5-m"}
+PACKAGES = {"int8": f"{MODELS_ROOT}/qimg-21-fast/int8-smooth-a0.6",
+            "nvfp4": f"{MODELS_ROOT}/qimg-21-fast/nvfp4-svd-a0.5-m"}
 PRESET_WEIGHTS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}
 ATTENTION = {"sage": "sage", "flash": "flash", "exact": "cutlass-efficient"}
 VAE = HERE / "test_cuda_qimg21_vae"

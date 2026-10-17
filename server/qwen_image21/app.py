@@ -25,13 +25,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from server.model_paths import MODELS_ROOT
+
 WEB = ROOT / "web"
-DEFAULT_MODEL = Path("/mnt/disk1/models/qimg-21")
-DEFAULT_QUANT = ROOT / "tmp/qimg21-int8-package"
+DEFAULT_MODEL = MODELS_ROOT / "qimg-21"
+DEFAULT_QUANT = MODELS_ROOT / "qimg21-int8-package"
 DEFAULT_PYTHON = ROOT / "tmp/qimg21-ref-venv/bin/python"
 DEFAULT_FAST = ROOT / "cuda/qimg21/test_cuda_qimg21_fast"
-DEFAULT_FAST_PACKAGES = {"int8": Path("/mnt/disk1/models/qimg-21-fast/int8-smooth-a0.6"),
-                         "nvfp4": Path("/mnt/disk1/models/qimg-21-fast/nvfp4-svd-a0.5-m")}
+DEFAULT_FAST_PACKAGES = {"int8": MODELS_ROOT / "qimg-21-fast/int8-smooth-a0.6",
+                         "nvfp4": MODELS_ROOT / "qimg-21-fast/nvfp4-svd-a0.5-m"}
 # Fast CUDA denoiser presets (test_cuda_qimg21_fast --preset) and the
 # pack_fast.py weight package each needs.
 FAST_PRESETS = {"low8": "int8", "low8-fp4": "nvfp4", "fast12": "int8", "accurate": None}

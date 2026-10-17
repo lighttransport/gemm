@@ -18,9 +18,10 @@ import numpy as np
 
 from .. import gpu
 from ..service import ROOT
+from server.model_paths import MODELS_ROOT
 
 DEFAULT_RUNNER = ROOT / "tmp/vhuman-emotion/runtime/llama-funasr-sensevoice"
-DEFAULT_MODEL = ROOT / "tmp/vhuman-emotion/sensevoice-small-q8.gguf"
+DEFAULT_MODEL = MODELS_ROOT / "vhuman/sensevoice-small-q8.gguf"
 MODEL_NAME = "FunAudioLLM/SenseVoiceSmall-GGUF"
 SAMPLE_RATE = 16000
 WINDOW_SECONDS = 4.0

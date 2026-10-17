@@ -2,11 +2,12 @@
 import argparse
 import json
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def audit(models_root=Path('/mnt/disk1/models')):
+def audit(models_root=MODELS_ROOT):
     models = Path(models_root)
     required = {
         'qwen-image-2.1': models / 'qimg-21/model_index.json',
@@ -27,13 +28,13 @@ def audit(models_root=Path('/mnt/disk1/models')):
         'tts': models / 'speech/Qwen3-TTS-12Hz-1.7B-CustomVoice',
         'ja-aligner': models / 'speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors',
         'naf': ROOT / 'ref/pixal3d/weights/naf_release.safetensors',
-        'gnm': ROOT / 'tmp/vhuman-rig/models/gnm-v3/gnm_head.npz',
-        'ict': ROOT / 'tmp/vhuman-rig/models/ict-facekit/source/FaceXModel/generic_neutral_mesh.obj',
+        'gnm': models / 'vhuman-rig-models/gnm-v3/gnm_head.npz',
+        'ict': models / 'vhuman-rig-models/ict-facekit/source/FaceXModel/generic_neutral_mesh.obj',
     }
     optional = {
-        'portrait-depth': ROOT / 'tmp/vhuman-rig/models/depth-anything-v2-small/native/native.json',
-        'speech-emotion': ROOT / 'tmp/vhuman-emotion/sensevoice-small-q8.gguf',
-        'video-face-landmarks': ROOT / 'tmp/vhuman-rig/models/face_landmarker.task',
+        'portrait-depth': models / 'vhuman-rig-models/depth-anything-v2-small/native/native.json',
+        'speech-emotion': models / 'vhuman/sensevoice-small-q8.gguf',
+        'video-face-landmarks': models / 'vhuman-rig-models/face_landmarker.task',
     }
     def describe(paths):
         return {key: {'path': str(path), 'present': path.exists()} for key, path in paths.items()}
@@ -44,7 +45,7 @@ def audit(models_root=Path('/mnt/disk1/models')):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--models-root', type=Path, default=Path('/mnt/disk1/models'))
+    parser.add_argument('--models-root', type=Path, default=MODELS_ROOT)
     args = parser.parse_args()
     result = audit(args.models_root)
     print(json.dumps(result, indent=2))

@@ -80,7 +80,7 @@ Torch-capable interpreter:
 
 ```sh
 python -m server.vhuman.realtime.src.animation.export_native \
-  tmp/vhuman-realtime/motion-v3.pt
+  /mnt/nvme02/models/vhuman/realtime/motion-v3.pt
 ```
 
 `--adapter` accepts the exported directory or the original `.pt` path (resolved
@@ -448,10 +448,10 @@ sh server/vhuman/realtime/run.sh render --rig "$RIG" \
   --output tmp/vhuman-realtime/clean-neutral-render-srgb.png
 sh server/vhuman/realtime/run.sh train-motion \
   --manifest tmp/vhuman-realtime/motion-corpus-v2/manifest.json \
-  --output tmp/vhuman-realtime/motion-v3.pt --epochs 150
+  --output /mnt/nvme02/models/vhuman/realtime/motion-v3.pt --epochs 150
 sh server/vhuman/realtime/run.sh live --rig "$RIG" \
   --avatar tmp/vhuman-realtime/clean-neutral-avatar-v3.npz \
-  --adapter tmp/vhuman-realtime/motion-v3.pt \
+  --adapter /mnt/nvme02/models/vhuman/realtime/motion-v3.pt \
   --model /mnt/nvme01/models/speech/Qwen3-TTS-12Hz-0.6B-CustomVoice \
   --revision bc3c7e785eb961179c25450d1acff03f839e0002f2f3a5aeb67b5735c0fa2adb \
   --text 'こんにちは。今日は、このアバターの動きと音声の同期を確認します。' --sink offline --resident --tts-threads 4 \

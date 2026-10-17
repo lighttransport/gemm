@@ -44,6 +44,7 @@ import uuid
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from server.model_paths import MODELS_ROOT
 
 from . import gpu
 from .eye import params as P
@@ -239,7 +240,7 @@ class App:
         def configured(handler):
             def run(request, progress, cancel):
                 with gpu.execution(getattr(args, "inference_backend", "auto"),
-                                   getattr(args, "device", 0), getattr(args, "models_root", "/mnt/disk1/models")) as selected:
+                                   getattr(args, "device", 0), getattr(args, "models_root", str(MODELS_ROOT))) as selected:
                     result = handler(request, progress, cancel)
                     result.setdefault("backend", "mock" if args.mock else selected)
                     result.setdefault("device", gpu.device_index())
@@ -249,7 +250,7 @@ class App:
 
     def health(self) -> dict:
         with gpu.execution(getattr(self.args, "inference_backend", "auto"),
-                           getattr(self.args, "device", 0), getattr(self.args, "models_root", "/mnt/disk1/models")):
+                           getattr(self.args, "device", 0), getattr(self.args, "models_root", str(MODELS_ROOT))):
             return self._health()
 
     def _health(self) -> dict:

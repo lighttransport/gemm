@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 from .native_landmarks import Graph, FaceLandmarker, ROOT, detections
 from .landmark_assets import export
+from .face_assets import asset_path
 
 
 class NativeLandmarkTests(unittest.TestCase):
@@ -29,13 +30,13 @@ class NativeLandmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'truncated'):
                 Graph(path)
 
-    @unittest.skipUnless((ROOT/'tmp/vhuman-rig/models/face_landmarker.task').is_file() and
+    @unittest.skipUnless(asset_path('mediapipe').is_file() and
                          (ROOT/'cpu/vhuman/libvhuman_landmarks.so').is_file(),'pinned model/native build required')
     def test_observation_and_video_paths_without_inference_runtime(self):
         from PIL import Image
         from .reconstruction.observations import observe
         from .rig.video_fit import _observe
-        task=ROOT/'tmp/vhuman-rig/models/face_landmarker.task'
+        task=asset_path('mediapipe')
         portrait=ROOT/'tmp/vhuman-realtime/clean-identity-001/neutral.png'
         if not portrait.is_file():self.skipTest('local portrait fixture absent')
         original=builtins.__import__

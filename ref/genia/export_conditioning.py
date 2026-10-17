@@ -1,7 +1,7 @@
 """Export GenIA's separate SLAT conditioning fuser from existing checkpoints.
 
 The existing native sam3d_cond_fuser is exported from SS, not SLAT. This tool
-does not overwrite it or download weights. Defaults write into repo tmp/.
+does not overwrite it or download weights. Defaults write into models/genia/native.
 Use the offline Torch/safetensors interpreter; production needs neither package.
 """
 import argparse
@@ -9,8 +9,12 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from server.model_paths import MODELS_ROOT
 PREFIX = "_base_models.condition_embedder."
 
 
@@ -24,8 +28,8 @@ def digest(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoints", type=Path, default=Path("/mnt/nvme01/models/sam3d/checkpoints"))
-    parser.add_argument("--output", type=Path, default=ROOT / "tmp/genia-native-models")
+    parser.add_argument("--checkpoints", type=Path, default=MODELS_ROOT / "sam3d/checkpoints")
+    parser.add_argument("--output", type=Path, default=MODELS_ROOT / "genia/native")
     args = parser.parse_args()
     import torch
     def fuser(name):

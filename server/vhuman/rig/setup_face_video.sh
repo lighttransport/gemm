@@ -1,10 +1,10 @@
 #!/bin/sh
 # Optional face-video observer and independent PyTorch compression reference.
-# All downloads are confined to ignored repository tmp/.
+# Model downloads use the checkout volume's models/; reference builds stay in tmp/.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
-models="$root/tmp/vhuman-rig/models"
+models=$(PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'from server.model_paths import MODELS_ROOT; print(MODELS_ROOT / "vhuman-rig-models")')
 reference="$root/tmp/vhuman-rig/compskin"
 model="$models/face_landmarker.task"
 url=https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
