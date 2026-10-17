@@ -8,13 +8,14 @@ LABELS = ('background', 'skin', 'left_brow', 'right_brow', 'left_eye', 'right_ey
 
 
 class FaceParser:
-    def __init__(self, model=None):
+    def __init__(self, model=None, *, threads=4):
         import onnxruntime as ort
         model = model or asset_path('parsing')
         if sha256(model) != PARSING_SHA256:
             raise ValueError('verified face parsing weights required')
         options = ort.SessionOptions()
-        options.intra_op_num_threads = 4
+        if type(threads) is not int or not 1<=threads<=256: raise ValueError('threads must be 1..256')
+        options.intra_op_num_threads = threads
         self.session = ort.InferenceSession(str(model), options, providers=['CPUExecutionProvider'])
 
     def __call__(self, rgb):

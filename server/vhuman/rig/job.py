@@ -1,8 +1,9 @@
 """The rig as a server job: run rig/build.py in the rig interpreter (numpy,
 scipy, PyTorch) as a subprocess, relay its progress, honour cancellation.
-Registration uses the configured CPU/CUDA/ROCm device under the shared lock."""
+GPU registration uses the shared device lock; explicit CPU jobs bypass it."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 import sys
@@ -21,6 +22,7 @@ RIG_FILES = ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "preview.png", "r
              "wm_smile.png", "wm_mouth.png", "expressions/manifest.json", "rig_lod1.glb", "rig_lod2.glb",
              "rig_lod1.usda", "rig_lod2.usda", "rig_deformer_lod1.safetensors", "rig_deformer_lod2.safetensors",
              "viz_lod1.json", "viz_lod2.json")
+RIG_FILES += ("gnm_bind.npz", "gnm_bind.json")
 RIG_FILES += ("soft_deformer.safetensors", "soft_deformer_lod1.safetensors",
               "soft_deformer_lod2.safetensors", "soft_deformer_report.json")
 RIG_FILES += ("skin_material.json", "rig_coverage.png", "rig_confidence.png", "rig_specular.png")
@@ -76,8 +78,8 @@ def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = 
         lock = (service.work / "mock-gpu.lock") if mock else gpu.LOCK_PATH
         tail = []
         # Auto selection uses CPU when no GPU is detected; explicit GPU requests stay strict.
-        check = not mock and gpu.gpu_status() is not None
-        with gpu.device_session(MIN_FREE_MIB, cancel, lock_path=lock, check_memory=check):
+        check = gpu.backend() != "cpu" and not mock and gpu.gpu_status() is not None
+        with gpu.device_session(MIN_FREE_MIB, cancel, lock_path=lock, check_memory=check) if gpu.backend() != "cpu" else nullcontext():
             env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
             from ..runtime import python_command
             from ..process import run

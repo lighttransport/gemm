@@ -13,7 +13,6 @@ import math
 import os
 import re
 import shutil
-import signal
 import subprocess
 import uuid
 from pathlib import Path
@@ -112,7 +111,7 @@ def _extract(source: Path, stage: Path) -> list[Path]:
     return paths
 
 
-def _observe(paths: list[Path], model: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _observe(paths: list[Path], model: Path, *, dense=False, threads=4) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from ..native_landmarks import FaceLandmarker
     from PIL import Image
 
@@ -122,9 +121,10 @@ def _observe(paths: list[Path], model: Path) -> tuple[np.ndarray, np.ndarray, np
     controls = np.zeros((len(paths), len(names)), np.float32)
     landmarks = np.zeros((len(paths), len(ANCHORS), 2), np.float32)
     valid = np.zeros(len(paths), bool)
+    full = np.zeros((len(paths),478,3),np.float32)
     # Per-image inference is deterministic and independent of frame sampling.
     # Temporal regularization remains in fit_observations, below.
-    with FaceLandmarker(model) as tracker:
+    with FaceLandmarker(model,threads=threads) as tracker:
         for i, path in enumerate(paths):
             with Image.open(path) as image:
                 result = tracker.detect(np.asarray(image.convert('RGB')))
@@ -134,6 +134,7 @@ def _observe(paths: list[Path], model: Path) -> tuple[np.ndarray, np.ndarray, np
                 continue
             valid[i] = True
             points = result[0]['landmarks']
+            full[i] = points
             for j, (_, index) in enumerate(ANCHORS):
                 ids = list(index) if isinstance(index, tuple) else [index]
                 landmarks[i, j] = points[ids, :2].mean(0)
@@ -148,7 +149,7 @@ def _observe(paths: list[Path], model: Path) -> tuple[np.ndarray, np.ndarray, np
             for k in range(series.shape[-1]):
                 column = series[(slice(None), *j, k)]
                 series[(slice(None), *j, k)] = np.interp(np.arange(len(series)), observed, column[observed])
-    return controls, landmarks, valid
+    return (controls, landmarks, valid, full) if dense else (controls, landmarks, valid)
 
 
 def _anchor_rig(rig_dir: Path):
@@ -225,12 +226,41 @@ def fit_observations(rig_dir: Path, direct: np.ndarray, landmarks: np.ndarray,
                                         "projection_scale": scale}
 
 
-def fit_video(rig_dir: Path, source: Path, out_dir: Path, model: Path = MODEL) -> dict:
+def fit_video(rig_dir: Path, source: Path, out_dir: Path, model: Path = MODEL, *, iterations=400, threads=16, cancel=None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     frames = _extract(source, out_dir)
-    direct, observed, valid = _observe(frames, model)
-    fitted, report = fit_observations(rig_dir, direct, observed, valid)
-    names = list(rigdef.CONTROLS)
+    definition=json.loads((rig_dir/'rig.json').read_text())
+    if definition.get('face_model') == 'gnm_v3':
+        from ..reconstruction.gnm_motion import rig_bind,views_from_landmarks,fit_views,retarget,overlay
+        from ..reconstruction.reference import Camera
+        from ..face_parsing import FaceParser
+        from PIL import Image
+        bind=rig_bind(rig_dir)
+        direct,observed,valid,dense=_observe(frames,model,dense=True,threads=threads)
+        with Image.open(frames[0]) as image: size=image.size
+        camera=Camera.from_dict(bind['metadata']['camera'])
+        old_size=bind['metadata']['size'];ratio=min(size[0]/old_size[0],size[1]/old_size[1])
+        camera=camera.scaled(ratio)
+        camera.cx+=(size[0]-old_size[0]*ratio)/2;camera.cy+=(size[1]-old_size[1]*ratio)/2
+        parser=FaceParser(threads=threads);labels=[]
+        for path in frames:
+            if cancel is not None and cancel.is_set(): raise gpu.Cancelled('cancelled')
+            with Image.open(path) as image: labels.append(parser.predict(np.asarray(image.convert('RGB')))[0])
+        views=views_from_landmarks(dense,valid,camera,size,labels=np.asarray(labels),synthetic=False)
+        result=fit_views(bind,views,np.arange(len(frames))/FPS,out=out_dir,iterations=iterations,threads=threads,cancel=cancel)
+        fitted,retarget_report=retarget(rig_dir,bind,result,direct,threads=threads,cancel=cancel)
+        if not result['report']['quality_gate']:
+            fitted=direct.copy()
+            retarget_report.update(rms_mm=retarget_report['baseline_rms_mm'],p95_mm=None,
+                                   fallback_frames=len(frames),fallback_reason='GNM refinement rejected')
+        result['track'].update(clip=str(source.resolve()),clip_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),source='real face video')
+        (out_dir/'motion.json').write_text(json.dumps(result['track'],indent=2))
+        overlay(out_dir,frames,result,fps=FPS,cancel=cancel)
+        report=dict(result['track'],valid_frames=int(valid.sum()),retarget=retarget_report,optimizer='full GNM CPU Adam/L-BFGS')
+    else:
+        direct, observed, valid = _observe(frames, model)
+        fitted, report = fit_observations(rig_dir, direct, observed, valid)
+    names = [c["name"] for c in definition["controls"]]
     animation = {"format": "vhuman.performance.v1", "fps": FPS, "duration": len(frames) / FPS,
                  "controls": names, "frames": [{"t": i / FPS, "v": {name: round(float(v), 5)
                     for name, v in zip(names, row) if abs(v) > 1e-4}} for i, row in enumerate(fitted)],
@@ -238,7 +268,7 @@ def fit_video(rig_dir: Path, source: Path, out_dir: Path, model: Path = MODEL) -
                  "secondary_strength": 0.}
     (out_dir / "animation.json").write_text(json.dumps(animation, separators=(",", ":")))
     report.update({"format": "vhuman.face_video_fit.v1", "fps": FPS, "duration": animation["duration"],
-                   "tracker": "MediaPipe Face Landmarker", "optimizer": "vhuman TorchRig"})
+                   "tracker": "MediaPipe Face Landmarker", "optimizer": report.get("optimizer","vhuman TorchRig")})
     (out_dir / "fit_report.json").write_text(json.dumps(report, indent=2))
     shutil.rmtree(out_dir / "frames")
     return report
@@ -255,43 +285,41 @@ def fit_job(service, request: dict, progress, cancel, *, python=None, model: Pat
         raise ValueError(f"rig interpreter is missing: {py}")
     if not Path(model).is_file():
         raise ValueError(f"face landmarker model is missing: {model}; run setup_face_video.sh")
+    iterations=request.get('iterations',400);threads=request.get('threads',16)
+    if type(iterations) is not int or not 10<=iterations<=2000: raise ValueError('iterations must be 10..2000')
+    if type(threads) is not int or not 1<=threads<=256: raise ValueError('threads must be 1..256')
     take_id = uuid.uuid4().hex[:12]
     root = rig_path.parent / "takes"
     root.mkdir(parents=True, exist_ok=True)
     stage = root / (".partial-" + take_id)
     stage.mkdir()
     cmd = [str(py), "-m", "server.vhuman.rig.video_fit", "decode", str(rig_path.parent),
-           str(source), str(stage), "--model", str(model)]
+           str(source), str(stage), "--model", str(model),"--iterations",str(iterations),"--threads",str(threads)]
     progress(.02, "observing facial video")
     with gpu.device_session(1536, cancel) if gpu.backend() != "cpu" else nullcontext():
-        proc = subprocess.Popen(runtime.python_command(cmd), cwd=Path(__file__).resolve().parents[3], stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        from ..process import run
+        tail=[]
+        def on_line(line):
+            tail.append(line)
+            del tail[:-20]
         try:
-            while proc.poll() is None:
-                if cancel.is_set():
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.communicate(timeout=5)
-                    raise RuntimeError("face video fitting cancelled")
-                import time
-                time.sleep(.1)
-            output = proc.communicate()[0]
-            if proc.returncode:
-                raise RuntimeError("face video fitting failed: " + output[-1500:])
+            rc=run(runtime.python_command(cmd),cancel,on_line,
+                   cwd=Path(__file__).resolve().parents[3],env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
+            if rc: raise RuntimeError('face video fitting failed: '+' | '.join(tail[-8:]))
             report = json.loads((stage / "fit_report.json").read_text())
             manifest = {"id": take_id, "head_id": head, "format": "vhuman.performance.v1",
                         "source": "face_video", "source_upload_id": upload_meta["id"],
                         "source_sha256": upload_meta["sha256"], "duration": report["duration"],
                         "fps": FPS, "frames": report["frames"],
-                        "rig_sha256": hashlib.sha256(rig_path.read_bytes()).hexdigest()[:16]}
+                        "rig_sha256": hashlib.sha256(rig_path.read_bytes()).hexdigest()[:16],
+                        "quality_gate": report.get("quality_gate",True),"solver":report.get("solver","legacy"),
+                        "retarget":report.get("retarget"),
+                        "rig_package_sha256":hashlib.sha256((rig_path.parent/"rig_deformer.safetensors").read_bytes()).hexdigest()}
             (stage / "manifest.json").write_text(json.dumps(manifest, indent=2))
             stage.rename(root / take_id)
             progress(.99, "face video take ready")
             return service.take_summary(head, take_id)
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait()
             if stage.exists():
                 shutil.rmtree(stage, ignore_errors=True)
 
@@ -303,8 +331,9 @@ def main(argv=None):
     ap.add_argument("source", type=Path)
     ap.add_argument("out", type=Path)
     ap.add_argument("--model", type=Path, default=MODEL)
+    ap.add_argument("--iterations",type=int,default=400);ap.add_argument("--threads",type=int,default=16)
     args = ap.parse_args(argv)
-    print(json.dumps(fit_video(args.rig_dir, args.source, args.out, args.model)))
+    print(json.dumps(fit_video(args.rig_dir, args.source, args.out, args.model, iterations=args.iterations,threads=args.threads)))
 
 
 if __name__ == "__main__":

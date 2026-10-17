@@ -26,7 +26,7 @@ def configure_args(args):
             setattr(args, key, str(gpu.model_path(relative)))
     selected = gpu.backend()
     defaults = {"qwen_python": "tmp/qimg21-ref-venv/bin/python",
-                "rig_python": "tmp/vhuman-rig-venv/bin/python"}
+                "rig_python": "tmp/vhuman-cpu-venv/bin/python" if selected == "cpu" else "tmp/vhuman-rig-venv/bin/python"}
     for key, relative in defaults.items():
         if not getattr(args, key, None):
             legacy = root / ("tmp/vhuman-rocm-venv/bin/python" if selected == "rocm" else relative)
@@ -65,8 +65,9 @@ def main():
     parser.add_argument("--models-root", required=True)
     parser.add_argument("--module", required=True)
     args, rest = parser.parse_known_args()
-    from .rocm_runtime import library_path
-    rocm_lib = library_path()
+    if args.inference_backend == "rocm":
+        from .rocm_runtime import library_path
+        rocm_lib = library_path()
     if args.inference_backend == "rocm" and os.environ.get("LD_LIBRARY_PATH", "").split(":")[0] != rocm_lib:
         env = dict(os.environ)
         env["LD_LIBRARY_PATH"] = rocm_lib + ":" + env.get("LD_LIBRARY_PATH", "")

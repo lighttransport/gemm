@@ -65,7 +65,11 @@ def acceptance_gate(before,after,minimum_area_ratio,target_px=None):
         and (target_px is None or after['heldout_px']<target_px))
 
 
-def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm=0.,target_px=None,device='cuda:0',parsing_model=None):
+def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm=0.,target_px=None,device='cpu',parsing_model=None,threads=16):
+    if device == 'cpu' and not surface_mm:
+        if target_px is not None and (not np.isfinite(target_px) or target_px<=0): raise ValueError('target error must be positive')
+        from .gnm_refine import refine as refine_full
+        return refine_full(candidate,out,iterations=iterations,modes=modes,identity_modes=identity_modes,target_px=target_px,threads=threads,parsing_model=parsing_model)
     import torch
     from ..rig.gnm_model import GNMModel
     from .dense_landmarks import attachments
@@ -79,6 +83,8 @@ def refine(candidate,out, *, iterations=400,modes=64,identity_modes=0,surface_mm
     candidate,out=Path(candidate).resolve(),Path(out).resolve()
     if out.exists() and any(out.iterdir()):raise ValueError('output must be empty')
     manifest=validate_candidate(candidate);observations=load(candidate/'observations.json')
+    if manifest.get('geometry',{}).get('coordinate_convention')=='fixed_camera_posed_surfaces_v2':
+        raise ValueError('posed native GNM candidates require CPU full-equation refinement with --surface-mm 0')
     if len(observations['views'])!=1:raise ValueError('native portrait refinement requires one source view')
     view=observations['views'][0];camera=Camera.from_dict(manifest['geometry']['fitted_cameras'][0])
     with np.load(candidate/'geometry.npz',allow_pickle=False) as data:geometry={k:data[k] for k in data.files}
@@ -241,7 +247,7 @@ def main():
     p.add_argument('--surface-mm',type=float,default=0.)
     p.add_argument('--target-px',type=float,help='require held-out mean error below this pixel threshold')
     p.add_argument('--parsing-model',help='explicit checksum-pinned face parsing ONNX path')
-    p.add_argument('--device',default='cuda:0');a=p.parse_args()
+    p.add_argument('--device',default='cpu');p.add_argument('--threads',type=int,default=16);a=p.parse_args()
     import torch
     backend=('rocm' if torch.version.hip else 'cuda') if a.device.startswith('cuda') else 'cpu';index=int(a.device.split(':')[-1]) if ':' in a.device else 0
     with gpu.execution(backend,index):

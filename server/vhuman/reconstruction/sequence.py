@@ -28,6 +28,46 @@ def predict(candidate,timestamps,out):
         raise ValueError('prediction timestamps must increase')
     if target.min()<times[0] or target.max()>times[-1]:
         raise ValueError('target timestamps outside training interval; no implicit extrapolation')
+    if manifest.get('geometry',{}).get('coordinate_convention') == 'fixed_camera_posed_surfaces_v2':
+        from .gnm_motion import candidate_bind
+        from .gnm_fit import replay,cpu_threads,area_ratio
+        from ..rig.gnm_model import GNMModel
+        bind=candidate_bind(candidate)
+        with np.load(candidate/'geometry.npz',allow_pickle=False) as z:
+            expression=z['gnm_expressions'];native_rot=z['gnm_rotations'];native_t=z['gnm_translations'];tri=z['triangles']
+        if (expression.shape!=(len(times),383) or native_rot.shape!=(len(times),4,3) or native_t.shape!=(len(times),3)
+                or not all(np.isfinite(a).all() for a in (expression,native_rot,native_t))):
+            raise ValueError('native training capture count or parameter mismatch')
+        coefficients=np.stack([np.interp(target,times,column) for column in expression.T],1)
+        translation=np.stack([np.interp(target,times,column) for column in native_t.T],1)
+        rotations=np.stack([Slerp(times,Rotation.from_rotvec(native_rot[:,j]))(target).as_rotvec() for j in range(4)],1)
+        model=GNMModel(device='cpu')
+        with cpu_threads():
+            surfaces,_=replay(model,bind['identity'],coefficients,rotations,translation,scale=float(bind['scale']),
+                               alignment=bind['alignment'],offset=bind['offset'],bind_residual=bind['bind_residual'])
+        # Guard interpolated expressions at the interpolated joint pose.
+        skin=model.group('skin_exterior');full_tri=model.data['triangles'];full_tri=full_tri[skin[full_tri].all(1)]
+        steps=np.ones(len(target))
+        for i in range(len(target)):
+            reference_rotation=rotations[i].copy();reference_rotation[1:]=0
+            reference,_=model.evaluate(bind['identity'],rotations=reference_rotation,translation=translation[i],bind_residual=bind['bind_residual'])
+            reference=float(bind['scale'])*reference.detach().numpy()@bind['alignment'].T+bind['offset']
+            for attempt in range(9):
+                if area_ratio(reference,surfaces[i],full_tri)>=.05: break
+                coefficients[i]*=.5;rotations[i,1:]*=.5;steps[i]*=.5
+                p,_=replay(model,bind['identity'],coefficients[i:i+1],rotations[i:i+1],translation[i:i+1],
+                           scale=float(bind['scale']),alignment=bind['alignment'],offset=bind['offset'],bind_residual=bind['bind_residual'])
+                surfaces[i]=p[0]
+            if area_ratio(reference,surfaces[i],full_tri)<.05: raise ValueError('unsafe interpolated native GNM expression')
+        exterior=skin;surfaces=surfaces[:,exterior]
+        out.parent.mkdir(parents=True,exist_ok=True)
+        np.savez_compressed(out,positions=surfaces,triangles=tri,timestamps=target)
+        report=dict(format='vhuman.sequence_prediction.v2',method='native GNM expression interpolation + joint SLERP',
+                    geometry_sha256=manifest['geometry_sha256'],training_observations_sha256=sha256(candidate/'observations.json'),
+                    target_annotations_used=False,output_sha256=sha256(out),safe_steps=steps.tolist(),
+                    training_timestamps=times.tolist(),target_timestamps=target.tolist())
+        out.with_suffix('.json').write_text(json.dumps(report,indent=2)+'\n')
+        return report
     rotations=[];translations=[]
     for view,fitted in zip(document['views'],manifest['geometry']['fitted_cameras']):
         original=Camera.from_dict(view['camera']);fitted=Camera.from_dict(fitted)

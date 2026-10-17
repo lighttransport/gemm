@@ -1590,3 +1590,120 @@ License for the configured Qwen-Image 2.1 model). Their outputs are tagged
 `qwen-research` and remain in the local work directory. The MIT code license
 does not relicense third-party models or generated assets. No user/LLM-supplied
 measurement is treated as independently verified anatomy.
+
+## GNM fitting and deformation without a GPU
+
+`setup_cpu_fit.sh` creates `tmp/vhuman-cpu-venv` with the pinned CPU-only
+Torch wheel and locked NumPy/SciPy, CPU ONNX Runtime, OpenCV and threadpool
+packages. It builds the repository CPU landmark and corrective libraries.
+Python 3.11/3.12, `uv`, GCC/G++, and FFmpeg are required. Existing hash-pinned
+GNM, landmark and parsing assets are reused; image/video generation is separate.
+
+```sh
+server/vhuman/setup_cpu_fit.sh /path/to/python3.12
+PY=tmp/vhuman-cpu-venv/bin/python
+$PY -m server.vhuman.cli --backend cpu portrait-reconstruct \
+  --portrait portrait.png --iterations 400 --threads 16
+$PY -m server.vhuman.cli --backend cpu gnm-refine-fit \
+  --candidate tmp/vhuman/heads/HEAD/reconstruction/RUN \
+  --out tmp/gnm-refined --identity-modes 32 --iterations 400 --threads 16
+$PY -m server.vhuman.cli --backend cpu rig-fit-video \
+  --head HEAD --video performance.mp4 --iterations 400 --threads 16
+```
+
+For an isolated candidate rig, without promoting it to the accepted head:
+
+```sh
+$PY -m server.vhuman.runtime --backend cpu --device 0 --models-root /mnt/nvme02/models \
+  --module server.vhuman.rig.video_fit decode \
+  tmp/vhuman/heads/HEAD/reconstruction/RUN/rig performance.mp4 tmp/face-take \
+  --iterations 400 --threads 16
+```
+
+The CPU quality solver uses the complete GNM equations for fitting and replay:
+identity-dependent joints, regional expression PCA, pose correctives and LBS.
+Native GNM has neck/head/eye joints; mouth opening is an expression, so this
+path adds no procedural jaw transform. Authored GNM68 attachments receive
+priority over inferred dense correspondences. Expression subspaces come from
+weighted projected derivatives of training attachments. Shared identity is
+refined in 32/64-mode stages; 170 head modes require independent calibrated
+views. A 2 mm spatial trust prior restrains identity drift from a fitted seed.
+Expression changes also have a metric trust prior to constrain off-camera
+depth that projected landmark observability cannot determine.
+
+Cameras remain fixed; captured surfaces include explicit object pose. New
+accepted geometry reports `fixed_camera_posed_surfaces_v2` and retains native
+rotations/translations. Existing candidates remain readable. Sequence
+prediction interpolates native coefficients and joint rotations for v2,
+without applying pose twice. Canonical bind residuals follow native skinning;
+explicit alignment/joint metadata anchors the joints even when surface
+corrections have a nonzero mean.
+
+Video uses one frozen identity, timestamp-aware regularization, 64-frame windows
+with 16-frame overlap and boundary refinement. Missing observations have zero
+data weight. Optimization uses CPU Adam/L-BFGS with bounded parameters. Full
+neutral and posed exterior-skin triangle checks and rest-relative lip/eye constraints run
+before acceptance; unsafe updates are backed off. Canonical spatial patches
+are withheld together, including duplicate semantic attachments. A stage must improve withheld
+landmark error by 2% without worsening mouth, eye or other-face error by 5%.
+Failed refinements retain the previous state and save diagnostics. Single-view
+scale/focal length and hidden anatomy remain priors; tracker holdouts do not
+establish independent 3D accuracy.
+
+A rebuilt candidate rig contains hash-bound `gnm_bind.npz/json`. Video takes
+retain full `motion.npz/json` tracks, compatible controls JSON, a CPU-encoded
+landmark movie and a software z-buffer mesh preview. The semantic rig is
+retargeted with nonlinear skinning and ML correctives; errors are measured
+with the actual native CPU deformer, including contacts. Frames that worsen
+native retarget error keep the tracker-control prior. Compatible control/GLB
+playback remains an approximation to the separately retained GNM motion.
+Rejected GNM fits are labelled for review and retain tracker controls.
+
+CPU selection is propagated to child workers and bypasses GPU discovery and
+device sessions. The quality solver never selects a GPU tensor device. No GPU
+is needed for tracking, parsing, optimization, deformation or review exports.
+The ordinary interactive web viewer still uses its existing graphics renderer;
+the CPU validation path uses the exported software previews.
+
+Reproducible checks on existing inputs (fresh output directories required):
+
+```sh
+TMPDIR="$PWD/tmp" OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 \
+  $PY -B -m unittest server.vhuman.test_gnm_cpu server.vhuman.test_gnm_anatomy \
+  server.vhuman.test_native_fit server.vhuman.test_expression_catalog
+$PY -m server.vhuman.reconstruction.benchmark_cpu video \
+  --candidate CANDIDATE --frames FRAME_DIRECTORY --fps 28 --count 72 --stride 1 \
+  --iterations 80 --threads 4 --out tmp/gnm-video-comparison
+$PY -m server.vhuman.reconstruction.benchmark_cpu scan \
+  --prepared PREPARED_MULTIFACE --baseline EXISTING_SCAN_REPORT_DIRECTORY \
+  --iterations 80 --threads 4 --out tmp/gnm-scan-comparison
+```
+
+The scan benchmark reads held-out scan geometry only after fitting, reports
+exact point-to-triangle RMS at fixed model sample IDs, and flags degradation
+above 2%. Reports include source hashes, identity checks, accepted/rejected
+stages, host-memory high-water mark and fitting time. No speed or scan-quality
+claim follows from landmark improvement alone.
+
+CPU validation on the local development fixtures (4 threads, 120 iterations
+for the portrait and 80 for video/scan) measured:
+
+| Check | Before | Accepted result |
+| --- | ---: | ---: |
+| Portrait withheld landmarks | 5.13 px | 5.13 px (update rejected) |
+| 72-frame SpeakingFaces withheld landmarks | 9.01 px | 5.73 px |
+| SpeakingFaces mouth landmarks | 7.12 px | 3.58 px |
+| SpeakingFaces eye landmarks | 5.82 px | 1.51 px |
+| Multiface mouth landmarks | 16.66 px | 9.19 px |
+| Multiface eye landmarks | 16.62 px | 8.46 px |
+| Multiface development scan RMS | 4.35 mm | 4.41 mm |
+
+The portrait retains its source because its update does not improve spatial
+holdouts by 2%, even though fitting landmarks improve. Video identity bytes
+stay unchanged; the video accepts rank 32 and rejects rank 64. The scan's
+1.3% increase is within the 2% regression
+tolerance, not a scan-accuracy improvement. This scan was used during solver
+development, so its result is a development check rather than an untouched
+test-set estimate. Local reports and CPU previews are recorded under
+`tmp/vhuman-cpu-quality/`; source portraits, scans and model weights are not
+committed.

@@ -176,6 +176,18 @@ class NativeMobileTests(unittest.TestCase):
             matrix, offset = native.joint_transform(1)
             np.testing.assert_allclose(neutral@matrix.T+offset, moved, atol=1e-6)
 
+    def test_biased_bind_residual_does_not_shift_authored_joints(self):
+        rest,joints=self.model.evaluate(self.beta)
+        residual=self.residual+np.array([.004,-.006,.003])
+        geometry=dict(self.geometry,full_neutral=self.scale*(rest+residual)@self.rotation.T+self.offset,
+                      gnm_joint_positions=self.scale*joints@self.rotation.T+self.offset)
+        path=self.root/'biased.bin';write_model(path,self.model,geometry)
+        rotations=np.zeros((4,3));rotations[0,1]=.4
+        expected,_=self.model.evaluate(self.beta,rotations=rotations,bind_residual=residual)
+        with Native(self.library,path) as native:
+            actual=native.evaluate(np.zeros(383),rotations)
+        np.testing.assert_allclose(actual,self.scale*expected@self.rotation.T+self.offset,atol=1e-6)
+
     def test_invalid_model_and_pose_rejected(self):
         (self.root/'bad.bin').write_bytes(b'VHGNM001'+b'\xff'*16)
         with self.assertRaises(ValueError): Native(self.library, self.root/'bad.bin')

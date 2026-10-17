@@ -255,7 +255,7 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
     return candidate.astype(np.float32), np.asarray(captured, np.float32), cams, report
 
 
-def fit_staged(source, initial, views, **kwargs):
+def fit_staged_linear(source, initial, views, **kwargs):
     """Expand identity only when withheld anatomical landmarks improve.
 
     A portrait enables 32/64 head modes. 170 head modes require multiple
@@ -299,3 +299,73 @@ def fit_staged(source, initial, views, **kwargs):
     accepted[3]['identity_stages']=history
     accepted[3]['identity_validation']='every tenth dense tracker attachment withheld; synthetic correspondence validation, not measured 3D'
     return accepted
+
+
+def fit_staged(source, initial, views, **kwargs):
+    """Keep the frozen linear baseline unless full GNM improves held-out anatomy."""
+    threads=kwargs.pop('threads',16)
+    if getattr(source, 'name', None) != 'gnm_v3':
+        return fit_staged_linear(source, initial, views, **kwargs)
+    if sum(sum(name.startswith('mp_') for name in view.get('anchors',{})) for view in views)<30:
+        return fit_staged_linear(source,initial,views,**kwargs)
+    from .gnm_fit import solve,observation_arrays,holdout_mask,cpu_threads
+    from ..rig.gnm_model import GNMModel
+    from scipy.spatial.transform import Rotation
+    model = GNMModel(device='cpu')
+    sampled,ai,aw,_,_,names,region=observation_arrays(model,views)
+    canonical=(model.data['template_vertex_positions'][sampled][ai]*aw[...,None]).sum(1)
+    held=holdout_mask(names,region,canonical)
+    import copy
+    training_views=copy.deepcopy(views)
+    for view in training_views:
+        for name,withheld in zip(names,held):
+            if withheld: view.get('anchors',{}).pop(name,None)
+    # The legacy fit remains a reproducible baseline and a pose initializer.
+    baseline_kwargs = dict(kwargs)
+    baseline_kwargs['iterations'] = min(kwargs.get('iterations', 400), 80)
+    with cpu_threads(threads):
+        result = fit_staged_linear(source, initial, training_views, **baseline_kwargs)
+    old = result[3]
+    beta = np.zeros(model.identity_dim, np.float32)
+    coefficients = old.get('identity_coefficients', [])
+    beta[:len(coefficients)] = coefficients
+    expression = np.zeros((len(views), model.expression_dim), np.float32)
+    expression[:, old.get('expression_modes', [])] = old.get('expression_coefficients', [])
+    alignment = np.asarray(kwargs.get('rotation', np.eye(3)))
+    scale = kwargs.get('scale', 1.)
+    offset = initial[0]-scale*(source.vertices[0]@alignment.T)
+    rotations = np.zeros((len(views), 4, 3), np.float32)
+    translations = np.zeros((len(views), 3), np.float32)
+    joint = model.data['template_joint_positions'][0]+np.einsum('i,ic->c', beta, model.data['joint_identity_basis'][:,0])
+    for i, (r, t) in enumerate(zip(old['pose_rotations'], old['pose_translations'])):
+        world = Rotation.from_rotvec(r).as_matrix()
+        native = alignment.T@world@alignment
+        rotations[i,0] = Rotation.from_matrix(native).as_rotvec()
+        translations[i] = (native-np.eye(3))@joint + ((world@offset+np.asarray(t)-offset)@alignment)/scale
+    independent = not any(v.get('synthetic') or v.get('camera_kind') == 'estimated' for v in views)
+    cameras = [Camera.from_dict(v['camera']) for v in views]
+    multi = independent and len(views)>=3 and max(np.linalg.norm(c.rotation-cameras[0].rotation) for c in cameras)>.25
+    fitted = solve(views, identity=beta, expression=expression, rotations=rotations, translation=translations,
+                   scale=scale, alignment=alignment, offset=offset, identity_modes=170 if multi else 64,
+                   iterations=kwargs.get('iterations',400),threads=threads,groups=kwargs.get('expression_groups'),
+                   freeze_pose=kwargs.get('freeze_pose',False), fixed_pose_views=kwargs.get('fixed_pose_views',()),model=model)
+    diagnostics = fitted['report']
+    if not diagnostics['quality_gate']:
+        old['gnm_refinement'] = diagnostics
+        return result
+    exterior = np.flatnonzero(model.group('skin_exterior'))
+    native_joint = model.data['template_joint_positions'][0]+np.einsum('i,ic->c',fitted['identity'],model.data['joint_identity_basis'][:,0])
+    world_rotations=[];world_translations=[]
+    for r,t in zip(fitted['rotations'][:,0],fitted['translation']):
+        native_rotation=Rotation.from_rotvec(r).as_matrix()
+        world_rotation=alignment@native_rotation@alignment.T
+        world_rotations.append(Rotation.from_matrix(world_rotation).as_rotvec().tolist())
+        world_translations.append((scale*alignment@((np.eye(3)-native_rotation)@native_joint+t)+offset-world_rotation@offset).tolist())
+    report = dict(old, **diagnostics)
+    report.update(identity_coefficients=fitted['identity'].tolist(),
+                  expression_modes=list(range(model.expression_dim)), expression_coefficients=fitted['expression'].tolist(),
+                  expression_labels=model.data['expression_names'].tolist(),
+                  gnm_rotations=fitted['rotations'].tolist(), gnm_translations=fitted['translation'].tolist(),
+                  gnm_alignment_offset=offset.tolist(), pose_rotations=world_rotations,pose_translations=world_translations,linear_baseline=old,
+                  identity_validation='spatial blocks of weighted anatomical attachments withheld')
+    return fitted['neutral'][exterior], fitted['vertices'][:,exterior], cameras, report

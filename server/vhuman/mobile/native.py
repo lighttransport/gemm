@@ -10,7 +10,12 @@ import numpy as np
 def write_model(path, model, geometry):
     beta=geometry['gnm_identity'];rest,joints=model.evaluate(beta)
     scale=float(geometry['scale']);rotation=geometry['rotation']
-    offset=np.median(geometry['full_neutral']-scale*rest@rotation.T,axis=0)
+    if 'gnm_alignment_offset' in geometry:
+        offset=np.asarray(geometry['gnm_alignment_offset'])
+    elif 'gnm_joint_positions' in geometry:
+        offset=np.median(geometry['gnm_joint_positions']-scale*joints@rotation.T,axis=0)
+    else:
+        offset=np.median(geometry['full_neutral']-scale*rest@rotation.T,axis=0)
     bind=(geometry['full_neutral']-offset)@rotation/scale
     arrays=[np.array([scale]),rotation,offset,joints,bind,
             model.data['expression_basis'],model.data['pose_correctives_regressor'],model.data['skinning_weights']]

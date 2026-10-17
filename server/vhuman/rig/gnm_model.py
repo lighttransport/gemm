@@ -10,8 +10,28 @@ from ..face_assets import asset_path, sha256
 from .face_models import GNM_SHA256
 
 
+def rotation_matrices(rotations):
+    """Rodrigues with finite derivatives at zero, for NumPy and Torch."""
+    if isinstance(rotations, np.ndarray):
+        xp = np
+        theta = np.sqrt(np.maximum(np.square(rotations).sum(-1), 1e-16))
+        eye = np.eye(3)
+        stack, zero = np.stack, np.zeros_like(rotations[..., 0])
+    else:
+        import torch
+        xp = torch
+        theta = torch.sqrt(torch.clamp(rotations.square().sum(-1), min=1e-16))
+        eye = torch.eye(3, dtype=rotations.dtype, device=rotations.device)
+        stack, zero = torch.stack, torch.zeros_like(rotations[..., 0])
+    x, y, z = rotations[..., 0], rotations[..., 1], rotations[..., 2]
+    skew = stack((stack((zero,-z,y),-1), stack((z,zero,-x),-1), stack((-y,x,zero),-1)), -2)
+    a = xp.sinc(theta / np.pi)
+    b = .5 * xp.sinc(theta / (2*np.pi))**2
+    return eye + a[...,None,None]*skew + b[...,None,None]*(skew@skew)
+
+
 class GNMModel:
-    def __init__(self, path=None, *, device=None):
+    def __init__(self, path=None, *, device=None, dtype=None):
         path = path or asset_path('gnm')
         if sha256(path) != GNM_SHA256:
             raise ValueError('GNM model hash mismatch')
@@ -26,19 +46,21 @@ class GNMModel:
             import torch
             if str(device).startswith('cuda') and not torch.cuda.is_available():
                 raise ValueError('GPU GNM fitting requires an available PyTorch CUDA/ROCm device')
+            self.dtype = dtype or torch.float32
             for key, value in self.data.items():
                 if value.dtype.kind == 'f':
-                    self.tensors[key] = torch.as_tensor(value,dtype=torch.float32,device=device)
+                    self.tensors[key] = torch.as_tensor(value,dtype=self.dtype,device=device)
 
     def group(self, name):
         return self.data['vertex_groups'][self.data['vertex_group_names'].tolist().index(name)] > .5
 
-    def frame_evaluator(self, identity, vertex_ids=None, *, bind_residual=None):
+    def frame_evaluator(self, identity, vertex_ids=None, *, bind_residual=None, fit_identity=False):
         """Cache fixed identity and sampled anatomy for batched temporal fitting.
 
         Expressions and the four native joint rotations remain differentiable.
         Sampling affects vertex output only; all joints and pose correctives
-        retain the complete model equations.
+        retain the complete model equations. With fit_identity=True the closure
+        also accepts identity= for gradients through both vertices and joints.
         """
         if self.device is None:
             raise ValueError('batched fitting requires a PyTorch device')
@@ -46,13 +68,13 @@ class GNMModel:
         ids = np.arange(len(self.data['template_vertex_positions'])) if vertex_ids is None else np.asarray(vertex_ids)
         if ids.ndim != 1 or ids.dtype.kind not in 'iu' or (ids < 0).any() or (ids >= len(self.data['template_vertex_positions'])).any():
             raise ValueError('invalid sampled GNM vertex ids')
-        beta = torch.as_tensor(identity, dtype=torch.float32, device=self.device)
+        beta = torch.as_tensor(identity, dtype=self.dtype, device=self.device)
         if beta.shape != (self.identity_dim,) or not bool(torch.isfinite(beta).all()):
             raise ValueError('invalid shared GNM identity')
         d = self.tensors
         bind = (d['template_vertex_positions'][ids] + torch.einsum('i,ivc->vc',beta,d['vertex_identity_basis'][:,ids])).detach()
         if bind_residual is not None:
-            residual = torch.as_tensor(bind_residual,dtype=torch.float32,device=self.device)
+            residual = torch.as_tensor(bind_residual,dtype=self.dtype,device=self.device)
             if residual.shape != d['template_vertex_positions'].shape or not bool(torch.isfinite(residual).all()):
                 raise ValueError('invalid GNM bind-space residual')
             bind = bind + residual[ids].detach()
@@ -60,26 +82,31 @@ class GNMModel:
         basis = d['expression_basis'][:,ids].reshape(self.expression_dim,-1)
         correctives = d['pose_correctives_regressor'].reshape(36,-1,3)[:,ids].reshape(36,-1)
         weights = d['skinning_weights'][:,ids]
-        eye = torch.eye(3,device=self.device)
+        eye = torch.eye(3,dtype=self.dtype,device=self.device)
+        identity_basis = d['vertex_identity_basis'][:,ids] if fit_identity else None
 
-        def evaluate(expression, rotations, translation):
+        def evaluate(expression, rotations, translation, identity=None):
             frames = len(expression)
             if expression.shape != (frames,self.expression_dim) or rotations.shape != (frames,4,3) or translation.shape != (frames,3):
                 raise ValueError('invalid batched GNM dimensions')
-            angle = torch.sqrt(torch.clamp((rotations*rotations).sum(-1),min=1e-8))
-            axis = rotations/angle[...,None]
-            x,y,z = axis.unbind(-1);zero = torch.zeros_like(x)
-            skew = torch.stack((zero,-z,y,z,zero,-x,-y,x,zero),-1).reshape(frames,4,3,3)
-            local = eye+torch.sin(angle)[...,None,None]*skew+(1-torch.cos(angle))[...,None,None]*(skew@skew)
-            vertices = bind[None]+(expression@basis).reshape(frames,len(ids),3)
+            bind_now, joints_now = bind, joints
+            if identity is not None:
+                if not fit_identity or identity.shape != (self.identity_dim,):
+                    raise ValueError('identity changes require a differentiable identity evaluator')
+                bind_now = d['template_vertex_positions'][ids] + torch.einsum('i,ivc->vc', identity, identity_basis)
+                if bind_residual is not None:
+                    bind_now = bind_now + residual[ids]
+                joints_now = d['template_joint_positions'] + torch.einsum('i,ijc->jc', identity, d['joint_identity_basis'])
+            local = rotation_matrices(rotations)
+            vertices = bind_now[None]+(expression@basis).reshape(frames,len(ids),3)
             vertices = vertices+((local-eye).reshape(frames,36)@correctives).reshape(vertices.shape)
-            world_r,world_t = [local[:,0]], [joints[0]+translation]
+            world_r,world_t = [local[:,0]], [joints_now[0]+translation]
             for j in range(1,4):
                 parent = self.parents[j]
                 world_r.append(world_r[parent]@local[:,j])
-                world_t.append((world_r[parent]@(joints[j]-joints[parent])[:,None])[...,0]+world_t[parent])
+                world_t.append((world_r[parent]@(joints_now[j]-joints_now[parent])[:,None])[...,0]+world_t[parent])
             r,t = torch.stack(world_r,1),torch.stack(world_t,1)
-            offset = t-(r@joints[None,:,:,None])[...,0]
+            offset = t-(r@joints_now[None,:,:,None])[...,0]
             weighted_r = torch.einsum('jv,fjab->fvab',weights,r)
             weighted_t = torch.einsum('jv,fja->fva',weights,offset)
             return (weighted_r@vertices[...,None])[...,0]+weighted_t,t
@@ -90,20 +117,16 @@ class GNMModel:
         torch_mode = self.device is not None
         if torch_mode:
             import torch
-            arr = lambda x: torch.as_tensor(x,dtype=torch.float32,device=self.device)
-            zeros = lambda shape: torch.zeros(shape,dtype=torch.float32,device=self.device)
-            eye = torch.eye(3,dtype=torch.float32,device=self.device)
+            arr = lambda x: torch.as_tensor(x,dtype=self.dtype,device=self.device)
+            zeros = lambda shape: torch.zeros(shape,dtype=self.dtype,device=self.device)
+            eye = torch.eye(3,dtype=self.dtype,device=self.device)
             einsum, stack = torch.einsum, torch.stack
-            sin, cos, sqrt = torch.sin, torch.cos, torch.sqrt
-            maximum = lambda x, floor: torch.clamp(x,min=floor)
             data = self.tensors
         else:
             arr = lambda x: np.asarray(x,dtype=np.float64)
             zeros = lambda shape: np.zeros(shape,np.float64)
             eye = np.eye(3)
             einsum, stack = np.einsum, np.stack
-            sin, cos, sqrt = np.sin, np.cos, np.sqrt
-            maximum = np.maximum
             data = self.data
         identity = zeros((self.identity_dim,)) if identity is None else arr(identity)
         expression = zeros((self.expression_dim,)) if expression is None else arr(expression)
@@ -115,12 +138,7 @@ class GNMModel:
         finite = all(bool(torch.isfinite(x).all()) for x in values) if torch_mode else all(np.isfinite(x).all() for x in values)
         if not finite:
             raise ValueError('nonfinite GNM coefficients')
-        angle = sqrt(maximum((rotations*rotations).sum(-1),1e-8))
-        axis = rotations/angle[:,None]
-        x,y,z = axis[:,0],axis[:,1],axis[:,2]
-        zero = zeros(x.shape)
-        skew = stack((stack((zero,-z,y),-1),stack((z,zero,-x),-1),stack((-y,x,zero),-1)),-2)
-        local_r = eye+sin(angle)[:,None,None]*skew+(1-cos(angle))[:,None,None]*(skew@skew)
+        local_r = rotation_matrices(rotations)
         vertices = data['template_vertex_positions']+einsum('i,ivc->vc',identity,data['vertex_identity_basis'])+einsum('e,evc->vc',expression,data['expression_basis'])
         if bind_residual is not None:
             residual = arr(bind_residual)

@@ -26,7 +26,7 @@ def crop_camera(camera, source_size, target_size):
     return c
 
 
-def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0'):
+def fit_clip(candidate, folder, out, *, iterations=400, modes=64, device='cpu', threads=16, cancel=None):
     import torch
     candidate,folder,out=map(Path,(candidate,folder,out))
     if torch.version.hip is None and str(device).startswith('cuda'):
@@ -60,6 +60,22 @@ def fit_clip(candidate, folder, out, *, iterations=200, modes=64, device='cuda:0
         beta=data['gnm_identity'];reference_expression=data['gnm_expressions'][0]
         scale=float(data['scale']);rotation=data['rotation'];rest=data['full_neutral']
         triangles=data['full_triangles']
+    if device == 'cpu':
+        from .gnm_motion import candidate_bind,fit_views,views_from_landmarks
+        rows=observations['observations'];valid=np.array([row.get('visible',False) and row.get('landmarks') is not None for row in rows])
+        landmarks=np.zeros((len(rows),478,3))
+        for i,row in enumerate(rows):
+            if valid[i]: landmarks[i]=row['landmarks']
+        labels_path=folder/'face_parsing.npz'
+        with np.load(labels_path,allow_pickle=False) as z: labels=z['labels']
+        fps=float(observations['fps'])
+        if not np.isfinite(fps) or fps<=0: raise ValueError('invalid temporal frame rate')
+        views=views_from_landmarks(landmarks,valid,camera,(w,h),labels=labels,synthetic=True)
+        timestamps=np.array([row.get('t',i/fps) for i,row in enumerate(rows)],float)
+        fitted=fit_views(candidate_bind(candidate),views,timestamps,out=out,iterations=iterations,modes=modes,threads=threads,cancel=cancel)
+        result=fitted['track'];result.update(candidate=str(candidate.resolve()),clip=str(clip.resolve()),clip_sha256=sha256(clip))
+        (out/'motion.json').write_text(json.dumps(result,indent=2))
+        return result
     model=GNMModel(device=device)
     native_rest,_=model.evaluate(beta)
     offset=np.median(rest-scale*native_rest.detach().cpu().numpy()@rotation.T,axis=0)
@@ -219,15 +235,19 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('candidate');parser.add_argument('--catalog',required=True)
     parser.add_argument('--out',required=True);parser.add_argument('--expressions',default='neutral,happy,sad,angry,fear,surprise,disgust')
-    parser.add_argument('--iterations',type=int,default=200);parser.add_argument('--modes',type=int,default=64)
+    parser.add_argument('--iterations',type=int,default=400);parser.add_argument('--modes',type=int,default=64)
+    parser.add_argument('--device',default='cpu');parser.add_argument('--threads',type=int,default=16)
     args=parser.parse_args();catalog=Path(args.catalog);out=Path(args.out)
-    with gpu.execution('rocm',gpu.device_index()),gpu.device_session(2048):
+    from contextlib import nullcontext
+    backend='cpu' if args.device=='cpu' else 'rocm'
+    out.mkdir(parents=True,exist_ok=True)
+    with gpu.execution(backend,gpu.device_index()),(gpu.device_session(2048) if backend!='cpu' else nullcontext()):
         results={}
         for expression in args.expressions.split(','):
             if expression not in ('neutral','happy','sad','angry','fear','surprise','disgust'):
                 raise ValueError('unknown catalog expression')
             results[expression]=fit_clip(args.candidate,catalog/expression,out/expression,iterations=args.iterations,modes=args.modes,
-                                        device=f'cuda:{gpu.device_index()}')
+                                        device=args.device,threads=args.threads)
         (out/'catalog.json').write_text(json.dumps(results,indent=2))
 
 

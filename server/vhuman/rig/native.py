@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -83,7 +84,7 @@ def build_library(out_dir: Path) -> Path:
     lib = out_dir / "libvhuman_deformer.so"
     cmd = ["gcc", "-O3", "-mavx2", "-mfma", "-ffast-math", "-fPIC", "-shared", "-o", str(lib),
            *[str(ROOT / s) for s in SOURCES], "-lm"]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run(cmd, check=True, capture_output=True, text=True, env=dict(os.environ,TMPDIR=str(out_dir.resolve())))
     return lib
 
 

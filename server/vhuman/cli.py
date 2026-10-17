@@ -272,7 +272,7 @@ def cmd_reconstruction(args):
     req = dict(head_id=getattr(args, 'head', None), portrait=getattr(args, 'portrait', None),
                face_model=args.face_model, observations=args.observations, profile=args.profile,
                gaussians=args.gaussians, depth_installation=args.depth_installation,
-               res=args.res, texture_res=args.texture_res, iterations=args.iterations, build_rig=not args.no_rig, roughness=args.roughness, f0=args.f0,
+               res=args.res, texture_res=args.texture_res, iterations=args.iterations,threads=args.threads, build_rig=not args.no_rig, roughness=args.roughness, f0=args.f0,
                detail_um=args.detail_um,spatial_materials=args.spatial_materials,auto_exclusions=args.auto_exclusions,
                occlusion_mode=args.occlusion_mode)
     return reconstruction_job(EyeService(Path(args.work)), req, _progress, threading.Event(),
@@ -291,10 +291,10 @@ def cmd_gnm_refine_fit(args):
     import subprocess
     from . import gpu
     from .runtime import python_command
-    if not args.rig_python:raise ValueError('a configured ROCm Python interpreter is required')
+    if not args.rig_python:raise ValueError('a configured CPU fitting interpreter is required')
     command=[args.rig_python,'-m','server.vhuman.reconstruction.refine_fit',args.candidate,
              '--out',args.out,'--iterations',str(args.iterations),'--modes',str(args.modes),
-             '--identity-modes',str(args.identity_modes),'--surface-mm',str(args.surface_mm),
+             '--identity-modes',str(args.identity_modes),'--surface-mm',str(args.surface_mm),'--threads',str(args.threads),
              '--device','cpu' if gpu.backend()=='cpu' else f'cuda:{args.device}']
     if args.target_px is not None:command.extend(['--target-px',str(args.target_px)])
     result=subprocess.run(python_command(command),check=True)
@@ -414,7 +414,7 @@ def cmd_rig_fit_video(args) -> dict:
         raise ValueError("video must be MP4, WebM or MOV")
     with media.open("rb") as stream:
         item = video_fit.upload(svc, stream, media.stat().st_size, ctype)
-    return video_fit.fit_job(svc, {"head_id": args.head, "upload_id": item["id"]},
+    return video_fit.fit_job(svc, {"head_id": args.head, "upload_id": item["id"],"iterations":args.iterations,"threads":args.threads},
                              _progress, threading.Event(), python=args.rig_python,
                              model=Path(args.model) if args.model else video_fit.MODEL)
 
@@ -567,7 +567,8 @@ def main(argv=None) -> int:
         sp.add_argument("--profile", choices=("geometry", "material", "full"), default="full")
         sp.add_argument("--res", type=int, choices=(256, 512, 1024), default=512)
         sp.add_argument('--texture-res',type=int,choices=(256,512,1024,2048),help='separate skin atlas resolution')
-        sp.add_argument("--iterations", type=int, default=80)
+        sp.add_argument("--iterations", type=int, default=400)
+        sp.add_argument("--threads",type=int,default=16)
         sp.add_argument("--gaussians", type=int, choices=(0, 2000, 8000, 20000), default=0)
         sp.add_argument("--depth-installation")
         sp.add_argument("--roughness", type=float, default=.55, help="artist prior, .08..1")
@@ -599,8 +600,9 @@ def main(argv=None) -> int:
     sp.add_argument('--candidate',required=True)
     sp.add_argument('--out',required=True)
     sp.add_argument('--iterations',type=int,default=400)
+    sp.add_argument('--threads',type=int,default=16)
     sp.add_argument('--modes',type=int,default=64)
-    sp.add_argument('--identity-modes',type=int,default=0,help='optional observable native identity modes, up to 128')
+    sp.add_argument('--identity-modes',type=int,default=0,help='native identity modes: up to 64; up to 170 with independent calibrated CPU multiview observations')
     sp.add_argument('--surface-mm',type=float,default=0.,help='optional smooth portrait correction bound, up to 5 mm')
     sp.add_argument('--target-px',type=float,help='require held-out mean error below this pixel threshold')
     sp.set_defaults(fn=cmd_gnm_refine_fit)
@@ -684,6 +686,8 @@ def main(argv=None) -> int:
     sp = sub.add_parser("rig-fit-video", help="fit a face video to an existing facial rig")
     sp.add_argument("--head", required=True)
     sp.add_argument("--video", required=True)
+    sp.add_argument("--iterations",type=int,default=400)
+    sp.add_argument("--threads",type=int,default=16)
     sp.add_argument("--model", help="MediaPipe Face Landmarker task file")
     sp.set_defaults(fn=cmd_rig_fit_video)
     sp = sub.add_parser("video", help="generate a silent expression video from an existing head portrait")

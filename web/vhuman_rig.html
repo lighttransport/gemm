@@ -1195,11 +1195,12 @@ async function loadTake(take) {
   $('soft-tissue').disabled = !state.tissueAvailable;
   $('speech-auto-emotion').checked = false;
   $('speech-msg').textContent = take.rig_stale ? 'Rig changed since export; rebuild this animation for the current rig.'
+    : take.quality_gate === false ? 'Face refinement did not pass validation. Tracker controls are retained; review the fit report.'
     : take.emotion_source === 'SenseVoiceSmall' ? 'SenseVoiceSmall suggestions loaded. Review and edit the emotion keys.' : '';
   renderEmotionKeys();
   const links = $('speech-downloads');
   links.replaceChildren();
-  for (const [label, key] of [['WAV', 'audio'], ['controls JSON', 'animation'], ['LightRig track', 'lightrig'], ['USD animation', 'usd'], ['emotion analysis', 'emotion'], ['soft tissue USD', 'soft_tissue'], ['tissue report', 'soft_tissue_report'], ['video fit report', 'fit_report']]) {
+  for (const [label, key] of [['WAV', 'audio'], ['controls JSON', 'animation'], ['LightRig track', 'lightrig'], ['USD animation', 'usd'], ['emotion analysis', 'emotion'], ['soft tissue USD', 'soft_tissue'], ['tissue report', 'soft_tissue_report'], ['video fit report', 'fit_report'], ['full face motion', 'gnm_motion'], ['motion quality report', 'gnm_report'], ['fit preview', 'fit_overlay'], ['mesh preview', 'mesh_preview']]) {
     if (!take.urls[key]) continue;
     const a = document.createElement('a');
     a.className = 'dl'; a.textContent = label; a.href = take.urls[key]; a.download = '';
@@ -1217,7 +1218,7 @@ async function loadTakes(headId, selectId) {
   for (const take of data.takes) {
     const option = document.createElement('option');
     option.value = take.id;
-    option.textContent = `${take.id} · ${take.text || take.source} · ${take.duration.toFixed(2)}s${take.emotion_source === 'SenseVoiceSmall' ? ' · auto emotion' : ''}`;
+    option.textContent = `${take.id} · ${take.text || take.source} · ${take.duration.toFixed(2)}s${take.quality_gate === false ? ' · review fit' : ''}${take.emotion_source === 'SenseVoiceSmall' ? ' · auto emotion' : ''}`;
     select.appendChild(option);
   }
   state.takes = data.takes;

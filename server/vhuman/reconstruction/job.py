@@ -1,4 +1,5 @@
 """Subprocess reconstruction jobs with cancellation and candidate isolation."""
+from contextlib import nullcontext
 import json
 import os
 import shutil
@@ -30,9 +31,11 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
     profile = request.get('profile','full')
     if profile not in ('geometry','material','full'):
         raise ValueError('invalid reconstruction profile')
-    res, iterations = int(request.get('res',512)),int(request.get('iterations',80))
-    if res not in (256,512,1024) or not 10<=iterations<=300:
-        raise ValueError('res must be 256/512/1024; iterations 10..300')
+    res, iterations = int(request.get('res',512)),int(request.get('iterations',400))
+    if res not in (256,512,1024) or not 10<=iterations<=2000:
+        raise ValueError('res must be 256/512/1024; iterations 10..2000')
+    threads=request.get('threads',16)
+    if type(threads) is not int or not 1<=threads<=256: raise ValueError('threads must be 1..256')
     texture_res=int(request.get('texture_res') or res)
     if texture_res not in (256,512,1024,2048):raise ValueError('invalid texture resolution')
     roughness,f0 = float(request.get('roughness',.55)),float(request.get('f0',.028))
@@ -48,7 +51,7 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
         raise ValueError('gaussians must be 0/2000/8000/20000')
     cmd = [str(py),'-m','server.vhuman.reconstruction.pipeline',str(folder),'--run-id',run_id,
            '--profile',profile,'--face-model',model,'--res',str(res),'--iterations',str(iterations),
-           '--roughness',str(roughness),'--f0',str(f0),'--detail-um',str(detail_um),'--texture-res',str(texture_res)]
+           '--roughness',str(roughness),'--f0',str(f0),'--detail-um',str(detail_um),'--texture-res',str(texture_res),'--threads',str(threads)]
     if request.get('spatial_materials',False):cmd.append('--spatial-materials')
     if request.get('auto_exclusions',False):cmd.append('--auto-exclusions')
     occlusion_mode = request.get('occlusion_mode','auto')
@@ -72,9 +75,10 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
             raise gpu.Cancelled('cancelled')
         if direct:
             folder.mkdir(parents=True)
-        progress(.02,'waiting for reconstruction device')
+        progress(.02,'preparing CPU reconstruction' if gpu.backend()=='cpu' else 'waiting for reconstruction device')
+        check=gpu.backend()!='cpu' and not mock and gpu.gpu_status() is not None
         with gpu.device_session(MIN_FREE_MIB,cancel,lock_path=service.work/'mock-gpu.lock' if mock else gpu.LOCK_PATH,
-                                check_memory=not mock and gpu.gpu_status() is not None):
+                                check_memory=check) if gpu.backend() != 'cpu' else nullcontext():
             progress(.05,'fitting portrait and baking candidate materials')
             from ..runtime import python_command
             from ..process import run
@@ -82,7 +86,7 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
                 tail.append(line)
                 del tail[:-12]
             rc = run(python_command(cmd), cancel, on_line, cwd=ROOT,
-                     env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1',OPENBLAS_NUM_THREADS='4',OMP_NUM_THREADS='4'))
+                     env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1',OPENBLAS_NUM_THREADS=str(threads),OMP_NUM_THREADS=str(threads)))
         if cancel.is_set():
             raise gpu.Cancelled('cancelled')
         if rc:

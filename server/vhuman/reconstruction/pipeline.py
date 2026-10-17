@@ -33,7 +33,7 @@ def subject_override(subject, run):
     return replace(subject,folder=run,positions=p,normals=n,triangles=t,uvs=uv,tangents=tan)
 
 
-def direct_seed(image, out, model):
+def direct_seed(image, out, model, *, threads=4):
     """GNM surface + existing analytic eye/lid fitting; no generated mesh required."""
     from ..eye.glb import GLBBuilder
     from ..head.camera import PixalCamera
@@ -41,7 +41,7 @@ def direct_seed(image, out, model):
     out = Path(out)
     out.mkdir(parents=True,exist_ok=True)
     src = face_models.load(model)
-    obs = observations.observe(image)
+    obs = observations.observe(image,threads=threads)
     view = obs['views'][0]
     er, el = [np.array(view['anchors'][n]['xy']) for n in ('eye_right','eye_left')]
     cam = PixalCamera.from_portrait(image,np.deg2rad(20))
@@ -87,10 +87,10 @@ def direct_seed(image, out, model):
 
 
 def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
-        res=512, iterations=80, build_rig=False, rig_iters=80, depth_installation=None,
+        res=512, iterations=400, build_rig=False, rig_iters=80, depth_installation=None,
         gaussian_count=0, run_id=None, roughness=.55, f0=.028, detail_um=0., spatial_materials=False, auto_exclusions=False,
         occlusion_mode='manual', texture_res=None, input_provenance=None, fit_seed=None,
-        fixed_pose_views=(), protect_front=False, front_gate=None):
+        fixed_pose_views=(), protect_front=False, front_gate=None, threads=16):
     folder = Path(folder)
     if occlusion_mode not in ('auto','manual'):
         raise ValueError('occlusion mode must be auto or manual')
@@ -113,7 +113,7 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
         if observation_file:
             doc = observations.load(observation_file)
         else:
-            doc = observations.observe(subject.portrait,pixal_camera(subject),dense=face_model=='gnm_v3')
+            doc = observations.observe(subject.portrait,pixal_camera(subject),dense=face_model=='gnm_v3',threads=threads)
             for v in doc['views']:
                 v['image_path'] = v['image']
         cams = []
@@ -129,13 +129,13 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
         if occlusion_mode == 'auto':
             from ..face_parsing import FaceParser
             from .occlusion import parsing_masks
-            parser = FaceParser()
+            parser = FaceParser(threads=threads)
             for i, view in enumerate(doc['views']):
                 parsing_reports.append(parsing_masks(view, staging/f'parsing_{i}', parser))
         neutral, captured = initial.astype(np.float32),np.repeat(initial[None].astype(np.float32),len(doc['views']),axis=0)
         report = dict(status='geometry held at surface initialization')
         if profile in ('geometry','full'):
-            neutral,captured,cams,report = fitting.fit_staged(src,initial,doc['views'],scale=scale,rotation=rotation,iterations=iterations,
+            neutral,captured,cams,report = fitting.fit_staged(src,initial,doc['views'],scale=scale,rotation=rotation,iterations=iterations,threads=threads,
                 surface_prior=(subject.positions,subject.normals), seed=fit_seed, fixed_pose_views=fixed_pose_views)
         if front_gate:
             from .multiview import check_front
@@ -216,11 +216,15 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
             offset = initial[0]-scale*(src.vertices[0]@rotation.T)
             rest,joints = full.evaluate(beta)
             full_rest = scale*rest@rotation.T+offset
-            full_capture = np.stack([scale*full.evaluate(beta,e)[0]@rotation.T+offset for e in expr])
+            native_rot = np.asarray(report.get('gnm_rotations',np.zeros((len(expr),4,3))))
+            native_trans = np.asarray(report.get('gnm_translations',np.zeros((len(expr),3))))
             exterior = full.group('skin_exterior')
-            # Explicit residuals include any accepted optional depth correction.
+            # Residual geometry is canonical and follows the same LBS as fitting.
             full_rest[exterior] = neutral
-            full_capture[:,exterior] = captured
+            bind_residual=(full_rest-offset)@rotation/scale-rest
+            full_capture = np.stack([scale*full.evaluate(beta,e,r,t,bind_residual=bind_residual)[0]@rotation.T+offset
+                                     for e,r,t in zip(expr,native_rot,native_trans)])
+            captured=full_capture[:,exterior].astype(np.float32)
             component_names = full.data['mesh_component_names']
             component = np.full(len(full.data['triangles']),-1,np.int16)
             for i,name in enumerate(component_names):
@@ -230,7 +234,7 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
             anatomy = dict(full_neutral=full_rest.astype(np.float32),full_captured=full_capture.astype(np.float32),
                 full_triangles=full.data['triangles'],full_triangle_uvs=full.data['triangle_uvs'],
                 full_component_ids=component,component_names=component_names,
-                gnm_identity=beta,gnm_expressions=expr,gnm_joint_positions=scale*joints@rotation.T+offset)
+                gnm_alignment_offset=offset,gnm_bind_residual=bind_residual,gnm_identity=beta,gnm_expressions=expr,gnm_rotations=native_rot,gnm_translations=native_trans,gnm_joint_positions=scale*joints@rotation.T+offset)
             report['complete_anatomy'] = dict(vertices=len(rest),identity_dim=full.identity_dim,
                 expression_dim=full.expression_dim,unsupported_identity_modes='eye and tooth parameters remain neutral priors')
         np.savez_compressed(staging/'geometry.npz',neutral=neutral,captured=captured,
@@ -283,7 +287,8 @@ def main():
     ap.add_argument('--face-model',choices=['gnm_v3','ict_facekit_light'],default='gnm_v3')
     ap.add_argument('--res',type=int,default=512)
     ap.add_argument('--texture-res',type=int,choices=(256,512,1024,2048))
-    ap.add_argument('--iterations',type=int,default=80)
+    ap.add_argument('--iterations',type=int,default=400)
+    ap.add_argument('--threads',type=int,default=16)
     ap.add_argument('--rig',action='store_true')
     ap.add_argument('--run-id')
     ap.add_argument('--portrait')
@@ -298,9 +303,9 @@ def main():
     ap.add_argument('--occlusion-mode',choices=['auto','manual'],default='auto')
     a = ap.parse_args()
     if a.portrait:
-        direct_seed(Path(a.portrait),Path(a.folder),a.face_model)
+        direct_seed(Path(a.portrait),Path(a.folder),a.face_model,threads=a.threads)
     options = dict(observation_file=a.observations,profile=a.profile,face_model=a.face_model,
-                 res=a.res,texture_res=a.texture_res,iterations=a.iterations,build_rig=a.rig,depth_installation=a.depth_installation,
+                 res=a.res,texture_res=a.texture_res,iterations=a.iterations,threads=a.threads,build_rig=a.rig,depth_installation=a.depth_installation,
                  gaussian_count=a.gaussians,run_id=a.run_id,roughness=a.roughness,f0=a.f0,detail_um=a.detail_um,spatial_materials=a.spatial_materials,auto_exclusions=a.auto_exclusions,occlusion_mode=a.occlusion_mode)
     if a.generated_input:
         from .multiview import run_generated

@@ -7,6 +7,6 @@ never replace the accepted subject or its trained deformation packages.
 FILES = ('manifest.json','observations.json','geometry.npz','skin_material.json',
          'skin_basecolor.png','skin_orm.png','skin_normal.png','skin_specular.png',
          'skin_coverage.png','skin_confidence.png','skin_completion_confidence.png',
-         'gaussians.json','depth.npy','depth.json',
+         'gaussians.json','depth.npy','depth.json','fit_refinement.json','landmark_diagnostic.npz','fit_comparison.png','mesh_preview.png',
          'portrait.png','preview.png','skin_generated_support.png','skin_front_protected.png',
          'multiview_review.json')

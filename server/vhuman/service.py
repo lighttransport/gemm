@@ -400,12 +400,17 @@ class EyeService:
         manifest = json.loads(self.take_file(hid, take_id, "manifest.json").read_text())
         current_rig = hashlib.sha256(self.rig_file(hid, "rig.json").read_bytes()).hexdigest()[:16]
         manifest["rig_stale"] = bool(manifest.get("rig_sha256") and manifest["rig_sha256"] != current_rig)
+        expected_package=manifest.get('rig_package_sha256')
+        if expected_package:
+            package=self.rig_file(hid,'rig.json').parent/'rig_deformer.safetensors'
+            manifest['rig_stale'] |= not package.is_file() or hashlib.sha256(package.read_bytes()).hexdigest()!=expected_package
         base = f"/v1/heads/{hid}/rig/takes/{take_id}/"
         manifest["urls"] = {key: base + name for key, name in {
             "manifest": "manifest.json", "audio": "audio.wav", "align": "align.json",
             "animation": "animation.json", "usd": "animation.usda", "lightrig": "lightrig.txt",
             "emotion": "emotion.json", "soft_tissue": "soft_tissue.usda",
-            "soft_tissue_report": "soft_tissue_report.json", "fit_report": "fit_report.json",
+            "soft_tissue_report": "soft_tissue_report.json", "fit_report": "fit_report.json", "gnm_motion": "motion.npz", "gnm_report": "motion.json",
+            "fit_overlay": "fit_overlay.mp4", "mesh_preview": "mesh_preview.png",
         }.items() if (self.work / "heads" / hid / "rig" / "takes" / take_id / name).is_file()}
         return manifest
 

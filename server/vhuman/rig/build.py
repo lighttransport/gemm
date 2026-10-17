@@ -478,6 +478,9 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
                                              default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
     native_stats = native.write_package(out / "rig_deformer.safetensors", rig, native_pos, native_shapes, native_joints, native_weights, ml,
                                         contacts_viz=contacts_viz)
+    if reconstruction is not None and face_model == 'gnm_v3':
+        from ..reconstruction.gnm_motion import export_bind
+        export_bind(out,reconstruction)
     glb_stats = gltf.write(asset, out / "rig.glb")
     t = lap("gltf", t)
     usd_stats = usd.write(asset, out, subj)

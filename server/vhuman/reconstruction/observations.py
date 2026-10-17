@@ -91,7 +91,7 @@ def load(path):
     return doc
 
 
-def observe(image, camera=None, task=None, *, dense=False):
+def observe(image, camera=None, task=None, *, dense=False, threads=4):
     from ..face_assets import asset_path
     task = Path(task) if task else asset_path('mediapipe')
     if not task.is_file() or sha256(task) != TASK_SHA256:
@@ -101,7 +101,7 @@ def observe(image, camera=None, task=None, *, dense=False):
     with Image.open(image) as im:
         w, h = im.size
         rgb = np.asarray(im.convert('RGB'))
-    with FaceLandmarker(task) as tracker:
+    with FaceLandmarker(task,threads=threads) as tracker:
         result = tracker.detect(rgb, blendshapes=False)
     if len(result) != 1:
         raise ValueError('expected exactly one detected face; use manual observations')

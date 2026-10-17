@@ -176,6 +176,39 @@ class WorkflowTests(unittest.TestCase):
     def test_body_cancelled_after_assembly_preserves_avatar_and_motions(self):
         self._body_rebuild(cancel_assembly=True)
 
+    def test_cpu_reconstruction_job_never_probes_or_locks_gpu(self):
+        from .reconstruction.job import reconstruction_job
+        self._head(False)
+        commands=[]
+        def worker(command,*args,**kwargs):
+            commands.append(command)
+            folder=Path(command[command.index('--module')+2])
+            run=command[command.index('--run-id')+1]
+            destination=folder/'reconstruction'/run;destination.mkdir(parents=True)
+            (destination/'manifest.json').write_text('{}')
+            return 0
+        with gpu.execution('cpu'),patch.object(gpu,'gpu_status',side_effect=AssertionError('GPU discovery')), \
+                patch.object(gpu,'device_session',side_effect=AssertionError('GPU session')), \
+                patch.object(process,'run',side_effect=worker):
+            result=reconstruction_job(self.service,dict(head_id='abc',threads=2,iterations=20),
+                                      lambda *_:None,threading.Event(),python=sys.executable)
+        self.assertTrue(result['run_id'])
+        self.assertEqual(commands[0][commands[0].index('--backend')+1],'cpu')
+        self.assertEqual(commands[0][commands[0].index('--threads')+1],'2')
+
+    def test_video_take_detects_changed_native_package_with_same_controls(self):
+        rig=self._head(False)
+        (rig/'rig_deformer.safetensors').write_bytes(b'old native package')
+        take=rig/'takes/012345abcdef';take.mkdir()
+        manifest=dict(id=take.name,rig_sha256=hashlib.sha256((rig/'rig.json').read_bytes()).hexdigest()[:16],
+                      rig_package_sha256=hashlib.sha256(b'old native package').hexdigest())
+        (take/'manifest.json').write_text(json.dumps(manifest))
+        (take/'motion.npz').write_bytes(b'motion')
+        self.assertFalse(self.service.take_summary('abc',take.name)['rig_stale'])
+        self.assertIn('gnm_motion',self.service.take_summary('abc',take.name)['urls'])
+        (rig/'rig_deformer.safetensors').write_bytes(b'new native package')
+        self.assertTrue(self.service.take_summary('abc',take.name)['rig_stale'])
+
     def test_motion_staleness_checks_geometry_and_body_metadata(self):
         self._body_rebuild()
         body = self.root/'heads/abc/body'
