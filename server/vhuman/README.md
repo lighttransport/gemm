@@ -6,6 +6,11 @@ CUDA primitive tests, see [GenIA integration status](../../doc/genia.md). The
 remain unavailable and do not replace existing avatar jobs.
 
 For RX 9070 XT / RDNA4, see [ROCm setup and validation](ROCM.md).
+Python setup scripts share `/mnt/nvme01/.cache/uv` and keep separate dependency
+profiles under `/mnt/nvme01/venvs/gemm`; legacy branch environment paths remain
+compatibility symlinks. `server/python_env.py` resolves both locations. Override
+them with `UV_CACHE_DIR` and `GEMM_VENVS_ROOT` when needed. Scratch stays in repo
+`tmp/`, and CPU, CUDA and ROCm environments remain separate.
 For Wan/H3/HV1.5 expression capture, downloaded face models and GNM mapping,
 see [ROCm expression candidates and GNM](VIDEO_EXPRESSIONS.md).
 For identity-frozen head/bust creation, complete GNM anatomy and offline HIP

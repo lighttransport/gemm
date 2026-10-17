@@ -54,7 +54,7 @@ fi
 if [ "$install_deps" -eq 1 ]; then
     python=${VHUMAN_PYTHON:-$root/tmp/vhuman-rig-venv/bin/python}
     export TMPDIR="$root/tmp/vhuman-runtime"
-    export UV_CACHE_DIR="$root/tmp/uv-cache"
+    export UV_CACHE_DIR="$(python3 "$root/server/python_env.py" cache)"
     mkdir -p "$TMPDIR" "$UV_CACHE_DIR"
     [ -x "$python" ] || { printf 'create the vhuman rig venv first\n' >&2; exit 1; }
     uv pip install --python "$python" 'numpy' 'pillow' 'opencv-python-headless' 'remotezip==0.12.6'

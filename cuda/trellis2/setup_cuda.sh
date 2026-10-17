@@ -22,12 +22,15 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "         The CUDA torch wheels will install but won't be usable." >&2
 fi
 
+export UV_CACHE_DIR="$(python3 "$REPO_ROOT/server/python_env.py" cache)"
+VENV=$(python3 "$REPO_ROOT/server/python_env.py" venv "$SCRIPT_DIR/.venv" --link)
+export VIRTUAL_ENV="$VENV"
 cd "$SCRIPT_DIR"
 
 # 1. venv
-if [[ ! -d .venv ]]; then
+if [[ ! -x "$VENV/bin/python" ]]; then
     echo "[1/4] Creating .venv (python 3.12)"
-    uv venv --python 3.12 .venv
+    uv venv --python 3.12 "$VENV"
 else
     echo "[1/4] Reusing existing .venv"
 fi

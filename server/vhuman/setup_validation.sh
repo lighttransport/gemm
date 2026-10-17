@@ -15,10 +15,11 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
-python="$root/tmp/vhuman-rocm-venv/bin/python"
+venv=$(python3 "$root/server/python_env.py" venv "$root/tmp/vhuman-rocm-venv" --link)
+python="$venv/bin/python"
 [ -x "$python" ] || { echo 'Run server/vhuman/setup_rocm.sh first' >&2; exit 1; }
 export TMPDIR="$root/tmp/vhuman-runtime"
-export UV_CACHE_DIR="$root/tmp/uv-cache"
+export UV_CACHE_DIR="$(python3 "$root/server/python_env.py" cache)"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$root/tmp/vhuman-cache}"
 export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mkdir -p "$TMPDIR" "$UV_CACHE_DIR" "$XDG_CACHE_HOME" "$tools"

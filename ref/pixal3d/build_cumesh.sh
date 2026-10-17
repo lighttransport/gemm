@@ -10,6 +10,7 @@ mkdir -p "$TMPDIR"
 cd "$project_dir/cumesh-upstream"
 git submodule update --init --recursive
 # Some toolkit installations omit headers shipped by the local PyTorch wheels.
-site="$project_dir/.venv-cuda/lib/python3.12/site-packages/nvidia"
+environment=$(python3 "$project_dir/../../server/python_env.py" venv "$project_dir/.venv-cuda")
+site="$environment/lib/python3.12/site-packages/nvidia"
 export CPATH="$site/cusparse/include:$site/cublas/include:$site/cusolver/include${CPATH:+:$CPATH}"
-exec "$project_dir/.venv-cuda/bin/python" setup.py build_ext --inplace
+exec "$environment/bin/python" setup.py build_ext --inplace

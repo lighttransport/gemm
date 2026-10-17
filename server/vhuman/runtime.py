@@ -1,6 +1,7 @@
 """Explicit inference configuration and Python subprocess entry point."""
 from pathlib import Path
 from server.model_paths import MODELS_ROOT
+from server.python_env import environment_path
 from . import gpu
 
 def add_arguments(parser):
@@ -28,7 +29,8 @@ def configure_args(args):
                 "rig_python": "tmp/vhuman-rig-venv/bin/python"}
     for key, relative in defaults.items():
         if not getattr(args, key, None):
-            path = root / ("tmp/vhuman-rocm-venv/bin/python" if selected == "rocm" else relative)
+            legacy = root / ("tmp/vhuman-rocm-venv/bin/python" if selected == "rocm" else relative)
+            path = environment_path(legacy.parent.parent) / "bin/python"
             if path.exists():
                 setattr(args, key, str(path))
 

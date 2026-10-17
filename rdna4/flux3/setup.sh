@@ -4,8 +4,8 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
 mkdir -p tmp
-export TMPDIR="$root/tmp" UV_CACHE_DIR="$root/tmp/uv-cache"
-venv="$root/tmp/flux3-text-venv"
+export TMPDIR="$root/tmp" UV_CACHE_DIR="$(python3 "$root/server/python_env.py" cache)"
+venv=$(python3 "$root/server/python_env.py" venv "$root/tmp/flux3-text-venv" --link)
 [ -x "$venv/bin/python" ] || uv venv --python 3.12 "$venv"
 uv pip install --python "$venv/bin/python" --index-url https://download.pytorch.org/whl/cpu 'torch==2.11.0'
 uv pip install --python "$venv/bin/python" 'transformers==5.8.1' 'safetensors==0.8.0' accelerate numpy pillow

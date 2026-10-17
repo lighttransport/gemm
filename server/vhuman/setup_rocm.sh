@@ -1,15 +1,16 @@
 #!/bin/sh
-# Isolated ROCm interpreter; all caches and temporary files stay in this tree.
+# Isolated ROCm interpreter in shared storage; scratch stays in the repository.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 export TMPDIR="$root/tmp/vhuman-rocm-tmp"
-export UV_CACHE_DIR="$root/tmp/uv-cache"
+export UV_CACHE_DIR="$(python3 "$root/server/python_env.py" cache)"
 mkdir -p "$TMPDIR" "$UV_CACHE_DIR"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$root/tmp/vhuman-cache}"
 mkdir -p "$XDG_CACHE_HOME"
 export LD_LIBRARY_PATH="/opt/rocm/core/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-python="$root/tmp/vhuman-rocm-venv/bin/python"
-if [ ! -x "$python" ]; then uv venv --python 3.12 "$root/tmp/vhuman-rocm-venv"; fi
+venv=$(python3 "$root/server/python_env.py" venv "$root/tmp/vhuman-rocm-venv" --link)
+python="$venv/bin/python"
+if [ ! -x "$python" ]; then uv venv --python 3.12 "$venv"; fi
 # Reuse the RDNA4 wheels pinned by ref/pixal3d; keep the system interpreter intact.
 uv pip install --python "$python" \
  'torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl' \

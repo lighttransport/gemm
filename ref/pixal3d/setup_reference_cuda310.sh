@@ -2,11 +2,11 @@
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export TMPDIR="$project_dir/../../tmp/pixal3d"
-export UV_CACHE_DIR="$project_dir/.cache/uv"
+export UV_CACHE_DIR="$(python3 "$project_dir/../../server/python_env.py" cache)"
 export UV_PYTHON_INSTALL_DIR="$project_dir/.cache/python"
-environment="$project_dir/.venv-reference-cuda310"
+environment=$(python3 "$project_dir/../../server/python_env.py" venv "$project_dir/.venv-reference-cuda310" --link)
 mkdir -p "$TMPDIR"
-uv venv --python 3.10 "$environment"
+[ -x "$environment/bin/python" ] || uv venv --python 3.10 "$environment"
 rm -f "$environment/.pixal3d-reference-ready"
 uv pip install --python "$environment/bin/python" \
   --index-strategy unsafe-best-match \

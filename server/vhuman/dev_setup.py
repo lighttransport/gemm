@@ -1,6 +1,6 @@
 """Rebuild the vhuman CUDA development installation without running GPU jobs.
 
-Run through setup_cuda.sh. State, caches, logs and environments stay in repo tmp/.
+Run through setup_cuda.sh. Scratch stays in repo tmp/; Python storage is shared.
 Existing research assets may be imported from an explicitly selected SSH host.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ import sys
 import urllib.request
 
 from server.model_paths import MODELS_ROOT
+from server.python_env import cache_path, environment_path
 from .relocate_models import link_shared_models, relocate_models
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,15 +54,16 @@ class Setup:
         # Emscripten computes relative paths inside its cache. Resolve the repo's
         # tmp symlink so those paths are relative to the actual working directory.
         self.state = (ROOT / "tmp/vhuman-dev").resolve()
-        self.python = ROOT / "tmp/vhuman-cuda-venv/bin/python"
+        self.python = environment_path(ROOT / "tmp/vhuman-cuda-venv", link=True) / "bin/python"
+        self.uv_cache = cache_path()
         self.ssh = ["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"]
         if args.ssh_identity:
             self.ssh += ["-i", str(args.ssh_identity.expanduser())]
-        for relative in ("scratch", "cache/uv", "cache/xdg", "logs", "tools/python", "tools/bin"):
+        for relative in ("scratch", "cache/xdg", "logs", "tools/python", "tools/bin"):
             (self.state / relative).mkdir(parents=True, exist_ok=True)
         os.environ.update(
             TMPDIR=str(self.state / "scratch"), TMP=str(self.state / "scratch"),
-            TEMP=str(self.state / "scratch"), UV_CACHE_DIR=str(self.state / "cache/uv"),
+            TEMP=str(self.state / "scratch"), UV_CACHE_DIR=str(self.uv_cache),
             XDG_CACHE_HOME=str(self.state / "cache/xdg"),
             UV_PYTHON_INSTALL_DIR=str(self.state / "tools/python"),
             UV_PYTHON_BIN_DIR=str(self.state / "tools/bin"),
@@ -206,7 +208,7 @@ class Setup:
                  "print(torch.__version__, diffusers.__version__, transformers.__version__)")
         for name in ("musclemimic-upstream", "vhuman-gmr-upstream"):
             self.checkout(ROOT / "tmp" / name, *SOURCES[name])
-        muscle_python = ROOT / "tmp/vhuman-musclemimic-py312/bin/python"
+        muscle_python = environment_path(ROOT / "tmp/vhuman-musclemimic-py312", link=True) / "bin/python"
         if not muscle_python.exists():
             self.run("uv", "venv", "--python", "3.12", muscle_python.parent.parent)
         self.run("uv", "pip", "install", "--python", muscle_python, "--no-deps",
@@ -494,7 +496,7 @@ class Setup:
             "VHUMAN_BLENDER": self.state / "tools" / BLENDER / "blender",
             "VHUMAN_THREE": self.state / "tools/three/package", "VHUMAN_RIG_PYTHON": self.python,
             "PYTHON": self.python,
-            "TMPDIR": self.state / "scratch", "UV_CACHE_DIR": self.state / "cache/uv",
+            "TMPDIR": self.state / "scratch", "UV_CACHE_DIR": self.uv_cache,
             "XDG_CACHE_HOME": self.state / "cache/xdg", "EM_CACHE": self.state / "cache/emscripten",
             "HF_HOME": self.state / "cache/huggingface", "PYTHONDONTWRITEBYTECODE": "1",
         }

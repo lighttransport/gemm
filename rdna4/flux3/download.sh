@@ -7,15 +7,16 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
 state="$root/tmp/flux3-download"
 mkdir -p "$state"
-export TMPDIR="$root/tmp" UV_CACHE_DIR="$root/tmp/uv-cache"
+export TMPDIR="$root/tmp" UV_CACHE_DIR="$(python3 "$root/server/python_env.py" cache)"
 export HF_HUB_DISABLE_XET=1 HF_HUB_DISABLE_PROGRESS_BARS=1
 export PYTHONDONTWRITEBYTECODE=1
 model_dir=${1:-/mnt/nvme02/model/flux3-klein}
 revision=${FLUX3_REVISION:-337337621b8526e120f2275d250242f4a6bedd75}
-hf="$root/tmp/flux3-download-venv/bin/hf"
+venv=$(python3 "$root/server/python_env.py" venv "$root/tmp/flux3-download-venv" --link)
+hf="$venv/bin/hf"
 if [ ! -x "$hf" ]; then
-    uv venv --python 3.12 "$root/tmp/flux3-download-venv"
-    uv pip install --python "$root/tmp/flux3-download-venv/bin/python" 'huggingface_hub==0.36.0'
+    uv venv --python 3.12 "$venv"
+    uv pip install --python "$venv/bin/python" 'huggingface_hub==0.36.0'
 fi
 exec 9>"$state/download.lock"
 flock -n 9 || { echo 'A FLUX 3 download job is already running.'; exit 1; }

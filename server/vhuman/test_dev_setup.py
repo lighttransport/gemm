@@ -21,17 +21,21 @@ class DevSetupTest(unittest.TestCase):
         self.root_patch = patch.object(dev_setup, "ROOT", root)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
+        os.environ['GEMM_VENVS_ROOT'] = str(root / 'shared-venvs')
+        os.environ['UV_CACHE_DIR'] = str(root / 'shared-cache/uv')
         args = argparse.Namespace(ssh_identity=None, source_host=None, source_repo="repo",
                                   jobs=2, gpu_arch="sm_80", cuda_home=Path("/cuda"), data_root=root / "assets",
                                   models_root=root / "models", shared_models_root=None,
                                   source_models='/source-models')
         self.setup = dev_setup.Setup(args)
 
-    def test_installation_masks_gpu_and_keeps_caches_local(self):
+    def test_installation_masks_gpu_and_uses_shared_python_storage(self):
         self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "")
         self.assertEqual(os.environ["JAX_PLATFORMS"], "cpu")
-        for name in ("TMPDIR", "TEMP", "TMP", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "EM_CACHE"):
+        for name in ("TMPDIR", "TEMP", "TMP", "UV_PYTHON_INSTALL_DIR", "EM_CACHE"):
             self.assertTrue(Path(os.environ[name]).resolve().is_relative_to(dev_setup.ROOT.resolve()))
+        self.assertEqual(Path(os.environ['UV_CACHE_DIR']), dev_setup.ROOT / 'shared-cache/uv')
+        self.assertTrue(self.setup.python.is_relative_to(dev_setup.ROOT / 'shared-venvs'))
 
     def test_broken_link_is_preserved_before_repair(self):
         path = dev_setup.ROOT / "old"

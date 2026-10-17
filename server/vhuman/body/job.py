@@ -14,6 +14,7 @@ import time
 import uuid
 from pathlib import Path
 from server.model_paths import MODELS_ROOT
+from server.python_env import environment_path
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -24,7 +25,7 @@ from ..service import ROOT
 MODEL_DIR = MODELS_ROOT / "sam3d-body"
 SAM3_MODEL = MODELS_ROOT / "sam3/sam3.model.safetensors"
 CLIP_BPE = MODELS_ROOT / "clip-bpe"
-DEFAULT_RIG_PYTHON = ROOT / "tmp/vhuman-rig-venv/bin/python"
+DEFAULT_RIG_PYTHON = environment_path(ROOT / "tmp/vhuman-rig-venv") / "bin/python"
 FILES = ("body_image.png", "body_image_raw.png", "body_mhr.glb", "body_mhr.glb.json",
          "pixal3d_full.glb", "body_basecolor.png", "avatar.glb", "avatar.usda", "avatar_usd.zip",
          "avatar.json", "body_report.json", "garments.json", "deformer.lrm",

@@ -14,6 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from server.vhuman.body.terra_assets import REVISIONS
+from server.python_env import cache_path, environment_path
 
 
 def run(*args, **kwargs):
@@ -50,12 +51,12 @@ def main():
     ap.add_argument("--cuda", action="store_true", help="include the pinned JAX CUDA plugin")
     args = ap.parse_args()
     root = args.root.resolve()
-    os.environ.update(TMPDIR=str(root/"tmp"), UV_CACHE_DIR=str(root/"uv-cache"))
+    os.environ.update(TMPDIR=str(root/"tmp"), UV_CACHE_DIR=str(cache_path()))
     os.environ.setdefault("UV_HTTP_TIMEOUT", "300")
     (root/"tmp").mkdir(parents=True, exist_ok=True)
     stage(root)
     if args.install:
-        environment = root/"venv"
+        environment = environment_path(root/"venv", link=True)
         if not environment.exists():
             run("uv", "venv", "--python", args.python, environment)
         # Frozen export retains upstream's package versions. OpenCV 4 retains

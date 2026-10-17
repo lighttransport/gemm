@@ -7,9 +7,9 @@ case "$backend" in cpu|cuda|rocm) ;; *) echo "Invalid backend: $backend" >&2; ex
 export TMPDIR="$project_dir/../../tmp/pixal3d"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$project_dir/../../tmp/vhuman-cache}"
 mkdir -p "$XDG_CACHE_HOME"
-export UV_CACHE_DIR="$project_dir/.cache/uv"
+export UV_CACHE_DIR="$(python3 "$project_dir/../../server/python_env.py" cache)"
 export UV_PYTHON_INSTALL_DIR="$project_dir/.cache/python"
-export UV_PROJECT_ENVIRONMENT="$project_dir/.venv-$backend"
+export UV_PROJECT_ENVIRONMENT="$(python3 "$project_dir/../../server/python_env.py" venv "$project_dir/.venv-$backend" --link)"
 unset VIRTUAL_ENV
 export PYTHONDONTWRITEBYTECODE=1
 export TORCH_EXTENSIONS_DIR="$project_dir/.cache/extensions-$backend"
