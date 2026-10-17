@@ -1,5 +1,6 @@
 """Backend selection and subprocess propagation without loading model weights."""
 import tempfile
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +9,40 @@ from types import SimpleNamespace
 from . import gpu, runtime
 
 class RuntimeTest(unittest.TestCase):
+    def test_face_assets_follow_models_root_across_contexts_and_subprocess(self):
+        from .face_assets import asset_path, data_root
+        from .rig import face_models
+        from .reconstruction.upload import server_request
+        import subprocess
+        import json
+        import sys
+        with tempfile.TemporaryDirectory(dir=gpu.ROOT/'tmp') as td, \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('VHUMAN_DATA_ROOT', None)
+            for name in ('first', 'second'):
+                root = Path(td)/name
+                with gpu.execution('cpu', models_root=str(root)):
+                    expected = root/'vhuman-rig-models'
+                    self.assertEqual(data_root(), expected)
+                    for asset in ('gnm', 'mediapipe', 'parsing'):
+                        self.assertTrue(asset_path(asset).is_relative_to(expected))
+                    with patch.object(face_models, '_gnm_path', side_effect=RuntimeError('stop before loading')) as lookup:
+                        with self.assertRaisesRegex(RuntimeError, 'stop before loading'):
+                            face_models.load('gnm_v3')
+                        lookup.assert_called_once_with(expected)
+                    req = server_request(None, {'depth': True})
+                    self.assertEqual(req['depth_installation'], str(expected/'depth-anything-v2-small'))
+            with gpu.execution('cpu', models_root=str(root)):
+                probe = Path(td)/'probe.py'
+                probe.write_text('import json\nfrom server.vhuman.face_assets import asset_path\n'
+                                 'print(json.dumps(str(asset_path("gnm"))))\n')
+                command = runtime.python_command([sys.executable, '-m', 'server.vhuman.face_assets'])
+                command[command.index('--module')+1] = f'tmp.{Path(td).name}.probe'
+                result = subprocess.run(command, cwd=gpu.ROOT, check=True, capture_output=True, text=True)
+                self.assertEqual(Path(json.loads(result.stdout)), expected/'gnm-v3/gnm_head.npz')
+            with patch.dict(os.environ, VHUMAN_DATA_ROOT=str(Path(td)/'explicit-face-root')):
+                self.assertEqual(asset_path('gnm').parent.parent, Path(td)/'explicit-face-root')
+
     def test_rocm_library_set_includes_the_smi_abi_required_by_torch(self):
         from .rocm_runtime import library_path
         with patch.object(Path, 'is_file', lambda p: str(p).startswith('/opt/rocm/core-10.0/')):

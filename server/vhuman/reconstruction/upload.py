@@ -1,6 +1,7 @@
 """Bounded image uploads; remote jobs cannot nominate arbitrary host files."""
 import hashlib
 import io
+import uuid
 from PIL import Image
 
 MAX_UPLOAD = 16 << 20
@@ -25,13 +26,18 @@ def upload(service, stream, length, content_type):
     root=service.work/'portrait_uploads';root.mkdir(parents=True,exist_ok=True)
     path=root/f'{uid}.png'
     if not path.exists():
-        partial=root/f'{uid}.partial';partial.write_bytes(data);partial.replace(path)
+        partial=root/f'.{uid}.{uuid.uuid4().hex}.partial'
+        try:
+            partial.write_bytes(data)
+            partial.replace(path)
+        finally:
+            partial.unlink(missing_ok=True)
     return dict(upload_id=uid,width=im.width,height=im.height)
 
 
 def server_request(service, request, *, direct=False):
     from ..service import ServiceError
-    from ..rig.face_models import MODEL_CACHE
+    from ..face_assets import data_root
     req=dict(request)
     if any(k in req for k in ('portrait','observations','depth_installation','generated_input')):
         raise ServiceError('local file paths are available only through the CLI')
@@ -50,5 +56,5 @@ def server_request(service, request, *, direct=False):
                 raise ServiceError('portrait upload missing')
             req['portrait']=str(portrait)
     if req.pop('depth',False):
-        req['depth_installation']=str(MODEL_CACHE/'depth-anything-v2-small')
+        req['depth_installation']=str(data_root()/'depth-anything-v2-small')
     return req

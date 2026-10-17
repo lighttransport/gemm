@@ -27,7 +27,8 @@ def synthesize(out,identities=8,views=4,side=64):
     out=artifact_path(out)
     if out.exists():raise ValueError('synthetic dataset already exists')
     if not 4<=identities<=32 or not 2<=views<=16 or side not in (64,128):raise ValueError('bounded synthetic configuration required')
-    cached=face_models.MODEL_CACHE/'gnm-v3/gnm_head.npz'
+    from ..face_assets import asset_path
+    cached=asset_path('gnm')
     if not cached.is_file():raise ValueError('cached GNM weights required; no implicit download')
     source=face_models.load('gnm_v3');images=[];normal_maps=[];masks=[];groups=[];records=[];priors=[]
     camera=Camera(side*1.6,side/2,side/2,np.array([0.,0.,.5]),np.eye(3))

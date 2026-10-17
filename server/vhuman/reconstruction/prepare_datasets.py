@@ -147,8 +147,8 @@ def speakingfaces(root,out,fit=False):
     from . import pipeline
     from .reference import pixal_camera
     from ..rig.common import load_subject
-    from ..rig.face_models import MODEL_CACHE
-    if not (MODEL_CACHE/'gnm-v3/gnm_head.npz').is_file() or not (MODEL_CACHE/'face_landmarker.task').is_file():
+    from ..face_assets import asset_path
+    if not asset_path('gnm').is_file() or not asset_path('mediapipe').is_file():
         raise ValueError('cached GNM and MediaPipe weights required; run model setup first')
     source=root/'speakingfaces';out.mkdir(parents=True)
     seed=out/'head';seed.mkdir()

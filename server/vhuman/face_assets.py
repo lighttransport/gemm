@@ -9,16 +9,20 @@ import urllib.request
 import uuid
 import zipfile
 
-from server.model_paths import MODELS_ROOT
-
 ROOT = Path(__file__).resolve().parents[2]
-DATA = Path(os.environ.get("VHUMAN_DATA_ROOT", str(MODELS_ROOT / "vhuman-rig-models")))
 LEGACY = ROOT / "tmp/vhuman-rig/models"
 PARSING_SHA256 = "0d9bd318e46987c3bdbfacae9e2c0f461cae1c6ac6ea6d43bbe541a91727e33f"
 PARSING_REVISION = "bfcc7d48ea8412d55de406cecf96b65b3ca720b2"
 
 
-def asset_path(name, root=DATA):
+def data_root():
+    from . import gpu
+    override = os.environ.get('VHUMAN_DATA_ROOT')
+    return Path(override) if override else gpu.model_path('vhuman-rig-models')
+
+
+def asset_path(name, root=None):
+    root = data_root() if root is None else Path(root)
     relative = {"gnm": "gnm-v3/gnm_head.npz", "mediapipe": "face_landmarker.task",
                 "parsing": "face-parsing/resnet18.onnx"}[name]
     path = Path(root) / relative
@@ -35,10 +39,10 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def fetch(root=DATA):
+def fetch(root=None):
     from .rig.face_models import GNM_SHA256, GNM_REVISION
     from .landmark_assets import TASK_SHA256, MODELS, export
-    root = Path(root)
+    root = data_root() if root is None else Path(root)
     specs = [
         ("gnm-v3/gnm_head.npz", GNM_SHA256,
          f"https://huggingface.co/google/gnm-v3/resolve/{GNM_REVISION}/v3_0/gnm_head.npz",
@@ -88,7 +92,7 @@ def fetch(root=DATA):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=DATA)
+    parser.add_argument("--root", type=Path)
     args = parser.parse_args()
     print(json.dumps(fetch(args.root), indent=2))
 

@@ -91,6 +91,7 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <select id="face-model"><option value="gnm_v3">GNM v3 (default)</option><option value="ict_facekit_light">ICT-FaceKit Light</option><option value="procedural">Procedural</option></select>
       <label>Reconstruction candidate</label>
       <select id="reconstruction"><option value="">Accepted rig</option></select>
+      <div class="msg" id="rig-target-msg"></div>
       <button id="refine-portrait">Refine portrait</button>
       <label><input type="checkbox" id="gaussian-preview" style="width:auto"> Gaussian radiance preview</label>
       <button class="primary" id="build" disabled>Build rig for selected head</button>
@@ -1096,6 +1097,19 @@ function sampleFrames(frames, t) {
 }
 const speechAudio = $('speech-audio');
 let emotionKeys = [], speechLoadGen = 0;
+function acceptedTarget() { return !!state.current?.rig && !state.candidate; }
+function updateTargetActions() {
+  const accepted = acceptedTarget();
+  $('speech-generate').disabled = !accepted || !state.speechAvailable || !!state.speechJob;
+  $('speech-rebuild').disabled = !accepted || !state.take || state.take.source === 'face_video' || !!state.speechJob;
+  $('soft-tissue').disabled = !accepted || !state.take || !state.tissueAvailable || !!state.tissueJob;
+  $('train-soft').disabled = !accepted || !state.takes?.some(t => t.urls.soft_tissue_report);
+  $('fit-face-video').disabled = !accepted || !$('face-video').files?.length;
+  $('build-body').disabled = !accepted || !state.bodyAvailable || !!state.job;
+  $('avatar-mode').disabled = !accepted || !state.current?.body;
+  $('build').textContent = state.candidate ? 'Rebuild selected candidate' : state.current?.rig ? 'Rebuild accepted rig' : 'Build rig for selected head';
+  $('rig-target-msg').textContent = state.candidate ? 'Candidate preview. Select Accepted rig to use speech and body tools.' : '';
+}
 function renderEmotionKeys() {
   const box = $('emotion-keys');
   box.replaceChildren();
@@ -1140,9 +1154,10 @@ $('take-time').addEventListener('input', () => {
   else { state.takeClockStart = performance.now() - state.takeTime * 1000; updateTakeFrame(); }
 });
 async function loadTake(take) {
+  if (!acceptedTarget()) return;
   const gen = ++speechLoadGen;
   const animation = await api(take.urls.animation);
-  if (gen !== speechLoadGen || animation.format !== 'vhuman.performance.v1') return;
+  if (gen !== speechLoadGen || !acceptedTarget() || animation.format !== 'vhuman.performance.v1') return;
   stopAnim();
   state.take = take;
   state.takeFrames = animation.frames;
@@ -1191,11 +1206,12 @@ async function loadTake(take) {
     links.appendChild(a);
   }
   updateTakeFrame();
+  updateTargetActions();
 }
 async function loadTakes(headId, selectId) {
   const gen = ++speechLoadGen;
   const data = state.candidate ? {takes: []} : await api(`/v1/heads/${headId}/rig/takes`);
-  if (gen !== speechLoadGen || state.current?.id !== headId) return;
+  if (gen !== speechLoadGen || state.current?.id !== headId || (state.candidate && data.takes.length)) return;
   const select = $('speech-takes');
   select.replaceChildren();
   for (const take of data.takes) {
@@ -1217,13 +1233,14 @@ async function loadTakes(headId, selectId) {
     $('take-play').disabled = true;
     $('speech-downloads').replaceChildren();
   }
+  updateTargetActions();
 }
 $('speech-takes').addEventListener('change', () => {
   const take = state.takes?.find((t) => t.id === $('speech-takes').value);
   if (take) loadTake(take).catch((e) => { $('speech-msg').textContent = String(e); });
 });
 $('soft-tissue').addEventListener('click', async () => {
-  if (!state.current?.rig || !state.take || !state.tissueAvailable || state.tissueJob) return;
+  if (!acceptedTarget() || !state.take || !state.tissueAvailable || state.tissueJob) return;
   const headId = state.current.id, takeId = state.take.id;
   $('soft-tissue').disabled = true;
   try {
@@ -1242,13 +1259,14 @@ $('soft-tissue').addEventListener('click', async () => {
     $('speech-msg').textContent = String(e.message || e);
   } finally {
     state.tissueJob = null;
-    $('soft-tissue').disabled = !state.take || !state.tissueAvailable;
+    updateTargetActions();
   }
 });
 $('face-video').addEventListener('change', () => {
-  $('fit-face-video').disabled = !state.current?.rig || !$('face-video').files?.length;
+  updateTargetActions();
 });
 $('fit-face-video').addEventListener('click', async () => {
+  if (!acceptedTarget()) return;
   const file = $('face-video').files?.[0], headId = state.current?.id;
   if (!file || !headId || file.size > 64 * 1024 * 1024) {
     $('speech-msg').textContent = 'Select an MP4, WebM or MOV under 64 MiB.'; return;
@@ -1267,12 +1285,12 @@ $('fit-face-video').addEventListener('click', async () => {
       if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);
     }
   } catch (error) { $('speech-msg').textContent = String(error.message || error); }
-  finally { $('fit-face-video').disabled = !state.current?.rig || !$('face-video').files?.length; }
+  finally { updateTargetActions(); }
 });
 $('train-soft').addEventListener('click', async () => {
   const headId = state.current?.id;
   const takeIds = state.takes?.filter((t) => t.urls.soft_tissue_report).map((t) => t.id).slice(0, 8) || [];
-  if (!headId || !takeIds.length) return;
+  if (!acceptedTarget() || !headId || !takeIds.length) return;
   $('train-soft').disabled = true;
   try {
     const job = await api('/v1/jobs', { kind: 'rig_train_deformer', head_id: headId, take_ids: takeIds });
@@ -1285,7 +1303,7 @@ $('train-soft').addEventListener('click', async () => {
     }
     $('speech-msg').textContent = 'Compact soft-tissue model ready.';
   } catch (error) { $('speech-msg').textContent = String(error.message || error); }
-  finally { $('train-soft').disabled = !state.takes?.some((t) => t.urls.soft_tissue_report); }
+  finally { updateTargetActions(); }
 });
 $('add-emotion').addEventListener('click', () => {
   const t = state.take ? speechAudio.currentTime : 0;
@@ -1297,7 +1315,7 @@ $('add-emotion').addEventListener('click', () => {
 });
 $('clear-emotions').addEventListener('click', () => { emotionKeys = []; renderEmotionKeys(); });
 async function runSpeechJob(rebuild) {
-  if (!state.current?.rig || state.speechJob) return;
+  if (!acceptedTarget() || state.speechJob) return;
   const headId = state.current.id;
   const body = { kind: 'rig_speech', head_id: headId, emotion_keyframes: emotionKeys,
                  auto_emotion: $('speech-auto-emotion').checked,
@@ -1327,8 +1345,7 @@ async function runSpeechJob(rebuild) {
     state.speechJob = null;
     $('speech-msg').textContent = String(e.message || e);
   } finally {
-    $('speech-generate').disabled = !state.speechAvailable;
-    $('speech-rebuild').disabled = !state.take;
+    updateTargetActions();
   }
 }
 $('speech-generate').addEventListener('click', () => runSpeechJob(false));
@@ -1434,22 +1451,36 @@ requestAnimationFrame(tick);
 
 // ---- loading ------------------------------------------------------------------------------
 const loader = new GLTFLoader();
-let loadGen = 0;
-$('reconstruction').onchange=async()=>{state.candidate=$('reconstruction').value||null;showFacts(state.current);await loadRig(state.current);await loadTakes(state.current.id);};
+let loadGen = 0, selectionGen = 0;
+$('reconstruction').onchange=async()=>{
+  const h = state.current, gen = ++selectionGen;
+  ++loadGen; ++speechLoadGen;
+  state.candidate=$('reconstruction').value||null;
+  if (state.candidate) { state.avatarMode = false; $('avatar-mode').checked = false; }
+  showFacts(h);
+  await loadTakes(h.id);
+  if (gen !== selectionGen) return;
+  await loadRig(h);
+};
 $('refine-portrait').onclick=async()=>{
   if(!state.current)return;
+  const headId = state.current.id, gen = selectionGen;
   $('refine-portrait').disabled=true;
   try{
-    const submitted=await api('/v1/jobs',{kind:'rig_refine_portrait',head_id:state.current.id,gaussians:2000});
+    const submitted=await api('/v1/jobs',{kind:'rig_refine_portrait',head_id:headId,gaussians:2000});
     const id=submitted.job?.id||submitted.id;
     for(;;){
       const j=await api(`/v1/jobs/${id}`);const job=j.job||j;
       if(job.state==='failed'||job.state==='cancelled')throw Error(job.error||job.state);
       if(job.state==='done'){
-        const data=await api(`/v1/heads/${state.current.id}/reconstruction`);
+        const data=await api(`/v1/heads/${headId}/reconstruction`);
+        if(gen !== selectionGen || state.current?.id !== headId) break;
         state.candidates=data.candidates;
         $('reconstruction').replaceChildren(new Option('Accepted rig',''),...data.candidates.filter(c=>c.rig).map(c=>new Option(c.id,c.id)));
-        state.candidate=job.result.run_id;$('reconstruction').value=state.candidate;await loadRig(state.current);break;
+        state.candidate=job.result.run_id;$('reconstruction').value=state.candidate;
+        ++speechLoadGen; state.avatarMode=false; $('avatar-mode').checked=false;
+        showFacts(state.current); await loadTakes(headId);
+        if(gen === selectionGen && state.current?.id === headId) await loadRig(state.current);break;
       }
       await new Promise(r=>setTimeout(r,1000));
     }
@@ -1498,6 +1529,8 @@ function updateGaussians(){
 
 async function loadRig(h) {
   const gen = ++loadGen;
+  const candidate = state.candidate;
+  const current = () => gen === loadGen && state.current?.id === h.id && state.candidate === candidate;
   if(state.gaussian){scene.remove(state.gaussian.mesh);state.gaussian.dispose();state.gaussian=null;}
   $('empty').hidden = false;
   $('empty').textContent = 'loading rig…';
@@ -1508,7 +1541,7 @@ async function loadRig(h) {
   const hasLod = !lod || ((state.candidate?candidateRig:h.rig)?.lods || []).includes(lod);
   const [def, gltf] = await Promise.all([api(base + (avatar ? 'avatar.json' : 'rig.json')),
     loader.loadAsync(base + (avatar ? 'avatar.glb' : hasLod ? `rig${suffix}.glb` : 'rig.glb'))]);
-  if (gen !== loadGen) return;
+  if (!current()) { gltf.scene.traverse(o => o.geometry?.dispose()); return; }
   if (state.model) { scene.remove(state.model); state.model.traverse((o) => { o.geometry?.dispose(); }); }
   if (skelHelper) { scene.remove(skelHelper); skelHelper = null; }
   state.exact = null;                                   // the previous mesh's contact state (other vertex ids)
@@ -1533,7 +1566,9 @@ async function loadRig(h) {
   skelHelper.visible = $('bones').checked;
   scene.add(skelHelper);
   gltf.scene.traverse((o) => { if (o.isSkinnedMesh && !state.skeleton) state.skeleton = o.skeleton; });
-  state.vizData = avatar ? null : await fetch(base + (hasLod && lod ? `viz${suffix}.json` : 'viz.json')).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  const vizData = avatar ? null : await fetch(base + (hasLod && lod ? `viz${suffix}.json` : 'viz.json')).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  if (!current()) return;
+  state.vizData = vizData;
   viz.ct = null;
   for (const el of viz.labels) el.remove();
   viz.labels = [];
@@ -1544,6 +1579,7 @@ async function loadRig(h) {
   if (def.face_model) $('face-model').value = def.face_model;
   if (def.ml_deformer) {
     const t = await loadSafetensors(base + def.ml_deformer.model);
+    if (!current()) return;
     const ranges = Object.fromEntries(def.controls.map((c) => [c.name, [c.min, c.max]]));
     state.rig.ml = new MLDeformer(t, Object.assign({ ranges }, def.ml_deformer));
   }
@@ -1554,7 +1590,9 @@ async function loadRig(h) {
     const basisFile = lod ? sd.lod_models?.[String(lod)] : sd.model;
     if (basisFile) {
       const model = await loadSafetensors(base + sd.model);
+      if (!current()) return;
       const basis = basisFile === sd.model ? model : await loadSafetensors(base + basisFile);
+      if (!current()) return;
       state.softModel = new SoftDeformer(model, basis, sd, def);
     }
   }
@@ -1578,21 +1616,24 @@ async function loadRig(h) {
       tex.colorSpace = THREE.NoColorSpace;
       return Object.assign({ tex }, m);
     }));
-    state.wrinkles = { def: def.wrinkles, maps };
+    let side;
     if (def.wrinkles.side_file) {
-      const side = await tl.loadAsync(base + def.wrinkles.side_file);
+      side = await tl.loadAsync(base + def.wrinkles.side_file);
       side.flipY = false;
       side.colorSpace = THREE.NoColorSpace;
-      state.wrinkles.side = side;
     }
+    if (!current()) { maps.forEach(m => m.tex.dispose()); side?.dispose(); return; }
+    state.wrinkles = { def: def.wrinkles, maps, side };
     gltf.scene.traverse((o) => { if (o.isMesh && o.name === 'head_skin') for (const mat of [].concat(o.material)) patchWrinkles(mat, state.wrinkles); });
   }
   const gaussianCount=state.candidates?.find(c=>c.id===state.candidate)?.manifest?.gaussians||0;
   $('gaussian-preview').disabled=!gaussianCount;
   if(!gaussianCount)$('gaussian-preview').checked=false;
   if(state.candidate&&gaussianCount&&!avatar&&!lod){
-    const response=await fetch(`/v1/heads/${h.id}/reconstruction/${state.candidate}/gaussians.json`);
-    if(response.ok){const binding=await response.json();state.gaussian=new BoundGaussians(binding,binding.triangles);
+    const response=await fetch(`/v1/heads/${h.id}/reconstruction/${candidate}/gaussians.json`);
+    if (!current()) return;
+    if(response.ok){const binding=await response.json();if (!current()) return;
+      state.gaussian=new BoundGaussians(binding,binding.triangles);
       state.gaussian.mesh.visible=$('gaussian-preview').checked;scene.add(state.gaussian.mesh);}
   }
   skinRenderer.patch(gltf.scene);
@@ -1609,6 +1650,7 @@ async function loadRig(h) {
   $('body-motion-tools').hidden = !avatar;
 }
 function showFacts(h) {
+  updateTargetActions();
   const r = state.candidate ? state.candidates?.find(c => c.id === state.candidate)?.rig : h.rig;
   const rows = [];
   if (r) {
@@ -1636,7 +1678,7 @@ function showFacts(h) {
     $('preview-img').src = r.urls.preview || '';
     $('preview-img').hidden = !r.urls.preview;
   } else $('preview-img').hidden = true;
-  if (h.body) {
+  if (h.body && !state.candidate) {
     const rep = h.body.report || {};
     rows.push(['body mesh / joints', `${rep.body_vertices || '?'} vertices · ${rep.body_joints || '?'} joints`],
       ['garments', (rep.garments || []).map((g) => `${g.name}: ${g.status}`).join(', ') || 'body texture']);
@@ -1660,53 +1702,63 @@ function renderHeads() {
     box.appendChild(el);
   }
 }
-async function select(h) {
+async function select(h, candidateOverride) {
+  const gen = ++selectionGen;
+  ++loadGen;
   if (state.current?.id !== h.id) {
     ++speechLoadGen; stopAnim(); state.take = null; state.takeFrames = null;
+    state.takes = [];
     state.bodyMotion = null; state.bodyMotionId = null; state.bodyMotionPlaying = false; state.bodyMotionTime = 0;
   }
   state.current = h;
-  state.candidate = new URLSearchParams(location.search).get("head") === h.id ? new URLSearchParams(location.search).get("reconstruction") : null;
+  state.candidate = candidateOverride === undefined ? (new URLSearchParams(location.search).get("head") === h.id ? new URLSearchParams(location.search).get("reconstruction") : null) : candidateOverride;
+  updateTargetActions();
   const candidates = await api(`/v1/heads/${h.id}/reconstruction`);
+  if (gen !== selectionGen) return;
   state.candidates=candidates.candidates;
   $("reconstruction").replaceChildren(new Option("Accepted rig", ""), ...candidates.candidates.filter(c=>c.rig).map(c=>new Option(c.id,c.id)));
   $("reconstruction").value = state.candidate || "";
   renderHeads();
   showFacts(h);
   $('build').disabled = !!state.job;
-  $('fit-face-video').disabled = !h.rig || !$('face-video').files?.length;
-  $('build-body').disabled = !!state.job || !h.rig || !state.bodyAvailable;
-  $('avatar-mode').disabled = !h.body;
-  if (!h.body) { state.avatarMode = false; $('avatar-mode').checked = false; }
+  if (!h.body || state.candidate) { state.avatarMode = false; $('avatar-mode').checked = false; }
   else $('avatar-mode').checked = state.avatarMode;
-  $('build').textContent = h.rig ? 'Rebuild rig for selected head' : 'Build rig for selected head';
+  updateTargetActions();
   if (h.rig || state.candidate) {
     const params = new URLSearchParams(location.search);
     const takeId = params.get('head') === h.id ? params.get('take') : null;
-    try { await loadRig(h); await loadTakes(h.id, takeId); if (h.body) await loadMotions(h.id); } catch (e) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; }
+    try {
+      await loadRig(h);
+      if (gen !== selectionGen) return;
+      await loadTakes(h.id, takeId);
+      if (gen !== selectionGen) return;
+      if (h.body && !state.candidate) await loadMotions(h.id);
+    } catch (e) { if (gen === selectionGen) { $('msg').textContent = String(e); $('msg').className = 'msg bad'; } }
   } else {
     $('speech-takes').replaceChildren();
     $('empty').hidden = false;
     $('empty').textContent = 'no rig yet: build one (≈ 1–2 min, GPU optional)';
   }
 }
-async function refresh(selectId) {
+async function refresh(selectId, candidate) {
+  const gen = selectionGen;
   const data = await api('/v1/heads');
+  if (gen !== selectionGen) return;
   state.heads = data.heads;
   renderHeads();
   const want = selectId || state.current?.id || new URLSearchParams(location.search).get('head');
   const h = state.heads.find((x) => x.id === want) || state.heads.find((x) => x.rig);
-  if (h && (!state.current || state.current.id !== h.id || selectId)) await select(h);
+  if (h && (!state.current || state.current.id !== h.id || selectId)) await select(h, candidate);
 }
 $('build').addEventListener('click', async () => {
   if (!state.current) return;
+  const headId = state.current.id, candidate = state.candidate, gen = selectionGen;
   $('build').disabled = true;
   $('msg').className = 'msg';
   try {
-    const job = await api('/v1/jobs', { kind: 'rig', head_id: state.current.id, res: +$('res').value,
+    const job = await api('/v1/jobs', { kind: 'rig', head_id: headId, reconstruction_run: candidate || undefined, res: +$('res').value,
       face_model: $('face-model').value });
     state.job = job.id;
-    const id = state.current.id;
     for (;;) {
       await new Promise((r) => setTimeout(r, 1000));
       const j = await api(`/v1/jobs/${job.id}`);
@@ -1716,7 +1768,7 @@ $('build').addEventListener('click', async () => {
       if (j.state === 'failed' || j.state === 'cancelled') throw new Error(j.error || j.state);
     }
     state.job = null;
-    await refresh(id);
+    if (gen === selectionGen) await refresh(headId, candidate);
   } catch (e) {
     state.job = null;
     $('msg').textContent = String(e.message || e);
@@ -1725,6 +1777,7 @@ $('build').addEventListener('click', async () => {
   $('build').disabled = false;
 });
 $('avatar-mode').addEventListener('change', async () => {
+  if (!acceptedTarget()) { $('avatar-mode').checked = false; return; }
   state.avatarMode = $('avatar-mode').checked;
   $('viz').value = 'shaded';
   if (state.current?.rig) await loadRig(state.current);
@@ -1937,7 +1990,7 @@ $('body-pose-reset').addEventListener('click', () => {
   applyRig();
 });
 $('build-body').addEventListener('click', async () => {
-  if (!state.current?.rig || state.job) return;
+  if (!acceptedTarget() || state.job) return;
   const id = state.current.id;
   $('build-body').disabled = true;
   $('body-msg').className = 'msg';
@@ -1963,7 +2016,7 @@ $('build-body').addEventListener('click', async () => {
     $('body-msg').textContent = String(e.message || e);
     $('body-msg').className = 'msg bad';
   }
-  $('build-body').disabled = !state.current?.rig || !state.bodyAvailable;
+  updateTargetActions();
 });
 api('/health').then((h) => {
   $('health').textContent = h.rig?.available ? `rig builder: ${h.rig.python}` : `rig builder unavailable: ${h.rig?.reason || '?'}`;
@@ -1971,13 +2024,11 @@ api('/health').then((h) => {
   state.tissueAvailable = !!h.rig_soft_tissue?.available;
   state.emotionAvailable = !!h.rig_emotion?.available;
   state.bodyAvailable = !!h.body?.available;
-  $('build-body').disabled = !!state.job || !state.current?.rig || !state.bodyAvailable;
   if (!state.bodyAvailable) $('body-msg').textContent = h.body?.reason ||
     `Body model or rig interpreter missing: ${(h.body?.missing || []).join(', ')}`;
   $('speech-auto-emotion').disabled = !state.emotionAvailable;
   $('speech-auto-emotion').title = state.emotionAvailable ? 'Extract coarse Japanese emotion tags from audio' : 'SenseVoiceSmall model or runtime missing';
-  $('speech-generate').disabled = !state.speechAvailable;
-  $('soft-tissue').disabled = !state.tissueAvailable || !state.take;
+  updateTargetActions();
   if (!h.rig_speech?.available) {
     $('speech-generate').disabled = true;
     $('speech-msg').textContent = 'Speech runner or model missing; see speech/README.md';

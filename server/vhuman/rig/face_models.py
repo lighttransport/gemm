@@ -15,12 +15,9 @@ from pathlib import Path
 
 import numpy as np
 
-from server.model_paths import MODELS_ROOT
-
 from . import bake, template
 
 ROOT = Path(__file__).resolve().parents[3]
-MODEL_CACHE = MODELS_ROOT / "vhuman-rig-models"
 GNM_SHA256 = "61d78bbfb4ad8e0b38495804a4caef3214d3df00f8c3f68761e63b41ce3747eb"
 GNM_REVISION = "c01e90d298d82301f9fd18f54806be751775cb7c"
 ICT_REVISION = "da5f95a607f5e6b37755b38d3385d7f2853732e5"
@@ -69,7 +66,8 @@ def _sha256(path: Path) -> str:
 
 
 def _gnm_path(cache: Path) -> Path:
-    if Path(cache) == MODEL_CACHE:
+    from ..face_assets import data_root
+    if Path(cache) == data_root():
         from ..face_assets import asset_path
         installed = asset_path("gnm")
         if installed.is_file():
@@ -155,7 +153,8 @@ def _obj(path: Path, *, faces: bool = True):
 def load(name: str, cache: Path | None = None) -> Source:
     if name not in SOURCES[:2]:
         raise ValueError(f"unknown external face model: {name}")
-    cache = Path(cache) if cache else MODEL_CACHE
+    from ..face_assets import data_root
+    cache = Path(cache) if cache is not None else data_root()
     if name == "gnm_v3":
         path = _gnm_path(cache)
         with np.load(path, allow_pickle=False) as z:

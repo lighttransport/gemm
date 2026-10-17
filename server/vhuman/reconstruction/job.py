@@ -2,9 +2,6 @@
 import json
 import os
 import shutil
-import signal
-import subprocess
-import threading
 import uuid
 from pathlib import Path
 from .. import gpu
@@ -80,35 +77,12 @@ def reconstruction_job(service, request, progress, cancel, *, python=None, mock=
                                 check_memory=not mock and gpu.gpu_status() is not None):
             progress(.05,'fitting portrait and baking candidate materials')
             from ..runtime import python_command
-            proc = subprocess.Popen(python_command(cmd),cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,start_new_session=True,
-                                    env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1',OPENBLAS_NUM_THREADS='4',OMP_NUM_THREADS='4'))
-            stop = threading.Event()
-            def watch():
-                cancelled_at = None
-                while not stop.wait(.25):
-                    if cancel.is_set() and proc.poll() is None:
-                        import time
-                        cancelled_at = cancelled_at or time.monotonic()
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL if time.monotonic()-cancelled_at > 3 else signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
-            watcher = threading.Thread(target=watch,daemon=True)
-            watcher.start()
-            try:
-                for line in proc.stdout:
-                    tail = (tail+[line.strip()])[-12:]
-                rc = proc.wait()
-            finally:
-                stop.set()
-                watcher.join()
-                proc.stdout.close()
-                if proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid,signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    proc.wait()
+            from ..process import run
+            def on_line(line):
+                tail.append(line)
+                del tail[:-12]
+            rc = run(python_command(cmd), cancel, on_line, cwd=ROOT,
+                     env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1',OPENBLAS_NUM_THREADS='4',OMP_NUM_THREADS='4'))
         if cancel.is_set():
             raise gpu.Cancelled('cancelled')
         if rc:

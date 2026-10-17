@@ -5,9 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
-import threading
 import shutil
 import uuid
 from pathlib import Path
@@ -67,7 +65,7 @@ def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = 
     face_model = request.get("face_model") or saved_model or "gnm_v3"
     if face_model not in SOURCES:
         raise ValueError(f"face_model must be one of {', '.join(SOURCES)}")
-    build_out = out.parent / (".rig-" + uuid.uuid4().hex + ".partial") if candidate else out
+    build_out = out.parent / (".rig-" + uuid.uuid4().hex + ".partial")
     cmd = [str(py), "-m", "server.vhuman.rig.build", str(folder), "--out", str(build_out), "--res", str(res),
            "--iters", str(iters), "--cache", str(service.work / "cache" / "rig"),
            "--face-model", face_model, "--progress"]
@@ -82,44 +80,37 @@ def rig_job(service, request: dict, progress, cancel, python=None, mock: bool = 
         with gpu.device_session(MIN_FREE_MIB, cancel, lock_path=lock, check_memory=check):
             env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
             from ..runtime import python_command
-            proc = subprocess.Popen(python_command(cmd), cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-            stop = threading.Event()
-
-            def watch():
-                while not stop.wait(0.5):
-                    if cancel.is_set() and proc.poll() is None:
-                        proc.terminate()
-            threading.Thread(target=watch, daemon=True).start()
-            try:
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line.startswith("@progress "):
-                        _, f, msg = line.split(" ", 2)
-                        progress(0.02 + 0.96 * float(f), msg)
-                    elif line:
-                        tail = (tail + [line])[-30:]
-                rc = proc.wait()
-            finally:
-                stop.set()
+            from ..process import run
+            def on_line(line):
+                if line.startswith("@progress "):
+                    _, f, msg = line.split(" ", 2)
+                    progress(0.02 + 0.96 * float(f), msg)
+                elif line:
+                    tail.append(line)
+                    del tail[:-30]
+            rc = run(python_command(cmd), cancel, on_line, cwd=ROOT, env=env)
         if cancel.is_set():
             raise gpu.Cancelled("cancelled")
         if rc != 0:
             raise RuntimeError("rig build failed: " + " | ".join(tail[-6:]))
         report = json.loads((build_out / "rig_report.json").read_text())
-        if candidate:
-            backup = out.parent / (".rig-" + uuid.uuid4().hex + ".backup")
-            if out.exists():
-                out.replace(backup)
-            try:
-                build_out.replace(out)
-            except BaseException:
-                if backup.exists():
-                    backup.replace(out)
-                raise
-            shutil.rmtree(backup, ignore_errors=True)
+        backup = out.parent / (".rig-" + uuid.uuid4().hex + ".backup")
+        if out.exists():
+            out.replace(backup)
+        try:
+            # Speech takes are user outputs, and must survive a rig rebuild.
+            if (backup/'takes').exists():
+                (backup/'takes').replace(build_out/'takes')
+            build_out.replace(out)
+        except BaseException:
+            if (build_out/'takes').exists() and backup.exists():
+                (build_out/'takes').replace(backup/'takes')
+            if backup.exists():
+                backup.replace(out)
+            raise
+        shutil.rmtree(backup, ignore_errors=True)
     except BaseException:
-        if candidate:
-            shutil.rmtree(build_out, ignore_errors=True)
+        shutil.rmtree(build_out, ignore_errors=True)
         raise
     base = f"/v1/heads/{head_id}/" + (f"reconstruction/{candidate}/rig/" if candidate else "rig/")
     return {"id": head_id, "seconds": report.get("seconds"), "glb_url": base + "rig.glb",

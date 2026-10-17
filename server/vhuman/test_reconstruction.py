@@ -283,7 +283,7 @@ class ReconstructionTests(unittest.TestCase):
             service=EyeService(Path(d));head=service.work/'heads'/'abc'
             head.mkdir(parents=True);(head/'head.json').write_text('{}')
             base=dict(head_id='abc',build_rig=False)
-            with patch('server.vhuman.reconstruction.job.subprocess.Popen',side_effect=StopBeforeLaunch) as launch, \
+            with patch('server.vhuman.process.subprocess.Popen',side_effect=StopBeforeLaunch) as launch, \
                  patch('server.vhuman.reconstruction.job.gpu.gpu_status',return_value=None):
                 for option in ('spatial_materials','auto_exclusions'):
                     for value in ('false','true',0,1,None,[],{}):
@@ -383,18 +383,14 @@ class ReconstructionTests(unittest.TestCase):
             for name in ('head.json','head_eyes.glb','fit.json','portrait.png'):(head/name).write_text('{}')
             candidate=head/'reconstruction'/'def';(candidate/'rig').mkdir(parents=True)
             (candidate/'manifest.json').write_text('{}');old=candidate/'rig'/'rig.glb';old.write_bytes(b'accepted candidate')
-            class Process:
-                stdout=[]
-                def __init__(self,cmd,**kwargs):
-                    out=Path(cmd[cmd.index('--out')+1]);out.mkdir(parents=True)
-                    (out/'rig_report.json').write_text('{"seconds":1}')
-                    (out/'rig.glb').write_bytes(b'partial replacement')
-                def wait(self):
-                    cancel.set()
-                    return 0
-                def poll(self):return 0
+            def run(cmd, cancel_event, on_line, **kwargs):
+                out=Path(cmd[cmd.index('--out')+1]);out.mkdir(parents=True)
+                (out/'rig_report.json').write_text('{"seconds":1}')
+                (out/'rig.glb').write_bytes(b'partial replacement')
+                cancel.set()
+                return 0
             cancel=threading.Event()
-            with patch('server.vhuman.rig.job.subprocess.Popen',Process), \
+            with patch('server.vhuman.process.run',run), \
                  patch('server.vhuman.rig.job.gpu.gpu_status', return_value=None):
                 with self.assertRaises(Cancelled):
                     rig_job(service,dict(head_id='abc',reconstruction_run='def',res=1024,iters=50),lambda *a:None,cancel,

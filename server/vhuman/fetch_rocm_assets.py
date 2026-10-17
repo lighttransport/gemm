@@ -11,8 +11,9 @@ def main():
     from safetensors.torch import save_file
 
     root = Path(__file__).resolve().parents[2]
-    print("GNM", face_models._gnm_path(face_models.MODEL_CACHE), flush=True)
-    print("ICT", face_models._ict_path(face_models.MODEL_CACHE), flush=True)
+    from .face_assets import data_root
+    print("GNM", face_models._gnm_path(data_root()), flush=True)
+    print("ICT", face_models._ict_path(data_root()), flush=True)
     sources = json.loads((root / "ref/pixal3d/sources.json").read_text())
     path = root / "ref/pixal3d/weights/naf_release.pth"
     path.parent.mkdir(parents=True, exist_ok=True)
