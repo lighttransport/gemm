@@ -34,6 +34,8 @@ hip_flux2_runner *hip_flux2_init(int device_id, int verbose);
 int  hip_flux2_load_dit(hip_flux2_runner *r, const char *safetensors_path);
 int  hip_flux2_load_vae(hip_flux2_runner *r, const char *safetensors_path);
 void hip_flux2_free(hip_flux2_runner *r);
+/* Select VAE convolution precision explicitly: 0=F32, 1=BF16 WMMA. */
+int hip_flux2_set_vae_wmma(hip_flux2_runner *r, int enabled);
 
 /* Run single DiT denoising step on GPU.
  *   img_tokens: [n_img, patch_in_ch] patchified latent (CPU, F32)

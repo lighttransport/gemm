@@ -1925,8 +1925,8 @@ static void vae_conv3(hip_flux2_runner *r, void *out, void *in,
                                   256, 1, 1, 0, NULL, args, NULL);
         }
     }
-    hipFree(d_col);
-    hipFree(d_yt);
+    vae_free(d_col);
+    vae_free(d_yt);
 
     /* 4. Add bias over the full output */
     if (bias) {
@@ -2161,6 +2161,13 @@ static void vae_dump_stage(const char *name, void *d_buf, size_t n_elems) {
 }
 
 /* ---- GPU VAE decode ---- */
+int hip_flux2_set_vae_wmma(hip_flux2_runner *r, int enabled) {
+    if (!r || (enabled != 0 && enabled != 1)) return -1;
+    if (enabled && !r->fn_gemm_bf16w_wmma) return -1;
+    r->use_vae_gemm_wmma = enabled;
+    return 0;
+}
+
 int hip_flux2_vae_decode(hip_flux2_runner *r,
                          const float *latent, int lat_h, int lat_w,
                          float *out_rgb) {
@@ -2348,10 +2355,13 @@ int hip_flux2_vae_decode(hip_flux2_runner *r,
         vae_dump_stage("conv_out", d_rgb, (size_t)3 * h * w);
 
         /* Download */
-        hipMemcpy(out_rgb, d_rgb, (size_t)3 * h * w * F, hipMemcpyDeviceToHost);
-        hipDeviceSynchronize();
+        hipError_t copy_status = hipMemcpy(out_rgb, d_rgb, (size_t)3 * h * w * F,
+                                           hipMemcpyDeviceToHost);
+        hipError_t sync_status = hipDeviceSynchronize();
         vae_free(d_rgb);
         vae_pool_drain();
+        HIP_CHECK(copy_status);
+        HIP_CHECK(sync_status);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);

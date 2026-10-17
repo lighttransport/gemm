@@ -21,6 +21,7 @@ No `hipcc` needed at build time - kernels are compiled at runtime via HIPRTC, lo
 | **PPD** | Pixel-Perfect Depth (DA2 encoder + DiT diffusion) | ~2700 | PyTorch .pth |
 | **MiniMax H3** | Native Ref2VA INT8 ConvRot text-to-video with INT8 WMMA | [runner](minimax_h3/README.md) | Local H3 safetensors |
 | **HunyuanVideo 1.5** | Native quality T2V/I2V and fast12 I2V | [runner](hunyuan_video15_native/README.md) | Existing native model manifest |
+| **FLUX 3 Image Klein** | Native BF16/row-scaled FP8 DiT and VAE; CPU prompt encoder | [runner](flux3/README.md) | FLUX3 safetensors |
 | **Qwen Image 2.1** | 32-block BF16 denoiser with RDNA4 WMMA GEMM | native fixture ABI | Qwen 2.1 safetensors |
 
 ## Requirements

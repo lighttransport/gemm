@@ -1,0 +1,5 @@
+/test_hip_flux3
+/hip_flux3_kernels.inc
+/*.o
+/*.d
+/__pycache__/
