@@ -55,6 +55,8 @@ struct w2v2_model {
     int n_conv, conv_k[8], conv_s[8], conv_c;
     float *conv0_w;          /* [512][10] */
     float *gn_w, *gn_b;
+    int conv_ln;             /* 1: the "layer" feature-extractor variant (lv60): conv bias + LayerNorm(C) + GELU per layer */
+    float *conv_b[8], *conv_ln_w[8], *conv_ln_b[8];
     ja_packed conv[8];       /* layers 1..: W[n=cout][k = j*cin + ci] */
     float *fp_ln_w, *fp_ln_b, *fp_b;
     ja_packed fp;
@@ -105,6 +107,18 @@ w2v2_model *w2v2_load(const char *path) {
     m->conv0_w = w2v2__need(&st, "feature_extractor.conv_layers.0.conv.weight", (size_t)C * m->conv_k[0]);
     m->gn_w = w2v2__need(&st, "feature_extractor.conv_layers.0.layer_norm.weight", (size_t)C);
     m->gn_b = w2v2__need(&st, "feature_extractor.conv_layers.0.layer_norm.bias", (size_t)C);
+    /* the lv60 ("layer") feature extractor: every conv layer has a bias and its own LayerNorm */
+    m->conv_ln = ja_st_find(&st, "feature_extractor.conv_layers.1.layer_norm.weight") != NULL;
+    if (m->conv_ln) {
+        for (int i = 0; i < m->n_conv; i++) {
+            snprintf(nm, sizeof(nm), "feature_extractor.conv_layers.%d.conv.bias", i);
+            m->conv_b[i] = w2v2__need(&st, nm, (size_t)C);
+            snprintf(nm, sizeof(nm), "feature_extractor.conv_layers.%d.layer_norm.weight", i);
+            m->conv_ln_w[i] = w2v2__need(&st, nm, (size_t)C);
+            snprintf(nm, sizeof(nm), "feature_extractor.conv_layers.%d.layer_norm.bias", i);
+            m->conv_ln_b[i] = w2v2__need(&st, nm, (size_t)C);
+        }
+    }
     for (int i = 1; i < m->n_conv; i++) {
         int k = m->conv_k[i];
         snprintf(nm, sizeof(nm), "feature_extractor.conv_layers.%d.conv.weight", i);
@@ -170,10 +184,13 @@ w2v2_model *w2v2_load(const char *path) {
     m->fln_w = w2v2__need(&st, "encoder.layer_norm.weight", (size_t)H);
     m->fln_b = w2v2__need(&st, "encoder.layer_norm.bias", (size_t)H);
     m->n_phon = (int)ja_st_find(&st, "phoneme_head.weight")->shape[0];
-    m->n_kana = (int)ja_st_find(&st, "kana_head.weight")->shape[0];
     w2v2__linear(&st, &m->phon, &m->phon_b, "phoneme_head", m->n_phon, H);
-    w2v2__linear(&st, &m->kana, &m->kana_b, "kana_head", m->n_kana, H);
-    m->inter = st.meta_inter[0] ? atoi(st.meta_inter) : m->n_layers / 2;
+    if (ja_st_find(&st, "kana_head.weight")) {
+        m->n_kana = (int)ja_st_find(&st, "kana_head.weight")->shape[0];
+        w2v2__linear(&st, &m->kana, &m->kana_b, "kana_head", m->n_kana, H);
+    }
+    /* inter_ctc_layer: the phoneme head's layer (un-normed output); "final" = the normed final output */
+    m->inter = st.meta_inter[0] ? (strcmp(st.meta_inter, "final") ? atoi(st.meta_inter) : -1) : m->n_layers / 2;
     ja_st_close(&st);
     return m;
 }
@@ -181,6 +198,7 @@ w2v2_model *w2v2_load(const char *path) {
 void w2v2_free(w2v2_model *m) {
     if (!m) return;
     free(m->conv0_w); free(m->gn_w); free(m->gn_b);
+    for (int i = 0; i < m->n_conv; i++) { free(m->conv_b[i]); free(m->conv_ln_w[i]); free(m->conv_ln_b[i]); }
     for (int i = 1; i < m->n_conv; i++) ja_packed_free(&m->conv[i]);
     free(m->fp_ln_w); free(m->fp_ln_b); free(m->fp_b); ja_packed_free(&m->fp);
     for (int g = 0; g < m->pos_groups; g++) ja_packed_free(&m->pos[g]);
@@ -267,6 +285,16 @@ int w2v2_run(w2v2_model *m, const float *wav, int n, w2v2_output *out, const cha
             h[(size_t)t * C + c] = s;
         }
     free(x);
+    if (m->conv_ln) {
+        /* "layer" variant: bias, LayerNorm over the channels of each frame, GELU */
+        #pragma omp parallel for schedule(static)
+        for (int t = 0; t < T; t++) {
+            float *row = h + (size_t)t * C;
+            for (int c = 0; c < C; c++) row[c] += m->conv_b[0][c];
+            ja_layernorm(row, row, m->conv_ln_w[0], m->conv_ln_b[0], C, 1e-5f);
+            for (int c = 0; c < C; c++) row[c] = ja_gelu(row[c]);
+        }
+    } else {
     #pragma omp parallel for schedule(static)
     for (int c = 0; c < C; c++) {
         double a = 0.0, b = 0.0;
@@ -280,14 +308,25 @@ int w2v2_run(w2v2_model *m, const float *wav, int n, w2v2_output *out, const cha
             *p = ja_gelu((float)(*p - a) * r * m->gn_w[c] + m->gn_b[c]);
         }
     }
+    }
     /* strided convs: the k*C window of rows t*s..t*s+k-1 is contiguous (channels-last) */
     for (int i = 1; i < m->n_conv; i++) {
         int k = m->conv_k[i], s = m->conv_s[i];
         int To = (T - k) / s + 1;
         float *y = (float *)malloc(sizeof(float) * (size_t)To * C);
         ja_sgemm(To, h, s * C, &m->conv[i], y, C, 0);
+        if (m->conv_ln) {
+            #pragma omp parallel for schedule(static)
+            for (int t = 0; t < To; t++) {
+                float *row = y + (size_t)t * C;
+                for (int c = 0; c < C; c++) row[c] += m->conv_b[i][c];
+                ja_layernorm(row, row, m->conv_ln_w[i], m->conv_ln_b[i], C, 1e-5f);
+                for (int c = 0; c < C; c++) row[c] = ja_gelu(row[c]);
+            }
+        } else {
         #pragma omp parallel for schedule(static)
         for (size_t e = 0; e < (size_t)To * C; e++) y[e] = ja_gelu(y[e]);
+        }
         free(h);
         h = y;
         T = To;
@@ -345,7 +384,7 @@ int w2v2_run(w2v2_model *m, const float *wav, int n, w2v2_output *out, const cha
     out->n_phon = m->n_phon;
     out->n_kana = m->n_kana;
     out->phon_logp = (float *)malloc(sizeof(float) * (size_t)T * m->n_phon);
-    out->kana_logp = (float *)malloc(sizeof(float) * (size_t)T * m->n_kana);
+    out->kana_logp = m->n_kana ? (float *)malloc(sizeof(float) * (size_t)T * m->n_kana) : NULL;
     for (int l = 0; l < m->n_layers; l++) {
         const w2v2_layer *L = &m->layers[l];
         #pragma omp parallel for schedule(static)
@@ -373,14 +412,20 @@ int w2v2_run(w2v2_model *m, const float *wav, int n, w2v2_output *out, const cha
     }
     for (int t = 0; t < T; t++) ja_layernorm(hs + (size_t)t * H, hs + (size_t)t * H, m->fln_w, m->fln_b, H, 1e-5f);
     w2v2__dump(dump, "w2v_final", hs, T, H);
-    ja_sgemm(T, hs, H, &m->kana, out->kana_logp, m->n_kana, 0);
-    w2v2__bias(out->kana_logp, m->kana_b, T, m->n_kana);
+    if (m->inter < 0) {          /* a single CTC head on the normed final output (Wav2Vec2ForCTC lm_head) */
+        ja_sgemm(T, hs, H, &m->phon, out->phon_logp, m->n_phon, 0);
+        w2v2__bias(out->phon_logp, m->phon_b, T, m->n_phon);
+    }
+    if (m->n_kana) {
+        ja_sgemm(T, hs, H, &m->kana, out->kana_logp, m->n_kana, 0);
+        w2v2__bias(out->kana_logp, m->kana_b, T, m->n_kana);
+    }
     for (int t = 0; t < T; t++) {
         ja_log_softmax(out->phon_logp + (size_t)t * m->n_phon, m->n_phon);
-        ja_log_softmax(out->kana_logp + (size_t)t * m->n_kana, m->n_kana);
+        if (m->n_kana) ja_log_softmax(out->kana_logp + (size_t)t * m->n_kana, m->n_kana);
     }
     w2v2__dump(dump, "phoneme_logp", out->phon_logp, T, m->n_phon);
-    w2v2__dump(dump, "kana_logp", out->kana_logp, T, m->n_kana);
+    if (m->n_kana) w2v2__dump(dump, "kana_logp", out->kana_logp, T, m->n_kana);
     free(hs); free(xn); free(q); free(kk); free(vv); free(att); free(ff);
     return 0;
 }

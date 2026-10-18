@@ -32,6 +32,12 @@ $(BUILD)/test_codec_stream: tests/test_codec_stream.c $(QT_HDRS) | $(BUILD)
 $(BUILD)/test_tokenizer: tests/test_tokenizer.c $(QT)/qtts_tokenizer.h | $(BUILD)
 	$(CC) $(CFLAGS) -I$(COMMON) -I$(QT) -o $@ $< -lm
 
+EN      := en_align
+EN_HDRS := $(wildcard $(EN)/*.h)
+# en_align: the English IPA CTC aligner on the same encoder (w2v2.h) and CTC/DSP headers.
+$(BUILD)/en_align: $(EN)/en_align_main.c $(EN_HDRS) $(JA_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -I$(JA) -o $@ $< -lm
+
 # ja_align is dependency-free: only its own directory is on the include path.
 $(BUILD)/ja_align: $(JA)/ja_align_main.c $(JA_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -I$(JA) -o $@ $< -lm

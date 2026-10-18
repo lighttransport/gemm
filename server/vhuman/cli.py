@@ -387,7 +387,7 @@ def cmd_rig_speech(args) -> dict:
     svc = EyeService(Path(args.work))
     emotions = json.loads(Path(args.emotions[1:]).read_text() if args.emotions.startswith("@") else args.emotions)
     req = {"head_id": args.head, "text": args.text, "wav": args.wav, "source_take": args.source_take,
-           "speaker": args.speaker, "instruct": args.instruct, "kana": args.kana,
+           "speaker": args.speaker, "instruct": args.instruct, "kana": args.kana, "language": args.language,
            "transcript": args.transcript, "seed": args.seed,
            "ref_wav": args.ref_wav, "ref_text": args.ref_text, "xvec_only": args.xvec_only,
            "emotion_keyframes": emotions, "auto_emotion": args.auto_emotion, "speech_strength": args.speech_strength,
@@ -667,13 +667,14 @@ def main(argv=None) -> int:
     sp.add_argument("--out", required=True)
     sp.add_argument("--fps", type=float, default=30.0)
     sp.set_defaults(fn=cmd_rig_track)
-    sp = sub.add_parser("rig-speech", help="Japanese text or WAV -> synchronized facial take")
+    sp = sub.add_parser("rig-speech", help="Japanese or English text or WAV -> synchronized facial take")
     sp.add_argument("--head", required=True)
     source = sp.add_mutually_exclusive_group(required=True)
     source.add_argument("--text")
     source.add_argument("--wav")
     source.add_argument("--source-take", help="reuse a completed take's audio and alignment")
-    sp.add_argument("--speaker", default="Ono_Anna")
+    sp.add_argument("--language", choices=("ja", "en"), default="ja", help="ja: Qwen3-TTS Japanese + ja_align; en: English + en_align")
+    sp.add_argument("--speaker", default=None, help="Qwen3-TTS speaker (default Ono_Anna for ja, Ryan for en)")
     sp.add_argument("--instruct", default="")
     sp.add_argument("--kana")
     sp.add_argument("--transcript", help="reference text to store with a WAV take")

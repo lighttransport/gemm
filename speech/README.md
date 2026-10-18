@@ -271,6 +271,31 @@ speech/build/ja_align_cuda --cuda --model ja_align.safetensors --wav x.wav --out
 
 **Edge padding.** wav2vec2 CTC misses speech that begins right at the start of the buffer, and TTS output starts speaking almost immediately. `ja_align` therefore pads 0.5 s of silence on both sides (`ja_align_opts.pad`) and drops the padded frames afterwards. `align_reference.py --pad 0.5` does the same, so end-to-end comparisons stay like-for-like.
 
+## en_align — English IPA CTC aligner
+
+`speech/en_align/` aligns English speech with the Apache-2.0
+`facebook/wav2vec2-lv-60-espeak-cv-ft` model on the same encoder as ja_align
+(`w2v2.h` now also implements the lv60 "layer" feature extractor: conv bias +
+per-layer LayerNorm, and a single CTC head on the normed final output).
+
+```sh
+python speech/en_align/convert_ckpt.py --out /mnt/nvme01/models/speech/wav2vec2-lv-60-espeak-cv-ft/en_align.safetensors
+make -C speech build/en_align
+speech/build/en_align --model .../en_align.safetensors --wav in.wav   [--text "the transcript"] [--dict /mnt/nvme01/models/speech/cmudict/cmudict.dict] [--out aux.json]
+speech/build/tts_ja --language English --speaker Ryan --text "..." --align-text --out out.wav --aux aux.json
+```
+
+Free mode decodes greedily; `--text` force-aligns the pronunciation (CMUdict,
+BSD; an original letter-to-sound fallback for words it lacks) and reports word
+spans. The JSON is `en_align.v1`: the `ja_align.v1` layout with `words` in
+place of `kana` and the same 15 viseme classes, so the rig's take converter
+accepts both. On a synthesized sentence ("The quick brown fox ...", CPU, 16
+threads) the free decode was phonetically correct, forced word confidences
+were 0.36-0.98, RTF 0.3; the transformers oracle agreed on every frame's top
+class (mean |delta log p| 0.042; float32 GEMM order differs, so it is not
+bit-exact). The English encoder runs on the CPU only (no CUDA/ROCm port of the
+lv60 feature extractor yet).
+
 ## Intelligibility eval (Qwen3-TTS, Japanese)
 
 ```

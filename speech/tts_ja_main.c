@@ -36,6 +36,7 @@
 #endif
 #define JA_ALIGN_IMPLEMENTATION
 #include "ja_align.h"
+#include "en_align/en_align.h"
 #ifdef QTTS_WITH_CUDA
 #define JA_CUDA_IMPLEMENTATION
 #include "ja_cuda.h"
@@ -55,6 +56,10 @@ static double now_s(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static int cuda_encoder_cpu_fallback(void *ctx, const float *wav, int n, w2v2_output *out, const char *dump) {
+    return w2v2_run((w2v2_model *)ctx, wav, n, out, dump);
+}
+
 static int32_t *tokenize(const bpe_vocab *v, const char *fmt, const char *text, int *n) {
     size_t len = strlen(fmt) + strlen(text) + 16;
     char *s = (char *)malloc(len);
@@ -70,6 +75,11 @@ int main(int argc, char **argv) {
     const char *model = "/mnt/nvme01/models/speech/Qwen3-TTS-12Hz-1.7B-CustomVoice";
     const char *aligner = "/mnt/nvme01/models/speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors";
     const char *text = NULL, *speaker = "Ono_Anna", *instruct = "", *out_wav = "out.wav", *aux = "aux.json";
+    const char *language = "Japanese";
+    const char *aligner_en = "/mnt/nvme01/models/speech/wav2vec2-lv-60-espeak-cv-ft/en_align.safetensors";
+    en_align_opts eo; en_align_opts_default(&eo);
+    eo.dict_path = "/mnt/nvme01/models/speech/cmudict/cmudict.dict";
+    int transcript_align = 0;
     int use_cuda = 0, xvec_only = 0, device = 0;
     const char *ref_wav = NULL, *ref_text = NULL;
     qtts_gen_params gp;
@@ -85,6 +95,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--speaker") && v) { speaker = v; i++; }
         else if (!strcmp(a, "--instruct") && v) { instruct = v; i++; }
         else if (!strcmp(a, "--kana") && v) { ao.kana = v; i++; }
+        else if (!strcmp(a, "--language") && v) { language = v; i++; }
+        else if (!strcmp(a, "--aligner-en") && v) { aligner_en = v; i++; }
+        else if (!strcmp(a, "--dict") && v) { eo.dict_path = v; i++; }
+        else if (!strcmp(a, "--align-text")) transcript_align = 1;
         else if (!strcmp(a, "--seed") && v) { gp.seed = strtoull(v, NULL, 10); i++; }
         else if (!strcmp(a, "--max-frames") && v) { gp.max_frames = atoi(v); i++; }
         else if (!strcmp(a, "--fps") && v) { ao.fps = (float)atof(v); i++; }
@@ -115,9 +129,15 @@ int main(int argc, char **argv) {
     char tokdir[1024];
     snprintf(tokdir, sizeof(tokdir), "%s/speech_tokenizer", model);
     qtts_codec *codec = qtts_codec_load(tokdir);
+    /* English: the IPA CTC aligner (CPU encoder; its lv60 feature extractor has no GPU port yet),
+     * force-aligned to the synthesized text with --align-text. Japanese: ja_align as before. */
+    int english = !strcmp(language, "English") || !strcmp(language, "english") || !strcmp(language, "en");
+    en_vocab evocab;
+    if (english && en_vocab_load(&evocab, aligner_en)) return 1;
+    if (english) { eo.fps = ao.fps; if (transcript_align) eo.text = text; }
     /* CPU encoder weights are only needed when the aligner runs on the CPU */
-    w2v2_model *w2v = use_cuda ? NULL : w2v2_load(aligner);
-    if (!m || !codec || (!use_cuda && !w2v)) return 1;
+    w2v2_model *w2v = (use_cuda && !english) ? NULL : w2v2_load(english ? aligner_en : aligner);
+    if (!m || !codec || ((!use_cuda || english) && !w2v)) return 1;
     qtts_clone_state cs;
     memset(&cs, 0, sizeof(cs));
     if (ref_wav) {
@@ -140,7 +160,7 @@ int main(int argc, char **argv) {
 #endif
     double t1 = now_s();
     qtts_gen_result res;
-    if (qtts_generate(m, be, ids, n_ids, inst, n_inst, speaker, "Japanese", &gp, 0, &res, NULL, NULL)) return 1;
+    if (qtts_generate(m, be, ids, n_ids, inst, n_inst, speaker, language, &gp, 0, &res, NULL, NULL)) return 1;
     int n = 0, dec_T = 0;
     float *wav;
     int32_t *dec_codes = qtts_clone_codes(&cs, res.codes, res.n_frames, &dec_T);
@@ -156,6 +176,28 @@ int main(int argc, char **argv) {
     ja_align_result r;
     int arc;
     double t_al0 = now_s();
+    if (english) {
+        en_align_result er;
+        arc = en_align_run_ex(cuda_encoder_cpu_fallback, w2v, &evocab, wav, n, 24000, &eo, &er);
+        if (arc) { fprintf(stderr, "alignment failed\n"); return 1; }
+        en_align_write_json(&er, aux);
+        double t3 = now_s();
+        fprintf(stderr, "load %.1fs | tts %.2fs for %.2fs audio (RTF %.2f) | align %.2fs (en, %s) | %s + %s\n",
+                t1 - t0, t2 - t1, n / 24000.0, (t2 - t1) / (n / 24000.0), t3 - t_al0, er.r.forced ? "forced" : "free", out_wav, aux);
+        printf("%s\n", er.r.phoneme_text);
+        en_align_result_free(&er);
+        free(wav); free(ids); free(inst);
+        qtts_gen_result_free(&res);
+        qtts_clone_free(&cs);
+#ifdef QTTS_WITH_CUDA
+        qtts_cuda_free(gpu);
+#endif
+        w2v2_free(w2v);
+        qtts_codec_free(codec);
+        qtts_model_free(m);
+        bpe_vocab_free(vocab);
+        return 0;
+    }
 #ifdef QTTS_WITH_CUDA
     if (use_cuda) {  /* created after TTS so each runtime keeps its own current context */
         w2v2_cuda *wg = w2v2_cuda_create(aligner, device, 0);

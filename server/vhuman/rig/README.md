@@ -467,8 +467,9 @@ eye triangle budgets.
 
 ## Speech takes
 
-`rig-speech` joins the existing Japanese Qwen3-TTS + `ja_align` pipeline to
-the facial rig. Build the CPU runner with `make -C speech build/tts_ja` (or
+`rig-speech` joins the Qwen3-TTS + `ja_align` (Japanese) or `en_align`
+(English, `--language en`, default speaker Ryan, forced to the synthesized
+text; see speech/README.md) pipeline to the facial rig. Build the CPU runner with `make -C speech build/tts_ja` (or
 `make -C speech cuda` for CUDA), then use a fitted, rigged head:
 
 ```sh

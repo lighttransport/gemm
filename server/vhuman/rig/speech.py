@@ -25,6 +25,10 @@ from . import rigdef, usd
 SPEECH = ROOT / "speech"
 DEFAULT_MODEL = MODELS_ROOT / "speech/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 DEFAULT_ALIGNER = MODELS_ROOT / "speech/japanese-wav2vec2-large-hiragana-ctc/ja_align.safetensors"
+DEFAULT_ALIGNER_EN = MODELS_ROOT / "speech/wav2vec2-lv-60-espeak-cv-ft/en_align.safetensors"
+DEFAULT_DICT_EN = MODELS_ROOT / "speech/cmudict/cmudict.dict"
+LANGUAGES = {"ja": "Japanese", "en": "English"}
+DEFAULT_SPEAKERS = {"ja": "Ono_Anna", "en": "Ryan"}
 FPS = 30
 VISEMES = ("sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou")
 TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "animation.usda", "lightrig.txt",
@@ -224,8 +228,8 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
                  emotion_strength: float = .6, emotion_provider=None,
                  secondary_seed: int = 7, secondary_strength: float = 1.0) -> list[dict]:
     """Produce finite, clamped frames of every rig control at the aligner's sample times."""
-    if aux.get("format") != "ja_align.v1":
-        raise ValueError("expected ja_align.v1")
+    if aux.get("format") not in ("ja_align.v1", "en_align.v1"):
+        raise ValueError("expected ja_align.v1 or en_align.v1")
     vis = aux.get("visemes") or {}
     fps = float(vis.get("fps", 0))
     duration = float(aux.get("duration", 0))
@@ -263,7 +267,7 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
         out[index["jawOpen"]] *= .78 + .22 * energy[i]
         out[index["browInnerUp"]] += .045 * max(0.0, pitch[i]) * energy[i] * speech_strength
         phone, closure = _phone_at(aux, t, i, fps)
-        if phone in ("p", "py", "b", "by", "m", "my"):
+        if phone in ("p", "py", "b", "by", "m", "my", "pʰ", "bʰ", "mʲ", "pʲ", "bʲ"):
             # On this rig even a tiny residual jaw/press opens a visible teeth
             # slit. The rest lips already meet, so seal these at the peak.
             seal = min(1.0, closure / .7)
@@ -273,7 +277,7 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
                 out[index[side]] *= 1 - seal
             if phone in ("m", "my"):
                 out[index["tongueUp"]] *= 1 - closure
-        elif phone in ("n", "ny", "N", "t", "ty", "d", "dy"):
+        elif phone in ("n", "ny", "N", "t", "ty", "d", "dy", "l", "ɾ", "n̩", "l̩", "t̪", "d̪"):
             out[index["tongueUp"]] = max(out[index["tongueUp"]], .4 * closure * speech_strength)
         weights = _emotion_at(keys, t)
         if emotion_provider is not None:
@@ -358,6 +362,11 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
             raise ValueError(f"{key} must be at most 1000 characters")
     if request.get("ref_wav") and not allow_wav:
         raise ValueError("reference WAV paths are available only through the CLI")
+    language = request.get("language", "ja")
+    if language not in LANGUAGES:
+        raise ValueError("language must be ja or en")
+    if language == "en" and request.get("kana"):
+        raise ValueError("kana readings apply to Japanese takes only")
     seed = request.get("seed") if request.get("seed") is not None else 7
     if type(seed) is not int or not 0 <= seed < 2**64:
         raise ValueError("seed must be a nonnegative integer")
@@ -392,24 +401,41 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
             if not src.is_file():
                 raise ValueError(f"no such WAV: {src}")
             shutil.copyfile(src, stage / "audio.wav")
-            runner = SPEECH / "build" / ("ja_align" if selected == "cpu" else f"ja_align_{selected}")
-            if not runner.is_file() or not Path(aligner).is_file():
-                raise ValueError("ja_align runner or aligner weights missing; see speech/README.md")
-            cmd = [str(runner), "--model", str(aligner), "--wav", str(stage / "audio.wav"),
-                   "--fps", str(FPS), "--out", str(stage / "align.json")]
-            if request.get("kana"):
-                cmd += ["--kana", request["kana"]]
-            if selected in ("cuda", "rocm"):
-                cmd += ["--rocm" if selected == "rocm" else "--cuda", "--device", str(gpu.device_index())]
-            with gpu.device_session(1536, cancel) if selected in ("cuda", "rocm") else nullcontext():
+            if language == "en":
+                # The English IPA aligner runs on the CPU (no GPU port of its feature extractor yet).
+                runner = SPEECH / "build" / "en_align"
+                if not runner.is_file() or not Path(DEFAULT_ALIGNER_EN).is_file():
+                    raise ValueError("en_align runner or aligner weights missing; see speech/README.md")
+                cmd = [str(runner), "--model", str(DEFAULT_ALIGNER_EN), "--wav", str(stage / "audio.wav"),
+                       "--fps", str(FPS), "--out", str(stage / "align.json"), "--dict", str(DEFAULT_DICT_EN)]
+                if request.get("transcript"):
+                    cmd += ["--text", request["transcript"]]
                 _run(cmd, cancel, progress)
+            else:
+                runner = SPEECH / "build" / ("ja_align" if selected == "cpu" else f"ja_align_{selected}")
+                if not runner.is_file() or not Path(aligner).is_file():
+                    raise ValueError("ja_align runner or aligner weights missing; see speech/README.md")
+                cmd = [str(runner), "--model", str(aligner), "--wav", str(stage / "audio.wav"),
+                       "--fps", str(FPS), "--out", str(stage / "align.json")]
+                if request.get("kana"):
+                    cmd += ["--kana", request["kana"]]
+                if selected in ("cuda", "rocm"):
+                    cmd += ["--rocm" if selected == "rocm" else "--cuda", "--device", str(gpu.device_index())]
+                with gpu.device_session(1536, cancel) if selected in ("cuda", "rocm") else nullcontext():
+                    _run(cmd, cancel, progress)
         else:
             runner = SPEECH / "build" / ("tts_ja" if selected == "cpu" else f"tts_ja_{selected}")
             if not runner.is_file() or not Path(model).is_dir() or not Path(aligner).is_file():
                 raise ValueError("tts_ja runner or model weights missing; see speech/README.md")
             cmd = [str(runner), "--model", str(model), "--aligner", str(aligner), "--text", text,
                    "--backend", selected, "--device", str(gpu.device_index()), "--fps", str(FPS), "--out", str(stage / "audio.wav"),
-                   "--aux", str(stage / "align.json")]
+                   "--aux", str(stage / "align.json"), "--language", LANGUAGES[language]]
+            if language == "en":
+                if not Path(DEFAULT_ALIGNER_EN).is_file():
+                    raise ValueError("English aligner weights missing; see speech/README.md")
+                cmd += ["--aligner-en", str(DEFAULT_ALIGNER_EN), "--dict", str(DEFAULT_DICT_EN), "--align-text"]
+            if request.get("speaker") is None:
+                cmd += ["--speaker", DEFAULT_SPEAKERS[language]]
             for arg, key in (("--speaker", "speaker"), ("--instruct", "instruct"), ("--kana", "kana"),
                              ("--ref-wav", "ref_wav"), ("--ref-text", "ref_text")):
                 if request.get(key) is not None:

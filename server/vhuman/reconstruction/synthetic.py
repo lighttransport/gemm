@@ -175,7 +175,11 @@ def head_inputs(out, seed: int = 1, *, strength: float = 1.0, identity=None, ton
     beta = np.asarray(identity, np.float64) if identity is not None else sample_identity(seed, strength, dim=model.identity_dim)
     vertices, joints = evaluate(model, beta)
     all_tris = model.data["triangles"]
-    skin = model.group("skin")[all_tris].all(1)                       # exterior skin + mouth lining
+    # The exterior skin with its eye-socket lining (the head fit casts rays through the
+    # portrait's eyes and needs a surface there) but without the mouth cavity, which would
+    # attract the template registration's correspondences.
+    outer = model.group("skin_exterior") | model.group("eye_sockets") | model.group("eye_interiors")
+    skin = outer[all_tris].all(1)
     eyeballs = (model.group("left_eye") | model.group("right_eye"))[all_tris].all(1)
     tris = all_tris[skin]
     uvs = model.data["triangle_uvs"][skin].astype(np.float64)
@@ -217,7 +221,7 @@ def head_inputs(out, seed: int = 1, *, strength: float = 1.0, identity=None, ton
               "license": "no image licence: procedural identity and appearance",
               "limitations": ["procedural skin tone, pores and lips only: no hair, brows or lashes in the texture",
                               "the portrait is a software render used by the head fit, not a photograph",
-                              "the GLB carries the skin and mouth lining; the eyes are rendered into the portrait and refitted analytically"]}
+                              "the GLB carries the outer skin only; the eyes are rendered into the portrait and refitted analytically"]}
     (out / "synthetic.json").write_text(json.dumps(record, indent=1))
     return record
 

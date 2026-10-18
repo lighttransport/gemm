@@ -46,3 +46,11 @@ black-box validation oracles, their source was not consulted):
 * Windowed-sinc resampler, RIFF/WAVE I/O, FFT.
 * Japanese kana -> phoneme and phoneme -> viseme tables, written from Japanese
   phonology (label strings follow the Apache-2.0 model vocabulary).
+* English (speech/en_align): IPA token -> viseme classes, ARPAbet -> IPA mapping and
+  an original letter-to-sound fallback for out-of-dictionary words. The model is
+  facebook/wav2vec2-lv-60-espeak-cv-ft (Apache-2.0; its espeak-style IPA label
+  strings are the model vocabulary, loaded at run time). Pronunciations come from
+  the CMU Pronouncing Dictionary (cmusphinx/cmudict, BSD-style licence; downloaded
+  separately, never bundled). espeak-ng (GPL) and g2p libraries are not used.
+  Numerical check: speech/ref/en_align_reference.py (HF transformers, Apache-2.0,
+  as a black-box oracle).

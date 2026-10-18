@@ -1319,12 +1319,13 @@ breathing, head micro-motion) under the head sliders and the pose sweep.
 `mobile.browser_verify` detects the runtime and checks loading, pose and camera
 changes, the sweep and the frame rate (`verification.json`, screenshots).
 
-Measured on 2026-10-19 with a procedural-template rig of head 291dfa911553
-(RX 9070 XT, ANGLE/Vulkan, 720x1280 cap): see the figures recorded in
-`tmp/morph-demo/verify2/verification.json` after the build; the GNM-transfer
-rig of the same Pixal3D head (46,320 triangles, two analytic eyes) ran at
-29.8 FPS steady and 30.2 FPS animated at the 30 FPS cap with 0.7 ms of rig and
-motion-layer evaluation per frame. Live speech in this runtime still needs the
+Measured on 2026-10-19 (RX 9070 XT, ANGLE/Vulkan, 720x1280 cap): the
+procedural-template rig of head 291dfa911553 (48,014 triangles, two analytic
+eyes, ML corrective) ran at 30.1 FPS steady and 30.0 FPS animated at the
+30 FPS cap with 0.7 ms of rig and motion-layer evaluation per frame; the
+GNM-transfer rig of the same Pixal3D head (46,320 triangles) measured the
+same rates. These are desktop figures under the mobile frame cap, not device
+measurements. Live speech in this runtime still needs the
 semantic control stream (the native stream carries GNM coefficients); mouth
 occlusion and the contact deformer are not applied here yet. No device was
 measured.
