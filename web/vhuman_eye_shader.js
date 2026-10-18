@@ -90,12 +90,10 @@ void main() {
   gl_FragColor = uRaw > 0.5 ? vec4(c, 1.0) : vec4(toSRGB(neutral(c * uExposure)), 1.0);
 }`;
 
-// The eye: a ray tracer in the eye frame, line by line the math of
-// server/vhuman/eye/render.py shade() (+ iris.colorize / sclera.colorize).
-export const EYE_FRAG = /* glsl */`
-precision highp float;
-precision highp int;
-${COMMON_GLSL}
+// The eye shading, shared by the proxy ray tracer below and the runtime mesh
+// material (web/vhuman_eye_mesh_shader.js): line by line the math of
+// server/vhuman/eye/render.py shade_points() (+ iris.colorize / sclera.colorize).
+export const EYE_SHADE_GLSL = /* glsl */`
 uniform sampler2D uIrisMasks;
 uniform sampler2D uIrisNormal;
 uniform sampler2D uScleraMasks;
@@ -116,7 +114,7 @@ uniform vec3 uLimbusColor;
 uniform float uScleraRot, uTransSpread, uVascInt, uVascCov;
 uniform vec3 uScleraTint;
 uniform vec3 uTransColor;
-uniform float uCorneaRough, uScleraRough;
+uniform float uCorneaRough, uScleraRough, uCaustic, uCausticSharp;
 // The eye frame (metres, +Z gaze) and the world; uProj for the depth write.
 uniform mat4 uEyeFromWorld;
 uniform mat4 uWorldFromEye;
@@ -126,6 +124,8 @@ uniform mat4 uProj;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const vec3 ANGLE_COLOR = vec3(0.035, 0.028, 0.026);
 const vec3 SCLERA_ALBEDO = vec3(0.74, 0.70, 0.66);
+const float SCLERA_SOFTNESS = 0.25;      // optics.SCLERA_SOFTNESS
+const float CAUSTIC_RADIAL = 0.6;        // optics.CAUSTIC_RADIAL
 float sphereEntry(vec3 o, vec3 d, vec3 c, float r) {
   vec3 oc = o - c;
   float b = dot(oc, d);
@@ -188,22 +188,40 @@ vec3 customIris(vec4 m, vec3 photo) {
 float irisIrradiance(vec3 iN, vec3 L) {
   return clamp(dot(iN, L), 0.0, 1.0);
 }
+// optics.soft_wrap: wrapped diffuse with a smooth-max terminator (scattering stand-in)
+float softWrap(float ndl, float wrap) {
+  float a = (ndl + wrap) / (1.0 + wrap);
+  float s = 0.02 + SCLERA_SOFTNESS * wrap;
+  return 0.5 * (a + sqrt(a * a + s * s));
+}
+// optics.caustic_normal / optics.caustic: corneal focusing on the far side of the iris
+vec3 causticNormal(vec3 n, float irisMask, float tIris) {
+  float k = irisMask * clamp(1.0 - CAUSTIC_RADIAL * tIris, 0.0, 1.0);
+  return normalize(vec3(0.0, 0.0, 1.0) * (1.0 - k) - n * k);
+}
+float caustic(vec3 cN, vec3 iN, vec3 L) {
+  float ndl = clamp(dot(iN, L), 0.0, 1.0), cdl = clamp(dot(cN, L), 0.0, 1.0);
+  return uCaustic * pow(cdl, 1.0 + uCausticSharp * (1.0 - 0.7 * ndl));
+}
 // Lights and environment are fixed in the world (render.py's convention).
 vec3 lightEye(int k) { return normalize(mat3(uEyeFromWorld) * uBoxDir[k]); }
 float lightE(int k) { return uBoxRad[k] * 4.0 * uBoxSize[k].x * uBoxSize[k].y; }
 vec3 envEye(vec3 d, float r) { return environment(mat3(uWorldFromEye) * d, r); }
 vec3 ambEye(vec3 n) { return ambient(normalize(mat3(uWorldFromEye) * n)); }
 
-void main() {
-  vec3 ro = (uEyeFromWorld * vec4(viewRayOrigin(), 1.0)).xyz;
-  vec3 rd = normalize(mat3(uEyeFromWorld) * viewRayDir());
-  float ts = sphereEntry(ro, rd, vec3(0.0), uScleraR);
-  float tc = sphereEntry(ro, rd, vec3(0.0, 0.0, uCorneaZ), uCorneaR);
+// render.project_to_surface: mesh facets lie inside the analytic surface;
+// re-intersect the spheres along the view ray through the facet point.
+vec3 projectToSurface(vec3 x, vec3 rd, out bool hit) {
+  vec3 o = x - rd * 0.004;
+  float ts = sphereEntry(o, rd, vec3(0.0), uScleraR);
+  float tc = sphereEntry(o, rd, vec3(0.0, 0.0, uCorneaZ), uCorneaR);
   float t = min(ts, tc);
-  bool hit = t < 1e19;
-  if (!hit) t = max(-dot(ro, rd), 0.0);     // keep everything finite for the derivatives; discarded below
-  bool onC = hit && tc <= ts;
-  vec3 x = ro + t * rd;
+  hit = t < 1e19;
+  return hit ? o + t * rd : x;
+}
+
+// Linear radiance at the eye-space surface point x seen along rd (unit).
+vec3 shadeEye(vec3 x, vec3 rd, bool onC) {
   vec3 n = onC ? normalize(x - vec3(0.0, 0.0, uCorneaZ)) : normalize(x);
   float ndv = clamp(dot(n, -rd), 1e-4, 1.0);
   vec3 dir = normalize(x);
@@ -226,7 +244,7 @@ void main() {
   vec3 diffS = vec3(0.0);
   for (int k = 0; k < 2; k++) {
     float ndl = dot(nS, lightEye(k));
-    diffS += lightE(k) * max((ndl + wrap) / (1.0 + wrap), 0.0) / PI;
+    diffS += lightE(k) * softWrap(ndl, wrap) / PI;
   }
   diffS += ambEye(nS);
   vec3 colS = albS * diffS;
@@ -271,14 +289,38 @@ void main() {
   vec3 nm = textureGrad(uIrisNormal, iuv, gx, gy).xyz * 2.0 - 1.0;
   float cr = cos(rotA), sr = sin(rotA);
   vec3 irisN = normalize(vec3((nm.x * cr - nm.y * sr) * 0.6, (nm.x * sr + nm.y * cr) * 0.6, nm.z));
+  vec3 cN = causticNormal(n, corneaMask(tc1 * uCSize), tI);
   vec3 diffI = vec3(0.0);
-  for (int k = 0; k < 2; k++) diffI += lightE(k) * irisIrradiance(irisN, lightEye(k)) / PI;
+  for (int k = 0; k < 2; k++) {
+    vec3 L = lightEye(k);
+    diffI += lightE(k) * (irisIrradiance(irisN, L) + caustic(cN, irisN, L)) / PI;
+  }
   diffI += ambEye(irisN) * (1.0 - 0.5 * (1.0 - mI.g) * uShadow);
   vec3 colI = albI * diffI * (1.0 - fresnel(clamp(dot(-td, n), 0.0, 1.0)));
 
   vec3 refl = reflect(rd, n);
   vec3 env = envEye(refl, uCorneaRough) * cw + envEye(refl, uScleraRough) * (1.0 - cw);
-  vec3 col = (colI * cw + colS * (1.0 - cw)) * (1.0 - fres) + fres * env;
+  return (colI * cw + colS * (1.0 - cw)) * (1.0 - fres) + fres * env;
+}
+`;
+
+// The proxy eye: a ray tracer in the eye frame (render.py shade()).
+export const EYE_FRAG = /* glsl */`
+precision highp float;
+precision highp int;
+${COMMON_GLSL}
+${EYE_SHADE_GLSL}
+void main() {
+  vec3 ro = (uEyeFromWorld * vec4(viewRayOrigin(), 1.0)).xyz;
+  vec3 rd = normalize(mat3(uEyeFromWorld) * viewRayDir());
+  float ts = sphereEntry(ro, rd, vec3(0.0), uScleraR);
+  float tc = sphereEntry(ro, rd, vec3(0.0, 0.0, uCorneaZ), uCorneaR);
+  float t = min(ts, tc);
+  bool hit = t < 1e19;
+  if (!hit) t = max(-dot(ro, rd), 0.0);     // keep everything finite for the derivatives; discarded below
+  bool onC = hit && tc <= ts;
+  vec3 x = ro + t * rd;
+  vec3 col = shadeEye(x, rd, onC);
   if (!hit) discard;
   // the depth of the surface hit, not of the proxy: lids and eyeshells in front occlude it
   vec4 clip = uProj * viewMatrix * (uWorldFromEye * vec4(x, 1.0));
@@ -332,9 +374,9 @@ const SCALARS = ['uScleraR', 'uLimbusR', 'uCorneaR', 'uCorneaZ', 'uApexZ', 'uAlp
                  'uIor', 'uPupil', 'uPupilScale', 'uPRef', 'uTexScale', 'uCSizeRef', 'uBackUv', 'uF0', 'uChamber', 'uBlend',
                  'uBlendSoft', 'uRadial', 'uShadow', 'uRingSize', 'uRingSoft', 'uSat', 'uFeather', 'uIrisRot', 'uPhotoMix',
                  'uCSize', 'uLimbusSoft', 'uScleraRot', 'uTransSpread', 'uVascInt', 'uVascCov', 'uCorneaRough',
-                 'uScleraRough'];
+                 'uScleraRough', 'uCaustic', 'uCausticSharp'];
 
-export function makeEyeMaterial(studio) {
+export function makeEyeUniforms(studio) {
   const u = Object.assign({}, studio, {
     uIrisMasks: { value: BLANK }, uIrisNormal: { value: BLANK }, uScleraMasks: { value: BLANK }, uScleraNormal: { value: BLANK },
     uChart: { value: BLANK }, uIrisPhoto: { value: BLANK }, uHasPhoto: { value: 0 }, uIrisTexSize: { value: 1024 },
@@ -345,7 +387,11 @@ export function makeEyeMaterial(studio) {
     uEyeFromWorld: { value: new THREE.Matrix4() }, uWorldFromEye: { value: new THREE.Matrix4() }, uProj: { value: new THREE.Matrix4() },
   });
   for (const k of SCALARS) u[k] = { value: 0 };
-  return new THREE.ShaderMaterial({ uniforms: u, vertexShader: VERT, fragmentShader: EYE_FRAG,
+  return u;
+}
+
+export function makeEyeMaterial(studio) {
+  return new THREE.ShaderMaterial({ uniforms: makeEyeUniforms(studio), vertexShader: VERT, fragmentShader: EYE_FRAG,
                                     side: THREE.BackSide });
 }
 
@@ -402,6 +448,7 @@ export function applyEyeParams(material, p, g) {
   u.uTransSpread.value = p.sclera.transmission_spread; u.uTransColor.value.set(...p.sclera.transmission_color);
   u.uVascInt.value = p.sclera.vascularity_intensity; u.uVascCov.value = p.sclera.vascularity_coverage;
   u.uCorneaRough.value = o.cornea_roughness; u.uScleraRough.value = o.sclera_roughness;
+  u.uCaustic.value = o.caustic_strength; u.uCausticSharp.value = o.caustic_sharpness;
   return { pupilRatio: u.uPupil.value, pupilScale: u.uPupilScale.value };
 }
 

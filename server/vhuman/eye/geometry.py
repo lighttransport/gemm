@@ -48,8 +48,38 @@ def shell_alphas(profile: optics.Profile, rings: int) -> np.ndarray:
     return np.concatenate([near, back])
 
 
-def shell(profile: optics.Profile = optics.ANATOMICAL, rings: int = 120, segments: int = 160) -> Mesh:
-    alphas = shell_alphas(profile, rings)
+def runtime_alphas(profile: optics.Profile, rings: int) -> np.ndarray:
+    """Ring angles for a low-polygon eyeball: dense over the cornea, moderate
+    over the visible sclera (to 80 degrees), coarse inside the socket."""
+    a_l = profile.alpha_limbus
+    front = max(int(round(rings * 0.4)), 3)
+    mid = max(int(round(rings * 0.35)), 3)
+    back = max(rings - front - mid - 1, 1)
+    near = np.linspace(0.0, 1.35 * a_l, front + 1)[1:]
+    visible = np.linspace(1.35 * a_l, math.radians(80.0), mid + 1)[1:]
+    # The equator ring carries the frontal silhouette; the rest sits in the socket.
+    hidden = np.linspace(math.pi / 2, math.pi, back + 2)[1:-1]
+    return np.concatenate([near, visible, [math.pi / 2], hidden])
+
+
+def runtime_shell(profile: optics.Profile = optics.ANATOMICAL, rings: int = 16, segments: int = 36) -> Mesh:
+    """The real-time eyeball (about 1.2k triangles): one welded shell whose
+    material shades cornea and sclera analytically from the surface position."""
+    return shell(profile, rings, segments, alphas=runtime_alphas(profile, rings), name="eyeball_runtime")
+
+
+def runtime_iris(p: dict, profile: optics.Profile | None = None, rings: int = 2, segments: int = 36) -> Mesh:
+    """The iris disk for standard-material viewers of the runtime eye."""
+    return iris_disk(p, profile, rings=rings, segments=segments, wall_rings=1)
+
+
+def triangle_budget(meshes) -> int:
+    return int(sum(len(m.indices) for m in meshes))
+
+
+def shell(profile: optics.Profile = optics.ANATOMICAL, rings: int = 120, segments: int = 160, *,
+          alphas: np.ndarray | None = None, name: str = "eyeball_shell") -> Mesh:
+    alphas = shell_alphas(profile, rings) if alphas is None else np.asarray(alphas, np.float64)
     phis = np.linspace(0.0, 2 * math.pi, segments, endpoint=False)
     a, f = np.meshgrid(alphas, phis, indexing="ij")
     dirs = np.stack([np.sin(a) * np.cos(f), np.sin(a) * np.sin(f), np.cos(a)], -1).reshape(-1, 3)
@@ -72,12 +102,12 @@ def shell(profile: optics.Profile = optics.ANATOMICAL, rings: int = 120, segment
     last_ring = first + (n_ring - 1) * segments
     pole_fan = np.stack([np.full(segments, last), last_ring + (s + 1) % segments, last_ring + s], -1)
     indices = np.concatenate([apex_fan, _grid_indices(n_ring, segments, first), pole_fan]).astype(np.uint32)
-    return Mesh("eyeball_shell", positions.astype(np.float32), normals.astype(np.float32),
+    return Mesh(name, positions.astype(np.float32), normals.astype(np.float32),
                 uvs.astype(np.float32), indices).with_tangents()
 
 
 def iris_disk(p: dict, profile: optics.Profile | None = None, rings: int = 64,
-              segments: int = 160) -> Mesh:
+              segments: int = 160, *, wall_rings: int = 4) -> Mesh:
     """The iris at the iris plane (radius = limbus), plus the dark wall up
     towards the limbus plane. UVs are the iris texture layout."""
     p = P.validate(p)
@@ -88,7 +118,7 @@ def iris_disk(p: dict, profile: optics.Profile | None = None, rings: int = 64,
     phis = np.linspace(0.0, 2 * math.pi, segments, endpoint=False)
     radii = np.linspace(0.0, r_l, rings + 1)[1:]
     wall_top = min(profile.z_limbus - 0.0002, z_iris + 0.0015)
-    wall = np.linspace(z_iris, wall_top, 5)[1:]
+    wall = np.linspace(z_iris, wall_top, wall_rings + 1)[1:]
     rr, ff = np.meshgrid(radii, phis, indexing="ij")
     z_disk = z_iris + o["iris_convexity"] * (1.0 - rr / r_l)
     disk = np.stack([rr * np.cos(ff), rr * np.sin(ff), z_disk], -1).reshape(-1, 3)

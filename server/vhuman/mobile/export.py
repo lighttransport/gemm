@@ -54,13 +54,16 @@ def validate_package(folder):
     return manifest
 
 
-def export(candidate,out, *, scene,profile='iphone12'):
+def export(candidate,out, *, scene,profile='iphone12',eye_lod='runtime'):
     if profile!='iphone12':raise ValueError('unsupported mobile profile')
     candidate,out,scene=map(lambda p:Path(p).resolve(),(candidate,out,scene))
     manifest=validate_candidate(candidate);description=json.loads((scene/'scene.json').read_text())
     if validate_candidate(description['candidate'])['geometry_sha256']!=manifest['geometry_sha256']:
         raise ValueError('prepared scene belongs to different geometry')
     if out.exists() and any(out.iterdir()):raise ValueError('mobile output must be empty')
+    if eye_lod not in ('runtime','offline'):raise ValueError('eye_lod must be runtime or offline')
+    if eye_lod=='runtime' and not description.get('runtime_parts'):
+        raise ValueError('prepared scene has no runtime eye parts; re-run offline preparation or pass eye_lod=offline')
     with np.load(candidate/'geometry.npz',allow_pickle=False) as z:g={k:z[k] for k in z.files}
     with np.load(scene/'scene_assets.npz',allow_pickle=False) as z:assets={k:z[k] for k in z.files}
     # A scene path alone is not sufficient provenance: inspect native positions.
@@ -101,9 +104,17 @@ def export(candidate,out, *, scene,profile='iphone12'):
             pbr['roughnessFactor']=.025;pbr['baseColorFactor']=[1,1,1,1]
             m['extensions']={'KHR_materials_ior':{'ior':1.376 if kind=='cornea' else (1.336 if kind=='tear' else 1.5)},
                 'KHR_materials_transmission':{'transmissionFactor':1.}}
+        elif kind=='eyeshell':
+            # Head-bound lid-contact shadow cap: unlit black, alpha = the vertex U coordinate.
+            ramp=np.zeros((1,256,4),np.uint8);ramp[0,:,3]=np.arange(256)
+            pbr['baseColorFactor']=[0,0,0,1];pbr['baseColorTexture']={'index':b.texture(ramp,'eyeshell_alpha_ramp')}
+            m['alphaMode']='BLEND';m['extensions']={'KHR_materials_unlit':{}}
         if kind=='hair':m['doubleSided']=True;pbr['roughnessFactor']=.65
         materials[kind]=b.material(m);return materials[kind]
-    parts=list(description['parts']);full=g['full_captured'][0]
+    # Real-time eyes replace the dense Blender optics unless the offline LOD is requested.
+    if eye_lod=='runtime':parts=[p for p in description['parts'] if not p.get('optical')]+list(description['runtime_parts'])
+    else:parts=list(description['parts'])
+    full=g['full_captured'][0]
     curves=assets['hair_curves'];v,t,uv,selected=hair_cards(curves,width=.0002 if description['hair']['short_hair'] else .0005)
     if len(selected):
         name='mobile_hair';parts.append(dict(name=name,material='hair',native=False,joint=None,surface_bound=True))
@@ -151,6 +162,12 @@ def export(candidate,out, *, scene,profile='iphone12'):
             rotation_center_offset=center.tolist()))
         triangles+=len(tri)
     if triangles>IPHONE12['triangle_budgets'][0]:raise ValueError(f'mobile mesh exceeds triangle budget: {triangles}')
+    eye_triangles={}
+    if eye_lod=='runtime':
+        from ..reconstruction.offline_assets import RUNTIME_EYE_TRIANGLES
+        for side in ('left','right'):
+            eye_triangles[side]=sum(r['triangles'] for r in records if r['name'].startswith(side+'_runtime_'))
+            if eye_triangles[side]>RUNTIME_EYE_TRIANGLES:raise ValueError(f'{side} runtime eye exceeds its triangle budget: {eye_triangles[side]}')
     b.write(out/'avatar.glb');np.savez_compressed(out/'bindings.npz',**bindings)
     with (out/'streams.bin').open('wb') as f:
         f.write(struct.pack('<8sI',b'VHMES001',len(streams)))
@@ -172,11 +189,18 @@ def export(candidate,out, *, scene,profile='iphone12'):
         reference=g['gnm_expressions'][0].tolist(),range=[-3,3],rotations='four native axis-angle joints in radians',
         speech_mapping='requires geometry-matched semantic-to-native mapping; PCA names are not visemes')
     (out/'controls.json').write_text(json.dumps(controls,indent=2))
+    if (scene/'eye_params.json').is_file():
+        # The analytic eye material's inputs (live textures + uniforms), for runtimes without the server.
+        from ..eye import assets as eye_assets
+        eye_params=json.loads((scene/'eye_params.json').read_text())
+        eye_assets.write_live(eye_params,out/'eye',res=1024)
+        (out/'eye'/'params.json').write_text(json.dumps(eye_params,indent=1))
     if (scene/'skin_detail.npz').is_file():
         shutil.copyfile(scene/'skin_detail.npz',out/'skin_detail.npz')
         shutil.copyfile(scene/'skin_detail.json',out/'skin_detail.json')
     result=dict(schema='vhuman.mobile_avatar.v1',profile=IPHONE12,source_geometry_sha256=manifest['geometry_sha256'],
         source_portrait_sha256=manifest['portrait_sha256'],native=native,parts=records,triangles=triangles,
+        eyes=dict(lod=eye_lod,triangles=eye_triangles,material='standard glTF reference; the analytic mesh eye material uses eye/'),
         camera=description['camera'],material=manifest['material'],licenses=[dict(component='GNM v3',license='Apache-2.0',
         source='https://huggingface.co/google/gnm-v3')],texture_encoding='embedded PNG reference',
         validation=dict(device_measured=False,production_ready=False),
@@ -235,6 +259,7 @@ def export(candidate,out, *, scene,profile='iphone12'):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--candidate',required=True)
     p.add_argument('--scene',required=True);p.add_argument('--out',required=True);p.add_argument('--profile',default='iphone12',choices=['iphone12'])
+    p.add_argument('--eye-lod',dest='eye_lod',default='runtime',choices=['runtime','offline'],help='runtime: ~1.4k-triangle eyes + occlusion caps (default); offline: the dense Blender optics')
     a=p.parse_args();r=export(**vars(a));print(json.dumps(dict(out=a.out,triangles=r['triangles'],validation=r['validation']),indent=2))
 
 

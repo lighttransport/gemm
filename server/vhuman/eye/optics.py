@@ -154,8 +154,37 @@ def circ_mask(length, size, center, soft):
 
 
 def iris_irradiance(iris_n, light):
-    """Lambertian iris irradiance; no fitted caustic enhancement."""
+    """Lambertian iris irradiance (the caustic lobe is added separately)."""
     return np.clip(np.sum(iris_n * light, -1), 0.0, 1.0)
+
+
+SCLERA_SOFTNESS = 0.25       # terminator softening of the wrapped sclera diffuse, per unit wrap
+CAUSTIC_RADIAL = 0.6         # how fast the caustic normal relaxes to the iris plane towards the limbus
+
+
+def soft_wrap(ndl, wrap):
+    """Wrapped diffuse with a smooth-max terminator: a closed-form stand-in
+    for pre-integrated scattering (identical in GLSL, no lookup texture)."""
+    a = (np.asarray(ndl, np.float64) + wrap) / (1.0 + wrap)
+    s = 0.02 + SCLERA_SOFTNESS * np.asarray(wrap, np.float64)
+    return 0.5 * (a + np.sqrt(a * a + s * s))
+
+
+def caustic_normal(surface_n, iris_mask, t_iris):
+    """Original approximation of corneal focusing: the iris plane normal
+    tilted towards the reversed cornea normal, most at the pupil, so light
+    gathers on the far side of the iris."""
+    k = (np.asarray(iris_mask, np.float64) * np.clip(1.0 - CAUSTIC_RADIAL * np.asarray(t_iris, np.float64), 0.0, 1.0))[..., None]
+    plane = np.array([0.0, 0.0, 1.0])
+    return normalize(plane * (1.0 - k) - surface_n * k)
+
+
+def caustic(caustic_n, iris_n, light, strength, sharpness):
+    """Focused-light lobe: sharp at grazing iris incidence, broad facing the light."""
+    ndl = np.clip(np.sum(iris_n * light, -1), 0.0, 1.0)
+    cdl = np.clip(np.sum(caustic_n * light, -1), 0.0, 1.0)
+    exponent = 1.0 + sharpness * (1.0 - 0.7 * ndl)
+    return strength * np.power(cdl, exponent)
 
 
 # ---- studio environment (identical in GLSL) ------------------------------------
@@ -256,7 +285,7 @@ def uniforms(p: dict, profile: Profile | None = None) -> dict:
         "corneaRadius": profile.cornea_radius, "corneaCenterZ": profile.cornea_center_z,
         "apexZ": profile.apex_z, "zLimbus": profile.z_limbus, "alphaLimbus": profile.alpha_limbus,
         "irisZ": profile.iris_z(o["chamber_depth"]), "irisRadius": iris_radius(p, profile),
-        "irisConvexity": o["iris_convexity"], "ior": o["ior"],
+        "irisConvexity": o["iris_convexity"], "ior": o["ior"], "limbusBlend": profile.limbus_blend,
         "pupilRatio": P.pupil_ratio(p), "pupilScale": P.pupil_scale(p), "pRef": P.P_REF,
         "irisTexScale": IRIS_TEX_SCALE,
         "corneaSizeRef": CORNEA_SIZE_REF, "backUvRadius": BACK_UV_RADIUS, "f0": ((o["ior"] - 1) / (o["ior"] + 1)) ** 2,

@@ -23,9 +23,9 @@ TINT = (0.0, 0.0, 0.0)
 TEX = 256
 
 
-def shell_mesh(rings: int = 40, segments: int = 96) -> Mesh:
+def shell_mesh(rings: int = 40, segments: int = 96, profile: optics.Profile | None = None) -> Mesh:
     """The cap (eye-local metres, +Z gaze): the eye's outer surface, offset out."""
-    prof = optics.ANATOMICAL
+    prof = profile or optics.ANATOMICAL
     alphas = np.linspace(0.0, math.radians(CAP_DEG), rings + 1)[1:]
     phis = np.linspace(0.0, 2 * math.pi, segments, endpoint=False)
     a, f = np.meshgrid(alphas, phis, indexing="ij")
@@ -82,3 +82,31 @@ def build(eye, pose, cam) -> tuple[Mesh, np.ndarray, dict]:
     info = {"fissure_height_px": round(height, 2), "box_px": round(2 * half, 2),
             "strength": STRENGTH, "tint_linear": list(TINT), "blur": dict(BLUR)}
     return mesh, (np.clip(rgba, 0, 1) * 255 + 0.5).astype(np.uint8), info
+
+
+def polygon_inside_distance(points_xy: np.ndarray, polygon_xy: np.ndarray) -> np.ndarray:
+    """Distance from a closed polygon's boundary, positive inside (even-odd)."""
+    a = np.asarray(polygon_xy, np.float64)
+    b = np.roll(a, -1, axis=0)
+    ab = b - a
+    ap = np.asarray(points_xy, np.float64)[:, None, :] - a[None]
+    t = np.clip((ap * ab[None]).sum(-1) / np.maximum((ab * ab).sum(1), 1e-18)[None], 0.0, 1.0)
+    d = np.linalg.norm(ap - t[..., None] * ab[None], axis=-1).min(1)
+    x, y = points_xy[:, 0:1], points_xy[:, 1:2]
+    crosses = (a[None, :, 1] > y) != (b[None, :, 1] > y)
+    dy = np.where(np.abs(ab[:, 1]) < 1e-18, 1e-18, ab[:, 1])
+    xi = a[None, :, 0] + (y - a[None, :, 1]) * (ab[:, 0] / dy)[None]
+    inside = (crosses & (x < xi)).sum(1) % 2 == 1
+    return np.where(inside, d, -d)
+
+
+def cap_occlusion(points_xy: np.ndarray, polygon_xy: np.ndarray, medial_sign: float) -> np.ndarray:
+    """Per-vertex lid-contact shadow alpha for a cap whose vertices and the
+    fissure polygon are given in the eye's frontal plane (metres, +Y up).
+    The same Gaussian falloff and directional widths as the portrait path."""
+    c = polygon_xy.mean(0)
+    height = float(np.ptp(polygon_xy[:, 1]))
+    theta = np.arctan2(-(points_xy[:, 1] - c[1]), points_xy[:, 0] - c[0])     # image convention: up = -y
+    width = _blur_width(theta, medial_sign, max(height, 1e-6))
+    inside = polygon_inside_distance(points_xy, polygon_xy)
+    return np.exp(-2.0 * (np.maximum(inside, 0.0) / width) ** 2) * STRENGTH

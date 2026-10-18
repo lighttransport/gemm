@@ -655,14 +655,18 @@ an opaque iris plane behind it. The limbus determines the spheres' intersection.
 Defaults are **synthetic demonstration choices**, not a clinical specification
 or measurements of a licensed character:
 
-| Input | Default | Unit |
+| Input | Default (`gnm_v3` profile) | Unit |
 | --- | --- | --- |
-| Sclera radius | 0.012 | metres |
+| Sclera radius | 0.0146 | metres |
 | Limbus radius | 0.006 | metres |
-| Cornea curvature radius | 0.008 | metres |
+| Cornea curvature radius | 0.0085 | metres |
 | Junction blend width | 0.0005 | metres |
 | Chamber depth | 0.0035 | metres |
 | Refractive index | 1.336 | dimensionless |
+| Caustic strength / sharpness | 0.3 / 12 | dimensionless |
+
+Saved parameter files without a profile tag keep the earlier 0.012 / 0.008 m
+`legacy_v1` radii.
 
 Users or an LLM may choose different inputs through the same validated JSON
 schema. Non-finite inputs and impossible radius combinations are rejected.
@@ -699,15 +703,57 @@ establish redistribution rights for arbitrary user-provided values or images.
   measured UV table is imported, embedded or reconstructed.
 - Geometry uses sphere intersections and a smooth union. Refraction uses
   Snell's law; reflection uses Schlick's approximation with F0 derived from
-  the selected refractive index. Iris diffuse lighting is Lambertian.
+  the selected refractive index. Iris diffuse lighting is Lambertian plus an
+  original caustic lobe: the iris-plane normal tilted towards the reversed
+  cornea normal (most at the pupil) gathers focused light on the far side of
+  the iris, sharp at grazing iris incidence (`optics.caustic_strength`,
+  `optics.caustic_sharpness`; 0 disables it).
 - Iris appearance uses original spectral-noise fibres, crypts, spots and
   furrows, two-colour blending, neutral occlusion, a soft pupil and an outer
-  ring. There is no fitted caustic term or external material-graph replica.
+  ring. No external material graph is replicated.
 - Sclera vessels are original branching random walks. Synthetic optical
-  density produces their colour. Lid occlusion is a Gaussian falloff from
-  the portrait's eye opening; wet margins are original ribbon meshes.
+  density produces their colour; the wrapped sclera diffuse uses a closed-form
+  smooth-max terminator as a scattering stand-in (`optics.soft_wrap`). Lid
+  occlusion is a Gaussian falloff from the eye opening (a texture on the
+  portrait path, per-vertex alpha on the GNM path's head-bound cap); wet
+  margins are original ribbon meshes.
 - The CPU and GLSL implement the same mapping, pupil warp and albedo equations.
   The portable glTF eye bakes albedo and uses standard transmission materials.
+
+### Runtime mesh eye
+
+The ray-traced proxy (`web/vhuman_eye_shader.js`, `gl_FragDepth`) remains the
+editor's ground truth. Real-time runtimes use the same material on a welded
+**1,152-triangle shell** (`eye/geometry.py:runtime_shell`: dense cornea rings,
+moderate visible-sclera rings, an equator ring for the silhouette, coarse
+rings inside the socket) plus a 180-triangle iris disk and a 24-triangle pupil
+cup for standard-material viewers, about 1.4k triangles per eye instead of
+the 19k dense optics. `web/vhuman_eye_mesh_shader.js` shares `EYE_SHADE_GLSL`
+with the proxy: each fragment re-intersects the analytic spheres along its
+view ray (`render.project_to_surface`) and shades the exact surface point with
+analytic normals, so facet positions do not affect shading; depth is the
+standard rasterised depth, so lids, lashes and the occlusion cap composite
+without a depth write and the material ports to Filament and USD previews.
+
+Parity (`test_eye_mesh.py`, 384 px CPU camera, three gazes): the mesh render
+(`render.render_mesh`) matches `render.render` to 0.05/255 or better where
+both cover; coverage differs on at most 1.3% of the eye's pixels (the 36-gon
+silhouette). In the browser (`/eye` "Runtime mesh eye", SwiftShader), the mesh
+eye against the CPU tracer measured mean 0.36/255 and iris 0.70/255; the proxy
+measured 0.31/255 and 0.70/255 (`test_browser.py` gates 1.5 / 2.5).
+
+On the GNM path, `reconstruction/offline_assets.py:prepare` writes both the
+dense Blender optics (`parts`, tagged `optical`) and `runtime_parts` per eye:
+the runtime shell, iris disk, pupil cup (eye joint) and an **eyeshell cap**
+bound to the head joint whose U coordinate carries the lid-contact shadow alpha
+from the fissure polygon (`head/eyeshell.py:cap_occlusion`). `mobile-export`
+selects the runtime parts by default (`--eye-lod runtime`, per-eye budget 1,500
+triangles for the eyeball parts; `--eye-lod offline` keeps the dense optics),
+writes the eye material inputs to `eye/` (live textures, `uniforms.json`,
+`params.json`) and records `eyes` in `avatar.json`. The GLB still carries
+standard transmission/iris materials as the reference; wiring the analytic
+mesh material into the mobile browser and Filament players follows with the
+morph-target runtime.
 - Eye-aligned skin masks protect lips and dark brows. Pores/freckles are
   deterministic object-space fields. Optional `delight_strength` reduces
   broad portrait shading; it does not recover ground-truth albedo.

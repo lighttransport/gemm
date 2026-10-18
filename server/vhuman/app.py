@@ -20,6 +20,7 @@ Pixal3D demo server.
     GET  /v1/baselines, /v1/baselines/<id>/<file>   Pixal3D baseline runs
     GET  /head                      the head page (web/vhuman_head.html)
     GET  /vhuman_eye_shader.js      the analytic eye shader, shared by both pages
+    GET  /vhuman_eye_mesh_shader.js the runtime mesh eye (same material on a low-polygon shell)
     GET  /v1/heads, /v1/heads/<id>/<file>           Qwen portrait -> Pixal3D head -> fitted eyes
     GET  /rig                       the facial rig page (web/vhuman_rig.html)
     GET  /v1/heads/<id>/rig/<file>  rig outputs
@@ -401,7 +402,8 @@ def make_handler(app: App, quiet: bool = False):
                     from .body.musclemimic import catalog
                     return self._json(200, catalog(getattr(app.args, "musclemimic_assets", None),
                                                    getattr(app.args, "musclemimic_python", None)))
-                if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js", '/vhuman_portrait.js', '/vhuman_head_editor.js'):
+                if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js", '/vhuman_portrait.js', '/vhuman_head_editor.js',
+                            '/vhuman_eye_mesh_shader.js'):
                     return self._file(ROOT / "web" / path[1:])
                 if path.startswith("/v1/heads/") and "/videos" in path:
                     from . import video

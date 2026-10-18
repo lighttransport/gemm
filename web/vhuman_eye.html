@@ -138,6 +138,7 @@ button:disabled{opacity:.5;cursor:default}
       <div class="field"><label>Gaze pitch</label><span class="val" id="pitch-v">0°</span><input type="range" id="pitch" aria-label="Gaze pitch" min="-30" max="30" step="0.5" value="0"></div>
       <div class="field"><label>Exposure</label><span class="val" id="exposure-v">1.00</span><input type="range" id="exposure" aria-label="Exposure" min="0.25" max="3" step="0.01" value="1"></div>
       <div class="row"><button id="reset-view">Reset view</button><label><input type="checkbox" id="ortho"> Match CPU camera (orthographic)</label></div>
+      <div class="row"><label title="the low-polygon eyeball mesh with the shared analytic material (runtime eye), instead of the ray-traced proxy"><input type="checkbox" id="mesh-eye"> Runtime mesh eye</label><span class="val" id="mesh-eye-v"></span></div>
     </div>
     <div id="groups"></div>
   </aside>
@@ -171,12 +172,13 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import * as Eye from '/vhuman_eye_shader.js';
+import * as EyeMesh from '/vhuman_eye_mesh_shader.js';
 
 const $ = (id) => document.getElementById(id);
 const state = window.__eyeState = {
   schema: null, params: null, detail: { source: 'procedural' }, res: 1024, preset: null,
   texKey: null, timings: null, textureRequests: 0, textureSeconds: null, view: 'shader',
-  geometry: null, ready: false, lastCompare: null, errors: [],
+  geometry: null, ready: false, lastCompare: null, errors: [], meshEye: false,
 };
 window.__eyeReady = false;
 const deep = (o) => JSON.parse(JSON.stringify(o));
@@ -245,34 +247,44 @@ bgMesh.renderOrder = -1;
 bgMesh.frustumCulled = false;
 bgMesh.visible = false;
 shaderScene.add(bgMesh);
-let eyeMesh = null, eyeMaterial = null;
+let eyeMesh = null, eyeMaterial = null, meshEye = null, meshMaterial = null;
 const eyeToWorld = new THREE.Matrix4();          // the gaze (applyView); the eye sits at the origin
+const eyeMaterials = () => [eyeMaterial, meshMaterial].filter(Boolean);
 
 // Server geometry/optics numbers (optics.uniforms) -> uniforms.
 function applyGeometry(g) {
   state.geometry = g;
-  if (eyeMesh) {
-    shaderScene.remove(eyeMesh);
-    eyeMesh.geometry.dispose();
-    eyeMaterial.dispose();
+  for (const m of [eyeMesh, meshEye]) {
+    if (!m) continue;
+    shaderScene.remove(m);
+    m.geometry.dispose();
+    m.material.dispose();
   }
   eyeMaterial = Eye.makeEyeMaterial(common);
   eyeMesh = Eye.makeEyeProxy(eyeMaterial, g);
-  shaderScene.add(eyeMesh);
+  meshMaterial = EyeMesh.makeEyeMeshMaterial(common);
+  meshEye = new THREE.Mesh(EyeMesh.makeRuntimeShellGeometry(g), meshMaterial);
+  meshEye.onBeforeRender = (renderer, scene, camera) => { meshMaterial.uniforms.uProj.value.copy(camera.projectionMatrix); };
+  shaderScene.add(eyeMesh, meshEye);
+  $('mesh-eye-v').textContent = `${meshEye.geometry.index.count / 3} triangles`;
   setEyeFrame();
-  Eye.applyEyeGeometry(eyeMaterial, g);
+  for (const m of eyeMaterials()) Eye.applyEyeGeometry(m, g);
   Eye.applyStudio(common, g);
 }
 function setEyeFrame() {
-  if (!eyeMaterial) return;
-  eyeMaterial.uniforms.uWorldFromEye.value.copy(eyeToWorld);
-  eyeMaterial.uniforms.uEyeFromWorld.value.copy(eyeToWorld).invert();
+  if (eyeMesh) eyeMesh.quaternion.setFromRotationMatrix(eyeToWorld);
+  if (meshEye) meshEye.quaternion.setFromRotationMatrix(eyeToWorld);
+  for (const m of eyeMaterials()) {
+    m.uniforms.uWorldFromEye.value.copy(eyeToWorld);
+    m.uniforms.uEyeFromWorld.value.copy(eyeToWorld).invert();
+  }
 }
 
 // Live parameters -> uniforms (no network).
 function applyParams() {
   if (!eyeMaterial || !state.geometry) return;
   const { pupilRatio: pr, pupilScale: sc } = Eye.applyEyeParams(eyeMaterial, state.params, state.geometry);
+  if (meshMaterial) Eye.applyEyeParams(meshMaterial, state.params, state.geometry);
   const stretch = Math.max(sc, 1 / sc);
   state.dilationWarning = stretch > 1.6 ? `pupil ratio ${pr.toFixed(2)}: the iris texture stretches ${stretch.toFixed(2)}x` : null;
   requestRender();
@@ -290,6 +302,9 @@ function applyView() {
   common.uExposure.value = +$('exposure').value;
   const cpu = state.view === 'cpu';
   bgMesh.visible = $('studio-bg').checked || cpu;
+  state.meshEye = $('mesh-eye').checked;
+  if (eyeMesh) eyeMesh.visible = !state.meshEye;
+  if (meshEye) meshEye.visible = state.meshEye;
   $('yaw-v').textContent = `${(+$('yaw').value).toFixed(1)}°`;
   $('pitch-v').textContent = `${(+$('pitch').value).toFixed(1)}°`;
   $('exposure-v').textContent = (+$('exposure').value).toFixed(2);
@@ -344,7 +359,7 @@ async function loadTextures() {
     applyGeometry(resp.uniforms);
     const tex = await Eye.loadEyeTextures(resp, { anisotropy: maxAniso });
     if (seq !== texSeq) { tex.dispose(); return; }
-    Eye.bindEyeTextures(eyeMaterial, tex);
+    for (const m of eyeMaterials()) Eye.bindEyeTextures(m, tex);
     state.texKey = resp.key;
     state.timings = resp.timings;
     state.textureSeconds = resp.seconds;
@@ -611,6 +626,7 @@ function setView(v) {
   $('diff').style.display = v === 'cpu' ? 'block' : 'none';
   $('gl-label').textContent = v === 'glb' ? 'WebGL · portable GLB (MeshPhysicalMaterial, KHR transmission/ior/volume)'
     : v === 'cpu' ? 'WebGL · analytic eye shader (CPU camera)' : 'WebGL · analytic eye shader';
+  if (v === 'shader' || v === 'cpu') $('gl-label').textContent += state.meshEye ? ' · runtime mesh' : ' · ray-traced proxy';
   applyView();
   if (v === 'glb') showGlb();
   if (v === 'cpu') compareWithCpu();
@@ -651,8 +667,8 @@ async function compareWithCpu() {
     }
     $('diff').width = $('diff').height = size;
     diff.putImageData(img, 0, 0);
-    state.lastCompare = { mean: sum / cnt, iris_mean: cntI ? sumI / cntI : null, max: maxd, size };
-    $('compare-out').textContent = `|WebGL − CPU| mean ${state.lastCompare.mean.toFixed(2)}/255 · iris ${state.lastCompare.iris_mean?.toFixed(2)}/255 · max ${maxd.toFixed(0)}`;
+    state.lastCompare = { mean: sum / cnt, iris_mean: cntI ? sumI / cntI : null, max: maxd, size, mode: state.meshEye ? 'mesh' : 'proxy' };
+    $('compare-out').textContent = `|WebGL ${state.lastCompare.mode} − CPU| mean ${state.lastCompare.mean.toFixed(2)}/255 · iris ${state.lastCompare.iris_mean?.toFixed(2)}/255 · max ${maxd.toFixed(0)}`;
   } catch (e) {
     console.error('cpu compare:', e);
     $('compare-out').textContent = `CPU reference failed: ${e.message}`;
@@ -732,6 +748,7 @@ async function refreshHealth() {
 // ---------------------------------------------------------------- init
 for (const id of ['yaw', 'pitch', 'exposure']) $(id).addEventListener('input', applyView);
 for (const id of ['studio-bg', 'ortho']) $(id).addEventListener('change', applyView);
+$('mesh-eye').addEventListener('change', () => { applyView(); setView(state.view); });
 $('res').addEventListener('change', () => { state.res = +$('res').value; scheduleTextures(0); });
 $('reset-view').addEventListener('click', () => { $('yaw').value = 0; $('pitch').value = 0; applyView(); resetView(); });
 window.addEventListener('error', (e) => state.errors.push(String(e.message)));

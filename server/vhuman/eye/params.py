@@ -93,6 +93,8 @@ FIELDS: tuple[FieldSpec, ...] = (
     _f("optics.chamber_depth", .0035, .001, .006),
     _f("optics.iris_convexity", 0., -.0005, .0005),
     _f("optics.cornea_roughness", .06, 0., .5),
+    _f("optics.caustic_strength", .3, 0., 1., help="Focused-light lobe on the far side of the iris (0 disables)."),
+    _f("optics.caustic_sharpness", 12., 2., 40., help="Exponent of the caustic lobe at grazing iris incidence."),
     _f("optics.sclera_roughness", .12, 0., .7),
     _f("optics.sclera_radius", .0146, .008, .018, live=False, help="GNM v3 template sclera radius in metres; user adjustable."),
     _f("optics.limbus_radius", .006, .003, .009, live=False, help="User-selected limbus radius in metres."),

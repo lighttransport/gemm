@@ -311,6 +311,21 @@ class EyePageTest(unittest.TestCase):
                              ".then(b => String.fromCharCode(...new Uint8Array(b.slice(0, 4))))")
         self.assertEqual(magic, "glTF")
 
+        # The runtime mesh eye (shared analytic material on a ~1.2k-triangle
+        # shell) against the CPU ray tracer: like the proxy, within the
+        # documented parity gates, apart from its polygonal silhouette.
+        cdp.evaluate("(() => { const m = document.getElementById('mesh-eye'); m.checked = true;"
+                     " m.dispatchEvent(new Event('change')); })()")
+        cdp.evaluate("document.querySelector('#view-seg button[data-view=cpu]').click()")
+        compare = cdp.wait_for("__eyeState.lastCompare && __eyeState.lastCompare.mode === 'mesh' && __eyeState.lastCompare",
+                               timeout=240)
+        self.assertLess(compare["mean"], 1.5, compare)
+        self.assertLess(compare["iris_mean"], 2.5, compare)
+        self.assertRegex(cdp.evaluate("document.getElementById('mesh-eye-v').textContent"), r"^1[0-9]{3} triangles$")
+        cdp.evaluate("(() => { const m = document.getElementById('mesh-eye'); m.checked = false;"
+                     " m.dispatchEvent(new Event('change')); })()")
+        cdp.evaluate("document.querySelector('#view-seg button[data-view=shader]').click()")
+
         cdp.evaluate("1")
         self.assertEqual(cdp.console_errors(), [])
         self.assertEqual(cdp.evaluate("__eyeState.errors"), [])

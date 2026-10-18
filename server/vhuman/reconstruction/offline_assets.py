@@ -139,6 +139,46 @@ def bound_tubes(paths,root_ids,root_weights,full,radius):
     return positions,triangles,dict(ids=ids,weights=weights,offsets=offsets)
 
 
+RUNTIME_EYE_TRIANGLES = 1500      # eyeball shell + iris + pupil cup per side
+RUNTIME_EYE_PARTS = ('runtime_eye', 'runtime_iris', 'runtime_pupil', 'eyeshell')
+
+
+def runtime_eye_parts(part, side, joint, eye_params, profile, place_eye, lid_polygon_eye, medial_sign):
+    """The real-time optical parts of one eye: a ~1.2k-triangle welded shell
+    (shaded analytically by the mesh eye material; standard viewers see its
+    transmission material over the iris disk), a coarse iris disk and pupil
+    cup, and a head-bound occlusion cap with per-vertex lid-contact shadow
+    in its U coordinate. `lid_polygon_eye` is the fissure outline in the
+    eye frame (metres); `part` is the scene's part recorder."""
+    from ..eye import geometry, optics
+    from ..eye import params as params_module
+    from ..head import eyeshell
+    shell = geometry.runtime_shell(profile)
+    idx = shell.indices.reshape(-1, 3)
+    part(side + '_runtime_eye', place_eye(shell.positions), idx, shell.uvs[idx], 'cornea', joint=joint, runtime=True)
+    disk = geometry.runtime_iris(eye_params, profile)
+    idx = disk.indices.reshape(-1, 3)
+    pupil_radius = optics.iris_radius(eye_params, profile) * params_module.pupil_ratio(eye_params)
+    radius = np.linalg.norm(disk.positions[:, :2], axis=1)
+    idx = idx[(radius[idx] >= pupil_radius).all(1)]
+    part(side + '_runtime_iris', place_eye(disk.positions), idx, disk.uvs[idx], 'iris', joint=joint, runtime=True)
+    segments = 24
+    angle = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+    z = profile.iris_z(eye_params['optics']['chamber_depth'])
+    ring = np.stack((np.cos(angle) * pupil_radius * 1.4, np.sin(angle) * pupil_radius * 1.4, np.full(segments, z - .0002)), -1)
+    cup = np.concatenate((np.array([[0, 0, z - .004]]), ring))
+    faces = np.stack((np.zeros(segments, int), np.arange(segments) + 1, np.roll(np.arange(segments), -1) + 1), -1)
+    part(side + '_runtime_pupil', place_eye(cup), faces, np.zeros((segments, 3, 2)), 'pupil', joint=joint, runtime=True)
+    cap = eyeshell.shell_mesh(rings=6, segments=24, profile=profile)
+    alpha = eyeshell.cap_occlusion(cap.positions[:, :2].astype(np.float64), lid_polygon_eye[:, :2], medial_sign)
+    uv = np.stack((alpha, np.zeros_like(alpha)), -1).astype(np.float32)
+    idx = cap.indices.reshape(-1, 3)
+    # The cap follows the head (the lids), not the eyeball: joint 1.
+    part(side + '_eyeshell', place_eye(cap.positions), idx, uv[idx], 'eyeshell', joint=1, runtime=True)
+    return dict(shell_triangles=int(len(shell.indices)), cap_triangles=int(len(cap.indices)),
+                cap_alpha_max=float(alpha.max()), cap_alpha_min=float(alpha.min()))
+
+
 def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_fit=None,parsing_model=None,
             include_hair=True,fit_eyes=False):
     import cv2
@@ -163,8 +203,8 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         # Optional refined mouth lining with a per-pose lip/arch contact deformer.
         sock=({k:z['sock_'+k] for k in bound_keys} if 'sock_dense_triangles' in z else None)
         if sock is not None:sock['contact']={k:z['sock_contact_'+k] for k in ('active','weight','candidates','params','edges')}
-    model=GNMModel();parts=[];arrays={}
-    def part(name,positions,triangles,texcoords,material, *, native=False, joint=None,surface=None):
+    model=GNMModel();parts=[];runtime_parts=[];arrays={}
+    def part(name,positions,triangles,texcoords,material, *, native=False, joint=None,surface=None,runtime=False,optical=False):
         ids,remapped=np.unique(triangles,return_inverse=True)
         arrays[name+'_positions']=np.asarray(positions[ids],np.float32)
         arrays[name+'_triangles']=np.asarray(remapped.reshape(-1,3),np.int32)
@@ -172,7 +212,9 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         if native:arrays[name+'_native_ids']=ids
         if surface:
             for key,value in surface.items():arrays[name+'_surface_'+key]=value[ids]
-        parts.append(dict(name=name,material=material,native=native,joint=joint,surface_bound=bool(surface)))
+        record=dict(name=name,material=material,native=native,joint=joint,surface_bound=bool(surface))
+        if optical:record['optical']=True
+        (runtime_parts if runtime else parts).append(record)
     def append_bound(name,ear):
         # Native vertices keep their GNM ids; appended vertices follow anchor triangles
         # exactly like attachment-bound parts (barycentric root + attachment-frame offset).
@@ -236,7 +278,12 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
     it,st=assets.structures(eye_params,512)
     Image.fromarray(assets.srgb_u8(iris.bake_color(it,eye_params,512,sclera.sampler(st,eye_params)))).save(out/'iris.png')
     Image.fromarray(assets.shell_textures(eye_params,st,512)['base']).save(out/'sclera.png')
-    ocular_reports={}
+    ocular_reports={};runtime_eye_reports={}
+    from .dense_landmarks import attachments
+    lid_ids,lid_weights,_=attachments();skin_ids=np.flatnonzero(model.group('skin_exterior'))
+    lid_points=(full[skin_ids[lid_ids]]*lid_weights[:,:,None]).sum(1)
+    LID_MARGINS={'right':([33,7,163,144,145,153,154,155,133],[33,246,161,160,159,158,157,173,133]),
+                 'left':([263,249,390,373,374,380,381,382,362],[263,466,388,387,386,385,384,398,362])}
     for side,joint in [('left',2),('right',3)]:
         rotation=np.eye(3);eye_scale=1.
         if fit_eyes:
@@ -251,18 +298,24 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         idx=shell.indices.reshape(-1,3)
         cornea=(shell.positions[idx,2].mean(1)>profile.z_limbus)
         for name,mask,material in [('cornea',cornea,'cornea'),('sclera',~cornea,'sclera')]:
-            part(side+'_'+name,place_eye(shell.positions),idx[mask],shell.uvs[idx[mask]],material,joint=joint)
+            part(side+'_'+name,place_eye(shell.positions),idx[mask],shell.uvs[idx[mask]],material,joint=joint,optical=True)
         disk=geometry.iris_disk(eye_params,profile,rings=32,segments=96);idx=disk.indices.reshape(-1,3)
         pupil_radius=optics.iris_radius(eye_params,profile)*params_module.pupil_ratio(eye_params)
         radius=np.linalg.norm(disk.positions[:,:2],axis=1)
         idx=idx[(radius[idx]>=pupil_radius).all(1)]
-        part(side+'_iris',place_eye(disk.positions),idx,disk.uvs[idx],'iris',joint=joint)
+        part(side+'_iris',place_eye(disk.positions),idx,disk.uvs[idx],'iris',joint=joint,optical=True)
         angle=np.linspace(0,2*np.pi,96,endpoint=False)
         z=profile.iris_z(eye_params['optics']['chamber_depth'])
         ring=np.stack((np.cos(angle)*pupil_radius*1.4,np.sin(angle)*pupil_radius*1.4,np.full(96,z-.0002)),-1)
         cup=np.concatenate((np.array([[0,0,z-.004]]),ring))
         faces=np.stack((np.zeros(96,int),np.arange(96)+1,np.roll(np.arange(96),-1)+1),-1)
-        part(side+'_pupil_cup',place_eye(cup),faces,np.zeros((96,3,2)),'pupil',joint=joint)
+        part(side+'_pupil_cup',place_eye(cup),faces,np.zeros((96,3,2)),'pupil',joint=joint,optical=True)
+        # Real-time optical parts (selected by the mobile export; Blender keeps the dense ones).
+        lower,upper=LID_MARGINS[side]
+        polygon=np.concatenate((lid_points[upper],lid_points[lower[1:-1]][::-1]))
+        polygon_eye=((polygon-joints[joint])@rotation)/eye_scale
+        runtime_eye_reports[side]=runtime_eye_parts(part,side,joint,eye_params,profile,place_eye,polygon_eye,
+                                                    1. if side=='right' else -1.)
     h,w=image.shape[:2]
     obs=json.loads((candidate/'observations.json').read_text())['views'][0]['anchors']
     eye_pixels=[np.asarray(obs[k]['xy']) for k in ('eye_right','eye_left')]
@@ -375,13 +428,9 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
                 hair_roots.append(np.flatnonzero(skin)[triangle[np.argmax(bary)]])
                 hair_triangles.append(np.flatnonzero(skin)[triangle]);hair_weights.append(bary)
     # Lower-lid wet line and sparse lashes use fixed anatomical attachments.
-    from .dense_landmarks import attachments
-    lid_ids,lid_weights,_=attachments();skin_ids=np.flatnonzero(skin)
-    lid_points=(full[skin_ids[lid_ids]]*lid_weights[:,:,None]).sum(1)
+    if not np.array_equal(skin_ids,np.flatnonzero(skin)):raise ValueError('skin component ids changed during preparation')
     lash_paths=[];lash_ids=[];lash_weights=[]
-    for side,lower,upper in [
-        ('right',[33,7,163,144,145,153,154,155,133],[33,246,161,160,159,158,157,173,133]),
-        ('left',[263,249,390,373,374,380,381,382,362],[263,466,388,387,386,385,384,398,362])]:
+    for side,(lower,upper) in LID_MARGINS.items():
         tearpath=lid_points[lower]+[0,0,.00015]
         v,t,binding=bound_tubes([tearpath],[skin_ids[lid_ids[lower]]],[lid_weights[lower]],full,.00012)
         part(side+'_tearline',v,t,np.zeros((len(t),3,2)),'tear',surface=binding)
@@ -406,13 +455,16 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
     for name,path in curves.items():arrays[name]=path.astype(np.float32)
     np.savez_compressed(out/'scene_assets.npz',**arrays)
     detail=build(candidate,out,preset=detail_preset)
-    scene=dict(schema='vhuman.offline_scene.v1',candidate=str(candidate.resolve()),parts=parts,
+    (out/'eye_params.json').write_text(json.dumps(eye_params,indent=1))
+    scene=dict(schema='vhuman.offline_scene.v1',candidate=str(candidate.resolve()),parts=parts,runtime_parts=runtime_parts,
         camera=camera.as_dict(),source_size=[w,h],curves=list(curves),accessories=accessory_records,
         hair=dict(enabled=include_hair,strands=len(hair_paths),lashes=len(lash_paths),short_hair=short_hair,color_linear=hair_color.tolist(),source_color_linear=source_hair_color.tolist(),color_gain_prior=.25 if short_hair else 1.,
             crown_gap_completion_prior=short_hair,crown_cutoff_y_m=crown_cutoff,crown_feather_width_m=.004,source_mask_sigma_px=1.,
             undercoat='opaque shader on native skin; no overlapping scalp meshes',root_attachment='source-camera visible triangle barycentrics',
             source='visible parsing + front-facing scalp attachment; short undercoat, density, strand shape and depth inferred'),
         optical_eyes=dict(source='analytic GNM-profile shell, iris annulus and recessed pupil cavity',
+            runtime='welded runtime shell (analytic mesh material), coarse iris and pupil, head-bound occlusion cap',
+            runtime_reports=runtime_eye_reports,eye_params='eye_params.json',
             fitting=ocular_reports,head_fit_source=str(fit_path.resolve()),head_fit_sha256=sha256(fit_path),
             pupil_ratio=params_module.pupil_ratio(eye_params),pupil_status=pupil_status,
             ior=eye_params['optics']['ior_cornea'] if 'ior_cornea' in eye_params['optics'] else 1.376),
