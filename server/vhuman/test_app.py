@@ -143,8 +143,13 @@ class ServerTest(unittest.TestCase):
     def test_rig_page_and_routes(self):
         status, ctype, body = self.get("/rig")
         self.assertEqual(status, 200)
-        self.assertIn(b"class LinearRig", body)
+        self.assertIn(b"/vhuman_rig_eval.js", body)              # the shared rig evaluator module
         self.assertIn(b"body-motion-backend", body)
+        status, _, module = self.get("/vhuman_rig_eval.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"class LinearRig", module)
+        for name in ("/vhuman_eye_mesh_shader.js", "/vhuman_motion_layer.js"):
+            self.assertEqual(self.get(name)[0], 200)
         status, _, body = self.get("/rig?head=abc&take=123")
         self.assertEqual(status, 200)
         self.assertIn(b"params.get('take')", body)
