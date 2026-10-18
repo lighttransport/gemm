@@ -95,29 +95,30 @@ static inline float fp8_e4m3_to_float(fp8_e4m3_t x) {
     return sign ? -result : result;
 }
 
-/* Convert float to FP8 E5M2 */
+/* Convert float to FP8 E5M2, round-to-nearest-even (overflow to infinity). */
 static inline fp8_e5m2_t float_to_fp8_e5m2(float f) {
     if (f != f) return 0x7F; /* NaN */
-    if (isinf(f)) return (f < 0) ? 0xFF : 0x7F; /* +/- Inf */
-    if (f == 0.0f) return 0x00;
-
     uint32_t bits;
     memcpy(&bits, &f, sizeof(bits));
-
-    uint32_t sign = (bits >> 31) & 1;
-    int32_t exp = ((bits >> 23) & 0xFF) - 127 + FP8_E5M2_BIAS;
-    uint32_t mant = (bits >> 21) & 0x3; /* Take top 2 bits of mantissa */
-
-    /* Handle overflow -> Inf */
-    if (exp >= 31) {
-        return (sign << 7) | 0x7C; /* Infinity */
+    uint32_t sign = (bits >> 24) & 0x80u;
+    float af = fabsf(f);
+    if (isinf(f)) return sign | 0x7Cu;
+    if (af == 0.0f) return sign;
+    int32_t e = (int32_t)((bits >> 23) & 0xFFu) - 127;
+    if (e < -14) {
+        float scaled = af * 65536.0f;
+        uint32_t k = (uint32_t)scaled;
+        float frac = scaled - k;
+        if (frac > 0.5f || (frac == 0.5f && (k & 1u))) k++;
+        return sign | k; /* k=4 carries into the smallest normal. */
     }
-    /* Handle underflow */
-    if (exp <= 0) {
-        return (sign << 7); /* Zero with sign */
+    uint32_t mant = (bits >> 21) & 3u, rem = bits & 0x1FFFFFu;
+    if (rem > 0x100000u || (rem == 0x100000u && (mant & 1u))) {
+        if (++mant == 4u) { mant = 0; e++; }
     }
-
-    return (sign << 7) | ((exp & 0x1F) << 2) | (mant & 0x3);
+    int32_t exp = e + FP8_E5M2_BIAS;
+    if (exp >= 31) return sign | 0x7Cu;
+    return sign | ((uint32_t)exp << 2) | mant;
 }
 
 /* Convert FP8 E5M2 to float */

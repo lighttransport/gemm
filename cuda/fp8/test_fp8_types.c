@@ -178,30 +178,24 @@ static void test_e5m2_nan(void) {
 }
 
 static void test_e5m2_inf(void) {
-    TEST("e5m2: +Inf encoding (known bug: encodes as NaN)");
-    /* BUG: float_to_fp8_e5m2 returns 0x7F (exp=31,mant=3) for Inf
-     * but should return 0x7C (exp=31,mant=0). Decoder treats 0x7F as NaN. */
+    TEST("e5m2: +Inf encoding");
     fp8_e5m2_t pi = float_to_fp8_e5m2(INFINITY);
     float back = fp8_e5m2_to_float(pi);
     if (isinf(back) && back > 0) {
         PASS();
     } else {
-        g_tests_passed++;
-        printf("SKIP (known bug: Inf -> 0x%02X -> %s)\n", pi,
-               isnan(back) ? "NaN" : "other");
+        FAIL("Inf encoded as 0x%02X", pi);
     }
 }
 
 static void test_e5m2_neg_inf(void) {
-    TEST("e5m2: -Inf encoding (known bug: encodes as NaN)");
+    TEST("e5m2: -Inf encoding");
     fp8_e5m2_t ni = float_to_fp8_e5m2(-INFINITY);
     float back = fp8_e5m2_to_float(ni);
     if (isinf(back) && back < 0) {
         PASS();
     } else {
-        g_tests_passed++;
-        printf("SKIP (known bug: -Inf -> 0x%02X -> %s)\n", ni,
-               isnan(back) ? "NaN" : "other");
+        FAIL("-Inf encoded as 0x%02X", ni);
     }
 }
 
@@ -369,18 +363,17 @@ static void test_e4m3_exhaustive_roundtrip(void) {
 }
 
 static void test_e5m2_exhaustive_roundtrip(void) {
-    TEST("e5m2: exhaustive normal-value decode->encode consistency");
+    TEST("e5m2: exhaustive finite decode->encode consistency");
     int mismatches = 0;
     for (int i = 0; i < 256; i++) {
         fp8_e5m2_t orig = (fp8_e5m2_t)i;
         int exp = (orig >> 2) & 0x1F;
-        /* Skip NaN, Inf, zero, and denormals */
+        /* Every finite encoding, including subnormals and signed zeros. */
         if (exp == 31) continue; /* NaN or Inf */
-        if (exp == 0) continue;  /* zero or denormal */
         float f = fp8_e5m2_to_float(orig);
         fp8_e5m2_t re = float_to_fp8_e5m2(f);
         float f2 = fp8_e5m2_to_float(re);
-        if (fabsf(f - f2) > 1e-6f) {
+        if (orig != re || f != f2) {
             mismatches++;
             if (mismatches <= 3) {
                 fprintf(stderr, "    mismatch: bits=0x%02X -> %f -> 0x%02X -> %f\n",
@@ -390,6 +383,18 @@ static void test_e5m2_exhaustive_roundtrip(void) {
     }
     if (mismatches == 0) PASS();
     else FAIL("%d mismatches in roundtrip", mismatches);
+}
+
+static void test_e5m2_rounding(void) {
+    TEST("e5m2: RNE ties, subnormal boundary, and signed zero");
+    if (float_to_fp8_e5m2(1.125f) == 0x3C &&
+        float_to_fp8_e5m2(1.375f) == 0x3E &&
+        float_to_fp8_e5m2(1.875f) == 0x40 &&
+        float_to_fp8_e5m2(ldexpf(1.0f,-17)) == 0 &&
+        float_to_fp8_e5m2(ldexpf(3.0f,-17)) == 2 &&
+        float_to_fp8_e5m2(ldexpf(7.0f,-17)) == 4 &&
+        float_to_fp8_e5m2(-0.0f) == 0x80) PASS();
+    else FAIL("RNE or signed zero mismatch");
 }
 
 int main(void) {
@@ -426,6 +431,7 @@ int main(void) {
     test_e5m2_monotonicity();
     test_e5m2_sign_symmetry();
     test_e5m2_exhaustive_roundtrip();
+    test_e5m2_rounding();
 
     printf("\nCross-format comparison:\n");
     test_e4m3_vs_e5m2_range();

@@ -17,6 +17,7 @@
 #include <time.h>
 
 #include "cuew.h"
+#include "fp8_types.h"
 
 /* cuBLAS data types */
 typedef enum {
@@ -39,9 +40,9 @@ typedef enum {
 } cublasLtMatmulPreferenceAttributes_t;
 
 typedef enum {
-    CUBLASLT_MATMUL_DESC_TRANSA = 0,
-    CUBLASLT_MATMUL_DESC_TRANSB = 1,
-    CUBLASLT_MATMUL_DESC_EPILOGUE = 2,
+    CUBLASLT_MATMUL_DESC_TRANSA = 3,
+    CUBLASLT_MATMUL_DESC_TRANSB = 4,
+    CUBLASLT_MATMUL_DESC_EPILOGUE = 7,
     CUBLASLT_MATMUL_DESC_A_SCALE_POINTER = 17,
     CUBLASLT_MATMUL_DESC_B_SCALE_POINTER = 18,
     CUBLASLT_MATMUL_DESC_C_SCALE_POINTER = 19,
@@ -64,7 +65,7 @@ typedef void* cublasLtMatrixLayout_t;
 typedef void* cublasLtMatmulPreference_t;
 
 typedef struct {
-    void* algo;
+    struct { uint64_t data[8]; } algo;
     size_t workspaceSize;
     int32_t status;
     float wavesCount;
@@ -170,57 +171,6 @@ static int load_cublas(void) {
     } \
 } while(0)
 
-/* FP8 E4M3 conversion utilities (round-to-nearest-even, saturate-to-finite —
- * matches the hardware cvt.rn.satfinite.e4m3x2.f32). Max finite 448
- * (exp=15,mant=6); (exp=15,mant=7) is NaN; smallest normal 2^-6; subnormals
- * are k*2^-9 for k=1..7. */
-static uint8_t float_to_fp8_e4m3(float f) {
-    if (f != f) return 0x7F;  /* NaN */
-
-    uint32_t bits;
-    memcpy(&bits, &f, sizeof(bits));
-    uint8_t s8 = (uint8_t)(((bits >> 31) & 1u) << 7);
-    float af = (f < 0.0f) ? -f : f;
-    if (af == 0.0f) return s8;                       /* +/-0 keep sign */
-    if (af >= 448.0f) return (uint8_t)(s8 | (0xFu << 3) | 0x6u); /* saturate (incl. Inf) */
-
-    int32_t E = (int32_t)((bits >> 23) & 0xFF) - 127; /* unbiased f32 exponent */
-    if (E < -6) {
-        /* Subnormal range: nearest multiple of 2^-9 (k=0..8), RNE. */
-        float scaled = af * 512.0f;                  /* exact power-of-two scale */
-        uint32_t k = (uint32_t)scaled;
-        float frac = scaled - (float)k;
-        if (frac > 0.5f || (frac == 0.5f && (k & 1u))) k++;
-        if (k == 0u) return s8;
-        if (k < 8u) return (uint8_t)(s8 | (k & 0x7u));        /* subnormal */
-        return (uint8_t)(s8 | (1u << 3));                     /* -> smallest normal */
-    }
-    /* Normal range: reduce the 23-bit mantissa to 3 bits with RNE. */
-    uint32_t mant = (bits >> 20) & 0x7u;
-    uint32_t rem  = bits & 0xFFFFFu;
-    if (rem > 0x80000u || (rem == 0x80000u && (mant & 1u))) {
-        if (++mant == 8u) { mant = 0u; E++; }
-    }
-    int32_t exp_field = E + 7;
-    if (exp_field > 15 || (exp_field == 15 && mant > 6u))
-        return (uint8_t)(s8 | (0xFu << 3) | 0x6u);   /* saturate to 448 */
-    return (uint8_t)((uint32_t)s8 | ((uint32_t)exp_field << 3) | mant);
-}
-
-static float fp8_e4m3_to_float(uint8_t fp8) {
-    int sign = (fp8 >> 7) & 1;
-    int exp = (fp8 >> 3) & 0xF;
-    int mant = fp8 & 0x7;
-
-    if (exp == 0 && mant == 0) return sign ? -0.0f : 0.0f;
-    if (exp == 15 && mant == 7) return sign ? -INFINITY : INFINITY;
-
-    float mantissa = 1.0f + mant / 8.0f;
-    float value = mantissa * powf(2.0f, exp - 7);
-
-    return sign ? -value : value;
-}
-
 /* BF16 to float conversion */
 static float bf16_to_float(uint16_t bf16) {
     uint32_t bits = (uint32_t)bf16 << 16;
@@ -231,13 +181,13 @@ static float bf16_to_float(uint16_t bf16) {
 
 /* CPU reference implementation */
 static void gemm_reference_fp8(const uint8_t* A, const uint8_t* B, float* C,
-                               int M, int N, int K) {
+                               int M, int N, int K, int e5m2) {
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
             float sum = 0.0f;
             for (int k = 0; k < K; k++) {
-                float a = fp8_e4m3_to_float(A[i * K + k]);
-                float b = fp8_e4m3_to_float(B[k * N + j]);
+                float a = e5m2 ? fp8_e5m2_to_float(A[i * K + k]) : fp8_e4m3_to_float(A[i * K + k]);
+                float b = e5m2 ? fp8_e5m2_to_float(B[j * K + k]) : fp8_e4m3_to_float(B[j * K + k]);
                 sum += a * b;
             }
             C[i * N + j] = sum;
@@ -269,14 +219,6 @@ static gpu_specs_t get_gpu_specs(CUdevice dev) {
 
     cuDeviceGetName(specs.name, sizeof(specs.name), dev);
     return specs;
-}
-
-/* Get FP8 Tensor Core ops per SM per cycle */
-static int get_fp8_tensor_ops_per_sm_per_cycle(int major, int minor) {
-    if (major >= 12) return 4096;  /* Blackwell SM 12.0 */
-    if (major >= 10) return 4096;  /* Blackwell SM 10.0 */
-    if (major >= 9) return 2048;   /* Hopper */
-    return 0;  /* No FP8 tensor cores before Hopper */
 }
 
 static void print_usage(const char* prog) {
@@ -318,9 +260,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (M <= 0 || N <= 0 || K <= 0 || M > 16384 || N > 16384 || K > 16384) {
+        fprintf(stderr, "Dimensions must be in 1..16384\n"); return 1;
+    }
+
     const char* format_name = use_e5m2 ? "E5M2" : "E4M3";
-    printf("cuBLAS FP8 %s GEMM: C[%d,%d] = A[%d,%d] x B[%d,%d]\n",
-           format_name, M, N, M, K, K, N);
+    printf("cuBLAS FP8 %s GEMM: C[%d,%d] = A[%d,%d] x B[%d,%d]^T\n",
+           format_name, M, N, M, K, N, K);
 
     /* Initialize CUDA */
     if (cuewInit(CUEW_INIT_CUDA) != CUEW_SUCCESS) {
@@ -341,10 +287,6 @@ int main(int argc, char** argv) {
     printf("Compute Capability: SM %d.%d\n", specs.major, specs.minor);
     printf("SM Count: %d\n", specs.sm_count);
     printf("GPU Clock: %d MHz\n", specs.clock_mhz);
-
-    int ops_per_sm = get_fp8_tensor_ops_per_sm_per_cycle(specs.major, specs.minor);
-    double peak_tops = (double)specs.sm_count * specs.clock_mhz * ops_per_sm * 2.0 / 1e6;
-    printf("Theoretical FP8 Peak: %.2f TOPS\n", peak_tops);
 
     /* Load cuBLAS */
     if (load_cublas() != 0) {
@@ -369,17 +311,17 @@ int main(int argc, char** argv) {
     srand(42);
     for (size_t i = 0; i < size_A; i++) {
         float val = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-        h_A[i] = float_to_fp8_e4m3(val);
+        h_A[i] = use_e5m2 ? float_to_fp8_e5m2(val) : float_to_fp8_e4m3(val);
     }
     for (size_t i = 0; i < size_B; i++) {
         float val = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-        h_B[i] = float_to_fp8_e4m3(val);
+        h_B[i] = use_e5m2 ? float_to_fp8_e5m2(val) : float_to_fp8_e4m3(val);
     }
 
     /* Compute reference */
     if (!skip_verify) {
         printf("Computing CPU reference...\n");
-        gemm_reference_fp8(h_A, h_B, h_C_ref, M, N, K);
+        gemm_reference_fp8(h_A, h_B, h_C_ref, M, N, K, use_e5m2);
     }
 
     /* Allocate device memory */
@@ -404,16 +346,15 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cuMemcpyHtoD(d_scale_B, &h_scale_B, sizeof(float)));
     CHECK_CUDA(cuMemcpyHtoD(d_scale_D, &h_scale_D, sizeof(float)));
 
-    /* Create matmul descriptor - try FAST_TF32 compute for FP8 */
+    /* FP8 inputs, FP32 accumulation and scale type. */
     cublasLtMatmulDesc_t matmul_desc;
-    CHECK_CUBLAS(p_cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F));
+    CHECK_CUBLAS(p_cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
 
     /* FP8 data type */
     cudaDataType_t fp8_type = use_e5m2 ? CUDA_R_8F_E5M2 : CUDA_R_8F_E4M3;
 
-    /* Set transpose operations - TN layout (A transposed, B not transposed) */
-    /* This is the standard layout for FP8 GEMM in cuBLAS */
-    /* D = alpha * A^T * B + beta * C where A stored as [K,M], B as [K,N], D as [M,N] */
+    /* C_rm[M,N] = X_rm[M,K] * W_rm[N,K]^T. In column-major:
+     * C_cm[N,M] = W_cm[K,N]^T * X_cm[K,M]. */
     cublasOperation_t opT = CUBLAS_OP_T;
     cublasOperation_t opN = CUBLAS_OP_N;
     CHECK_CUBLAS(p_cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)));
@@ -423,18 +364,14 @@ int main(int argc, char** argv) {
     CHECK_CUBLAS(p_cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_A, sizeof(d_scale_A)));
     CHECK_CUBLAS(p_cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_B, sizeof(d_scale_B)));
 
-    /* Create matrix layouts for TN (column-major) */
-    /* A: stored as [K,M] in column-major, transposed to get [M,K] */
-    /* B: stored as [K,N] in column-major */
-    /* D: stored as [M,N] in column-major with BF16 output */
     cublasLtMatrixLayout_t layout_A, layout_B, layout_C;
 
-    /* A: column-major [K,M], leading dim = K */
-    CHECK_CUBLAS(p_cublasLtMatrixLayoutCreate(&layout_A, fp8_type, K, M, K));
-    /* B: column-major [K,N], leading dim = K */
-    CHECK_CUBLAS(p_cublasLtMatrixLayoutCreate(&layout_B, fp8_type, K, N, K));
-    /* C/D: column-major [M,N], leading dim = M with BF16 output */
-    CHECK_CUBLAS(p_cublasLtMatrixLayoutCreate(&layout_C, CUDA_R_16BF, M, N, M));
+    /* A operand: W row-major [N,K] -> column-major [K,N], op=T. */
+    CHECK_CUBLAS(p_cublasLtMatrixLayoutCreate(&layout_A, fp8_type, K, N, K));
+    /* B operand: X row-major [M,K] -> column-major [K,M], op=N. */
+    CHECK_CUBLAS(p_cublasLtMatrixLayoutCreate(&layout_B, fp8_type, K, M, K));
+    /* C/D: row-major [M,N] -> column-major [N,M], BF16 output. */
+    CHECK_CUBLAS(p_cublasLtMatrixLayoutCreate(&layout_C, CUDA_R_16BF, N, M, N));
 
     /* Create preference */
     cublasLtMatmulPreference_t preference;
@@ -457,18 +394,11 @@ int main(int argc, char** argv) {
 
     if (status != 0 || algo_count == 0) {
         fprintf(stderr, "\n========================================\n");
-        fprintf(stderr, "FP8 GEMM NOT SUPPORTED on SM %d.%d\n", specs.major, specs.minor);
+        fprintf(stderr, "No FP8 %s algorithm for %dx%dx%d on SM %d.%d\n",
+                format_name, M, N, K, specs.major, specs.minor);
         fprintf(stderr, "========================================\n\n");
         fprintf(stderr, "cuBLAS status: %d, algorithms found: %d\n\n", status, algo_count);
-        fprintf(stderr, "Known limitations:\n");
-        fprintf(stderr, "  - Standard FP8 (E4M3/E5M2) GEMM via cublasLtMatmul may not be\n");
-        fprintf(stderr, "    available on SM 12.0 (GeForce RTX 50 series) in cuBLAS 13.x\n");
-        fprintf(stderr, "  - SM 12.0 may require MXFP8 (block-scaled FP8) instead\n");
-        fprintf(stderr, "  - Try CUTLASS examples/79_blackwell_geforce_gemm/ for SM120 FP8\n\n");
-        fprintf(stderr, "Alternatives:\n");
-        fprintf(stderr, "  - Use INT8 GEMM: ./cublas_int8_gemm (47+ TOPS on RTX 5060 Ti)\n");
-        fprintf(stderr, "  - Use FP16/BF16 GEMM via cuBLAS\n");
-        fprintf(stderr, "  - Use custom PTX kernel (fp8_gemm)\n\n");
+        fprintf(stderr, "No algorithm for this shape, format pair, and output type.\n");
 
         /* Cleanup and exit */
         p_cublasLtMatmulPreferenceDestroy(preference);
@@ -496,8 +426,8 @@ int main(int argc, char** argv) {
         CHECK_CUBLAS(p_cublasLtMatmul(
             handle, matmul_desc,
             &alpha,
-            (void*)d_A, layout_A,
-            (void*)d_B, layout_B,
+            (void*)d_B, layout_A,
+            (void*)d_A, layout_B,
             &beta,
             (void*)d_C, layout_C,
             (void*)d_C, layout_C,
@@ -513,8 +443,8 @@ int main(int argc, char** argv) {
         CHECK_CUBLAS(p_cublasLtMatmul(
             handle, matmul_desc,
             &alpha,
-            (void*)d_A, layout_A,
-            (void*)d_B, layout_B,
+            (void*)d_B, layout_A,
+            (void*)d_A, layout_B,
             &beta,
             (void*)d_C, layout_C,
             (void*)d_C, layout_C,
@@ -532,7 +462,8 @@ int main(int argc, char** argv) {
     /* Copy result back */
     CHECK_CUDA(cuMemcpyDtoH(h_C, d_C, size_C));
 
-    /* Verify - convert BF16 to float for comparison */
+    int verified = 1;
+    /* Verify against decoded FP8 inputs, allowing only BF16 output rounding. */
     if (!skip_verify) {
         int errors = 0;
         float max_diff = 0.0f;
@@ -545,7 +476,7 @@ int main(int argc, char** argv) {
                 float rel_diff = (ref_abs > 1e-6f) ? diff / ref_abs : diff;
                 if (diff > max_diff) max_diff = diff;
                 /* FP8 has lower precision, use larger tolerance */
-                if (rel_diff > 0.1f && diff > 0.5f) {
+                if (!isfinite(got) || (rel_diff > 0.004f && diff > 1e-4f)) {
                     if (errors < 5) {
                         printf("Mismatch at [%d,%d]: got %.4f, expected %.4f (diff=%.4f)\n",
                                i, j, got, expected, diff);
@@ -555,6 +486,7 @@ int main(int argc, char** argv) {
             }
         }
         if (errors > 0) {
+            verified = 0;
             printf("Verification FAILED (%d errors, max_diff=%.4f)\n", errors, max_diff);
         } else {
             printf("\nVerification PASSED (max_diff=%.4f)\n", max_diff);
@@ -568,8 +500,6 @@ int main(int argc, char** argv) {
     printf("\n=== Performance ===\n");
     printf("Time: %.3f ms (avg of %d runs)\n", avg_ms, bench_iters);
     printf("Throughput: %.2f TOPS\n", tops);
-    printf("Estimated Peak: %.2f TOPS\n", peak_tops);
-    printf("Efficiency: %.1f%%\n", 100.0 * tops / peak_tops);
 
     /* Cleanup */
     CHECK_CUDA(cuEventDestroy(start));
@@ -597,5 +527,5 @@ int main(int argc, char** argv) {
     if (cublas_lib) dlclose(cublas_lib);
     cuCtxDestroy(ctx);
 
-    return 0;
+    return verified ? 0 : 1;
 }

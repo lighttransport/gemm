@@ -1,5 +1,45 @@
 # 4-bit on consumer Blackwell (sm_120) — FP4 vs INT4, hardware or not?
 
+**E0M3 update:** the INT4 conclusions below describe the legacy PTX `s4` path.
+SM120 also executes signed-magnitude E0M3 (`-7..7`, FP32 accumulation) through
+format-patched `OMMA.SF` instructions. See [cuda/int4](../int4/README.md) for the
+validated RTX 5060 Ti implementation, quantization, and GEMM benchmarks.
+
+**FP4 GEMM comparison:** `make -C cuda/fp4 bench` benchmarks the actual FP4
+reference/shared-memory/`cp.async` kernels from this directory alongside the new
+FP4 and E0M3 kernels, with common inputs, verification, and timing. See
+[measured results and reproduction commands](RESULTS.md).
+
+**cuBLAS correction (2026-10-18/19):** NVFP4 and per-tensor FP8 both work on
+this SM120 card with cuBLASLt 13.4.1. The old probe used incorrect transpose
+attribute IDs (`0/1` instead of `3/4`), producing false unsupported results.
+`make -C cuda/fp4 cublas-bench` now measures verified, tuned 8192³ NVFP4 GEMM:
+**236.82 TOp/s with FP32 output**, **261.08 with BF16 output**, and **260.94
+with FP16 output**, all with FP32 accumulation. Current SM clocks are about
+2070 MHz. The current FP4/E0M3 instruction probe measures about **297 TOp/s**;
+the older 406 TOp/s probe below came from an earlier faster-clock run.
+
+**300 TOp/s tuning attempt (2026-10-19):** the new optional CUTLASS path reaches
+**280.8 TOp/s at 8192³**, with FP32 accumulation and BF16 output, at the same
+approximately 2070 MHz clocks. This is **7.8% faster** than the paired cuBLAS
+control, with all 67,108,864 outputs bit-identical to cuBLAS. The 300 TOp/s
+target has not been reached. `make -C cuda/fp4 cutlass-bench` builds the selected
+256x128x128 tile using unmodified CUTLASS headers; `CUTLASS_DIR` can override
+the local checkout. `cutlass-sweep`, `cutlass-test`, and `cutlass-sanitize`
+provide the full tile sweep, reference checks, and sanitizer checks.
+See [the tuning results](RESULTS.md#attack-on-300-tops-at-current-clocks).
+
+The same tuned kernel now also reaches **280.8 TOp/s with E0M3 inputs**,
+using a verified format-only SASS patch. Build and benchmark it with
+`make -C cuda/int4 cutlass-bench`; see the
+[E0M3 results and validation](../int4/RESULTS.md#optimized-e0m3-at-8192-cubed-280-tops-target-reached).
+
+The follow-up **290 TOp/s** attempt retains that bulk kernel: larger epilogues
+and a different MMA/TMA handoff were slower. The new
+[GLM5.3-Flash decode adapter](../int4/README.md#glm53-flash-decode-projections)
+also reuses its unpatched MMA tiles for FP4. The common runner now supports
+`--graph`, `--flush-mb`, and `--pilot-iters` for comparable short-kernel timing.
+
 This directory revisits an earlier "FP4 is software-emulated on sm_120" assumption and tests
 two hypotheses: **maybe NVFP4 is HW-accelerated while MXFP4 is software**, and (follow-up)
 **maybe INT4 is available and HW-accelerated too.**
@@ -13,20 +53,19 @@ ptxas/NVRTC and **cuBLASLt 13.4**.
 
 - **FP4 (e2m1) IS hardware-accelerated on consumer sm_120**, through the warp-level
   `mma.sync.aligned.m16n8k64 … e2m1 … block_scale` 5th-gen tensor-core instruction. (sm_120
-  has *no* `tcgen05.mma`; that block-level instruction is sm_100/datacenter only.) ~406 TOPS,
-  4× FP8, 8× BF16.
+  has *no* `tcgen05.mma`; that block-level instruction is sm_100/datacenter only.) The
+  earlier raw probe reached ~406 TOPS, 4× its legacy FP8 MMA probe and 8× BF16.
 - **NVFP4 == MXFP4** in throughput, within 0.1%. That hypothesis is **refuted** — both ride
   the same tensor-core datapath and differ only in *scale granularity*, not HW vs SW.
 - **INT4 (s4) is the opposite story: available but SOFTWARE-EMULATED.** The `s4` mma still
   assembles at `sm_120a`, but ptxas lowers it to **2× `IMMA.s8` + ~180 integer unpack ops**
   (confirmed in SASS), so it runs at only ~5% of the INT8 mma rate (21.6 TOPS — *slower* than
-  BF16). The native 4-bit integer tensor core of Turing/Ampere is gone on Blackwell. Use FP4
-  or INT8 instead. (INT8 itself is native and fast: 203 TOPS, 2× FP8.)
-- **cuBLASLt does NOT expose FP4 (or block-scaled FP8) GEMM on sm_120.** Every config returns
-  `CUBLAS_STATUS_NOT_SUPPORTED` (15), even fully block-scale-configured with the exact layout
-  from NVIDIA's `LtNvfp4Matmul` sample. The narrow-precision cuBLAS kernels are gated to
-  datacenter Blackwell (sm_100). On this card FP4 is reachable only via hand-written
-  `mma.sync` — exactly as the VLM/LLM runners already do for FP8.
+  BF16). This describes two's-complement `s4`; the E0M3 path above uses a different
+  codebook and FP32 accumulation. (INT8 itself is native and fast: 203 TOPS, 2× FP8.)
+- **cuBLASLt supports NVFP4 on this SM120 card.** Correct transpose attributes,
+  `VEC16_UE4M3` scales in the documented 128x4 layout, and FP32 compute select
+  native kernels. The FP4 + `VEC32_UE8M0` combination returns invalid-value
+  status 7 in the current library; its documented FP4 API uses K16/UE4M3.
 
 > **Takeaway:** on consumer Blackwell the *new* 4-bit format (FP4) got a hardware datapath,
 > while the *old* 4-bit format (INT4) lost its native tensor core and is now emulated on top
@@ -125,11 +164,12 @@ FP4 `2·16·8·64 = 16384`.
 ### 3.2 `cublas_fp4_gemm` — cuBLASLt support probe + BF16 baseline
 
 Drives `cublasLtMatmul` for BF16 (works), per-tensor FP8, and block-scaled NVFP4/MXFP4. To
-keep the scale-factor layout from mattering, every input element and every block scale is the
-encoding of **1.0**, so the expected output is exactly **K** at every position (a correctness
-check that is independent of the swizzled scale layout). Scale buffers are padded to
-`roundup(rows,128) × roundup(K/block,4)` and over-allocated. The cuBLAS heuristic reports
-whether each precision is supported at all.
+test real scale indexing, the default inputs are varying signed FP4 codes and
+positive K16 scales, packed in the documented 128x4 scale layout. `--data ones`
+retains the original constant-input check. Allocation and packing are excluded
+from timing. The runner searches up to 32 heuristic candidates (six were
+returned for 8192³), verifies them against FP64 CPU sums, and records five
+rounds of 100 launches with FP32, BF16, or FP16 output.
 
 ---
 
@@ -177,37 +217,57 @@ Compiling single mmas with `nvcc -arch=sm_120a -cubin` and dumping SASS
   unpack 4-bit → 8-bit. **No `IMMA.*.S4` opcode is emitted for sm_120 at all** — Turing/Ampere
   had one, Blackwell dropped it. The ~90× instruction blow-up is the measured ~19× slowdown.
 
-### 4.4 Would a direct PTX / SASS path help INT4? No.
+### 4.4 Would writing the same legacy `s4` instruction directly help?
 
 A natural follow-up: if inline-asm INT4 got emulated, can a hand-written PTX (or SASS) kernel
-force the native path? **No** — the emulation is not a frontend artifact:
+avoid this lowering? The emulation is not a frontend artifact:
 
 1. `nvcc -arch=sm_120a -ptx` emits the PTX **verbatim**: it literally contains
    `mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32`. The CUDA-C frontend does *not* emulate.
 2. Feeding that exact PTX straight to **`ptxas -arch=sm_120a`** produces the same
    `2× IMMA.S8 + unpack` SASS. **ptxas is the lowering stage** that emulates — so a hand-written
    PTX with the identical instruction is byte-for-byte identical.
-3. Below PTX is only SASS, and (a) there is no public SASS assembler, and (b) sm_120 exposes no
-   native `IMMA.*.S4` opcode to target anyway. The INT4 limitation is in **silicon**, surfaced
-   at the ptxas stage; no software layer recovers it.
+3. This does not rule out another SASS instruction family. The E0M3 experiment in
+   [cuda/int4](../int4/README.md) uses format bits in `OMMA.SF`, with signed-magnitude
+   `-7..7` inputs and FP32 accumulation, rather than `IMMA.*.S4`.
 
 FP4 needs no such path — it is already a single native `OMMA` regardless of route (inline asm,
 hand PTX, or direct `ptxas`).
 
 ### 4.2 `cublas_fp4_gemm`
 
+```sh
+make -C cuda/fp4 cublas-bench
+make -C cuda/fp4 cublas-test
+make -C cuda/fp4 cublas-sanitize
+```
+
+For individual configurations, use `--format nvfp4 --output f32|bf16|f16`,
+`--data random|ones`, `--algos 32`, `--workspace-mb 256`, and `--csv PATH`.
+The default is 8192³ with FP32 output and varying signed codes/scales. The
+matrix is `C[M,N] = A[M,K] * B[N,K]^T`; packing is outside timing. Results
+include median/min/max, selected heuristic, workspace, and decoded-input
+precision errors. A `.metadata.txt` sidecar records library/device details
+and selected opaque algorithms. See [results](RESULTS.md) for the full setup.
+
 | format | status | note |
 |--------|--------|------|
-| BF16 | **ok**, ≈50 TFLOP/s @4096³, verified | row-major-swap NN recipe |
-| FP8 (per-tensor) | unsupported (status 15) | as expected on sm_120 |
-| NVFP4 (VEC16_UE4M3) | unsupported (status 15) | even fully block-scale-configured |
-| MXFP4 (VEC32_UE8M0) | unsupported (status 15) | "" |
+| BF16 | supported | FP32 compute, TN layout |
+| FP8 (per-tensor) | supported | see [FP8 measurements](../fp8/RESULTS.md) |
+| NVFP4 (VEC16_UE4M3) | supported | 236.82 TOp/s F32 / 261.08 BF16 output at 8192³ |
+| FP4 + VEC32_UE8M0 | invalid-value status 7 | this FP4 scale-mode combination is not exposed |
+
+The earlier unsupported results were caused by incorrect descriptor IDs.
+They do not describe cuBLAS support on this GPU. The current runner checks
+descriptor-call status and validates the nonuniform scale layout. The raw
+4× ratio above compares to legacy FP8 MMA, not the newer cuBLAS FP8 kernel.
 
 ---
 
 ## 5. Conclusions
 
-1. **FP4 is hardware-accelerated on consumer sm_120**, at ~406 TOPS here — 4× FP8 and 8× BF16.
+1. **FP4 is hardware-accelerated on consumer sm_120**, at ~406 TOPS in the earlier
+   raw probe — 4× its legacy FP8 probe and 8× BF16.
    The "FP4 is software-emulated" assumption was about the dequant→bf16/fp8 path; native
    `mma.sync` e2m1 is real silicon.
 2. **NVFP4 and MXFP4 are equally hardware-accelerated** (identical to 0.1%). They share one
@@ -215,13 +275,13 @@ hand PTX, or direct `ptxas`).
    block 32 + ue8m0), *not* HW vs SW. Hypothesis refuted.
 3. **INT4 (s4) is available but software-emulated** — it assembles, but ptxas lowers it to
    2× INT8 `IMMA` + integer unpacking (SASS-confirmed), so it runs ~19× slower than INT8 and
-   even slower than BF16. The native 4-bit *integer* tensor core of Turing/Ampere is gone on
-   Blackwell; the 4-bit hardware now lives in *FP4*. Prefer FP4 or INT8.
-4. **INT8 is native and the fastest 8-bit path** (203 TOPS, 2× FP8) — GeForce throttles FP8 to
-   the FP16 tensor rate, while INT8 runs full-rate.
-5. **cuBLAS gives you none of the narrow paths on sm_120.** To exploit FP4 on GeForce Blackwell
-   you must hand-write the `mma.sync` kernels (or use CUTLASS sm120 collectives) — the same
-   situation as FP8 on this card.
+   even slower than BF16. E0M3 can instead use the native `OMMA.SF` datapath with a
+   different integer codebook and FP32 accumulation; see the update above.
+4. **INT8 is native** (203 TOPS in the earlier issue-rate probe). Its 2× ratio
+   to FP8 concerns the legacy FP8 instruction tested there. Current cuBLAS FP8
+   uses a faster path and reaches roughly 142 TOp/s at the current clocks.
+5. **cuBLAS exposes NVFP4 on SM120.** The 8192³ library GEMM is substantially
+   faster than the current custom FP4 kernels; use it as the optimization baseline.
 
 ---
 
@@ -251,9 +311,9 @@ make                  # builds cublas_fp4_gemm and mma_fp4_probe
 - **mma fragment shape** is shared across BF16/FP8/FP4 (D:4×f32, A:4×b32, B:2×b32, C:4×f32);
   FP4 just appends `scale-reg, {byte-id,thread-id}` per operand (selectors are literal `{0,0}`
   here since every scale is 1.0).
-- **cuBLASLt BF16 quirk:** explicitly setting `TRANSA`/`TRANSB` (even to `N`) made the BF16
-  heuristic return NOT_SUPPORTED on this card. Leaving the defaults (the standalone bench's
-  NN row-major-swap recipe) works. Narrow precision (TN) still needs them set.
+- **cuBLASLt descriptor IDs:** `TRANSA=3`, `TRANSB=4`. The previous `0/1`
+  values refer to different attributes and caused misleading unsupported results.
+  The corrected TN setup works for BF16, FP8, and NVFP4.
 - **`cublasLtMatmulHeuristicResult_t.algo` is `uint64_t[8]` (64 B), not a `void*`** — the older
   fp8/bf16 templates mis-declared it as a pointer, which showed up as a bogus ~4 GB workspace
   print. Fixed here.
@@ -267,5 +327,5 @@ make                  # builds cublas_fp4_gemm and mma_fp4_probe
   `kind::mxf4`).
 - NVIDIA CUDALibrarySamples — `cuBLASLt/LtNvfp4Matmul` (the layout/scale-mode reference).
 - cuBLAS docs §"16/32-Element 1D Block Scaling for FP8 and FP4 Data Types".
-- Related repo note: cuBLAS FP8 also unsupported on sm_120 (VLM encoder uses a custom
-  `mma.sync` FP8 kernel) — see `cuda/vlm/`.
+- [cuBLAS FP4 requirements and scale layout](https://docs.nvidia.com/cuda/cublas/#d-block-scaling-factors-layout).
+- [Current cuBLAS FP8 results](../fp8/RESULTS.md).
