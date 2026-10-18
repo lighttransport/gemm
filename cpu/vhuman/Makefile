@@ -15,6 +15,9 @@ libvhuman_motion.so: ../../common/vhuman_motion.c ../../common/swin_runner.c $(w
 test_vhuman_ops: test_vhuman_ops.c ../../common/vhuman_models.c $(wildcard ../../common/*.h) $(AVX_OBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(AVX_OBJ) -lm -lpthread
 .PHONY: test
+test_motion_layer: test_motion_layer.c ../../common/vhuman_motion_layer.c ../../common/vhuman_motion_layer.h
+	$(CC) $(CFLAGS) -o $@ test_motion_layer.c ../../common/vhuman_motion_layer.c -lm
+
 test: test_vhuman_ops test_vhuman_training
 	./test_vhuman_ops
 	./test_vhuman_training

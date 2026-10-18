@@ -62,6 +62,19 @@ class PackageTests(unittest.TestCase):
             del files['../escape']; del files['gnm.bin']; write()
             with self.assertRaises(ValueError): validate_package(root)
 
+    def test_morph_runtime_manifest(self):
+        WORK.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=WORK) as temp:
+            root = Path(temp); files = {}
+            for name in ('rig.glb', 'rig.json', 'eye_params.json'):
+                (root/name).write_bytes(b'fixture'); files[name] = dict(sha256=sha256(root/name), bytes=7)
+            manifest = dict(schema='vhuman.mobile_avatar.v1', runtime='morph', files=files)
+            (root/'avatar.json').write_text(json.dumps(manifest)); validate_package(root)
+            manifest['runtime'] = 'wasm'; (root/'avatar.json').write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError): validate_package(root)         # a native package needs gnm.bin
+            manifest['runtime'] = 'other'; (root/'avatar.json').write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError): validate_package(root)
+
     def test_hair_ribbons_have_deterministic_root_layout_and_budget(self):
         rng = np.random.default_rng(7); paths = np.cumsum(rng.normal(0, .001, (1500, 8, 3)), axis=1)
         p, tri, uv, selected = hair_cards(paths)

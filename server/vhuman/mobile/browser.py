@@ -60,12 +60,16 @@ def build(package,out,three,detail=None,skin_review=None):
         (out/target).write_text(text)
     for name in ('vhuman_mobile.html','vhuman_mobile.js','vhuman_mobile_occlusion.js','vhuman_mobile_contact.js','vhuman_mobile_hash.js','vhuman_mobile_worker.js','vhuman_mobile_stream.js','vhuman_mobile_audio.js'):
         shutil.copyfile(ROOT/'web'/name,out/('index.html' if name.endswith('.html') else name))
+    # The shared rig evaluator, analytic eye material and motion layer (morph runtime, analytic eyes).
+    for name in ('vhuman_rig_eval.js','vhuman_eye_shader.js','vhuman_eye_mesh_shader.js','vhuman_motion_layer.js'):
+        (out/name).write_text((ROOT/'web'/name).read_text().replace("from 'three'","from './three.module.js'"))
     shutil.copyfile(ROOT/'web/vhuman_device_test.html',out/'device-test.html')
     shutil.copyfile(ROOT/'web/vhuman_device_test.js',out/'vhuman_device_test.js')
     (out/'config.json').write_text(json.dumps(dict(schema='vhuman.browser.v1',package='avatar/',
         package_sha256=sha256(package/'avatar.json'),detail='detail/' if detail else None,
         detail_sha256=sha256(detail/'detail.json') if detail else None,
-        skin_review='skin-review/review.html' if skin_review else None,three='0.163.0',runtime='WebGL2 + WASM SIMD')))
+        skin_review='skin-review/review.html' if skin_review else None,three='0.163.0',
+        runtime=json.loads((package/'avatar.json').read_text()).get('runtime','wasm'))))
     return dict(out=str(out),serve=f'python -m http.server 8088 --bind 127.0.0.1 --directory {out}',url='http://127.0.0.1:8088/')
 
 

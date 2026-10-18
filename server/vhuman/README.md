@@ -785,6 +785,23 @@ eyes, carves/drapes the lids, adds lining/wet margins/occlusion, and bakes skin.
 The head viewer supports analytic and portable eye rendering. Source portraits,
 raw generated heads, fit metadata and maps remain beside each exported GLB.
 
+## Synthetic identities (no image)
+
+`python -m server.vhuman.cli --work WORK synthetic --seed N [--strength s]
+[--tone-u u --tone-v v] [--iris brown|hazel|green|blue|gray|dark_brown]` samples
+bounded GNM v3 identity modes (`reconstruction/synthetic.py`: unit-scale
+Gaussian over the 170 fitted modes, clipped to +-2 sigma), evaluates the
+neutral anatomy, paints a procedural skin in the model's own atlas (tone
+chart, cellular pores and mottling, lip and mouth-lining tints), writes a
+Pixal3D-style `pixal3d.glb` (skin and mouth lining) and a software-rendered
+neutral `portrait.png` whose eyeballs are coloured by vertex (sclera, iris,
+pupil), then runs the ordinary head fit (`head-fit` semantics, procedural
+iris) so the head record, rig builder and exports work unchanged. The record
+is tagged `source: synthetic` with the seed and coefficients; no image
+licence applies (GNM v3 is Apache-2.0). `--inputs-only DIR` writes just the
+two inputs. Limitations: no hair, brows or lashes in the texture; the
+portrait is a render, so skin detail comes from the procedural prior only.
+
 ## Facial rig
 
 `/rig` and `python3 -m server.vhuman.cli rig --head <id>` turn a fitted head
@@ -1285,6 +1302,32 @@ multi-view review; a low frontal landmark error does not establish unseen facial
 shape. Asset manifests explicitly set `production_ready=false` and
 `device_measured=false`. On-device LLM/TTS and the planned six-identity / bilingual
 acceptance corpus are not implemented by this mobile reference.
+
+### Morph-target browser runtime
+
+`python -m server.vhuman.mobile.morph_export --rig HEAD/rig --out PKG --head HEAD`
+packages a built facial rig (rig.glb with skinning and sparse morph targets,
+rig.json, deformer.lrm, LOD glTFs) with the analytic eye inputs (flat
+`eye_*` files from the head's eye parameters) and the same checksummed
+`avatar.json` (`runtime: "morph"`). `mobile.browser` builds the same player
+bundle for it (plus the shared `vhuman_rig_eval.js`, eye shaders and motion
+layer); the player then evaluates the rig on the GPU through morph targets and
+skinning (`web/vhuman_rig_eval.js`, ML corrective included), shades the carried
+runtime eyeballs with the analytic mesh eye material in the exported rest eye
+frames, and runs the seeded motion layer (blinks, saccades, convergence, pupil,
+breathing, head micro-motion) under the head sliders and the pose sweep.
+`mobile.browser_verify` detects the runtime and checks loading, pose and camera
+changes, the sweep and the frame rate (`verification.json`, screenshots).
+
+Measured on 2026-10-19 with a procedural-template rig of head 291dfa911553
+(RX 9070 XT, ANGLE/Vulkan, 720x1280 cap): see the figures recorded in
+`tmp/morph-demo/verify2/verification.json` after the build; the GNM-transfer
+rig of the same Pixal3D head (46,320 triangles, two analytic eyes) ran at
+29.8 FPS steady and 30.2 FPS animated at the 30 FPS cap with 0.7 ms of rig and
+motion-layer evaluation per frame. Live speech in this runtime still needs the
+semantic control stream (the native stream carries GNM coefficients); mouth
+occlusion and the contact deformer are not applied here yet. No device was
+measured.
 
 ### Browser target and skin-detail preprocessing
 

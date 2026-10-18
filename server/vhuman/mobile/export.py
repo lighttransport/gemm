@@ -39,11 +39,17 @@ def hair_cards(paths,limit=1024,width=.00035):
     return vertices,faces.reshape(-1,3),np.tile(uv[np.array([[0,1,2],[1,3,2],[2,3,4],[3,5,4]])],(len(curves),1,1)),selected
 
 
+MORPH_FILES={'rig.glb','rig.json'}
+WASM_FILES={'gnm.bin','avatar.glb','streams.bin','bindings.bin','controls.json'}
+
+
 def validate_package(folder):
     folder=Path(folder).resolve();manifest=json.loads((folder/'avatar.json').read_text())
     if manifest.get('schema')!='vhuman.mobile_avatar.v1':raise ValueError('unsupported mobile avatar')
     files=manifest.get('files',{})
-    if not isinstance(files,dict) or not {'gnm.bin','avatar.glb','streams.bin','bindings.bin','controls.json'}<=files.keys():
+    runtime=manifest.get('runtime','wasm')
+    if runtime not in ('wasm','morph'):raise ValueError('unsupported mobile runtime')
+    if not isinstance(files,dict) or not (MORPH_FILES if runtime=='morph' else WASM_FILES)<=files.keys():
         raise ValueError('incomplete mobile package')
     for name,record in files.items():
         path=(folder/name).resolve()
@@ -52,6 +58,19 @@ def validate_package(folder):
                 or sha256(path)!=record['sha256']):
             raise ValueError('mobile asset path/checksum mismatch')
     return manifest
+
+
+def write_eye_files(eye_params,out,res=1024):
+    """Flat eye_* files (live textures, uniforms, params) for the analytic mesh eye material."""
+    from ..eye import assets as eye_assets
+    from ..eye import params as params_module
+    eye_params=params_module.validate(eye_params)
+    folder=Path(out)/'_eye_tmp';written=eye_assets.write_live(eye_params,folder,res=res)
+    for name in written['files']:
+        (folder/name).replace(Path(out)/('eye_'+name))
+    folder.rmdir()
+    (Path(out)/'eye_params.json').write_text(json.dumps(eye_params,indent=1))
+    return ['eye_'+n for n in written['files']]+['eye_params.json']
 
 
 def export(candidate,out, *, scene,profile='iphone12',eye_lod='runtime'):
@@ -191,16 +210,13 @@ def export(candidate,out, *, scene,profile='iphone12',eye_lod='runtime'):
     (out/'controls.json').write_text(json.dumps(controls,indent=2))
     if (scene/'eye_params.json').is_file():
         # The analytic eye material's inputs (live textures + uniforms), for runtimes without the server.
-        from ..eye import assets as eye_assets
-        eye_params=json.loads((scene/'eye_params.json').read_text())
-        eye_assets.write_live(eye_params,out/'eye',res=1024)
-        (out/'eye'/'params.json').write_text(json.dumps(eye_params,indent=1))
+        write_eye_files(json.loads((scene/'eye_params.json').read_text()),out)
     if (scene/'skin_detail.npz').is_file():
         shutil.copyfile(scene/'skin_detail.npz',out/'skin_detail.npz')
         shutil.copyfile(scene/'skin_detail.json',out/'skin_detail.json')
     result=dict(schema='vhuman.mobile_avatar.v1',profile=IPHONE12,source_geometry_sha256=manifest['geometry_sha256'],
         source_portrait_sha256=manifest['portrait_sha256'],native=native,parts=records,triangles=triangles,
-        eyes=dict(lod=eye_lod,triangles=eye_triangles,material='standard glTF reference; the analytic mesh eye material uses eye/'),
+        eyes=dict(lod=eye_lod,triangles=eye_triangles,material='standard glTF reference; the analytic mesh eye material uses the eye_* files'),
         camera=description['camera'],material=manifest['material'],licenses=[dict(component='GNM v3',license='Apache-2.0',
         source='https://huggingface.co/google/gnm-v3')],texture_encoding='embedded PNG reference',
         validation=dict(device_measured=False,production_ready=False),

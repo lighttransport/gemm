@@ -4,6 +4,10 @@ import {AvatarStream} from './vhuman_mobile_stream.js';
 import {sha256} from './vhuman_mobile_hash.js';
 import {oralUniforms,setOralUniforms,patchOralMaterial,cpuOralOcclusion} from './vhuman_mobile_occlusion.js';
 import {partContact} from './vhuman_mobile_contact.js';
+import {LinearRig,MLDeformer,eulerZYX,restMatrix} from './vhuman_rig_eval.js';
+import * as Eye from './vhuman_eye_shader.js';
+import * as EyeMesh from './vhuman_eye_mesh_shader.js';
+import {MotionLayer} from './vhuman_motion_layer.js';
 
 const $=id=>document.getElementById(id), status=$('status');
 const state={ready:false,pending:false,animate:false,frames:0,poseId:0,workerMs:0,updateMs:0,detail:true,errors:[]};
@@ -132,6 +136,7 @@ async function main(){
     const config=await (await fetch('./config.json')).json();
     const manifest=json(await bytes(config.package+'avatar.json',config.package_sha256));
     if(manifest.schema!=='vhuman.mobile_avatar.v1')throw Error('Unsupported avatar');
+    if((manifest.runtime||'wasm')==='morph'){await morphRuntime(renderer,config,manifest);return;}
     if(manifest.material?.synthetic_completion){
         const note=document.createElement('p');note.className='muted';
         note.textContent='Unseen skin includes AI-generated texture. Photographed skin is preserved.';
@@ -300,6 +305,121 @@ async function main(){
         if(now-lastReport>1000){
             state.fps=frames*1000/(now-lastReport);frames=0;lastReport=now;
             status.textContent=`WebGL2 • ${manifest.triangles.toLocaleString()} triangles\nDisplay ${state.fps.toFixed(1)} FPS\nWASM pose ${state.workerMs.toFixed(1)} ms\nBindings + normals ${state.updateMs.toFixed(1)} ms\n${oralSpec?`Mouth occlusion ${(state.oralMs||0).toFixed(1)} ms\n`:''}${state.detailMetrics?(state.detailDriver==='trained'?'Trained strain driver · held-out checked':'Analytic strain driver · fit rejected'):'Static skin detail'}\nReference build · device quality unverified`;
+        }
+    }
+    requestAnimationFrame(frame);
+}
+// ---- the morph-target runtime: rig.glb (skinned, sparse morph targets) + rig.json evaluated on the GPU
+async function morphRuntime(renderer,config,manifest){
+    const buffers={};
+    for(const [name,file] of Object.entries(manifest.files)){
+        if(name.includes('/')||name.includes('\\')||file.bytes>256*1024*1024)throw Error('Invalid asset filename/size');
+        status.textContent=`Checking ${name}…`;
+        const data=await bytes(config.package+name,file.sha256,file.bytes);
+        if(['rig.glb','rig.json','deformer.lrm','eye_uniforms.json','eye_params.json'].includes(name))buffers[name]=data;
+    }
+    const def=json(buffers['rig.json']);
+    const gltf=await new GLTFLoader().parseAsync(buffers['rig.glb'],'');
+    const scene=new THREE.Scene();scene.add(gltf.scene);
+    const bones={},morphMeshes=[];let triangles=0;
+    gltf.scene.traverse(o=>{
+        if(o.isBone)bones[o.name]=o;
+        if(o.isMesh){o.frustumCulled=false;triangles+=o.geometry.index?o.geometry.index.count/3:o.geometry.attributes.position.count/3;
+            if(o.morphTargetDictionary&&Object.keys(o.morphTargetDictionary).length)morphMeshes.push(o);
+            for(const m of [].concat(o.material)){if(/mouth/.test(m.name))m.side=THREE.DoubleSide;if(/eyeshell/.test(o.name))m.depthWrite=false;}}
+    });
+    const rig=new LinearRig(def);
+    if(def.ml_deformer&&buffers['deformer.lrm']){
+        const buf=buffers['deformer.lrm'],n=Number(new DataView(buf).getBigUint64(0,true));
+        const header=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,8,n))),t={};
+        for(const [k,h] of Object.entries(header)){if(k==='__metadata__')continue;const [a,b]=h.data_offsets;t[k]={shape:h.shape,data:new Float32Array(buf.slice(8+n+a,8+n+b))};}
+        rig.ml=new MLDeformer(t,Object.assign({ranges:Object.fromEntries(def.controls.map(c=>[c.name,[c.min,c.max]]))},def.ml_deformer));rig.mlOn=true;
+    }
+    const restR=def.joints.map(restMatrix),_m4=new THREE.Matrix4();
+    const box=new THREE.Box3().setFromObject(gltf.scene),center=box.getCenter(new THREE.Vector3()),size=box.getSize(new THREE.Vector3());
+    const camera=new THREE.PerspectiveCamera(35,1,.01,10);camera.position.copy(center).add(new THREE.Vector3(0,0,Math.max(size.y*1.8,.35)));camera.lookAt(center);
+    const reviewViews={front:[0,0],left:[-85,10],right:[85,10],rear:[180,20],crown:[0,75]};
+    state.setView=name=>{
+        if(!reviewViews[name])throw Error('Unknown review view');
+        const [yaw,pitch]=reviewViews[name].map(v=>v*Math.PI/180),radius=Math.max(size.y*1.8,.35);
+        camera.position.copy(center).add(new THREE.Vector3(Math.sin(yaw)*Math.cos(pitch),Math.sin(pitch),Math.cos(yaw)*Math.cos(pitch)).multiplyScalar(radius));
+        camera.lookAt(center);$('view').value=name;
+    };
+    $('view').onchange=()=>state.setView($('view').value);
+    const key=new THREE.DirectionalLight(0xffefd9,3.2);key.position.set(-.4,.5,1);
+    const fill=new THREE.DirectionalLight(0xcbdfff,1.1);fill.position.set(.7,.1,1);
+    const ambient=new THREE.HemisphereLight(0xd6e4ff,0x5f4837,1.2);scene.add(key,fill,ambient);
+    $('lighting').onchange=()=>{const mode=$('lighting').value;key.position.set(mode==='side'?-1:-.4,.5,mode==='side'?.2:1);key.intensity=mode==='soft'?1.2:3.2;fill.intensity=mode==='side'?.25:1.1;
+        for(const e of eyes)Eye.setSoftboxDirection(e.studio,0,key.position);};
+    // Analytic eyes: the carried runtime eyeballs shaded in the exported rest eye frames.
+    const eyes=[];
+    if(def.eyes&&buffers['eye_uniforms.json']){
+        const g=json(buffers['eye_uniforms.json']),params=json(buffers['eye_params.json']);
+        const urls={};for(const n of ['iris_masks','iris_normal','sclera_masks','sclera_normal','iris_color_chart'])urls[n]=config.package+'eye_'+n+'.png';
+        const tex=await Eye.loadEyeTextures({urls,res:1024},{anisotropy:renderer.capabilities.getMaxAnisotropy()});
+        for(const side of ['left','right']){
+            const info=def.eyes[side],shell=gltf.scene.getObjectByName(`eye_${side}_shell`),iris=gltf.scene.getObjectByName(`eye_${side}_iris`),bone=info&&bones[info.joint];
+            if(!info||!shell||!bone||!shell.skeleton)continue;
+            const studio=Eye.makeStudioUniforms();Eye.applyStudio(studio,g,0);Eye.setSoftboxDirection(studio,0,key.position);
+            const mat=EyeMesh.makeEyeMeshMaterial(studio,{skinned:true});
+            const p=JSON.parse(JSON.stringify(params));p.optics.side=side;
+            Eye.applyEyeGeometry(mat,g);Eye.applyEyeParams(mat,p,g);Eye.bindEyeTextures(mat,tex);
+            const boneInverse=shell.skeleton.boneInverses[shell.skeleton.bones.indexOf(bone)];
+            const frame=new THREE.Matrix4().fromArray(info.frame.flat()).transpose();
+            EyeMesh.attachEyeFrame(shell,{bone,boneInverse,frame});
+            shell.material=mat;if(iris)iris.visible=false;
+            eyes.push({side,shell,mat,studio,params:p,g,lastMult:1});
+        }
+    }
+    state.eyes=eyes.length;state.runtime='morph';
+    const motion=new MotionLayer(7);const t0=performance.now();
+    state.values={};
+    function applyRig(values){
+        const ev=rig.evaluate(values);
+        for(let j=0;j<def.joints.length;j++){
+            const J=def.joints[j],bone=bones[J.name];if(!bone)continue;
+            const d=ev.delta.subarray(j*6,j*6+6);
+            bone.position.set(J.rest_translation[0]+d[0],J.rest_translation[1]+d[1],J.rest_translation[2]+d[2]);
+            _m4.copy(restR[j]).multiply(eulerZYX(d[3],d[4],d[5]));bone.quaternion.setFromRotationMatrix(_m4);
+        }
+        for(const mesh of morphMeshes){const dict=mesh.morphTargetDictionary;for(const [name,i] of Object.entries(dict))mesh.morphTargetInfluences[i]=ev.weights[name]||0;}
+        const mult=1+0.6*(values.pupilWide||0)-0.5*(values.pupilNarrow||0);
+        for(const e of eyes){if(Math.abs(mult-e.lastMult)<1e-4)continue;const q=JSON.parse(JSON.stringify(e.params));q.pupil.scale*=mult;Eye.applyEyeParams(e.mat,q,e.g);e.lastMult=mult;}
+        state.poseId++;
+    }
+    state.setControls=values=>{state.animate=false;state.values=Object.assign({},values);state.hold=true;};
+    const sweepControls=t=>({jawOpen:.35+.35*Math.sin(t*1.1),mouthSmileLeft:.5+.5*Math.sin(t*.7),mouthSmileRight:.5+.5*Math.sin(t*.7),
+        browInnerUp:.5+.5*Math.sin(t*.9+1),mouthPucker:Math.max(0,Math.sin(t*.5)),eyeWideLeft:.3+.3*Math.sin(t*1.3),eyeWideRight:.3+.3*Math.sin(t*1.3)});
+    for(const name of ['sweep','reset'])$(name).disabled=false;
+    $('sweep').onclick=()=>{state.animate=!state.animate;state.hold=false;$('sweep').textContent=state.animate?'Pause sweep':'Play pose sweep';};
+    $('reset').onclick=()=>{state.animate=false;state.hold=false;$('yaw').value=0;$('pitch').value=0;state.setView('front');$('sweep').textContent='Play pose sweep';};
+    $('detail').disabled=true;$('oral').disabled=true;
+    for(const name of ['connect','speak','stop'])$(name).disabled=true;
+    $('speech-status').textContent='Live speech needs the semantic control stream (pending); the pose sweep and the motion layer run locally.';
+    const canvas=$('viewport');let drag=null;
+    const clampInput=(input,value)=>{input.value=String(Math.max(Number(input.min),Math.min(Number(input.max),value)));};
+    canvas.addEventListener('pointerdown',event=>{if(event.button!==0)return;drag={x:event.clientX,y:event.clientY,yaw:Number($('yaw').value),pitch:Number($('pitch').value)};canvas.setPointerCapture(event.pointerId);canvas.classList.add('dragging');});
+    canvas.addEventListener('pointermove',event=>{if(!drag)return;const rect=canvas.getBoundingClientRect(),gain=1.6/Math.max(rect.width,rect.height,1);clampInput($('yaw'),drag.yaw+(event.clientX-drag.x)*gain);clampInput($('pitch'),drag.pitch-(event.clientY-drag.y)*gain);});
+    const endDrag=event=>{if(!drag)return;drag=null;canvas.classList.remove('dragging');if(canvas.hasPointerCapture(event.pointerId))canvas.releasePointerCapture(event.pointerId);};
+    canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);
+    let lastDraw=0,lastReport=performance.now(),frames=0,evalMs=0;
+    function frame(now){
+        requestAnimationFrame(frame);if(document.hidden||now-lastDraw<1000/30)return;
+        lastDraw+=Math.floor((now-lastDraw)/(1000/30))*(1000/30);
+        const rect=$('viewport').getBoundingClientRect(),scale=Math.min(1,720/rect.width,1280/rect.height),w=Math.max(1,Math.round(rect.width*scale)),h=Math.max(1,Math.round(rect.height*scale));
+        if(renderer.domElement.width!==w||renderer.domElement.height!==h){renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();}
+        const start=performance.now(),t=(now-t0)/1000;
+        const values=state.hold?Object.assign({},state.values):(state.animate?sweepControls(t):{});
+        // head sliders: the rig's signed head controls (yaw +0.6 = 24 deg at the head joint); the motion layer adds idle motion
+        values.headYaw=(values.headYaw||0)+Number($('yaw').value);values.headPitch=(values.headPitch||0)+Number($('pitch').value);
+        const idle=motion.sample(t,{headYaw:values.headYaw,headPitch:values.headPitch,focusDistance:.6,light:.6,speaking:state.animate});
+        for(const [k,v] of Object.entries(idle)){if(k.startsWith('_'))continue;if(k.startsWith('head'))values[k]=(values[k]||0)+v;else if(k.startsWith('eyeBlink'))values[k]=Math.max(values[k]||0,v);else if(!(k in values))values[k]=v;}
+        applyRig(values);evalMs=performance.now()-start;state.evalMs=evalMs;
+        renderer.render(scene,camera);state.frames++;frames++;
+        if(!state.ready){state.ready=true;}
+        if(now-lastReport>1000){
+            state.fps=frames*1000/(now-lastReport);frames=0;lastReport=now;
+            status.textContent=`WebGL2 morph runtime • ${triangles.toLocaleString()} triangles\nDisplay ${state.fps.toFixed(1)} FPS\nRig + motion layer ${evalMs.toFixed(2)} ms\n${def.controls.length} controls · ${def.blendshapes.length} shapes${rig.ml?' · ML corrective':''}\n${eyes.length?'Analytic eyes':'Standard eye materials'}\nReference build · device quality unverified`;
         }
     }
     requestAnimationFrame(frame);

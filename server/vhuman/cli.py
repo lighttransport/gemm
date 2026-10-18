@@ -217,6 +217,15 @@ def cmd_head(args) -> dict:
     return pipeline.head_job(svc, req, _progress, threading.Event(), python=args.qwen_python, mock=args.mock)
 
 
+def cmd_synthetic(args) -> dict:
+    """An image-free identity: sampled GNM modes, procedural skin, rendered portrait, fitted head record."""
+    from .reconstruction import synthetic
+    kw = dict(strength=args.strength, tone=(args.tone_u, args.tone_v), iris=args.iris, fov_deg=args.fov)
+    if args.inputs_only:
+        return synthetic.head_inputs(args.inputs_only, args.seed, **kw)
+    return synthetic.create_head(args.work, args.seed, subject=args.subject, **kw)
+
+
 def cmd_head_fit(args) -> dict:
     """Fit eyes to an existing portrait + Pixal3D GLB, as a head record."""
     import shutil
@@ -541,6 +550,16 @@ def main(argv=None) -> int:
     sp.add_argument("--qwen-preset", choices=("fast12", "low8"), default="fast12")
     sp.add_argument("--skin", help="Skin controls as JSON or @file.json")
     sp.set_defaults(fn=cmd_head)
+    sp = sub.add_parser("synthetic", help="an image-free synthetic identity (GNM modes) as a fitted head record")
+    sp.add_argument("--seed", type=int, default=1)
+    sp.add_argument("--strength", type=float, default=1.0, help="identity variation (0 = the template, up to 2)")
+    sp.add_argument("--tone-u", type=float, default=0.5, help="skin undertone 0 cool .. 1 warm")
+    sp.add_argument("--tone-v", type=float, default=0.35, help="skin pigmentation 0 light .. 1 dark")
+    sp.add_argument("--iris", default="brown", choices=sorted(__import__("server.vhuman.reconstruction.synthetic", fromlist=["IRIS_COLORS"]).IRIS_COLORS))
+    sp.add_argument("--fov", type=float, default=20.0)
+    sp.add_argument("--subject", default=None)
+    sp.add_argument("--inputs-only", help="only write pixal3d.glb + portrait.png here (no head fit)")
+    sp.set_defaults(fn=cmd_synthetic)
     sp = sub.add_parser("head-fit", help="fit eyes to an existing portrait + Pixal3D GLB")
     sp.add_argument("--portrait", required=True)
     sp.add_argument("--glb", required=True)

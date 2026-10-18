@@ -516,7 +516,9 @@ over 8 degrees and at `sil` onsets of the alignment, convergence from a 0.9 m
 focus, a pupil response with hippus, breathing and 1/f-like head micro-motion.
 Speech frames (the `sil` viseme below 0.5) widen the gaze offsets and raise
 the blink rate. The head follow-through of the gaze is kept. The model uses
-only polynomial math and a 32-bit PRNG, so a seed reproduces a take exactly;
+only polynomial math and a 32-bit PRNG, so a seed reproduces a take exactly
+(the C port `common/vhuman_motion_layer.c`, for the native realtime path,
+matches to 1e-9 as well: `make -C cpu/vhuman test_motion_layer`);
 rebuilding a take reuses its seed unless overridden. Every take ends on a
 neutral frame. Playback samples these same
 controls against the WAV element's current time, including after seeking;

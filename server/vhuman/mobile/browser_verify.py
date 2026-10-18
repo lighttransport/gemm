@@ -44,6 +44,66 @@ def speech_fixture(package):
     finally:stop.set();thread.join(timeout=5)
 
 
+def verify_morph(player,out,hardware=False):
+    """The morph-target runtime: loads, evaluates the rig with the motion layer,
+    attaches the analytic eyes, renders at the 30 FPS cap, changes pixels on
+    pose/review-camera changes, no console errors. Writes verification.json."""
+    import base64
+    player,out=Path(player),Path(out);out.mkdir(parents=True,exist_ok=True)
+    manifest=json.loads((player/'avatar/avatar.json').read_text())
+    if manifest.get('runtime')!='morph':raise ValueError('not a morph runtime package')
+    work=Path(tempfile.mkdtemp(prefix='morph-verify-',dir=out))
+    server=ThreadingHTTPServer(('127.0.0.1',0),partial(SimpleHTTPRequestHandler,directory=str(player)))
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    profile=work/'chrome';flags=['--headless=new','--no-first-run','--no-sandbox','--ignore-gpu-blocklist','--window-size=900,1400','--remote-debugging-port=0',f'--user-data-dir={profile}']
+    flags+=['--use-gl=angle','--use-angle=vulkan'] if hardware else ['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']
+    chrome=subprocess.Popen([find_chrome(),*flags,'about:blank'],stdout=(work/'chrome.log').open('w'),stderr=subprocess.STDOUT)
+    try:
+        active=profile/'DevToolsActivePort';deadline=time.monotonic()+60
+        while not active.is_file() and time.monotonic()<deadline:time.sleep(.05)
+        port=int(active.read_text().splitlines()[0])
+        target=json.loads(urlopen(Request(f'http://127.0.0.1:{port}/json/new',method='PUT'),timeout=5).read())
+        cdp=Cdp(target['webSocketDebuggerUrl'])
+        try:
+            for domain in ('Runtime.enable','Log.enable','Page.enable'):cdp.call(domain)
+            cdp.call('Page.navigate',{'url':f'http://127.0.0.1:{server.server_port}/'})
+            cdp.wait_for('window.vhuman && vhuman.ready && vhuman.runtime==="morph"',timeout=180)
+            canvas=lambda:cdp.evaluate('document.querySelector("canvas").toDataURL()')
+            eyes=cdp.evaluate('vhuman.eyes')
+            before=canvas();frame=cdp.evaluate('vhuman.frames')
+            cdp.evaluate('vhuman.setControls({jawOpen:1,mouthSmileLeft:1,mouthSmileRight:1,eyeLookUpLeft:1,eyeLookUpRight:1})')
+            cdp.wait_for(f'vhuman.frames>{frame+2}')
+            if canvas()==before:raise AssertionError('pose change did not change pixels')
+            shot=cdp.call('Page.captureScreenshot',{'format':'png'});(out/'pose.png').write_bytes(base64.b64decode(shot['data']))
+            for view in ('left','front'):
+                before=canvas();frame=cdp.evaluate('vhuman.frames')
+                cdp.evaluate(f'vhuman.setView({json.dumps(view)})');cdp.wait_for(f'vhuman.frames>{frame+1}')
+                if canvas()==before:raise AssertionError('review camera did not change the frame: '+view)
+            cdp.evaluate('document.getElementById("reset").click()')
+            first=cdp.evaluate('({frames:vhuman.frames,time:performance.now()})')
+            cdp.wait_for(f'performance.now()>{first["time"]+3000}')
+            last=cdp.evaluate('({frames:vhuman.frames,time:performance.now()})')
+            cdp.evaluate('document.getElementById("sweep").click()')
+            a=cdp.evaluate('({frames:vhuman.frames,poses:vhuman.poseId,time:performance.now()})')
+            cdp.wait_for(f'performance.now()>{a["time"]+3000}')
+            b=cdp.evaluate('({frames:vhuman.frames,poses:vhuman.poseId,time:performance.now()})')
+            cdp.evaluate('document.getElementById("sweep").click()')
+            shot=cdp.call('Page.captureScreenshot',{'format':'png'});(out/'sweep.png').write_bytes(base64.b64decode(shot['data']))
+            driver=cdp.evaluate('(()=>{let g=document.querySelector("canvas").getContext("webgl2"),e=g.getExtension("WEBGL_debug_renderer_info");return e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):g.getParameter(g.RENDERER)})()')
+            console=[e for e in cdp.console_errors() if 'favicon.ico' not in e]
+            if console:raise AssertionError(console)
+            result=dict(runtime='morph',renderer=driver,triangles=manifest['triangles'],analytic_eyes=eyes,eval_ms=cdp.evaluate('vhuman.evalMs'),
+                display_fps=(last['frames']-first['frames'])*1000/(last['time']-first['time']),
+                animated_display_fps=(b['frames']-a['frames'])*1000/(b['time']-a['time']),
+                animated_pose_fps=(b['poses']-a['poses'])*1000/(b['time']-a['time']),
+                frame_checks=['pose change','review cameras','pose sweep'],passed=True)
+            (out/'verification.json').write_text(json.dumps(result,indent=2))
+            return result
+        finally:cdp.close()
+    finally:
+        chrome.terminate();server.shutdown()
+
+
 def verify(player,out,hardware=False,device_test=False):
     player,out=Path(player).resolve(),Path(out).resolve();out.mkdir(parents=True,exist_ok=True)
     if not find_chrome():raise RuntimeError('Chromium not installed')
@@ -219,7 +279,10 @@ def verify(player,out,hardware=False,device_test=False):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--player',required=True);p.add_argument('--out',required=True)
     p.add_argument('--hardware',action='store_true');p.add_argument('--device-test',action='store_true')
-    print(json.dumps(verify(**vars(p.parse_args())),indent=2))
+    a=p.parse_args()
+    if json.loads((Path(a.player)/'avatar/avatar.json').read_text()).get('runtime')=='morph':
+        print(json.dumps(verify_morph(a.player,a.out,hardware=a.hardware),indent=2))
+    else:print(json.dumps(verify(**vars(a)),indent=2))
 
 
 if __name__=='__main__':main()

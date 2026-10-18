@@ -99,5 +99,22 @@ class MotionLayerTest(unittest.TestCase):
                 self.assertAlmostEqual(v, frame[k], places=9, msg=(i, k))
 
 
+    @unittest.skipIf(shutil.which("cc") is None and shutil.which("gcc") is None, "no C compiler")
+    def test_c_port_matches(self):
+        build = subprocess.run(["make", "-C", str(ROOT / "cpu" / "vhuman"), "test_motion_layer"],
+                               capture_output=True, text=True)
+        if build.returncode != 0:
+            self.skipTest("cannot build the native motion layer: " + build.stderr[-500:])
+        c = json.loads(subprocess.run([str(ROOT / "cpu" / "vhuman" / "test_motion_layer")],
+                                      capture_output=True, text=True, check=True).stdout)
+        layer = ML.MotionLayer(5)
+        for i, frame in enumerate(c):
+            t = i / 30
+            py = layer.sample(t, head_yaw=0.2 * ML.value_noise(t * 0.5, 99), head_pitch=0.1, focus_distance=0.5,
+                              speaking=i > 100, light=0.7, pauses=(3.0, 6.5))
+            for k, v in frame.items():
+                self.assertAlmostEqual(py[k], v, places=9, msg=(i, k))
+
+
 if __name__ == "__main__":
     unittest.main()
