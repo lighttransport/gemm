@@ -1,0 +1,3 @@
+/build/
+!bench_fp8.c
+!fp8_gemm_kernels.h
