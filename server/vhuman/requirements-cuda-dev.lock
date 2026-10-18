@@ -226,6 +226,8 @@ six==1.17.0
     # via python-dateutil
 sympy==1.14.0
     # via torch
+threadpoolctl==3.6.0
+    # via -r server/vhuman/requirements-cuda-dev.txt
 timm==1.0.30
     # via -r server/vhuman/requirements-cuda-dev.txt
 tokenizers==0.23.3

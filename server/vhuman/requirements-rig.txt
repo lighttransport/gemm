@@ -6,4 +6,5 @@ numpy
 opencv-python-headless
 pillow
 scipy
+threadpoolctl==3.6.0
 torch

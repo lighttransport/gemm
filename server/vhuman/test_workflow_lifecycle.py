@@ -209,6 +209,93 @@ class WorkflowTests(unittest.TestCase):
         (rig/'rig_deformer.safetensors').write_bytes(b'new native package')
         self.assertTrue(self.service.take_summary('abc',take.name)['rig_stale'])
 
+    def _video_take(self, *, changed=None, worker_receipt=True, after_publication=False):
+        from .rig import video_fit
+        rig = self.root/'heads/abc/rig'
+        if not rig.exists():
+            rig = self._head(False)
+        (rig/'rig.json').write_text('old controls')
+        (rig/'rig_deformer.safetensors').write_bytes(b'original package')
+        (rig/'gnm_bind.json').write_text('{}')
+        source, model = self.root/'source.mp4', self.root/'landmarker.task'
+        source.write_bytes(b'video'); model.write_bytes(b'model')
+        receipt = video_fit._rig_receipt(rig)
+        original_takes = set((rig/'takes').iterdir())
+
+        def worker(command, *args, **kwargs):
+            stage = Path(command[command.index('decode')+3])
+            report = dict(duration=.1, frames=3)
+            if worker_receipt:
+                report['rig_source_sha256'] = receipt.copy()
+                if worker_receipt == 'different':
+                    report['rig_source_sha256']['rig.json'] = 'different source'
+            (stage/'fit_report.json').write_text(json.dumps(report))
+            if changed:
+                (rig/changed).write_bytes(b'rebuilt during fitting')
+            return 0
+
+        def progress(value, message):
+            if after_publication and value == .99:
+                (rig/'rig_deformer.safetensors').write_bytes(b'rebuilt after publication')
+
+        with gpu.execution('cpu'), patch.object(gpu, 'gpu_status', side_effect=AssertionError('GPU probe')), \
+                patch.object(gpu, 'device_session', side_effect=AssertionError('GPU lock')), \
+                patch.object(video_fit, 'source_file', return_value=(source, dict(id='upload', sha256='video'))), \
+                patch.object(process, 'run', side_effect=worker):
+            if changed or worker_receipt is not True:
+                with self.assertRaisesRegex(RuntimeError, 'rig changed|different rig'):
+                    video_fit.fit_job(self.service, dict(head_id='abc'), progress, threading.Event(),
+                                      python=sys.executable, model=model)
+                self.assertEqual(set((rig/'takes').iterdir()), original_takes)
+            else:
+                result = video_fit.fit_job(self.service, dict(head_id='abc'), progress, threading.Event(),
+                                           python=sys.executable, model=model)
+                manifest = json.loads((rig/'takes'/result['id']/'manifest.json').read_text())
+                self.assertEqual(manifest['rig_package_sha256'], receipt['rig_deformer.safetensors'])
+                self.assertEqual(manifest['rig_sha256'], receipt['rig.json'][:16])
+                self.assertEqual(result['rig_stale'], after_publication)
+        self.assertEqual((rig/'takes/take/audio.wav').read_bytes(), b'keep user take')
+
+    def test_video_take_rejects_rig_rebuilt_during_fitting_and_cleans_stage(self):
+        for name in ('rig.json', 'rig_deformer.safetensors', 'gnm_bind.json', 'gnm_bind.npz'):
+            with self.subTest(name=name):
+                self._video_take(changed=name)
+
+    def test_video_take_requires_matching_worker_source_receipt(self):
+        for receipt in (False, 'different'):
+            with self.subTest(receipt=receipt):
+                self._video_take(worker_receipt=receipt)
+
+    def test_video_take_records_fitting_source(self):
+        self._video_take()
+
+    def test_video_take_rebuilt_after_publication_is_stale(self):
+        self._video_take(after_publication=True)
+
+    def test_video_worker_verifies_inputs_and_reports_legacy_rig_source(self):
+        import numpy as np
+        from .rig import video_fit
+        rig = self._head(False)
+        (rig/'rig.json').write_text(json.dumps(dict(controls=[dict(name='jawOpen')])))
+        package = rig/'rig_deformer.safetensors'; package.write_bytes(b'package')
+        receipt = video_fit._rig_receipt(rig)
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                out = self.root/('worker-'+str(changed)); (out/'frames').mkdir(parents=True)
+                def fit(*args):
+                    if changed: package.write_bytes(b'new package')
+                    return np.zeros((3,1)), dict(frames=3)
+                with patch.object(video_fit, '_extract', return_value=[None]*3), \
+                        patch.object(video_fit, '_observe', return_value=(None,None,None)), \
+                        patch.object(video_fit, 'fit_observations', side_effect=fit):
+                    if changed:
+                        with self.assertRaisesRegex(RuntimeError, 'rig changed'):
+                            video_fit.fit_video(rig, self.root/'source.mp4', out)
+                        self.assertFalse((out/'fit_report.json').exists())
+                    else:
+                        report = video_fit.fit_video(rig, self.root/'source.mp4', out)
+                        self.assertEqual(report['rig_source_sha256'], receipt)
+
     def test_motion_staleness_checks_geometry_and_body_metadata(self):
         self._body_rebuild()
         body = self.root/'heads/abc/body'

@@ -23,14 +23,14 @@ uv pip install --python "$python" \
  'torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torch-2.11.0+rocm7.2.2.lw.git4e323059-cp312-cp312-linux_x86_64.whl' \
  'torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/torchvision-0.26.0+rocm7.2.2.git336d36e8-cp312-cp312-linux_x86_64.whl' \
  'triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.6.0+rocm7.2.2.git4ed88892-cp312-cp312-linux_x86_64.whl' \
- numpy pillow scipy opencv-python-headless safetensors timm einops easydict trimesh xatlas psutil \
+ numpy pillow scipy threadpoolctl==3.6.0 opencv-python-headless safetensors timm einops easydict trimesh xatlas psutil \
  accelerate qwen-vl-utils click matplotlib kornia \
  'utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183' \
  'pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6' \
  'diffusers @ git+https://github.com/huggingface/diffusers@80c7ed262aeffbeb43ef13ae04baeb9b84515a69' \
  'transformers @ git+https://github.com/huggingface/transformers@c587bc884db2c2e31fc2b8102314656b17aa07b1'
 uv pip install --python "$python" -r "$root/server/vhuman/requirements-face-parsing.txt"
-"$python" -B -c 'import torch; assert torch.version.hip, "expected a ROCm PyTorch build"; print(torch.__version__, torch.version.hip)'
+"$python" -B -c 'import torch, threadpoolctl; assert torch.version.hip, "expected a ROCm PyTorch build"; print(torch.__version__, torch.version.hip)'
 
 [ "$env_only" -eq 0 ] || exit 0
 cd "$root"

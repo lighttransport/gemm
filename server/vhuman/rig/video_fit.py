@@ -226,7 +226,38 @@ def fit_observations(rig_dir: Path, direct: np.ndarray, landmarks: np.ndarray,
                                         "projection_scale": scale}
 
 
+def _rig_receipt(rig_dir: Path) -> dict:
+    """Identify fitting inputs, including bind sidecars and older source layouts."""
+    names = ('rig.json', 'rig_deformer.safetensors', 'features.json', 'rig_report.json',
+             'gnm_bind.json', 'gnm_bind.npz')
+    if not (rig_dir/'gnm_bind.json').is_file():
+        names += ('../geometry.npz', '../manifest.json', '../observations.json',
+                  '../head.json', '../fit.json', '../head_eyes.glb', '../portrait.png')
+    receipt = {}
+    for name in names:
+        path = rig_dir/name
+        if name in ('rig.json', 'rig_deformer.safetensors') or path.is_file():
+            digest = hashlib.sha256()
+            with path.open('rb') as stream:
+                for block in iter(lambda: stream.read(1 << 20), b''):
+                    digest.update(block)
+            receipt[name] = digest.hexdigest()
+        else:
+            receipt[name] = None
+    return receipt
+
+
+def _verify_rig_receipt(rig_dir: Path, expected: dict):
+    try:
+        unchanged = _rig_receipt(rig_dir) == expected
+    except OSError as exc:
+        raise RuntimeError('rig changed during face video fitting; retry with the current rig') from exc
+    if not unchanged:
+        raise RuntimeError('rig changed during face video fitting; retry with the current rig')
+
+
 def fit_video(rig_dir: Path, source: Path, out_dir: Path, model: Path = MODEL, *, iterations=400, threads=16, cancel=None) -> dict:
+    rig_source = _rig_receipt(rig_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     frames = _extract(source, out_dir)
     definition=json.loads((rig_dir/'rig.json').read_text())
@@ -269,6 +300,8 @@ def fit_video(rig_dir: Path, source: Path, out_dir: Path, model: Path = MODEL, *
     (out_dir / "animation.json").write_text(json.dumps(animation, separators=(",", ":")))
     report.update({"format": "vhuman.face_video_fit.v1", "fps": FPS, "duration": animation["duration"],
                    "tracker": "MediaPipe Face Landmarker", "optimizer": report.get("optimizer","vhuman TorchRig")})
+    _verify_rig_receipt(rig_dir, rig_source)
+    report['rig_source_sha256'] = rig_source
     (out_dir / "fit_report.json").write_text(json.dumps(report, indent=2))
     shutil.rmtree(out_dir / "frames")
     return report
@@ -288,6 +321,7 @@ def fit_job(service, request: dict, progress, cancel, *, python=None, model: Pat
     iterations=request.get('iterations',400);threads=request.get('threads',16)
     if type(iterations) is not int or not 10<=iterations<=2000: raise ValueError('iterations must be 10..2000')
     if type(threads) is not int or not 1<=threads<=256: raise ValueError('threads must be 1..256')
+    rig_source = _rig_receipt(rig_path.parent)
     take_id = uuid.uuid4().hex[:12]
     root = rig_path.parent / "takes"
     root.mkdir(parents=True, exist_ok=True)
@@ -307,14 +341,18 @@ def fit_job(service, request: dict, progress, cancel, *, python=None, model: Pat
                    cwd=Path(__file__).resolve().parents[3],env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
             if rc: raise RuntimeError('face video fitting failed: '+' | '.join(tail[-8:]))
             report = json.loads((stage / "fit_report.json").read_text())
+            if report.get('rig_source_sha256') != rig_source:
+                raise RuntimeError('face video worker used a different rig; retry with the current rig')
+            _verify_rig_receipt(rig_path.parent, rig_source)
             manifest = {"id": take_id, "head_id": head, "format": "vhuman.performance.v1",
                         "source": "face_video", "source_upload_id": upload_meta["id"],
                         "source_sha256": upload_meta["sha256"], "duration": report["duration"],
                         "fps": FPS, "frames": report["frames"],
-                        "rig_sha256": hashlib.sha256(rig_path.read_bytes()).hexdigest()[:16],
+                        "rig_sha256": rig_source['rig.json'][:16],
                         "quality_gate": report.get("quality_gate",True),"solver":report.get("solver","legacy"),
                         "retarget":report.get("retarget"),
-                        "rig_package_sha256":hashlib.sha256((rig_path.parent/"rig_deformer.safetensors").read_bytes()).hexdigest()}
+                        "rig_package_sha256":rig_source['rig_deformer.safetensors'],
+                        "rig_source_sha256": rig_source}
             (stage / "manifest.json").write_text(json.dumps(manifest, indent=2))
             stage.rename(root / take_id)
             progress(.99, "face video take ready")

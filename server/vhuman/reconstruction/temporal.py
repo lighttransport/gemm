@@ -56,10 +56,6 @@ def fit_clip(candidate, folder, out, *, iterations=400, modes=64, device='cpu', 
     from .provenance import validate_candidate
     manifest=validate_candidate(candidate)
     camera=crop_camera(Camera.from_dict(manifest['geometry']['fitted_cameras'][0]),original.size,(w,h))
-    with np.load(candidate/'geometry.npz',allow_pickle=False) as data:
-        beta=data['gnm_identity'];reference_expression=data['gnm_expressions'][0]
-        scale=float(data['scale']);rotation=data['rotation'];rest=data['full_neutral']
-        triangles=data['full_triangles']
     if device == 'cpu':
         from .gnm_motion import candidate_bind,fit_views,views_from_landmarks
         rows=observations['observations'];valid=np.array([row.get('visible',False) and row.get('landmarks') is not None for row in rows])
@@ -76,6 +72,10 @@ def fit_clip(candidate, folder, out, *, iterations=400, modes=64, device='cpu', 
         result=fitted['track'];result.update(candidate=str(candidate.resolve()),clip=str(clip.resolve()),clip_sha256=sha256(clip))
         (out/'motion.json').write_text(json.dumps(result,indent=2))
         return result
+    with np.load(candidate/'geometry.npz',allow_pickle=False) as data:
+        beta=data['gnm_identity'];reference_expression=data['gnm_expressions'][0]
+        scale=float(data['scale']);rotation=data['rotation'];rest=data['full_neutral']
+        triangles=data['full_triangles']
     model=GNMModel(device=device)
     native_rest,_=model.evaluate(beta)
     offset=np.median(rest-scale*native_rest.detach().cpu().numpy()@rotation.T,axis=0)

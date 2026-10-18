@@ -27,7 +27,7 @@ def cpu_threads(threads=16):
     try:
         from threadpoolctl import threadpool_limits
     except ImportError as exc:
-        raise RuntimeError('CPU fitter needs threadpoolctl; run server/vhuman/setup_cpu_fit.sh') from exc
+        raise RuntimeError('GNM CPU fitter needs threadpoolctl in this interpreter; install requirements-rig.txt or rerun its environment setup') from exc
     if type(threads) is not int or not 1 <= threads <= 256:
         raise ValueError('threads must be 1..256')
     old = torch.get_num_threads()

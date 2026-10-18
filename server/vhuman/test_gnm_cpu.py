@@ -18,6 +18,13 @@ ROOT=Path(__file__).resolve().parents[2]
 
 
 class CpuUtilityTests(unittest.TestCase):
+    def test_all_fitting_environments_supply_threadpool_control(self):
+        folder=ROOT/'server/vhuman'
+        for name in ('requirements-rig.txt','requirements-cuda-dev.txt','requirements-cuda-dev.lock',
+                     'requirements-cpu-fit.txt','requirements-cpu-fit.lock','setup_rocm.sh'):
+            with self.subTest(name=name):
+                self.assertIn('threadpoolctl==3.6.0',(folder/name).read_text())
+
     def test_window_coverage_and_overlap(self):
         for count in (1,64,65,129,900):
             spans=list(gnm_fit.windows(count));covered=set()
@@ -244,6 +251,74 @@ class GnmCpuTests(unittest.TestCase):
         world=Rotation.from_rotvec(meta['pose_rotations'][0]).as_matrix()
         np.testing.assert_allclose(neutral@world.T+meta['pose_translations'][0],posed,atol=1e-6)
         self.assertEqual(sha256(folder/'geometry.npz'),before)
+
+    def _legacy_catalog(self):
+        from PIL import Image
+        from .reconstruction.observations import sha256
+        root=self.root/self._testMethodName;root.mkdir()
+        candidate=root/'candidate';candidate.mkdir()
+        folder=root/'neutral';(folder/'video').mkdir(parents=True)
+        Image.new('RGB',(8,8),(80,100,120)).save(candidate/'portrait.png')
+        Image.open(candidate/'portrait.png').save(root/'reference.png')
+        identity=np.zeros(253);identity[0]=.1
+        rest,_=self.numpy.evaluate(identity)
+        neutral=rest[self.exterior]+np.array([.01,-.02,.03])
+        neutral[:,1]+=.001*np.linspace(-1,1,len(neutral))
+        # The original six-array PCA layout deliberately has no full_* or gnm_* keys.
+        np.savez_compressed(candidate/'geometry.npz',neutral=neutral,captured=neutral,
+                            scale=1.,rotation=np.eye(3),triangles=np.array([[0,1,2]]),triangle_uvs=np.zeros((1,3,2)))
+        manifest=dict(format='vhuman.reconstruction.v1',face_model='gnm_v3',
+                      geometry_sha256=sha256(candidate/'geometry.npz'),portrait_sha256=sha256(candidate/'portrait.png'),
+                      geometry=dict(identity_coefficients=[.1],expression_modes=[7],expression_coefficients=[[.2]],
+                                    fitted_cameras=[self.camera.as_dict()]))
+        (candidate/'manifest.json').write_text(json.dumps(manifest))
+        (candidate/'observations.json').write_text(json.dumps(dict(views=[dict(size=[8,8])])))
+        (folder/'video/clip.mp4').write_bytes(b'cached clip')
+        (folder/'video/manifest.json').write_text(json.dumps(dict(image_sha256=sha256(root/'reference.png'))))
+        landmarks=np.zeros((478,3));landmarks[:,:2]=.5
+        rows=[dict(visible=True,landmarks=landmarks.tolist(),t=t) for t in (.125,.2)]
+        (folder/'observations.json').write_text(json.dumps(dict(source_sha256=sha256(folder/'video/clip.mp4'),
+                                                             width=8,height=8,fps=30,observations=rows)))
+        np.savez_compressed(folder/'face_parsing.npz',labels=np.ones((2,8,8),np.uint8))
+        return candidate,folder,root/'out',neutral
+
+    def test_cpu_catalog_accepts_original_pca_candidates_and_preserves_bind(self):
+        from .reconstruction import temporal,gnm_motion
+        candidate,folder,out,neutral=self._legacy_catalog()
+        before=(candidate/'geometry.npz').read_bytes()
+        with gpu.execution('cpu'), patch.object(gpu,'gpu_status',side_effect=AssertionError('GPU probe')), \
+                patch.object(gpu,'device_session',side_effect=AssertionError('GPU lock')), \
+                patch.object(gnm_motion,'fit_views',return_value=dict(track={})) as fit:
+            result=temporal.fit_clip(candidate,folder,out,iterations=20,threads=2)
+        bind,views,timestamps=fit.call_args.args
+        self.assertAlmostEqual(bind['identity'][0],.1)
+        self.assertAlmostEqual(bind['reference_expression'][7],.2)
+        rest,_=self.numpy.evaluate(bind['identity'],bind_residual=bind['bind_residual'])
+        np.testing.assert_allclose((rest+bind['offset'])[self.exterior],neutral,atol=1e-7)
+        np.testing.assert_allclose(timestamps,[.125,.2])
+        self.assertTrue(all(view['synthetic'] for view in views))
+        self.assertEqual(result['clip_sha256'],gnm_motion.sha256(folder/'video/clip.mp4'))
+        self.assertEqual((candidate/'geometry.npz').read_bytes(),before)
+        self.assertTrue((out/'motion.json').is_file())
+
+    def test_cpu_catalog_keeps_clip_portrait_and_generation_provenance_checks(self):
+        from .reconstruction import temporal,gnm_motion
+        from PIL import Image
+        candidate,folder,out,_=self._legacy_catalog()
+        changes=[(folder/'video/clip.mp4',b'changed clip','cached landmarks'),
+                 (folder/'video/manifest.json',b'{"image_sha256":"wrong"}','reference hash'),
+                 (candidate/'geometry.npz',b'changed geometry','geometry hash')]
+        other=folder/'other.png';Image.new('RGB',(8,8)).save(other)
+        changes.append((folder.parent/'reference.png',other.read_bytes(),'different portrait'))
+        with patch.object(gnm_motion,'fit_views',side_effect=AssertionError('unverified fitting')):
+            for path,changed,error in changes:
+                with self.subTest(path=path.name):
+                    original=path.read_bytes();path.write_bytes(changed)
+                    try:
+                        with self.assertRaisesRegex(ValueError,error):
+                            temporal.fit_clip(candidate,folder,out,iterations=20,threads=2)
+                    finally:
+                        path.write_bytes(original)
 
     def test_bind_offset_comes_from_joints_even_with_biased_skin_residual(self):
         from .reconstruction.gnm_motion import candidate_bind,export_bind,rig_bind
