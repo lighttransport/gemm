@@ -45,6 +45,20 @@ def run(args, work):
         library = build_device(work / "native/libaudio.so") if args.sink == "device" else build(work / "native/libpcm.so")
         ring = PcmRing(library)
         session = Session(ring, rig.names, rig.ranges)
+        # The native motion layer adds blinks, saccades, convergence, pupil and idle head motion
+        # to the speech controls (sample-clock time, so it stays in step with the audio).
+        idle_layer = None
+        if getattr(args, "motion_layer", True):
+            try:
+                from ..animation.idle_layer import NativeMotionLayer
+                idle_layer = NativeMotionLayer(int(getattr(args, "motion_seed", 7)))
+            except RuntimeError as error:
+                print(f"motion layer disabled: {error}")
+        jaw_index = rig.names.index("jawOpen") if "jawOpen" in rig.names else None
+        def with_idle(controls, position):
+            if idle_layer is None: return controls
+            speaking = jaw_index is not None and float(controls[jaw_index]) > 0.03
+            return idle_layer.apply(controls, rig.names, position / 24000.0, speaking=speaking)
         if args.sink == "device": device = AudioDevice(ring, library)
         view, intrinsics = for_avatar(avatar, rig.rest)
         # Resolve CUDA library/kernel initialization before starting audio playback.
@@ -95,7 +109,7 @@ def run(args, work):
                 if device:
                     device.update(session.clock)
                     position = session.clock.position(time.monotonic_ns())
-                    controls = session.motion.sample(position)
+                    controls = with_idle(session.motion.sample(position), position)
                 else:
                     now = time.monotonic_ns()
                     due = playout.due(now)
@@ -107,7 +121,7 @@ def run(args, work):
                         output.audio(pcm)
                         due -= count
                     position = session.clock.position()
-                    controls = session.motion.sample(position)
+                    controls = with_idle(session.motion.sample(position), position)
                 with session.metrics.wall("rig_submit_wall_ms"):
                     vertices = shared.submit(controls)
                 with session.metrics.wall("render_completion_wall_ms"):

@@ -802,6 +802,16 @@ licence applies (GNM v3 is Apache-2.0). `--inputs-only DIR` writes just the
 two inputs. Limitations: no hair, brows or lashes in the texture; the
 portrait is a render, so skin detail comes from the procedural prior only.
 
+Status (2026-10-19, seed 5): the head fit places the analytic eyes correctly
+(the GLB keeps the eye-socket lining for that), and `rig.build --face-model
+procedural` gives a recognisable rigged face (registration mean 3.5 mm,
+p95 15 mm at the crown, where the template scalp tears; lid clearance
+-0.28 mm before and exact after projection). The GNM-transfer face model
+(`gnm_v3` without a reconstruction candidate) distorts this head like it does
+Pixal3D heads, so use the procedural model for synthetic heads until the
+registration takes its features from the known GNM landmarks instead of
+detecting them on the render.
+
 ## Facial rig
 
 `/rig` and `python3 -m server.vhuman.cli rig --head <id>` turn a fitted head

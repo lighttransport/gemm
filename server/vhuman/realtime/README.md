@@ -18,7 +18,11 @@ named controls -> native CUDA rig/contact -> borrowed vertices -> native CUDA Ga
 PortAudio DAC sample clock -> silence-aware speech sample position -> interpolation
 ```
 
-`live` requires trained appearance and motion bundles. `--diagnostic` explicitly
+`live` requires trained appearance and motion bundles. The native motion layer
+(`common/vhuman_motion_layer.c` through `src/animation/idle_layer.py`) adds
+seeded blinks, saccades, convergence, pupil response, breathing and head
+micro-motion to the sampled speech controls on the sample clock (blinks by
+max, gaze/pupil set, head added; `--no-motion-layer`, `--motion-seed`). `--diagnostic` explicitly
 allows diagnostic bundles. A trained flag records optimization, not a quality
 certification. No pretrained direct-Qwen motion adapter is bundled.
 

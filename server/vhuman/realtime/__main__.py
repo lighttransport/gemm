@@ -186,6 +186,9 @@ def main():
     p.add_argument("--tts-threads", type=int, default=8)
     p.add_argument("--resident", action="store_true")
     p.add_argument("--text-feed", choices=["incremental", "full"], default="incremental")
+    p.add_argument("--no-motion-layer", dest="motion_layer", action="store_false",
+                   help="disable the native blink/saccade/pupil/idle motion layer")
+    p.add_argument("--motion-seed", type=int, default=7)
     p = commands.add_parser("evaluate-appearance")
     p.add_argument("--manifest", required=True); p.add_argument("--avatar", required=True)
     p.add_argument("--output", required=True)

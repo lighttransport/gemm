@@ -18,6 +18,9 @@ test_vhuman_ops: test_vhuman_ops.c ../../common/vhuman_models.c $(wildcard ../..
 test_motion_layer: test_motion_layer.c ../../common/vhuman_motion_layer.c ../../common/vhuman_motion_layer.h
 	$(CC) $(CFLAGS) -o $@ test_motion_layer.c ../../common/vhuman_motion_layer.c -lm
 
+libvhuman_motion_layer.so: ../../common/vhuman_motion_layer.c ../../common/vhuman_motion_layer.h
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ ../../common/vhuman_motion_layer.c -lm
+
 test: test_vhuman_ops test_vhuman_training
 	./test_vhuman_ops
 	./test_vhuman_training

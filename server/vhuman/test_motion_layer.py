@@ -116,5 +116,30 @@ class MotionLayerTest(unittest.TestCase):
                 self.assertAlmostEqual(py[k], v, places=9, msg=(i, k))
 
 
+    def test_native_library_binding(self):
+        build = subprocess.run(["make", "-C", str(ROOT / "cpu" / "vhuman"), "libvhuman_motion_layer.so"],
+                               capture_output=True, text=True)
+        if build.returncode != 0:
+            self.skipTest("cannot build the native motion layer library: " + build.stderr[-500:])
+        from .realtime.src.animation.idle_layer import NativeMotionLayer
+        native = NativeMotionLayer(5)
+        layer = ML.MotionLayer(5)
+        for i in range(0, 301, 3):
+            t = i / 30
+            kw = dict(head_yaw=0.2 * ML.value_noise(t * 0.5, 99), head_pitch=0.1, focus_distance=0.5,
+                      speaking=i > 100, light=0.7, pauses=(3.0, 6.5))
+            a, b = native.sample(t, **kw), layer.sample(t, **kw)
+            for k, v in b.items():
+                if k != "_gaze_deg":
+                    self.assertAlmostEqual(a[k], v, places=9, msg=(i, k))
+        names = ["jawOpen", "eyeBlinkLeft", "eyeBlinkRight", "eyeLookUpLeft", "headYaw", "pupilNarrow"]
+        merged = native.apply(np.array([0.5, 0.9, 0.0, 0.0, 0.1, 0.0], np.float32), names, 10.5)
+        self.assertEqual(merged[0], 0.5)
+        self.assertGreaterEqual(merged[1], 0.9)                       # blink keeps the larger value
+        self.assertNotEqual(merged[4], 0.1)                           # head micro-motion added
+        with self.assertRaises(ValueError):
+            native.sample(1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
