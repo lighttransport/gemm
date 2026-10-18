@@ -403,7 +403,7 @@ def make_handler(app: App, quiet: bool = False):
                     return self._json(200, catalog(getattr(app.args, "musclemimic_assets", None),
                                                    getattr(app.args, "musclemimic_python", None)))
                 if path in ("/vhuman_skin_shader.js", "/vhuman_gaussian.js", '/vhuman_portrait.js', '/vhuman_head_editor.js',
-                            '/vhuman_eye_mesh_shader.js'):
+                            '/vhuman_eye_mesh_shader.js', '/vhuman_motion_layer.js', '/vhuman_rig_eval.js'):
                     return self._file(ROOT / "web" / path[1:])
                 if path.startswith("/v1/heads/") and "/videos" in path:
                     from . import video

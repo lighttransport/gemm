@@ -188,47 +188,42 @@ def _phone_at(aux: dict, t: float, frame_index: int, fps: float) -> tuple[str, f
     return best_phone, best_score[0]
 
 
-def _secondary(times: np.ndarray, duration: float, seed: int) -> list[dict]:
-    """Repeatable blink and gaze tracks, with a small head follow-through."""
-    rng = random.Random(seed)
-    blinks = []
-    t = .8 + rng.uniform(0, .45)
-    while t < duration - .22:
-        blinks.append(t)
-        t += rng.uniform(2.8, 4.5)
-    targets = [(0.0, 0.0, 0.0)]
-    t = .55 + rng.uniform(0, .3)
-    while t < duration - .4:
-        targets.append((t, rng.uniform(-.13, .13), rng.uniform(-.07, .07)))
-        t += rng.uniform(2.0, 3.2)
+def _pauses(aux: dict, duration: float) -> list[float]:
+    """Silence onsets inside the utterance (blink opportunities), plus the end."""
+    out = []
+    for item in aux.get("intervals") or []:
+        if item.get("s") == "sil" and 0.3 < float(item.get("start", 0)) < duration - 0.3:
+            out.append(float(item["start"]))
+    out.append(max(0.0, duration - 0.25))
+    return sorted(out)
+
+
+def _secondary(times: np.ndarray, duration: float, seed: int, aux: dict | None = None,
+               speaking: np.ndarray | None = None) -> list[dict]:
+    """Repeatable blink, gaze, pupil and idle head tracks from the motion
+    layer (rig/motion_layer.py): fixations and saccades around the camera,
+    blinks more likely after large saccades and at speech pauses, a slight
+    head follow-through, breathing and micro-motion. gx/gy are signed unit
+    gaze (+gx: the character's left, +gy: up) for the historic mapping."""
+    from .motion_layer import MotionLayer
+    layer = MotionLayer(int(seed) & 0x7FFFFFFF)
+    pauses = _pauses(aux, duration) if aux is not None else []
     result = []
-    for now in times:
-        blink = 0.0
-        for start in blinks:
-            phase = now - start
-            if 0 <= phase < .075:
-                blink = max(blink, phase / .075)
-            elif .075 <= phase < .205:
-                blink = max(blink, 1 - (phase - .075) / .13)
-        previous, target = targets[0], targets[0]
-        for point in targets[1:]:
-            if point[0] <= now:
-                previous, target = target, point
-            else:
-                break
-        blend = np.clip((now - target[0]) / .2, 0, 1)
-        blend = blend * blend * (3 - 2 * blend)
-        fade = min(1.0, now / .35, max(0.0, (duration - now) / .35))
-        gx = float((previous[1] * (1 - blend) + target[1] * blend) * fade)
-        gy = float((previous[2] * (1 - blend) + target[2] * blend) * fade)
-        result.append({"blink": blink, "gx": gx, "gy": gy})
+    for i, now in enumerate(times):
+        fade = min(1.0, float(now) / .35, max(0.0, (duration - float(now)) / .35))
+        talk = bool(speaking[i]) if speaking is not None else False
+        c = layer.sample(float(now), speaking=talk, pauses=pauses, focus_distance=0.9, light=0.55)
+        yaw, pitch = c["_gaze_deg"]
+        result.append({"blink": c["eyeBlinkLeft"], "gx": float(yaw / 30.0 * fade), "gy": float(pitch / 24.0 * fade),
+                       "controls": {k: v for k, v in c.items() if k.startswith("head") or k.startswith("pupil")
+                                    or k.startswith("eyeWide")}})
     return result
 
 
 def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0,
                  emotion_strength: float = .6, emotion_provider=None,
                  secondary_seed: int = 7, secondary_strength: float = 1.0) -> list[dict]:
-    """Produce finite, clamped 60-control frames at the aligner's sample times."""
+    """Produce finite, clamped frames of every rig control at the aligner's sample times."""
     if aux.get("format") != "ja_align.v1":
         raise ValueError("expected ja_align.v1")
     vis = aux.get("visemes") or {}
@@ -257,7 +252,8 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
     speech = .25 * speech[:-2] + .5 * speech[1:-1] + .25 * speech[2:]
     times = np.minimum(np.arange(len(speech)) / fps, duration)
     energy, pitch = _prosody(aux, times)
-    secondary = _secondary(times, duration, secondary_seed)
+    speaking = values[:, VISEMES.index("sil")] < .5
+    secondary = _secondary(times, duration, secondary_seed, aux, speaking)
     index = {name: i for i, name in enumerate(names)}
     frames = []
     for i, row in enumerate(speech):
@@ -306,6 +302,8 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
             out[index[name]] += value
         out[index["headYaw"]] = .23 * gx
         out[index["headPitch"]] = .16 * gy + .025 * pitch[i] * energy[i] * speech_strength
+        for name, value in motion["controls"].items():          # idle head micro-motion, pupil, lid widening
+            out[index[name]] += value * secondary_strength
         for name in rigdef.SIGNED:
             out[index[name]] = np.clip(out[index[name]], -1, 1)
         for name in names:

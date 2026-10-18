@@ -33,6 +33,11 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     out = Path(argv[0])
     out.mkdir(parents=True, exist_ok=True)
+    # A CPU-only PyTorch build on a GPU host: do not select the host's accelerator.
+    import torch
+    from .. import gpu
+    if not torch.cuda.is_available():
+        gpu.configure("cpu")
     from ..head import pipeline, fit
     from . import build, template
     from . import template as T
@@ -68,6 +73,8 @@ def main(argv=None) -> int:
                "register": rep["register"], "gltf": rep["gltf"], "usd": rep["usd"], "deformer": rep["deformer"],
                "ml_targets": len(rig.get("ml_deformer", {}).get("targets", [])),
                "expressions": rep["expressions"], "wrinkles": rep["wrinkles"], "lods": rep["lods"],
+               "lid_clearance": rep["lid_clearance"], "eyes": rig.get("eyes"),
+               "eye_triangles": {m["name"]: m["triangles"] for m in rep["gltf"]["meshes"] if m["name"].startswith("eye_")},
                "lod_templates": {}}
     from . import lod
     for lv in rep["lods"]:

@@ -114,6 +114,66 @@ STAGES = {"features": .04, "register": .08, "fit_cache": .2, "skeleton_weights":
           "deformer": .25, "bake": .5, "assemble": .72, "gltf": .76, "usd": .8, "preview": .86}
 
 
+def eye_frames(subj) -> dict:
+    """Per side, the analytic eye frame at rest in the rig's H frame (metres,
+    +Z gaze, origin at the globe centre), from the head fit's eye poses. The
+    viewers shade the carried runtime eyeballs in this frame, moved by the
+    eye joint: world_from_eye = joint_world @ inverse(joint_bind) @ frame."""
+    out = {}
+    for e in subj.fit["export"]["eyes"]:
+        R = np.asarray(e["rotation"], np.float64)
+        M = np.eye(4)
+        M[:3, :3] = np.stack([subj.frame.dir_to_h(R[:, k]) for k in range(3)], 1)
+        M[:3, 3] = subj.frame.to_h(np.asarray(e["center"], np.float64))
+        out[e["side"]] = {"joint": "eye_L" if e["side"] == "left" else "eye_R", "frame": M.round(9).tolist(),
+                          "axes": "+X horizontal, +Y up, +Z gaze; metres"}
+    return out
+
+
+LID_GRID = [("neutral", {}), ("up", {"eyeLookUpLeft": 1, "eyeLookUpRight": 1}),
+            ("down", {"eyeLookDownLeft": 1, "eyeLookDownRight": 1}),
+            ("in", {"eyeLookInLeft": 1, "eyeLookInRight": 1}), ("out", {"eyeLookOutLeft": 1, "eyeLookOutRight": 1}),
+            ("up-in", {"eyeLookUpLeft": .5, "eyeLookUpRight": .5, "eyeLookInLeft": .5, "eyeLookInRight": .5}),
+            ("down-out", {"eyeLookDownLeft": .5, "eyeLookDownRight": .5, "eyeLookOutLeft": .5, "eyeLookOutRight": .5}),
+            ("up-wide", {"eyeLookUpLeft": 1, "eyeLookUpRight": 1, "eyeWideLeft": .6, "eyeWideRight": .6})]
+
+
+def lid_clearance(rig: dict, ml, pos, shapes: dict, joints, weights, contacts_viz: dict) -> dict:
+    """Lid-margin clearance to the eyeballs over gaze x blink (LID_GRID x
+    blink 0/.5/1): the worst signed clearance (mm, negative = inside the
+    contact threshold) of the eye contact vertices before and after the
+    post-skinning projection, and how many poses penetrate before it."""
+    from . import contacts as contacts_mod
+    R = rigdef.Rig(rig, ml=ml)
+    t = contacts_mod.tensors(contacts_viz, pos)
+    ids, ej, ec, thr = (t["contact.eye_ids"], t["contact.eye_joint"], t["contact.eye_center"].astype(np.float64),
+                        t["contact.eye_thr"].astype(np.float64))
+    names = [n for n in R.shape_names if n in shapes]
+    arange = np.arange(len(pos))
+    rows, worst_before, worst_after, penetrating = [], np.inf, np.inf, 0
+    wn = weights / np.maximum(weights.sum(1, keepdims=True), 1e-9)
+    for gaze, controls in LID_GRID:
+        for blink in (0.0, 0.5, 1.0):
+            c = dict(controls, eyeBlinkLeft=blink, eyeBlinkRight=blink)
+            ev = R.evaluate(c)
+            wts = dict(zip(R.shape_names, ev["weights"]))
+            posed = rigdef.deform(pos.astype(np.float64), joints, wn, ev["skin"],
+                                  [(arange, shapes[n]) for n in names], np.array([wts.get(n, 0.0) for n in names]))
+            def clearance(x):
+                S = ev["skin"][ej]
+                centre = np.einsum("nij,nj->ni", S[:, :3, :3], ec) + S[:, :3, 3]
+                return float((np.linalg.norm(x[ids] - centre, axis=1) - thr).min() * 1000)
+            before = clearance(posed)
+            after = clearance(contacts_mod.project(posed, ev["skin"], t))
+            rows.append({"gaze": gaze, "blink": blink, "min_clearance_mm": round(before, 4),
+                         "projected_min_clearance_mm": round(after, 4)})
+            worst_before, worst_after = min(worst_before, before), min(worst_after, after)
+            penetrating += before < -1e-6
+    return {"grid": rows, "poses": len(rows), "worst_mm": round(worst_before, 4),
+            "projected_worst_mm": round(worst_after, 4), "penetrating_poses": int(penetrating),
+            "note": "signed distance to the rest-relative eye contact threshold; projection makes contacts exact"}
+
+
 def head_parts(parts_t, pos, shapes, Jn, W) -> list[ExportPart]:
     """Skin and mouth-interior export parts of a (LOD) template with its shapes."""
     out = []
@@ -429,6 +489,7 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
         rig['input_provenance'] = manifest['input_provenance']
         rig['license_scope'] = 'rig definition; input_provenance records source image licenses'
     rig["face_model"] = face_model
+    rig["eyes"] = eye_frames(subj)
     if source is not None and source.name == 'gnm_v3':
         from .gnm_expression import project
         alignment = source_stats['expression_basis_alignment']
@@ -478,6 +539,11 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
                                              default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
     native_stats = native.write_package(out / "rig_deformer.safetensors", rig, native_pos, native_shapes, native_joints, native_weights, ml,
                                         contacts_viz=contacts_viz)
+    clearance = None
+    if contacts_viz and contacts_viz.get("eye"):
+        clearance = lid_clearance(rig, ml, native_pos, native_shapes, native_joints, native_weights, contacts_viz)
+        log(f"lid clearance over {clearance['poses']} gaze/blink poses: worst {clearance['worst_mm']} mm, "
+            f"projected {clearance['projected_worst_mm']} mm")
     if reconstruction is not None and face_model == 'gnm_v3':
         from ..reconstruction.gnm_motion import export_bind
         export_bind(out,reconstruction)
@@ -519,6 +585,7 @@ def assemble(folder, out_dir=None, res: int = 2048, iters: int = 600, log=print,
               "usd": usd_stats, "shapes": len(rig["blendshapes"]), "controls": len(rig["controls"]),
               "deformer": ml_stats, "native_package": native_stats, "expressions": expr_report,
               "wrinkles": [m["name"] for m in (wrinkle_maps or {}).get("maps", [])], "lods": lod_report,
+              "lid_clearance": clearance,
               "joints": names, "timings": timings, "seconds": round(time.perf_counter() - t0, 2),
               "preview": prev}
     (out / "rig_report.json").write_text(json.dumps(report, indent=1, default=float))

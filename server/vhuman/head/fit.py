@@ -345,8 +345,11 @@ def export_head(out: Path, mesh: dict, keep: np.ndarray, poses: list[EyePose], e
         b.node(wet.name, mesh=b.mesh(wet, wet_mat))
     eyes_info = []
     for n, (pose, p) in enumerate(zip(poses, eye_params)):
+        # Runtime (low-polygon) eyes: the rig carries them and the viewers shade
+        # them with the analytic mesh eye material; the dense optics are for the
+        # standalone eye export.
         shell_mesh, iris_mesh = assets.add_eye_meshes(b, p, res, iris_tex=iris_tex, name=f"eye_{pose.side}",
-                                                      volume=False)
+                                                      volume=False, runtime=True)
         kids = [b.node(f"eye_{pose.side}_shell", mesh=shell_mesh, root=False),
                 b.node(f"eye_{pose.side}_iris", mesh=iris_mesh, root=False)]
         occ_info = None

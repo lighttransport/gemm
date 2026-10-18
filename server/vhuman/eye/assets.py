@@ -98,12 +98,15 @@ def shell_textures(p: dict, st, res: int) -> dict:
 
 
 def add_eye_meshes(b: GLBBuilder, p: dict, res: int = 2048, *, profile=None, iris_tex=None,
-                   name: str = "eye", volume: bool = True) -> tuple[int, int]:
+                   name: str = "eye", volume: bool = True, runtime: bool = False) -> tuple[int, int]:
     """Add one eye's materials and meshes (metres, +Z gaze) to a builder:
     a transparent-cornea shell over an opaque iris. Returns the mesh indices.
     volume=False leaves the cornea thin-walled: real-time viewers (three.js)
     then skip their screen-space refraction offset, which in a head shows
-    displaced copies of the eyelids through the cornea."""
+    displaced copies of the eyelids through the cornea. runtime=True uses the
+    low-polygon shell and iris (about 1.3k triangles, geometry.runtime_*)
+    that the analytic mesh eye material shades; the dense meshes stay for
+    DCC export."""
     p = P.validate(p)
     profile = profile or optics.profile_from_params(p)
     it, st = structures(p, res, iris_tex)
@@ -133,8 +136,12 @@ def add_eye_meshes(b: GLBBuilder, p: dict, res: int = 2048, *, profile=None, iri
                                  "metallicFactor": 1.0, "roughnessFactor": 1.0},
         "normalTexture": {"index": b.texture(normal_u8(it.normal), f"{name}_iris_normal"), "scale": 0.6},
         "occlusionTexture": {"index": iris_orm_tex}})
-    shell_mesh = b.mesh(geometry.shell(profile), shell_mat)
-    iris_mesh = b.mesh(geometry.iris_disk(p, profile), iris_mat)
+    if runtime:
+        shell_mesh = b.mesh(geometry.runtime_shell(profile), shell_mat)
+        iris_mesh = b.mesh(geometry.runtime_iris(p, profile), iris_mat)
+    else:
+        shell_mesh = b.mesh(geometry.shell(profile), shell_mat)
+        iris_mesh = b.mesh(geometry.iris_disk(p, profile), iris_mat)
     return shell_mesh, iris_mesh
 
 

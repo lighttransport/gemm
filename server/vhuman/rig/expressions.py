@@ -109,6 +109,10 @@ def build(F: Fields, skel: dict, skin_w: tuple) -> dict:
                                         + _rotate_lid(F, side, False, a, axis_col=1))
         S[f"corr_blink_lookDown_{sname[0]}"] = -_rotate_lid(F, side, True,
                                                             np.full(T.EYE_N, math.radians(0.55 * 26)))
+        S[f"corr_blink_lookUp_{sname[0]}"] = -_rotate_lid(F, side, True,
+                                                          np.full(T.EYE_N, math.radians(-0.6 * 22)))
+        S[f"corr_wide_lookUp_{sname[0]}"] = -0.4 * (_rotate_lid(F, side, True, up)
+                                                   + _rotate_lid(F, side, True, np.full(T.EYE_N, math.radians(-0.6 * 22))))
     # ---- brows -------------------------------------------------------------------
     for side, sname in (("left", "Left"), ("right", "Right")):
         br = F.brow[side]

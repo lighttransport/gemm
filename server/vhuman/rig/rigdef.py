@@ -36,13 +36,16 @@ LR_FACE_V1 = (
     "mouthSmileLeft", "mouthSmileRight", "mouthStretchLeft", "mouthStretchRight", "mouthUpperUpLeft",
     "mouthUpperUpRight", "noseSneerLeft", "noseSneerRight")
 EXTRA = ("tongueOut", "tongueUp", "tongueDown", "tongueLeft", "tongueRight", "tongueCurlUp",
-         "headYaw", "headPitch", "headRoll")
+         "headYaw", "headPitch", "headRoll",
+         # pupil response: material-only controls (no joint or shape); the viewers scale the pupil
+         "pupilWide", "pupilNarrow")
 CONTROLS = LR_FACE_V1 + EXTRA
 SIGNED = {"headYaw", "headPitch", "headRoll"}
 ATTRS = ("tx", "ty", "tz", "rx", "ry", "rz")
 
 GROUPS = {"brow": "brow", "cheek": "cheek", "eyeBlink": "eyes", "eyeLook": "gaze", "eyeSquint": "eyes",
-          "eyeWide": "eyes", "jaw": "jaw", "mouth": "mouth", "nose": "nose", "tongue": "tongue", "head": "head"}
+          "eyeWide": "eyes", "jaw": "jaw", "mouth": "mouth", "nose": "nose", "tongue": "tongue", "head": "head",
+          "pupil": "pupil"}
 
 
 def group_of(name: str) -> str:
@@ -102,6 +105,12 @@ CORRECTIVES = (
     # upper lid: blink and look-down both lower it; take the overlap back
     ("corr_blink_lookDown_L", ("eyeBlinkLeft", "eyeLookDownLeft"), 1.0),
     ("corr_blink_lookDown_R", ("eyeBlinkRight", "eyeLookDownRight"), 1.0),
+    # blink while looking up: the upper lid must still close; cancel the look-up lift
+    ("corr_blink_lookUp_L", ("eyeBlinkLeft", "eyeLookUpLeft"), 1.0),
+    ("corr_blink_lookUp_R", ("eyeBlinkRight", "eyeLookUpRight"), 1.0),
+    # wide eyes looking up: the two lifts would run the lid over the globe; take part back
+    ("corr_wide_lookUp_L", ("eyeWideLeft", "eyeLookUpLeft"), 1.0),
+    ("corr_wide_lookUp_R", ("eyeWideRight", "eyeLookUpRight"), 1.0),
     # smiling with an open jaw: corners stay up with the cheeks
     ("corr_jawOpen_smile_L", ("jawOpen", "mouthSmileLeft"), 1.0),
     ("corr_jawOpen_smile_R", ("jawOpen", "mouthSmileRight"), 1.0),

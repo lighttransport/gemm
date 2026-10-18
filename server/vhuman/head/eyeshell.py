@@ -50,9 +50,10 @@ def _blur_width(theta, medial_sign: float, height: float):
     return np.maximum(w / np.maximum(up + down + med + lat, 1e-6), 0.05) * height
 
 
-def build(eye, pose, cam) -> tuple[Mesh, np.ndarray, dict]:
-    """The eye's shell mesh (UVs set) and its RGBA occlusion texture."""
-    mesh = shell_mesh()
+def build(eye, pose, cam, rings: int = 8, segments: int = 36) -> tuple[Mesh, np.ndarray, dict]:
+    """The eye's shell mesh (UVs set) and its RGBA occlusion texture. The
+    smooth 256-texel shadow needs only a coarse cap (540 triangles)."""
+    mesh = shell_mesh(rings, segments)
     k = pose.units_per_m
     world = pose.center + (mesh.positions.astype(np.float64) * k) @ pose.rotation.T
     pix = cam.project(world)

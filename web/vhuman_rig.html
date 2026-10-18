@@ -171,8 +171,10 @@ a.dl{color:var(--accent);margin-right:12px;font-size:13px;display:inline-block}
       <label title="expression wrinkle maps (from the subject's expression portraits) blended into the skin normals"><input type="checkbox" id="wrinkles" checked> wrinkles</label>
       <label title="level of detail: LOD0 12.6k, LOD1 ~3.7k, LOD2 ~1.4k head vertices; all driven by the same rig">LOD <select id="lod" style="width:auto"><option value="0">0</option><option value="1">1</option><option value="2">2</option></select></label>
       <label title="post-skinning contact projection: lids outside the eyeballs, lips outside teeth and tongue, upper lip above the lower (exact)"><input type="checkbox" id="exact" checked> exact contacts</label>
+      <label title="the analytic eye material (refraction, caustic, limbus, sclera) on the carried runtime eyeballs, driven by the eye joints and the pupil controls"><input type="checkbox" id="analytic-eyes" checked> analytic eyes</label>
       <label title="random blinks for manual posing; saved takes use baked blinks"><input type="checkbox" id="auto-blink" checked> auto blink</label>
       <label title="pointer gaze for manual posing; saved takes use baked gaze"><input type="checkbox" id="look-at"> look at pointer</label>
+      <label title="the seeded motion layer (vhuman_motion_layer.js): fixations, saccades, microsaccades, blinks, convergence, pupil, breathing and head micro-motion; the pointer is the focus when 'look at pointer' is on"><input type="checkbox" id="motion-layer"> motion layer</label>
       <label>exposure <input type="range" id="exposure" min="0.3" max="2.5" step="0.05" value="1" style="width:100px"></label>
     </div>
     <div class="card">
@@ -252,6 +254,10 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { SkinRenderer } from '/vhuman_skin_shader.js';
 import { BoundGaussians } from '/vhuman_gaussian.js';
+import * as Eye from '/vhuman_eye_shader.js';
+import * as EyeMesh from '/vhuman_eye_mesh_shader.js';
+import { MotionLayer } from '/vhuman_motion_layer.js';
+import { LinearRig, MLDeformer, loadSafetensors, eulerZYX } from '/vhuman_rig_eval.js';
 
 const $ = (id) => document.getElementById(id);
 const state = { heads: [], current: null, rig: null, model: null, values: {}, anim: null, job: null,
@@ -268,66 +274,7 @@ async function api(path, body) {
   return data;
 }
 
-// ---- the linear rig (same equations as server/vhuman/rig/rigdef.py) --------------------
-const ATTRS = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz'];
-class LinearRig {
-  constructor(def) {
-    this.def = def;
-    this.controls = def.controls.map((c) => c.name);
-    this.cidx = Object.fromEntries(this.controls.map((n, i) => [n, i]));
-    this.inputs = this.controls.concat(def.correctives.map((c) => c.name));
-    this.iidx = Object.fromEntries(this.inputs.map((n, i) => [n, i]));
-    this.joints = def.joints;
-    this.jidx = Object.fromEntries(this.joints.map((j, i) => [j.name, i]));
-    this.M = def.joint_matrix.map((e) => [this.jidx[e.joint] * 6 + ATTRS.indexOf(e.attr), this.iidx[e.input], e.value]);
-    this.shapes = def.blendshapes.map((b) => [b.name, this.iidx[b.input]]);
-  }
-  evaluate(values) {
-    const x = this.def.controls.map((c) => Math.min(c.max, Math.max(c.min, values[c.name] || 0)));
-    const clamp01 = (v) => Math.min(1, Math.max(0, v));
-    const inp = x.concat(this.def.correctives.map((c) => Math.min(1, c.inputs.reduce((p, n) => p * clamp01(x[this.cidx[n]]), c.weight ?? 1))));
-    const delta = new Float64Array(this.joints.length * 6);
-    for (const [row, col, v] of this.M) delta[row] += v * inp[col];
-    const weights = {};
-    for (const [name, src] of this.shapes) weights[name] = inp[src];
-    if (this.ml && this.mlOn) Object.assign(weights, this.ml.weights(Object.fromEntries(this.inputs.map((n, i) => [n, inp[i]]))));
-    return { delta, weights };
-  }
-}
-// ---- the ML corrective deformer (server/vhuman/rig/mldeformer.py) --------------------------
-async function loadSafetensors(url) {
-  const buf = await (await fetch(url)).arrayBuffer();
-  const n = Number(new DataView(buf).getBigUint64(0, true));
-  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, n)));
-  const out = {};
-  for (const [k, h] of Object.entries(header)) {
-    if (k === '__metadata__') continue;
-    const [a, b] = h.data_offsets;
-    out[k] = { shape: h.shape, data: new Float32Array(buf.slice(8 + n + a, 8 + n + b)) };
-  }
-  return out;
-}
-class MLDeformer {        // c = fc2(relu(fc1((x - mean) * scale))) * out.scale + out.mean; weight_k = c_k / out.scale_k
-  constructor(t, def) {
-    this.t = t; this.def = def;
-    [this.H, this.I] = t['fc1.weight'].shape; this.K = t['fc2.weight'].shape[0];
-    this.h = new Float32Array(this.H); this.x = new Float32Array(this.I);
-    this.lo = def.inputs.map((n) => (def.ranges[n] || [0, 1])[0]); this.hi = def.inputs.map((n) => (def.ranges[n] || [0, 1])[1]);
-  }
-  weights(values) {
-    const t = this.t, x = this.x, h = this.h, out = { ml_mean: 1 };
-    this.def.inputs.forEach((n, i) => { x[i] = (Math.max(this.lo[i], Math.min(this.hi[i], values[n] || 0)) - t['input.mean'].data[i]) * t['input.scale'].data[i]; });
-    const W1 = t['fc1.weight'].data, b1 = t['fc1.bias'].data, W2 = t['fc2.weight'].data, b2 = t['fc2.bias'].data;
-    for (let j = 0; j < this.H; j++) { let s = b1[j]; for (let i = 0; i < this.I; i++) s += W1[j * this.I + i] * x[i]; h[j] = s > 0 ? s : 0; }
-    const om = t['output.mean'].data, os = t['output.scale'].data;
-    for (let k = 0; k < this.K; k++) {
-      let s = b2[k]; for (let j = 0; j < this.H; j++) s += W2[k * this.H + j] * h[j];
-      out[this.def.targets[k + 1]] = (s * os[k] + om[k]) / os[k];
-    }
-    return out;
-  }
-}
-
+// ---- the linear rig and ML deformer: web/vhuman_rig_eval.js --------------------------------
 class SoftDeformer {
   constructor(model, basis, def, rigDef) {
     this.inputs = def.inputs;
@@ -412,13 +359,7 @@ function restMatrix3(j) {       // row-major nested -> Matrix4
   const R = j.rest_rotation;
   return new THREE.Matrix4().set(R[0][0], R[0][1], R[0][2], 0, R[1][0], R[1][1], R[1][2], 0, R[2][0], R[2][1], R[2][2], 0, 0, 0, 0, 1);
 }
-function eulerZYX(rx, ry, rz) {   // Rz @ Ry @ Rx (radians)
-  const cx = Math.cos(rx), sx = Math.sin(rx), cy = Math.cos(ry), sy = Math.sin(ry), cz = Math.cos(rz), sz = Math.sin(rz);
-  const Rx = new THREE.Matrix4().set(1, 0, 0, 0, 0, cx, -sx, 0, 0, sx, cx, 0, 0, 0, 0, 1);
-  const Ry = new THREE.Matrix4().set(cy, 0, sy, 0, 0, 1, 0, 0, -sy, 0, cy, 0, 0, 0, 0, 1);
-  const Rz = new THREE.Matrix4().set(cz, -sz, 0, 0, sz, cz, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
-  return Rz.multiply(Ry).multiply(Rx);
-}
+
 
 // ---- viewer -------------------------------------------------------------------------
 const viewer = $('viewer');
@@ -445,6 +386,65 @@ scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.03).texture
 const key = new THREE.DirectionalLight(0xffffff, 1.4);
 key.position.set(0.8, 1.2, 2.0);
 scene.add(key);
+// The analytic eye material's studio (vhuman_eye_shader.js): its key softbox follows this key light.
+const eyeStudio = Eye.makeStudioUniforms();
+state.runtimeEyes = [];
+
+// The carried runtime eyeballs (eye_<side>_shell, rigid on the eye joints) get
+// the analytic mesh eye material in the rest eye frame exported by the build
+// (rig.json "eyes"); the standard iris disk is hidden while it is active.
+async function attachRuntimeEyes(h, def, root) {
+  state.runtimeEyes = [];
+  if (!def.eyes || !h.urls?.fit || state.avatarMode) return;
+  let rec;
+  try { rec = await (await fetch(h.urls.fit)).json(); } catch (e) { console.warn('eye params:', e); return; }
+  if (!rec.eye_params || state.model !== root) return;
+  const detail = rec.plate ? { source: 'plate', id: rec.plate } : { source: 'procedural' };
+  for (const side of ['left', 'right']) {
+    const info = def.eyes[side], shell = root.getObjectByName(`eye_${side}_shell`), iris = root.getObjectByName(`eye_${side}_iris`);
+    const bone = info && state.bones[info.joint];
+    if (!info || !shell || !bone || !shell.skeleton) continue;
+    const params = JSON.parse(JSON.stringify(rec.eye_params));
+    params.optics.side = side;
+    let resp;
+    try { resp = await api('/v1/eye/textures', { params, res: 1024, detail }); } catch (e) { console.warn('eye textures:', e); return; }
+    if (state.model !== root) return;
+    const g = resp.uniforms;
+    Eye.applyStudio(eyeStudio, g, 0);                       // the rig frame faces +Z like the eye page
+    Eye.setSoftboxDirection(eyeStudio, 0, key.position);
+    const mat = EyeMesh.makeEyeMeshMaterial(eyeStudio, { skinned: true });
+    Eye.applyEyeGeometry(mat, g);
+    Eye.applyEyeParams(mat, params, g);
+    Eye.bindEyeTextures(mat, await Eye.loadEyeTextures(resp, { anisotropy: renderer.capabilities.getMaxAnisotropy() }));
+    if (state.model !== root) { mat.dispose(); return; }
+    const boneInverse = shell.skeleton.boneInverses[shell.skeleton.bones.indexOf(bone)];
+    const frame = new THREE.Matrix4().fromArray(info.frame.flat()).transpose();   // row-major rows -> column-major
+    EyeMesh.attachEyeFrame(shell, { bone, boneInverse, frame });
+    state.runtimeEyes.push({ side, shell, iris, mat, original: shell.material, params, g, lastMult: 1 });
+  }
+  applyAnalyticEyes();
+}
+function applyAnalyticEyes() {
+  const on = $('analytic-eyes').checked;
+  for (const e of state.runtimeEyes) {
+    e.shell.material = on ? e.mat : e.original;
+    e.shell.userData.analyticEye = on;                  // the skin renderer blanks analytic eyes in its passes
+    if (e.iris) e.iris.visible = !on;
+  }
+  dirty = true;
+}
+$('analytic-eyes').addEventListener('change', applyAnalyticEyes);
+// pupilWide / pupilNarrow: material-only controls scaling the pupil of the analytic eyes
+function applyPupil(values) {
+  const mult = 1 + 0.6 * (values.pupilWide || 0) - 0.5 * (values.pupilNarrow || 0);
+  for (const e of state.runtimeEyes) {
+    if (Math.abs(mult - e.lastMult) < 1e-4) continue;
+    const q = JSON.parse(JSON.stringify(e.params));
+    q.pupil.scale *= mult;
+    Eye.applyEyeParams(e.mat, q, e.g);
+    e.lastMult = mult;
+  }
+}
 const camera = new THREE.PerspectiveCamera(22, 1, 0.005, 20);
 const controls = new OrbitControls(camera, renderer.domElement);
 let dirty = true;
@@ -548,8 +548,29 @@ $('reset').addEventListener('click', () => { stopAnim(); tweenTo({}, 0.2); });
 
 // ---- apply ---------------------------------------------------------------------------------
 let blink = 0, gaze = { x: 0, y: 0 }, pointer = null;
+// The procedural motion layer for manual posing (saved takes bake their own).
+let motionLayer = null, motionT0 = 0, motionValues = null;
+function sampleMotionLayer(now) {
+  if (!$('motion-layer').checked || state.takeActive) { motionValues = null; return false; }
+  if (!motionLayer) { motionLayer = new MotionLayer(7); motionT0 = now; }
+  const t = (now - motionT0) / 1000;
+  const focus = $('look-at').checked && pointer ? { focusYaw: pointer.x * 20, focusPitch: pointer.y * 12 } : {};
+  motionValues = motionLayer.sample(t, Object.assign({ headYaw: state.values.headYaw || 0, headPitch: state.values.headPitch || 0,
+                                                        focusDistance: 0.6, light: 0.6 }, focus));
+  return true;
+}
+$('motion-layer').addEventListener('change', () => { motionLayer = null; motionValues = null; applyRig(); });
 function effectiveValues() {
   const v = Object.assign({}, state.values);
+  if (motionValues) {
+    for (const [k, val] of Object.entries(motionValues)) {
+      if (k.startsWith('_')) continue;
+      if (k.startsWith('head')) v[k] = (v[k] || 0) + val;             // idle micro-motion adds to the pose
+      else if (k.startsWith('eyeBlink')) v[k] = Math.max(v[k] || 0, val);
+      else v[k] = val;                                                // gaze, wide, pupil
+    }
+    return v;
+  }
   if (!state.takeActive && $('auto-blink').checked && blink > 0) {
     v.eyeBlinkLeft = Math.max(v.eyeBlinkLeft || 0, blink);
     v.eyeBlinkRight = Math.max(v.eyeBlinkRight || 0, blink);
@@ -608,6 +629,7 @@ function applyRig() {
     const dict = mesh.morphTargetDictionary;
     for (const [name, i] of Object.entries(dict)) mesh.morphTargetInfluences[i] = ev.weights[name] || 0;
   }
+  applyPupil(values);
   wrinkleWeights(values);
   updateSoftOffsets(values);
   dirty = true;
@@ -1433,13 +1455,14 @@ function tick(now) {
     if (state.bodyMotionTime >= duration) { state.bodyMotionPlaying = false; $('body-motion-play').textContent = '▶ play'; }
     changed = true;
   }
-  if ($('auto-blink').checked) {
+  if (sampleMotionLayer(now)) changed = true;
+  if ($('auto-blink').checked && !motionValues) {
     if (now > nextBlink) { blinkT0 = now; nextBlink = now + 2200 + Math.random() * 3500; }
     const bt = (now - blinkT0) / 1000;
     const b = bt < 0.08 ? bt / 0.08 : bt < 0.2 ? 1 - (bt - 0.08) / 0.12 : 0;
     if (b !== blink) { blink = b; changed = true; }
   }
-  if ($('look-at').checked) {
+  if ($('look-at').checked && !motionValues) {
     const tgt = pointer ? { x: Math.max(-1, Math.min(1, pointer.x * 1.6)), y: Math.max(-1, Math.min(1, pointer.y * 1.6)) } : { x: 0, y: 0 };
     const nx = gaze.x + (tgt.x - gaze.x) * 0.15, ny = gaze.y + (tgt.y - gaze.y) * 0.15;
     if (Math.abs(nx - gaze.x) + Math.abs(ny - gaze.y) > 1e-4) { gaze = { x: nx, y: ny }; changed = true; }
@@ -1563,6 +1586,9 @@ async function loadRig(h) {
     }
   });
   scene.add(gltf.scene);
+  for (const e of state.runtimeEyes) e.mat.dispose();
+  state.runtimeEyes = [];
+  attachRuntimeEyes(h, def, gltf.scene).catch((e) => console.warn('runtime eyes:', e));
   skelHelper = new THREE.SkeletonHelper(gltf.scene);
   skelHelper.visible = $('bones').checked;
   scene.add(skelHelper);

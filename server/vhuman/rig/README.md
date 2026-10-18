@@ -381,6 +381,14 @@ transfer and every LOD shares `rig.json` and the texture atlas. Outputs
 `viz_lod{1,2}.json`; the viewer's LOD selector switches meshes (`--lods` in
 `build.py`; head only, no body).
 
+## Manual posing in the viewer
+
+`/rig` has "auto blink" and "look at pointer" for manual posing, and a
+"motion layer" switch that runs `web/vhuman_motion_layer.js` on the animation
+clock instead (the pointer is the focus when "look at pointer" is on; the
+head controls feed its vestibulo-ocular compensation, and its pupil controls
+drive the analytic eyes). Saved takes bake their own motion.
+
 ## Inspection (web viewer)
 
 `/rig` → Inspect:
@@ -396,7 +404,7 @@ transfer and every LOD shares `rig.json` and the texture atlas. Outputs
 ## Rig evaluation (`rig.json`)
 
 ```
-x   = clamp(controls, range)                        60 controls
+x   = clamp(controls, range)                        62 controls
 c_p = min(1, w_p * prod_i clamp(x_i, 0, 1))         correctives
 in  = [x | c]
 dJ  = M in           per joint (tx ty tz rx ry rz), local, radians (sparse M)
@@ -412,7 +420,38 @@ Names are our own; the 51 expression controls are the LightRig canonical
 `lr.face.v1` set (ARKit-style names), so LightRig/MediaPipe face tracks
 (`timestamp` + 52 values per line) drive the rig in the viewer and through
 `cli rig-track`. Extra controls: `tongueOut/Up/Down/Left/Right/CurlUp`,
-`headYaw/Pitch/Roll`.
+`headYaw/Pitch/Roll`, and the material-only `pupilWide`/`pupilNarrow`
+(no joint or shape; the viewers scale the analytic eye's pupil by
+`1 + 0.6 wide - 0.5 narrow`), 62 controls in all.
+
+### Eyes in the rig
+
+The head export now carries the **runtime eyeballs** (`eye/geometry.py:
+runtime_shell`, 1,152 triangles, plus a 180-triangle iris disk) and a
+540-triangle occlusion cap instead of the dense optics, so a rigged head
+spends about 1.9k triangles per eye. `rig.json` records `eyes.<side>` with the
+rest eye frame (metres, +Z gaze, H frame) and the eye joint; the `/rig` viewer
+("analytic eyes") shades the carried shells with the shared analytic mesh eye
+material (`web/vhuman_eye_mesh_shader.js`, skinned variant) in
+`joint_world * inverse(joint_bind) * frame`, hides the iris disk, points the
+material's key softbox at the scene's key light, and applies the pupil
+controls. Unchecked, the standard glTF transmission materials are drawn.
+
+Lid follow-through under gaze stays procedural (`expressions.py`: the lids ride
+along with the eye at a fraction of its rotation), blended with the GNM
+expression-basis projection on GNM-topology rigs. GNM v3's pose-corrective
+regressor is identically zero for its eye joints, so there is no data-driven
+lid follow to bake from it. Correctives: `corr_blink_lookDown_*` (existing),
+`corr_blink_lookUp_*` (the upper lid still closes while looking up) and
+`corr_wide_lookUp_*` (wide eyes looking up keep the lid on the globe).
+
+Every build evaluates a **lid clearance grid** (`build.lid_clearance`: eight
+gazes x blink 0/.5/1 = 24 poses) and reports the worst signed distance of the
+eye contact vertices to their rest-relative threshold before and after the
+post-skinning projection (`rig_report.json` `lid_clearance`). The projection
+makes the eye contacts exact; the pre-projection figure measures the shapes
+and correctives themselves. The mock-head self-test asserts the report and the
+eye triangle budgets.
 
 ## Viewers and USD tools
 
@@ -466,9 +505,20 @@ closure does not disappear between samples. Jaw opening and lip press fade to
 zero at peak closure; a rendered Japanese /m/ frame showed that even small
 residual values exposed a thin teeth strip on this rig.
 Manual emotion drives the upper face and restrained mouth-corner motion.
-Repeatable blinks, gaze shifts and subtle head follow-through are baked into
-the timeline from the take seed; rebuilding a take reuses its seed unless
-overridden. Every take ends on a neutral frame. Playback samples these same
+Blinks, gaze, pupil and idle head motion come from the seeded **motion
+layer** (`rig/motion_layer.py`, spec `vhuman.motion_layer.v1`; the same
+algorithm runs in `web/vhuman_motion_layer.js` and is checked against it to
+1e-9 in `test_motion_layer.py`): fixations of 0.22-0.62 s (15% longer holds)
+around the camera, saccades on a 21 ms + 2.2 ms/degree main sequence with
+smoothstep profiles, microsaccades and lattice-noise drift, blinks every
+3-5 s (75 ms close, 130 ms open, a slight roll-up), more likely after saccades
+over 8 degrees and at `sil` onsets of the alignment, convergence from a 0.9 m
+focus, a pupil response with hippus, breathing and 1/f-like head micro-motion.
+Speech frames (the `sil` viseme below 0.5) widen the gaze offsets and raise
+the blink rate. The head follow-through of the gaze is kept. The model uses
+only polynomial math and a 32-bit PRNG, so a seed reproduces a take exactly;
+rebuilding a take reuses its seed unless overridden. Every take ends on a
+neutral frame. Playback samples these same
 controls against the WAV element's current time, including after seeking;
 the viewer's random blink and pointer gaze are used only for manual posing.
 Server `/health` reports speech runner/model availability.

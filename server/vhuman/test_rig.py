@@ -188,6 +188,25 @@ class RigEndToEndTests(unittest.TestCase):
             self.assertIn(j, self.summary["report"]["joints"])
         self.assertLess(self.summary["register"]["final_mean_dist_mm"], 3.0)
 
+    def test_runtime_eyes_and_lid_clearance(self):
+        """Carried eyes are the runtime meshes; the eye frames are exported;
+        the gaze x blink grid is reported and exact after projection."""
+        tri = self.summary["eye_triangles"]
+        for side in ("left", "right"):
+            self.assertLessEqual(tri[f"eye_{side}_shell"] + tri[f"eye_{side}_iris"], 1500, tri)
+            self.assertLessEqual(tri.get(f"eye_{side}_eyeshell", 0), 600, tri)
+            frame = np.asarray(self.summary["eyes"][side]["frame"])
+            self.assertEqual(frame.shape, (4, 4))
+            self.assertTrue(np.allclose(frame[:3, :3] @ frame[:3, :3].T, np.eye(3), atol=1e-6))
+            self.assertGreater(frame[2, 2], 0.5)                       # gazes along +Z in the rig frame
+        lc = self.summary["lid_clearance"]
+        self.assertEqual(lc["poses"], 24)
+        self.assertGreaterEqual(lc["projected_worst_mm"], -0.01)
+        self.assertGreater(lc["worst_mm"], -3.0)
+        names = {b for b in self.summary["blendshapes"]}
+        self.assertTrue({"corr_blink_lookUp_L", "corr_wide_lookUp_R"} <= names)
+        self.assertEqual(self.summary["rig_controls"], len(rigdef.CONTROLS))
+
     def test_glb_skin_and_morphs(self):
         from .eye.glb import GLB
         g = GLB.load(self.rig_dir / "rig.glb")

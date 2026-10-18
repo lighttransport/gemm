@@ -21,9 +21,24 @@ void main() {
   gl_FragColor = uSkinPass > .5 ? vec4(0.) : (uRaw > .5 ? vec4(col, 1.) : vec4(toSRGB(neutral(col * uExposure)), 1.0));
 }`;
 
-export function makeEyeMeshMaterial(studio) {
-  return new THREE.ShaderMaterial({ uniforms: makeEyeUniforms(studio), vertexShader: VERT, fragmentShader: EYE_MESH_FRAG,
-                                    side: THREE.FrontSide });
+// For a glTF SkinnedMesh eyeball (rigid on its eye joint): three.js binds the
+// bone texture and bind matrices to any material drawn by a SkinnedMesh.
+export const SKINNED_VERT = /* glsl */`
+#include <common>
+#include <skinning_pars_vertex>
+varying vec3 vWorld;
+void main() {
+  vec3 transformed = vec3(position);
+  #include <skinbase_vertex>
+  #include <skinning_vertex>
+  vec4 w = modelMatrix * vec4(transformed, 1.0);
+  vWorld = w.xyz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}`;
+
+export function makeEyeMeshMaterial(studio, { skinned = false } = {}) {
+  return new THREE.ShaderMaterial({ uniforms: makeEyeUniforms(studio), vertexShader: skinned ? SKINNED_VERT : VERT,
+                                    fragmentShader: EYE_MESH_FRAG, side: THREE.FrontSide });
 }
 
 // geometry.runtime_alphas: dense cornea, moderate visible sclera, an equator
@@ -84,11 +99,16 @@ export function makeRuntimeEye(material, g, { rings = 16, segments = 36 } = {}) 
   return mesh;
 }
 
-export function attachEyeFrame(mesh) {
+// The eye frame per draw. Default: the mesh's own world transform. With a
+// `bone` (a skinned eyeball): joint_world * inverse(joint_bind) * frame, where
+// `frame` is the rest eye frame exported in rig.json ("eyes").
+export function attachEyeFrame(mesh, { bone = null, boneInverse = null, frame = null } = {}) {
   mesh.onBeforeRender = (renderer, scene, camera) => {
     const u = mesh.material.uniforms;
+    if (!u || !u.uProj) return;
     u.uProj.value.copy(camera.projectionMatrix);
-    u.uWorldFromEye.value.copy(mesh.matrixWorld);
-    u.uEyeFromWorld.value.copy(mesh.matrixWorld).invert();
+    if (bone) u.uWorldFromEye.value.copy(bone.matrixWorld).multiply(boneInverse).multiply(frame);
+    else u.uWorldFromEye.value.copy(mesh.matrixWorld);
+    u.uEyeFromWorld.value.copy(u.uWorldFromEye.value).invert();
   };
 }

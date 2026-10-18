@@ -363,6 +363,16 @@ export function applyStudio(studio, g, yaw = 0) {
   studio.uSky.value.set(...g.sky); studio.uGround.value.set(...g.ground); studio.uHorizon.value.set(...g.horizon);
 }
 
+// Point softbox k of the studio at `direction` (world, towards the light), e.g.
+// a viewer's key light, so the corneal highlight agrees with the scene's lighting.
+export function setSoftboxDirection(studio, k, direction) {
+  const up = new THREE.Vector3(0, 1, 0);
+  const w = new THREE.Vector3().copy(direction).normalize();
+  const uu = new THREE.Vector3().crossVectors(up, w).normalize();
+  const vv = new THREE.Vector3().crossVectors(w, uu);
+  studio.uBoxDir.value[k].copy(w); studio.uBoxU.value[k].copy(uu); studio.uBoxV.value[k].copy(vv);
+}
+
 // The studio as a background (BackSide sphere) or, with uRaw, for an environment capture.
 export function makeBackgroundMaterial(studio, { raw = false } = {}) {
   const u = Object.assign({}, studio, { uRaw: { value: raw ? 1 : 0 } });
