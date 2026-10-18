@@ -42,7 +42,8 @@ static int en_vocab_load(en_vocab *v, const char *model_path) {
     while (v->n < EN_MAX_VOCAB && fgets(line, sizeof(line), f)) {
         size_t l = strlen(line);
         while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
-        snprintf(v->tok[v->n++], EN_TOK, "%s", line);
+        if (l >= EN_TOK) { fprintf(stderr, "en_align: vocabulary label too long: %s\n", line); fclose(f); return -1; }
+        memcpy(v->tok[v->n++], line, l + 1);
     }
     fclose(f);
     return v->n > 1 && !strcmp(v->tok[0], "<pad>") ? 0 : -1;
@@ -61,8 +62,9 @@ static int en_viseme(const char *t) {
         switch (c0) {
         case 'p': case 'b': case 'm': return JA_VIS_PP;
         case 'f': case 'v': return JA_VIS_FF;
-        case 't': return (t[1] == 's' || (unsigned char)t[1] == 0xCA) ? JA_VIS_CH : JA_VIS_DD;   /* ts, tʃ */
-        case 'd': return (t[1] == 'z' || (unsigned char)t[1] == 0xCA) ? JA_VIS_CH : JA_VIS_DD;   /* dz, dʒ */
+        /* affricates only: ts, tʃ, tɕ / dz, dʒ, dʑ; aspirated or palatalised stops (tʰ, tʲ, dʲ) stay DD */
+        case 't': return (t[1] == 's' || !strncmp(t + 1, "ʃ", 2) || !strncmp(t + 1, "ɕ", 2)) ? JA_VIS_CH : JA_VIS_DD;
+        case 'd': return (t[1] == 'z' || !strncmp(t + 1, "ʒ", 2) || !strncmp(t + 1, "ʑ", 2)) ? JA_VIS_CH : JA_VIS_DD;
         case 'n': case 'l': return JA_VIS_NN;
         case 'k': case 'g': case 'x': case 'h': case 'c': case 'q': case 'X': case 'N': return JA_VIS_KK;
         case 's': case 'z': case 'S': return JA_VIS_SS;

@@ -75,6 +75,22 @@ class PackageTests(unittest.TestCase):
             manifest['runtime'] = 'other'; (root/'avatar.json').write_text(json.dumps(manifest))
             with self.assertRaises(ValueError): validate_package(root)
 
+    def test_morph_export_packages_lod0_unless_lods_are_requested(self):
+        from .mobile import morph_export
+        WORK.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=WORK) as temp:
+            rig = Path(temp) / 'rig'; rig.mkdir()
+            (rig / 'rig.json').write_text(json.dumps({'controls': [{'name': 'jawOpen', 'min': 0, 'max': 1}],
+                'blendshapes': [{'name': 'jawOpen', 'input': 'jawOpen'}], 'joints': [{'name': 'root'}]}))
+            for name in ('rig.glb', 'rig_lod1.glb', 'rig_lod2.glb'):
+                (rig / name).write_bytes(b'glTF fixture')
+            plain = morph_export.export(rig, Path(temp) / 'plain')
+            self.assertEqual(plain['rig']['files'], ['rig.glb', 'rig.json'])
+            self.assertFalse(any(n.startswith('rig_lod') for n in plain['files']))
+            with_lods = morph_export.export(rig, Path(temp) / 'lods', lods=True)
+            self.assertEqual(with_lods['rig']['lods'], ['rig_lod1.glb', 'rig_lod2.glb'])
+            validate_package(Path(temp) / 'lods')
+
     def test_hair_ribbons_have_deterministic_root_layout_and_budget(self):
         rng = np.random.default_rng(7); paths = np.cumsum(rng.normal(0, .001, (1500, 8, 3)), axis=1)
         p, tri, uv, selected = hair_cards(paths)

@@ -16,10 +16,13 @@ from pathlib import Path
 from .export import validate_package, write_eye_files, sha256
 from .profile import IPHONE12
 
-RIG_FILES=('rig.glb','rig.json','deformer.lrm','rig_lod1.glb','rig_lod2.glb')
+RIG_FILES=('rig.glb','rig.json','deformer.lrm')
+# Lower-detail rigs are packaged only on request: the player renders LOD0 and would
+# otherwise download and checksum them for nothing.
+LOD_FILES=('rig_lod1.glb','rig_lod2.glb')
 
 
-def export(rig,out,*,head=None,eye_params=None,profile='iphone12'):
+def export(rig,out,*,head=None,eye_params=None,profile='iphone12',lods=False):
     rig,out=Path(rig),Path(out)
     if profile!='iphone12':raise ValueError('unsupported mobile profile')
     if not (rig/'rig.glb').is_file() or not (rig/'rig.json').is_file():raise ValueError('rig.glb and rig.json are required')
@@ -32,7 +35,7 @@ def export(rig,out,*,head=None,eye_params=None,profile='iphone12'):
     if triangles>IPHONE12['triangle_budgets'][0]:raise ValueError(f'rig exceeds the mobile triangle budget: {triangles}')
     out.mkdir(parents=True,exist_ok=True)
     copied=[]
-    for name in RIG_FILES:
+    for name in RIG_FILES+(LOD_FILES if lods else ()):
         if (rig/name).is_file():shutil.copyfile(rig/name,out/name);copied.append(name)
     if eye_params is None and head is not None:
         fit=json.loads((Path(head)/'fit.json').read_text())
@@ -60,7 +63,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--rig',required=True,help='a built rig folder (rig.glb, rig.json, ...)')
     p.add_argument('--out',required=True);p.add_argument('--head',help='the head folder whose fit.json supplies the eye parameters')
     p.add_argument('--profile',default='iphone12',choices=['iphone12'])
-    a=p.parse_args();r=export(a.rig,a.out,head=a.head,profile=a.profile)
+    p.add_argument('--lods',action='store_true',help='also package rig_lod1/2.glb (the player does not use them yet)')
+    a=p.parse_args();r=export(a.rig,a.out,head=a.head,profile=a.profile,lods=a.lods)
     print(json.dumps(dict(out=a.out,triangles=r['triangles'],rig=r['rig']['files'],eyes=r['eyes']['files']),indent=2))
 
 

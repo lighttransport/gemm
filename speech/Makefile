@@ -51,9 +51,13 @@ $(BUILD)/test_w2v2: tests/test_w2v2.c $(JA_HDRS) | $(BUILD)
 $(BUILD)/test_ja_dsp: tests/test_ja_dsp.c $(JA_HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -I$(JA) -o $@ $< -lm
 
-test: $(BUILD)/test_ja_ctc $(BUILD)/test_ja_dsp
+$(BUILD)/test_en_viseme: tests/test_en_viseme.c $(EN_HDRS) $(JA_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -I$(JA) -o $@ $< -lm
+
+test: $(BUILD)/test_ja_ctc $(BUILD)/test_ja_dsp $(BUILD)/test_en_viseme
 	$(BUILD)/test_ja_ctc
 	$(BUILD)/test_ja_dsp
+	$(BUILD)/test_en_viseme
 
 cuda: $(BUILD)/qwen3_tts_cuda $(BUILD)/tts_ja_cuda $(BUILD)/ja_align_cuda
 

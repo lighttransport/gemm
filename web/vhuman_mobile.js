@@ -314,6 +314,8 @@ async function morphRuntime(renderer,config,manifest){
     const buffers={};
     for(const [name,file] of Object.entries(manifest.files)){
         if(name.includes('/')||name.includes('\\')||file.bytes>256*1024*1024)throw Error('Invalid asset filename/size');
+        // LOD0 only: lower-detail rigs (opt-in in the package) are not downloaded until a LOD switch exists.
+        if(/^rig_lod\d+\.glb$/.test(name))continue;
         status.textContent=`Checking ${name}…`;
         const data=await bytes(config.package+name,file.sha256,file.bytes);
         if(['rig.glb','rig.json','deformer.lrm','eye_uniforms.json','eye_params.json'].includes(name))buffers[name]=data;

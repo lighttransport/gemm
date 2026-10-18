@@ -339,7 +339,8 @@ class EyePageTest(unittest.TestCase):
                            ".then(r => r.json())")
         cdp.wait_for(f"fetch('/v1/jobs/{job['id']}').then(r => r.json()).then(j => j.state === 'done')", timeout=300)
         cdp.call("Page.navigate", {"url": self.base + "/head"})
-        cdp.wait_for("document.getElementById('enable-head-editor')")
+        # !!: a DOM node serialises to {} by value, which is falsy in Python
+        cdp.wait_for("!!document.getElementById('enable-head-editor')")
         cdp.evaluate("document.getElementById('enable-head-editor').click()")
         cdp.wait_for("window.__headReady === true", timeout=180)
         state = cdp.evaluate("""(() => { const s = __headState; const out = {analytic: s.eyesAnalytic, proxies: [], hidden: []};

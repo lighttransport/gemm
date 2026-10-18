@@ -1317,7 +1317,8 @@ acceptance corpus are not implemented by this mobile reference.
 
 `python -m server.vhuman.mobile.morph_export --rig HEAD/rig --out PKG --head HEAD`
 packages a built facial rig (rig.glb with skinning and sparse morph targets,
-rig.json, deformer.lrm, LOD glTFs) with the analytic eye inputs (flat
+rig.json, deformer.lrm; the LOD glTFs only with `--lods`, since the player
+renders LOD0 and skips them) with the analytic eye inputs (flat
 `eye_*` files from the head's eye parameters) and the same checksummed
 `avatar.json` (`runtime: "morph"`). `mobile.browser` builds the same player
 bundle for it (plus the shared `vhuman_rig_eval.js`, eye shaders and motion
