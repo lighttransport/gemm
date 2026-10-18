@@ -148,7 +148,7 @@ typedef struct {
     int exhaustive, candidate;
     const char *cutlass;
     int raster, swizzle;
-    int compare_cublas;
+    int compare_cublas, graph, flush_mb, pilot_iters;
 } options;
 typedef struct {
     const char *name;
@@ -252,6 +252,10 @@ typedef struct {
     cublasLtMatmulHeuristicResult_t *algorithm;
     void *custom;
     int (*custom_run)(void *);
+    int (*custom_run_stream)(void *, void *);
+    CUstream stream;
+    CUdeviceptr flush;
+    int graph, flush_mb;
 } job;
 
 static int algo_value(const void *a, int attribute) {
@@ -319,19 +323,48 @@ static void exhaustive_algos(job *j, const config *c, int output,
         }
 }
 static int launch(job *j) {
-    if (j->custom_run) return j->custom_run(j->custom);
+    if (j->custom_run) return j->stream ? j->custom_run_stream(j->custom,j->stream) : j->custom_run(j->custom);
     float alpha = 1, beta = 0;
     return p_cublasLtMatmul(j->handle,j->desc,&alpha,
         (void *)(uintptr_t)j->b,j->a_layout,(void *)(uintptr_t)j->a,j->b_layout,&beta,
         (void *)(uintptr_t)j->output,j->out_layout,(void *)(uintptr_t)j->output,j->out_layout,
-        &j->algorithm->algo,(void *)(uintptr_t)j->workspace,j->workspace_bytes,NULL);
+        &j->algorithm->algo,(void *)(uintptr_t)j->workspace,j->workspace_bytes,j->stream);
 }
 static float time_job(job *j, int iters) {
     CUevent begin, end; CUDA(cuEventCreate(&begin,0)); CUDA(cuEventCreate(&end,0));
-    CUDA(cuEventRecord(begin,NULL));
-    for (int i = 0; i < iters; i++) REQUIRE(!launch(j));
-    CUDA(cuEventRecord(end,NULL)); CUDA(cuEventSynchronize(end));
-    float ms; CUDA(cuEventElapsedTime(&ms,begin,end));
+    CUgraph graph = NULL; CUgraphExec executable = NULL;
+    if (j->graph) {
+        REQUIRE(!j->custom_run || j->custom_run_stream);
+        CUDA(cuStreamCreate(&j->stream,CU_STREAM_NON_BLOCKING));
+        CUDA(cuStreamBeginCapture(j->stream,CU_STREAM_CAPTURE_MODE_THREAD_LOCAL));
+        if (j->flush_mb) {
+            CUDA(cuMemsetD8Async(j->flush,0xa5,(size_t)j->flush_mb << 20,j->stream));
+            CUDA(cuEventRecordWithFlags(begin,j->stream,CU_EVENT_RECORD_EXTERNAL));
+        }
+        int nodes = j->flush_mb ? 1 : iters;
+        for (int i = 0; i < nodes; i++) REQUIRE(!launch(j));
+        if (j->flush_mb) CUDA(cuEventRecordWithFlags(end,j->stream,CU_EVENT_RECORD_EXTERNAL));
+        CUDA(cuStreamEndCapture(j->stream,&graph));
+        CUDA(cuGraphInstantiate(&executable,graph,0));
+        /* Upload and warm the graph outside timing, including first-use setup. */
+        CUDA(cuGraphLaunch(executable,j->stream)); CUDA(cuStreamSynchronize(j->stream));
+    }
+    float ms = 0;
+    int trials = j->flush_mb ? iters : 1;
+    for (int t = 0; t < trials; t++) {
+        if (j->flush_mb && !executable)
+            CUDA(cuMemsetD8Async(j->flush,(unsigned char)t,(size_t)j->flush_mb << 20,j->stream));
+        if (!(j->flush_mb && executable)) CUDA(cuEventRecord(begin,j->stream));
+        if (executable) CUDA(cuGraphLaunch(executable,j->stream));
+        else for (int i = 0; i < (j->flush_mb ? 1 : iters); i++) REQUIRE(!launch(j));
+        if (!(j->flush_mb && executable)) CUDA(cuEventRecord(end,j->stream));
+        CUDA(cuEventSynchronize(end));
+        float elapsed; CUDA(cuEventElapsedTime(&elapsed,begin,end)); ms += elapsed;
+    }
+    if (executable) {
+        CUDA(cuGraphExecDestroy(executable)); CUDA(cuGraphDestroy(graph));
+        CUDA(cuStreamDestroy(j->stream)); j->stream = NULL;
+    }
     CUDA(cuEventDestroy(begin)); CUDA(cuEventDestroy(end)); return ms / iters;
 }
 static int compare_float(const void *a, const void *b) {
@@ -355,7 +388,8 @@ static int verify(job *j, const size_t *indices, const double *refs, int samples
     return *rel <= (type == CUDA_R_32F ? 1e-4 : type == CUDA_R_16BF ? 0.004 : 0.0005);
 }
 static void gpu_info(FILE *f) {
-    FILE *p = popen("nvidia-smi --query-gpu=name,driver_version,pstate,clocks.current.sm,clocks.max.sm,power.limit,temperature.gpu --format=csv,noheader","r");
+    fputs("GPU: name, driver, pstate, SM MHz, max SM MHz, memory MHz, max memory MHz, power limit W, temperature C\n",f);
+    FILE *p = popen("nvidia-smi --query-gpu=name,driver_version,pstate,clocks.current.sm,clocks.max.sm,clocks.current.memory,clocks.max.memory,power.limit,temperature.gpu --format=csv,noheader","r");
     if (p) { char line[1024]; while (fgets(line,sizeof(line),p)) fputs(line,f); pclose(p); }
 }
 static void *cutlass_lib;
@@ -424,10 +458,16 @@ static int run_cutlass(job *j, const config *c, int out_type, const char *out_na
     LOAD_PLUGIN(count,"fp4_kernel_count"); LOAD_PLUGIN(name,"fp4_kernel_name");
     LOAD_PLUGIN(create,"fp4_kernel_create"); LOAD_PLUGIN(destroy,"fp4_kernel_destroy");
     LOAD_PLUGIN(j->custom_run,"fp4_kernel_run");
+    void *stream_symbol = dlsym(cutlass_lib,"fp4_kernel_run_stream");
+    memcpy(&j->custom_run_stream,&stream_symbol,sizeof(j->custom_run_stream));
+    REQUIRE(!o->graph || j->custom_run_stream);
 #undef LOAD_PLUGIN
     const char *(*build_info)(void); void *build_symbol = dlsym(cutlass_lib,"fp4_kernel_build");
     memcpy(&build_info,&build_symbol,sizeof(build_info));
     if (build_info) { printf("%s\n",build_info()); if (meta) fprintf(meta,"%s\n",build_info()); }
+    void (*set_format)(int); void *format_symbol = dlsym(cutlass_lib,"fp4_kernel_set_format");
+    memcpy(&set_format,&format_symbol,sizeof(set_format));
+    if (set_format) set_format(c->codebook);
     int num = count(), best = -1; float fastest = INFINITY;
     REQUIRE(o->candidate < num);
     size_t elements = (size_t)o->m * o->n, bytes = elements * (out_type == CUDA_R_32F ? 4 : 2);
@@ -441,7 +481,8 @@ static int run_cutlass(job *j, const config *c, int out_type, const char *out_na
         if (!j->custom) continue;
         CUDA(cuMemsetD8(j->output,0xff,bytes)); REQUIRE(!launch(j)); CUDA(cuCtxSynchronize());
         if (!o->skip_verify) REQUIRE(verify(j,indices,refs,samples,out_type,o->full_check,elements,&rel,&max_error));
-        float pilot[3]; for (int r = 0; r < 3; r++) pilot[r] = time_job(j,3);
+        float pilot[3]; for (int r = 0; r < 3; r++)
+            pilot[r] = time_job(j,o->pilot_iters ? o->pilot_iters : o->graph ? 32 : 3);
         qsort(pilot,3,sizeof(float),compare_float);
         printf("CUTLASS candidate=%d %s ms=%.7f %.2f TOp/s %s\n",i,name(i),pilot[1],
             2.0 * o->m * o->n * o->k / (pilot[1] * 1e9),o->skip_verify ? "UNVERIFIED" : "PASS");
@@ -459,17 +500,18 @@ static int run_cutlass(job *j, const config *c, int out_type, const char *out_na
         (void *)(uintptr_t)j->output,out_type); REQUIRE(j->custom);
     for (int i = 0; i < o->warmup; i++) REQUIRE(!launch(j));
     CUDA(cuCtxSynchronize());
+    /* Verify the actual timed path, including graph stream dispatch. */
+    CUDA(cuMemsetD8(j->output,0xff,bytes));
     float times[101]; for (int i = 0; i < o->rounds; i++) times[i] = time_job(j,o->iters);
-    CUDA(cuMemsetD8(j->output,0xff,bytes)); REQUIRE(!launch(j)); CUDA(cuCtxSynchronize());
     if (!o->skip_verify) REQUIRE(verify(j,indices,refs,samples,out_type,o->full_check,elements,&rel,&max_error));
     qsort(times,o->rounds,sizeof(float),compare_float);
     float ms = times[o->rounds/2]; double tops = 2.0 * o->m * o->n * o->k / (ms * 1e9);
     printf("CUTLASS %s %s %s raster=%d swizzle=%d %.7f ms %.2f TOp/s %s rel_L2=%.6g max_error=%.6g\n",
         c->name,out_name,name(best),o->raster,o->swizzle,ms,tops,o->skip_verify ? "UNVERIFIED" : "PASS",rel,max_error);
     if (csv) {
-        fprintf(csv,"%d,%d,%d,cutlass_%s,%s,%s,%d,%d,%d,%d,%d,0,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d,%s\n",
+        fprintf(csv,"%d,%d,%d,cutlass_%s,%s,%s,%d,%d,%d,%d,%d,0,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d,%s,%s,%d\n",
             o->m,o->n,o->k,c->name,out_name,o->data,o->warmup,o->iters,o->rounds,best,num,ms,times[0],
-            times[o->rounds-1],tops,rel,max_error,samples,o->skip_verify ? "UNVERIFIED" : "PASS"); fflush(csv);
+            times[o->rounds-1],tops,rel,max_error,samples,o->skip_verify ? "UNVERIFIED" : "PASS",o->graph ? "graph" : "direct",o->flush_mb); fflush(csv);
     }
     if (meta) { fprintf(meta,"selected=%d %s raster=%d swizzle=%d\n",best,name(best),o->raster,o->swizzle);
         gpu_info(meta); fflush(meta); }
@@ -479,7 +521,8 @@ static int run_cutlass(job *j, const config *c, int out_type, const char *out_na
 }
 static int run_config(cublasLtHandle_t handle, const config *c, int out_type,
                        const char *out_name, const options *o, FILE *csv, FILE *meta) {
-    job j = {0}; j.handle = handle;
+    job j = {0}; j.handle = handle; j.graph = o->graph; j.flush_mb = o->flush_mb;
+    if (j.flush_mb) j.flush = device_alloc((size_t)j.flush_mb << 20);
     cublasLtMatmulPreference_t pref = NULL;
     CUdeviceptr sa = 0, sb = 0, one = 0;
     uint8_t *a, *b, *as, *bs;
@@ -553,7 +596,8 @@ static int run_config(cublasLtHandle_t handle, const config *c, int out_type,
         if (launch(&j)) continue;
         CUDA(cuCtxSynchronize());
         if (!o->skip_verify) REQUIRE(verify(&j,indices,refs,samples,out_type,o->full_check,count,&rel,&max_error));
-        float pilot[3]; for (int r = 0; r < 3; r++) pilot[r] = time_job(&j,3);
+        float pilot[3]; for (int r = 0; r < 3; r++)
+            pilot[r] = time_job(&j,o->pilot_iters ? o->pilot_iters : o->graph ? 32 : 3);
         qsort(pilot,3,sizeof(float),compare_float);
         if (o->exhaustive || o->candidate >= 0) {
             printf("  candidate=%d ms=%.7f ",i,pilot[1]); print_algo(stdout,algorithms[i].algo); puts("");
@@ -566,8 +610,8 @@ static int run_config(cublasLtHandle_t handle, const config *c, int out_type,
     REQUIRE(best >= 0); j.algorithm = &algorithms[best];
     for (int i = 0; i < o->warmup; i++) REQUIRE(!launch(&j));
     CUDA(cuCtxSynchronize());
+    CUDA(cuMemsetD8(j.output,0xff,out_bytes));
     float times[101]; for (int i = 0; i < o->rounds; i++) times[i] = time_job(&j,o->iters);
-    CUDA(cuMemsetD8(j.output,0xff,out_bytes)); REQUIRE(!launch(&j)); CUDA(cuCtxSynchronize());
     if (!o->skip_verify) REQUIRE(verify(&j,indices,refs,samples,out_type,o->full_check,count,&rel,&max_error));
     qsort(times,o->rounds,sizeof(float),compare_float);
     float ms = times[o->rounds / 2]; double tops = 2.0 * o->m * o->n * o->k / (ms * 1e9);
@@ -576,10 +620,10 @@ static int run_config(cublasLtHandle_t handle, const config *c, int out_type,
         algorithms[best].workspaceSize,o->skip_verify ? "UNVERIFIED" : "PASS",rel,max_error);
     print_algo(stdout,algorithms[best].algo); puts("");
     if (csv) {
-        fprintf(csv,"%d,%d,%d,%s,%s,%s,%d,%d,%d,%d,%d,%zu,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d,%s\n",
+        fprintf(csv,"%d,%d,%d,%s,%s,%s,%d,%d,%d,%d,%d,%zu,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d,%s,%s,%d\n",
             o->m,o->n,o->k,c->name,out_name,o->data,o->warmup,o->iters,o->rounds,best,returned,
             algorithms[best].workspaceSize,ms,times[0],times[o->rounds-1],tops,rel,max_error,samples,
-            o->skip_verify ? "UNVERIFIED" : "PASS"); fflush(csv);
+            o->skip_verify ? "UNVERIFIED" : "PASS",o->graph ? "graph" : "direct",o->flush_mb); fflush(csv);
     }
     if (meta) {
         fprintf(meta,"%s/%s/%s selected=%d returned=%d algo=",c->name,out_name,o->data,best,returned);
@@ -599,6 +643,7 @@ cleanup:
     if (j.desc) p_cublasLtMatmulDescDestroy(j.desc);
     free(indices); free(refs);
     free(algorithms);
+    if (j.flush) CUDA(cuMemFree(j.flush));
     if (one) CUDA(cuMemFree(one));
     if (j.decoded_a) CUDA(cuMemFree(j.decoded_a));
     if (j.decoded_b) CUDA(cuMemFree(j.decoded_b));
@@ -613,13 +658,14 @@ static int positive_int(const char *s) {
 }
 int main(int argc, char **argv) {
     setvbuf(stdout,NULL,_IOLBF,0);
-    options o = {8192,8192,8192,5,100,5,32,256,0,0,"all","f32","random",NULL,0,-1,NULL,0,1,0};
+    options o = {8192,8192,8192,5,100,5,32,256,0,0,"all","f32","random",NULL,0,-1,NULL,0,1,0,0,0,0};
     for (int i = 1; i < argc; i++) {
         const char *key = argv[i];
         if (!strcmp(key,"--help") || !strcmp(key,"-h")) {
             puts("cublas_fp4_gemm [-m M -n N -k K] [--format all|nvfp4|fp8|bf16|mxfp4|e0m3]\n"
                  "  [--output f32|bf16|f16|all] [--data random|ones|codebook] [--csv PATH]\n"
                  "  [--warmup N --iters N --rounds N --algos N --workspace-mb N]\n"
+                 "  [--graph] [--flush-mb N] [--pilot-iters N]\n"
                  "  [--full-check] [--skip-verify] [--exhaustive] [--candidate N]\n"
                  "  [--cutlass PATH --raster 0|1|2 --swizzle 1|2|4|8 --compare-cublas]\n"
                  "Defaults: 8192 cubed, random signed codes/varying block scales, FP32 output,\n"
@@ -629,6 +675,7 @@ int main(int argc, char **argv) {
                  "--compare-cublas then uses exactly decoded BF16 inputs outside timing.\n"
                  "Packed GEMM only; CPU packing/scale swizzle and algorithm search excluded."); return 0;
         }
+        if (!strcmp(key,"--graph")) { o.graph = 1; continue; }
         if (!strcmp(key,"--full-check")) { o.full_check = 1; continue; }
         if (!strcmp(key,"--exhaustive")) { o.exhaustive = 1; continue; }
         if (!strcmp(key,"--compare-cublas")) { o.compare_cublas = 1; continue; }
@@ -639,10 +686,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(key,"-k") || !strcmp(key,"--k")) o.k = positive_int(v);
         else if (!strcmp(key,"--warmup")) o.warmup = positive_int(v);
         else if (!strcmp(key,"--iters")) o.iters = positive_int(v);
+        else if (!strcmp(key,"--pilot-iters")) o.pilot_iters = positive_int(v);
         else if (!strcmp(key,"--rounds")) o.rounds = positive_int(v);
         else if (!strcmp(key,"--algos")) o.algos = positive_int(v);
         else if (!strcmp(key,"--workspace-mb")) o.workspace_mb = positive_int(v);
         else if (!strcmp(key,"--candidate")) o.candidate = !strcmp(v,"0") ? 0 : positive_int(v);
+        else if (!strcmp(key,"--flush-mb")) o.flush_mb = positive_int(v);
         else if (!strcmp(key,"--cutlass")) o.cutlass = v;
         else if (!strcmp(key,"--raster")) o.raster = !strcmp(v,"0") ? 0 : positive_int(v);
         else if (!strcmp(key,"--swizzle")) o.swizzle = positive_int(v);
@@ -652,7 +701,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(key,"--csv")) o.csv = v;
         else { fprintf(stderr,"unknown option %s\n",key); return 1; }
     }
-    REQUIRE(o.m <= 16384 && o.n <= 16384 && o.k <= 16384 && !(o.m % 16) && !(o.n % 16) && !(o.k % 64));
+    REQUIRE(o.m <= 16384 && o.n <= 262144 && o.k <= 32768 && !(o.n % 8) && !(o.k % 64));
+    /* Large vocabulary projections retain a bounded decode allocation. */
+    REQUIRE(o.n <= 32768 || (o.m <= 64 && o.k <= 4096));
+    REQUIRE(o.flush_mb <= 1024);
     REQUIRE(o.rounds <= 101 && (o.rounds & 1) && o.algos <= 64 && o.workspace_mb <= 1024);
     REQUIRE(o.raster <= 2 && (o.swizzle == 1 || o.swizzle == 2 || o.swizzle == 4 || o.swizzle == 8));
     REQUIRE(!o.compare_cublas || (o.cutlass && !o.skip_verify));
@@ -669,10 +721,11 @@ int main(int argc, char **argv) {
     REQUIRE(!load_cublas()); cublasLtHandle_t handle; REQUIRE(!p_cublasLtCreate(&handle));
     size_t (*version)(void); void *symbol = dlsym(cublas_lib,"cublasLtGetVersion"); memcpy(&version,&symbol,sizeof(symbol));
     printf("%s; driver API=%d cuBLASLt=%zu; M=%d N=%d K=%d; FP32 compute\n",name,driver,version ? version() : 0,o.m,o.n,o.k);
+    printf("timing=%s cache=%s flush_mb=%d\n",o.graph ? "graph" : "direct",o.flush_mb ? "evicted" : "warm",o.flush_mb);
     FILE *csv = NULL, *meta = NULL;
     if (o.csv) {
         csv = fopen(o.csv,"w"); REQUIRE(csv);
-        fputs("m,n,k,format,output,data,warmup,iters,rounds,algo_index,algos_returned,workspace_bytes,median_ms,min_ms,max_ms,tops,rel_l2,max_error,samples,status\n",csv);
+        fputs("m,n,k,format,output,data,warmup,iters,rounds,algo_index,algos_returned,workspace_bytes,median_ms,min_ms,max_ms,tops,rel_l2,max_error,samples,status,timing,flush_mb\n",csv);
         char path[4096]; REQUIRE(snprintf(path,sizeof(path),"%s.metadata.txt",o.csv) < (int)sizeof(path));
         meta = fopen(path,"w"); REQUIRE(meta);
         for (int i = 0; i < argc; i++) fprintf(meta,"%s%s",i ? " " : "",argv[i]);

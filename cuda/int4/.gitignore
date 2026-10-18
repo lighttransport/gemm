@@ -2,3 +2,4 @@
 __pycache__/
 !test_*.py
 !bench_*.h
+!bench_*.py

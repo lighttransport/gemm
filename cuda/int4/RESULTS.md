@@ -100,6 +100,130 @@ Artifacts are `build/cutlass_e0m3_8k.csv`,
 `build/cutlass_test.log`, `build/cutlass_validation_bench.log`, and
 `build/cutlass_cpu_regression.log`. Sanitizer timing is excluded from the table.
 
+## Further tuning and GLM5.3-Flash decode (2026-10-19)
+
+The **290 TOp/s target at 8192 cubed remains unreached**. Larger epilogue
+tiles measured 270.75 TOp/s (64x64) and 271.26 TOp/s (128x64). Moving the
+last register MMA before the next TMA-stage wait measured 278.99 TOp/s,
+with every output bit-identical to native cuBLAS NVFP4. These experiments
+used release builds, 256x128x128 mainloop tiles, FP32 accumulation, BF16
+output, AlongN raster order, and swizzle 4. Epilogue trials used 30 launches
+x 3 rounds; the MMA scheduling trial used 50 x 5. Their scratch headers
+never modified the external CUTLASS checkout. A two-CTA register-budget
+experiment stalled, was terminated, and its override was discarded. The
+original approximately 281 TOp/s bulk kernel remains selected.
+
+The final paired repeat at **2070 MHz** measured **280.85 TOp/s E0M3**
+(3.914960 ms) and **280.81 TOp/s FP4** (3.915556 ms), with five rounds of
+100 launches. Each format's 67,108,864 outputs matched its cuBLAS reference
+bit for bit. Evidence is `build/further_e0m3_8k.csv` and
+`build/further_fp4_8k.csv`, with metadata and full-comparison logs.
+
+The new decode adapter tunes **60 candidates**: 11 shared-memory tile
+shapes with asynchronous staging, FP32 global split-K, direct-register MMA,
+reduction within a block, and an E0M3 DP4A GEMV. Shared rows have 16 bytes of
+padding to avoid bank conflicts. The adapter needs no CUTLASS headers and
+returns BF16. Its binary-only build contains **308 format-patched OMMA
+instructions**; the manifest verifies that only those 308 bytes changed.
+The unpatched library reuses these MMA kernels for FP4 and excludes the
+E0M3-only DP4A candidate when that format is selected.
+
+Shapes come from Strata's GLM5.3-Flash tensor schema in
+`include/strata/artifact/glm_native.hpp`, including hidden=4096, expert=2048,
+dense FFN=12288, KDA=8192, MLA ranks 1536/512 and expanded width 16384,
+and vocabulary=154880. Inputs are synthetic signed nibbles with varying
+positive K16 UE4M3 scales. This is resident packed W4A4 GEMM, without model
+loading, quantization, routing, weight transfers, SwiGLU, or model-quality
+validation. For routed experts, M counts rows assigned to one expert.
+
+Timings use graph replay, 5 warmups, **100 launches x 5 rounds**, and GPU
+events. Warm mode repeats the same operands. Evicted mode writes **64 MiB
+before each GEMM**, with explicit graph event nodes timing only the GEMM
+and any reduction. Eviction can create memory writeback pressure; this is
+a synthetic cache experiment rather than a captured model decode trace.
+Packing, allocation, graph creation/upload, and validation are excluded.
+Tuning uses three pilots of 32 launches for core projections. The vocabulary
+M=64 decode/cold cases use four-launch pilots; its earlier cases used 32.
+Reproduction uses four for the vocabulary projection throughout, keeping
+100 x 5 final launches for every case. Core-sweep before/after SM-clock samples
+ranged from **2040 to 2077 MHz**, near the requested 2.07 GHz; observed memory
+clock was **7001 MHz**, versus reported maximum 14001 MHz. Clock settings
+and the configured 150 W power limit were unchanged.
+
+Single-token latency, in microseconds. Bulk is the previous 256x128x128
+BF16-output winner; comparisons share packed data, scale layout, output
+precision, timing, and independent references. Warm does not imply that
+large operands fit in L2.
+
+| Projection | K -> N | Warm bulk | Warm decode | Evicted bulk | Evicted decode |
+|---|---|---:|---:|---:|---:|
+| expert_gate_up | 4096 -> 2048 | 38.11 | 7.65 | 52.16 | 32.50 |
+| expert_gate_up_fused | 4096 -> 4096 | 39.24 | 12.62 | 64.61 | 56.77 |
+| expert_down | 2048 -> 4096 | 23.02 | 7.57 | 41.13 | 32.57 |
+| dense_gate_up | 4096 -> 12288 | 110.13 | 31.47 | 160.75 | 150.31 |
+| dense_down | 12288 -> 4096 | 104.16 | 32.26 | 172.53 | 155.86 |
+| kda_qkv_projection | 4096 -> 8192 | 75.52 | 21.34 | 112.32 | 104.18 |
+| kda_output | 8192 -> 4096 | 71.61 | 22.54 | 112.95 | 103.28 |
+| mla_q_a | 4096 -> 1536 | 38.04 | 6.56 | 51.81 | 25.83 |
+| mla_q_b | 1536 -> 16384 | 65.08 | 17.13 | 95.50 | 84.22 |
+| mla_kv_a | 4096 -> 512 | 37.56 | 3.98 | 46.11 | 13.97 |
+| mla_output | 16384 -> 4096 | 186.64 | 173.65 | 209.38 | 194.61 |
+| indexer_q_b | 1536 -> 4096 | 18.99 | 6.00 | 34.31 | 24.95 |
+| lm_head | 4096 -> 154880 | 1681.77 | 1665.26 | 1783.88 | 1745.73 |
+
+MLA KV-A improves **9.43x warm / 3.30x evicted** at M=1. Expert gate/up
+improves **4.98x / 1.60x**. Summing two single expert projection latencies
+gives 15.31 us warm, versus **12.62 us** for the concatenated gate+up matrix
+(about 17.5% lower). The analogous evicted comparison is 65.00 versus
+56.77 us. These compare GEMM latencies and exclude the SwiGLU operation.
+The 154880-wide output matrix occupies about 357 MB including scales;
+its M=1 decode timing corresponds to roughly **214 GB/s** of weight and
+scale traffic. It shows little improvement from changing the compute tile.
+The unpatched FP4 control on the expert 4096->2048, M=1 shape measured
+**7.62 us warm / 31.00 us evicted**, using the corresponding E0M3-selected
+tiles; all 2048 outputs matched native cuBLAS NVFP4 exactly.
+
+Larger M, with cold-cache fallback applied:
+
+| Projection | M | Warm decode us | Warm TOp/s | Warm speedup over bulk | Evicted selected us | Evicted library |
+|---|---:|---:|---:|---:|---:|---|
+| expert_gate_up | 16 | 8.57 | 31.33 | 4.45x | 34.09 | decode |
+| expert_gate_up | 64 | 16.66 | 64.47 | 2.29x | 41.68 | decode |
+| expert_gate_up_fused | 16 | 14.08 | 38.13 | 2.76x | 60.09 | decode |
+| expert_gate_up_fused | 64 | 27.08 | 79.31 | 1.44x | 66.04 | bulk |
+| expert_down | 16 | 7.94 | 33.80 | 2.87x | 35.90 | decode |
+| expert_down | 64 | 16.04 | 66.96 | 1.40x | 42.19 | bulk |
+
+Cold M=64 sometimes regresses: expert down is 44.29 us with the small-M
+adapter versus 42.19 us with bulk. `dispatch.csv` therefore retains bulk
+unless decode is at least 2% faster. It records library and candidate index
+for each shape, M, and cache mode; the raw summary preserves both timings.
+The table is an offline selection aid, not a Strata runtime integration.
+
+Reproduce from the repository root:
+
+```sh
+make -C cuda/int4 decode-test decode-sanitize
+make -C cuda/int4 decode-bench
+# Resume an interrupted default sweep without discarding completed rows:
+python3 cuda/int4/bench_decode.py --resume
+```
+
+All **156 final rows** (13 projections x three M values x two cache modes
+x two libraries) passed, with every output bit-identical to decoded-BF16
+cuBLAS and 64 independent FP64 CPU samples per row. The smaller unit cases
+check every output of every supported candidate, all 256 nibble-code pairs,
+M/N/K tails, FP4 reuse, graph dispatch, and both reduction strategies.
+Nine decode tests, 13 bulk regression tests, numeric/raw-patcher CPU checks,
+and native cuBLAS tests passed. Compute Sanitizer at 17x40x576 reported
+**zero memory errors and zero race hazards**, including all split-K factors
+and empty tail partitions. The DP4A single-token path also passed memcheck.
+
+Raw core-projection evidence is in `build/glm_decode/`, vocabulary evidence
+in `build/glm_head/`, with per-candidate logs, CSV metadata, binary hashes,
+and full reference comparisons. The default reproduction command writes a
+combined sweep to `build/decode/`. Generated binaries and logs remain local.
+
 ## Commands and correctness
 
 From the repository root:

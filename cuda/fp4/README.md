@@ -34,6 +34,12 @@ using a verified format-only SASS patch. Build and benchmark it with
 `make -C cuda/int4 cutlass-bench`; see the
 [E0M3 results and validation](../int4/RESULTS.md#optimized-e0m3-at-8192-cubed-280-tops-target-reached).
 
+The follow-up **290 TOp/s** attempt retains that bulk kernel: larger epilogues
+and a different MMA/TMA handoff were slower. The new
+[GLM5.3-Flash decode adapter](../int4/README.md#glm53-flash-decode-projections)
+also reuses its unpatched MMA tiles for FP4. The common runner now supports
+`--graph`, `--flush-mb`, and `--pilot-iters` for comparable short-kernel timing.
+
 This directory revisits an earlier "FP4 is software-emulated on sm_120" assumption and tests
 two hypotheses: **maybe NVFP4 is HW-accelerated while MXFP4 is software**, and (follow-up)
 **maybe INT4 is available and HW-accelerated too.**

@@ -38,7 +38,7 @@ using Source = Output;
 #endif
 
 struct kernel_state {
-    virtual int run() = 0;
+    virtual int run(cudaStream_t stream) = 0;
     virtual ~kernel_state() = default;
 };
 
@@ -77,8 +77,13 @@ struct kernel_impl : kernel_state {
     using Op = cutlass::arch::OpClassBlockScaledTensorOp;
     using Row = cutlass::layout::RowMajor;
     using Col = cutlass::layout::ColumnMajor;
+#ifdef FP4_EPI_M
+    using EpiTile = Shape<Int<FP4_EPI_M>,Int<FP4_EPI_N>>;
+#else
+    using EpiTile = cutlass::epilogue::collective::EpilogueTileAuto;
+#endif
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-        Arch,Op,Tile,Cluster,cutlass::epilogue::collective::EpilogueTileAuto,
+        Arch,Op,Tile,Cluster,EpiTile,
         float,float,Source,Row,128/cutlass::sizeof_bits<Output>::value,
         Output,Row,128/cutlass::sizeof_bits<Output>::value,
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
@@ -124,7 +129,7 @@ struct kernel_impl : kernel_state {
         if (bytes && cudaMalloc(&workspace,bytes) != cudaSuccess) return;
         valid = gemm.initialize(args,workspace) == cutlass::Status::kSuccess;
     }
-    int run() override { return static_cast<int>(gemm.run()); }
+    int run(cudaStream_t stream) override { return static_cast<int>(gemm.run(stream)); }
     ~kernel_impl() override { if (workspace) cudaFree(workspace); }
 };
 
@@ -186,5 +191,8 @@ extern "C" void *fp4_kernel_create(int index, int raster, int swizzle, int m, in
     }
     return nullptr;
 }
-extern "C" int fp4_kernel_run(void *state) { return static_cast<kernel_state *>(state)->run(); }
+extern "C" int fp4_kernel_run(void *state) { return static_cast<kernel_state *>(state)->run(nullptr); }
+extern "C" int fp4_kernel_run_stream(void *state, void *stream) {
+    return static_cast<kernel_state *>(state)->run(static_cast<cudaStream_t>(stream));
+}
 extern "C" void fp4_kernel_destroy(void *state) { delete static_cast<kernel_state *>(state); }

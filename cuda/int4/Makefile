@@ -22,6 +22,7 @@ CUTLASS_FLAGS := -O3 -DNDEBUG -std=c++17 --generate-code=arch=compute_120a,code=
 
 .PHONY: all clean test test-cpu test-gpu probe bench sanitize
 .PHONY: cutlass-bench cutlass-control cutlass-test cutlass-sanitize
+.PHONY: decode-bench decode-test decode-sanitize
 all: $(BUILD)/bench_int4 $(BUILD)/test_int4 $(VARIANTS) $(BUILD)/toolchain.txt
 
 $(BUILD) $(INT4_TMP_DIR):
@@ -108,9 +109,32 @@ cutlass-sanitize: $(CUTLASS_RUNNER) $(BUILD)/libcutlass_e0m3.so
 	$(CUDA_HOME)/bin/compute-sanitizer --tool memcheck --error-exitcode 1 $(CUTLASS_RUNNER) \
 	    --format e0m3 --output bf16 --cutlass ./$(BUILD)/libcutlass_e0m3.so \
 	    -m 384 -n 128 -k 320 --full-check --warmup 1 --iters 1 --rounds 1
+
 	$(CUDA_HOME)/bin/compute-sanitizer --tool racecheck --error-exitcode 1 $(CUTLASS_RUNNER) \
 	    --format e0m3 --output bf16 --cutlass ./$(BUILD)/libcutlass_e0m3.so \
 	    -m 384 -n 128 -k 320 --full-check --warmup 1 --iters 1 --rounds 1
+
+$(BUILD)/libdecode_base.so: decode.cu Makefile | $(BUILD) $(INT4_TMP_DIR)
+	$(NVCC) -O3 -DNDEBUG -std=c++17 --generate-code=arch=compute_120a,code=sm_120a \
+	    --compress-mode none -lineinfo -Xptxas=-warn-spills -Xcompiler=-fPIC -shared $< -o $@
+
+$(BUILD)/libdecode_e0m3.so $(BUILD)/libdecode_e0m3.sass $(BUILD)/libdecode_e0m3.patch.json &: \
+        $(BUILD)/libdecode_base.so patch_cutlass.py patch_formats.py | $(INT4_TMP_DIR)
+	$(PYTHON) patch_cutlass.py $< $(BUILD)/libdecode_e0m3.so --cuobjdump $(CUOBJDUMP) --scratch-dir $(INT4_TMP_DIR)
+
+decode-bench: $(CUTLASS_RUNNER) $(BUILD)/libdecode_e0m3.so $(BUILD)/libcutlass_e0m3.so
+	$(PYTHON) bench_decode.py
+
+decode-test: $(CUTLASS_RUNNER) $(BUILD)/libdecode_e0m3.so
+	$(PYTHON) -m unittest -v test_decode.py
+
+decode-sanitize: $(CUTLASS_RUNNER) $(BUILD)/libdecode_e0m3.so
+	$(CUDA_HOME)/bin/compute-sanitizer --tool memcheck --error-exitcode 1 $(CUTLASS_RUNNER) \
+	    --format e0m3 --output bf16 --cutlass ./$(BUILD)/libdecode_e0m3.so \
+	    -m 17 -n 40 -k 576 --full-check --warmup 1 --iters 1 --rounds 1
+	$(CUDA_HOME)/bin/compute-sanitizer --tool racecheck --error-exitcode 1 $(CUTLASS_RUNNER) \
+	    --format e0m3 --output bf16 --cutlass ./$(BUILD)/libdecode_e0m3.so \
+	    -m 17 -n 40 -k 576 --full-check --warmup 1 --iters 1 --rounds 1
 
 clean:
 	rm -rf $(BUILD)

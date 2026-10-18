@@ -16,7 +16,7 @@ import tempfile
 
 import patch_formats as patch
 
-PREFIXES = ("_ZN7cutlass13device_kernelI",)
+PREFIXES = ("_ZN7cutlass13device_kernelI", "gemm_decode_")
 
 
 def fatbin_section(data):

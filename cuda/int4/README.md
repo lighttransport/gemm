@@ -56,6 +56,51 @@ not cuBLAS support for the experimental E0M3 format. `--data codebook` at
 16x16x64 checks all 256 signed-nibble pairs with varying scales. Negative
 controls ensure an unpatched FP4 adapter fails E0M3 validation.
 
+## GLM5.3-Flash decode projections
+
+`decode.cu` supplies smaller tiles for M=1/16/64, with padded shared-memory
+rows, asynchronous double buffering, and FP32 split-K reductions. It also
+compares direct-register MMA, reduction within a block, and an E0M3-only DP4A
+GEMV. The 60 candidates are selected using verified timing pilots. This
+standalone adapter needs no CUTLASS headers; the bulk comparison does.
+
+```sh
+make -C cuda/int4 decode-test
+make -C cuda/int4 decode-sanitize
+make -C cuda/int4 decode-bench
+# Shorter expert-only comparison, after building:
+python3 cuda/int4/bench_decode.py --suite experts --output build/decode_experts
+```
+
+Shapes follow Strata's validated GLM5.3-Flash tensor schema in
+`include/strata/artifact/glm_native.hpp`: hidden width 4096, expert width 2048,
+dense FFN width 12288, KDA width 8192, MLA ranks 1536/512 with expanded
+width 16384, and vocabulary width 154880. The suite benchmarks each resident projection at M=1/16/64;
+for an expert, M means the number of token rows routed to that expert.
+It does not run a model or modify Strata. Arithmetic uses synthetic signed
+codes and varying positive K16 scales; no model-quality claim is made.
+
+The shared runner's `--graph` option removes CPU launch gaps from repeated
+decode timings. `--flush-mb 64` additionally writes 64 MiB before **each**
+GEMM. In graph mode, explicit GPU event nodes enclose only the GEMM and its
+reduction; eviction, graph creation, and graph upload are excluded. These
+are cache-eviction measurements, not streamed-weight or host-transfer timings.
+The default sweep records both modes, full decoded-BF16 cuBLAS comparisons,
+per-candidate logs, library hashes, and `summary.csv` under `build/decode/`.
+Output is checked after the actual timed graph runs.
+`dispatch.csv` records the selected library and candidate for each shape/cache
+case, retaining the bulk kernel unless decode improves its paired timing by
+at least 2%. This is a measured configuration table, not integration into Strata.
+`--resume` preserves completed rows after an interruption and checks their GPU
+library hashes. Large vocabulary matrices use shorter tuning pilots while
+retaining the same final iteration count.
+
+The unpatched `build/libdecode_base.so` can also benchmark NVFP4 using
+`--format nvfp4 --output bf16 --cutlass PATH`; the runner disables the
+E0M3-only DP4A candidate for that format. Other tiles and reductions are
+shared. Like the optimized bulk adapter, decode consumes the 128x4 scale
+layout and returns BF16; packing and activation quantization are excluded.
+
 ## Build and test
 
 Requires Linux, GCC, Python 3, a CUDA toolkit supporting `sm_120a`, and an SM120

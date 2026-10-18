@@ -17,6 +17,8 @@ parser.add_argument("cutlass", type=Path)
 parser.add_argument("output", type=Path)
 parser.add_argument("--handoff", choices=("cta", "warp"), default="warp")
 parser.add_argument("--unroll", type=int, choices=(0, 2, 4, 8), default=0)
+parser.add_argument("--mma-before-wait", action="store_true",
+                    help="Issue the final register MMA before waiting for the next TMA stage")
 args = parser.parse_args()
 relative = Path("cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp")
 source = (args.cutlass / "include" / relative).read_text()
@@ -32,6 +34,22 @@ if args.unroll:
     if patched.count(loop) != 1:
         raise SystemExit("Expected one mainloop K loop; inspect this CUTLASS version.")
     patched = patched.replace(loop, f"#pragma unroll {args.unroll}\n    for ( ; k_tile_count > 1; --k_tile_count)")
+if args.mma_before_wait:
+    before = """          pipeline.consumer_wait(smem_pipe_read);
+        }
+
+        copy_kblock(k_block_next);
+        gemm_kblock(k_block);"""
+    after = """          gemm_kblock(k_block);
+          pipeline.consumer_wait(smem_pipe_read);
+          copy_kblock(k_block_next);
+        } else {
+          copy_kblock(k_block_next);
+          gemm_kblock(k_block);
+        }"""
+    if patched.count(before) != 1:
+        raise SystemExit("Expected one inter-stage MMA sequence; inspect this CUTLASS version.")
+    patched = patched.replace(before,after)
 target = args.output / relative
 target.parent.mkdir(parents=True, exist_ok=True)
 target.write_text(patched)
