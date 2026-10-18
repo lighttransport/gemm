@@ -24,13 +24,16 @@ vhuman_models: ../../common/vhuman_models.c $(wildcard ../../common/*.h) ../../c
 	$(CC) $(CFLAGS) $(VH_EXTRA_FLAGS) -o $@ $< $(AVX_OBJ) $(VH_EXTRA_SRC) -lm -lpthread $(VH_EXTRA_LIBS)
 .PHONY: clean
 clean:
-	rm -f vhuman_models libvhuman_motion.so libvhuman_landmarks.so libvhuman_training.so test_vhuman_ops test_vhuman_training gemm_avx2.o tokenizer_probe
+	rm -f libvhuman_face.so vhuman_models libvhuman_motion.so libvhuman_landmarks.so libvhuman_training.so test_vhuman_ops test_vhuman_training gemm_avx2.o tokenizer_probe
 
 tokenizer_probe: tokenizer_probe.c ../../common/gguf_loader.h ../../common/bpe_tokenizer.h
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 libvhuman_landmarks.so: landmarks.cpp $(AVX_OBJ)
-	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fopenmp $(if $(AVX_OBJ),-mavx2 -mfma) -fPIC -shared -o $@ $< $(AVX_OBJ)
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fopenmp $(if $(AVX_OBJ),-DVHF_HAVE_AVX2) -fPIC -shared -o $@ $< $(AVX_OBJ)
+
+libvhuman_face.so: face.cpp face_image.cpp face_optimization.cpp face_losses.cpp ../../common/vhuman_face.h $(AVX_OBJ)
+	$(CXX) -O3 -std=c++17 -Wall -Wextra -Wpedantic -fopenmp $(if $(AVX_OBJ),-DVHF_HAVE_AVX2) -fPIC -shared -o $@ $< $(AVX_OBJ)
 
 TRAINING_SRC = training.cpp corrective_training.cpp cue_training.cpp appearance_training.cpp
 libvhuman_training.so: $(TRAINING_SRC) $(AVX_OBJ)

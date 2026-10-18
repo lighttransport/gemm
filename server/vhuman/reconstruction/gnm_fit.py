@@ -183,17 +183,17 @@ def area_ratio(rest, posed, triangles):
 
 def replay(model, identity, expression, rotations, translation, *, scale=1., alignment=None, offset=None, bind_residual=None, cancel=None):
     """Full CPU expansion in four-frame chunks; same evaluator as optimization."""
-    import torch
+    from ..native_face import Gnm
     alignment=np.eye(3) if alignment is None else np.asarray(alignment)
     offset=np.zeros(3) if offset is None else np.asarray(offset)
-    evaluate=model.frame_evaluator(identity,bind_residual=bind_residual)
     vertices,joints=[],[]
-    with torch.no_grad():
+    with Gnm(model) as evaluator:
         for lo in range(0,len(expression),4):
             check_cancel(cancel)
-            args=[torch.as_tensor(x[lo:lo+4],dtype=model.dtype,device='cpu') for x in (expression,rotations,translation)]
-            p,j=evaluate(*args)
-            vertices.append(scale*p.numpy()@alignment.T+offset);joints.append(scale*j.numpy()@alignment.T+offset)
+            p,j=evaluator.evaluate(identity,expression[lo:lo+4],rotations[lo:lo+4],
+                                   translation[lo:lo+4],bind_residual=bind_residual)
+            vertices.append(scale*p@alignment.T+offset)
+            joints.append(scale*j@alignment.T+offset)
     return np.concatenate(vertices).astype(np.float32),np.concatenate(joints).astype(np.float32)
 
 

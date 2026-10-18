@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 #include <omp.h>
-#ifdef __AVX2__
+#ifdef VHF_HAVE_AVX2
 #include "../../ryzen/gemm_avx2.h"
 #endif
 
@@ -69,14 +69,15 @@ void gemm(float *y,const float *x,const float *w,int m,int n,int k) {
     // Weights are OHWI: compute W * X^T using the repository row-major GEMM.
     std::vector<float> xt(size_t(k)*m),yt(size_t(n)*m);
     for(int i=0;i<m;i++) for(int j=0;j<k;j++) xt[size_t(j)*m+i]=x[size_t(i)*k+j];
-#ifdef __AVX2__
-    sgemm_avx2(n,m,k,1,w,k,xt.data(),m,0,yt.data(),m);
-#else
+#ifdef VHF_HAVE_AVX2
+    if(__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
+        sgemm_avx2(n,m,k,1,w,k,xt.data(),m,0,yt.data(),m);
+    else
+#endif
     for(int i=0;i<n;i++) for(int j=0;j<m;j++) {
         double s=0;for(int d=0;d<k;d++) s+=double(w[size_t(i)*k+d])*xt[size_t(d)*m+j];
         yt[size_t(i)*m+j]=float(s);
     }
-#endif
     for(int i=0;i<m;i++) for(int j=0;j<n;j++) y[size_t(i)*n+j]=yt[size_t(j)*m+i];
 }
 void conv(graph &g,const node &op) {
@@ -122,6 +123,54 @@ void conv(graph &g,const node &op) {
 void run_node(graph &g,const node &op) {
     tensor &y=g.t.at(op.output);
     const tensor &x=g.t.at(op.in.at(0));
+    if(op.code>=100 && op.code<=102) {
+        require(x.rank==4 && y.rank==4 && x.dim(0)==1 && y.dim(0)==1,"parser tensor rank");
+        int ci=x.dim(1),h=x.dim(2),w=x.dim(3),co=y.dim(1),oh=y.dim(2),ow=y.dim(3);
+        if(op.code==100) {
+            const tensor &weight=g.t.at(op.in.at(1)),&bias=g.t.at(op.in.at(2));
+            require(weight.rank==4 && weight.dim(0)==co && weight.dim(1)==ci && bias.size()==size_t(co),"parser convolution weights");
+            int kh=weight.dim(2),kw=weight.dim(3),sh=op.a[0],sw=op.a[1],ph=op.a[2],pw=op.a[3],dh=op.a[4],dw=op.a[5];
+            require(sh>0 && sw>0 && dh>0 && dw>0 && kh<=7 && kw<=7,"parser convolution parameters");
+            int k=ci*kh*kw;
+            #pragma omp parallel for num_threads(g.threads) schedule(static)
+            for(int start=0;start<oh*ow;start+=128) {
+                int count=std::min(128,oh*ow-start);std::vector<float> col(size_t(count)*k),out(size_t(count)*co);
+                for(int p=0;p<count;++p)for(int c=0;c<ci;++c)for(int yy=0;yy<kh;++yy)for(int xx=0;xx<kw;++xx) {
+                    int iy=(start+p)/ow*sh-ph+yy*dh,ix=(start+p)%ow*sw-pw+xx*dw;
+                    if(iy>=0 && iy<h && ix>=0 && ix<w)col[size_t(p)*k+(c*kh+yy)*kw+xx]=x.data[(size_t(c)*h+iy)*w+ix];
+                }
+                gemm(out.data(),col.data(),weight.data.data(),count,co,k);
+                for(int p=0;p<count;++p)for(int c=0;c<co;++c)y.data[size_t(c)*oh*ow+start+p]=out[size_t(p)*co+c]+bias.data[c];
+            }
+        } else if(op.code==101) {
+            require(ci==co,"parser pool channels");
+            int sh=op.a[0],sw=op.a[1],ph=op.a[2],pw=op.a[3],kh=op.a[4],kw=op.a[5];
+            require(sh>0 && sw>0 && kh>0 && kw>0,"parser pooling parameters");
+            #pragma omp parallel for num_threads(g.threads)
+            for(int c=0;c<ci;++c)for(int p=0;p<oh*ow;++p) {
+                float v=op.a[6]?0:-INFINITY;int count=0;
+                for(int yy=0;yy<kh;++yy)for(int xx=0;xx<kw;++xx) {
+                    int iy=p/ow*sh-ph+yy,ix=p%ow*sw-pw+xx;
+                    if(iy>=0 && iy<h && ix>=0 && ix<w) { float z=x.data[(size_t(c)*h+iy)*w+ix];v=op.a[6]?v+z:std::max(v,z);++count; }
+                }
+                y.data[size_t(c)*oh*ow+p]=op.a[6]?v/std::max(1,op.a[7]?kh*kw:count):v;
+            }
+        } else {
+            require(ci==co && op.a[0]>=0 && op.a[0]<=1 && op.a[1]>=0 && op.a[1]<=2 && op.a[2]>=0 && op.a[2]<=3,"parser resize parameters");
+            auto coord=[&](int p,int in,int out) {return op.a[1]==1?(out>1?double(p)*(in-1)/(out-1):0):op.a[1]==2?double(p)*in/out:(p+.5)*in/out-.5;};
+            auto nearest=[&](double p) {return int(op.a[2]==0?std::floor(p):op.a[2]==1?std::ceil(p-.5):op.a[2]==2?std::floor(p+.5):std::ceil(p));};
+            #pragma omp parallel for num_threads(g.threads)
+            for(int c=0;c<ci;++c)for(int iy=0;iy<oh;++iy)for(int ix=0;ix<ow;++ix) {
+                double py=coord(iy,h,oh),px=coord(ix,w,ow);float v;
+                auto at=[&](int y0,int x0) {return x.data[(size_t(c)*h+std::clamp(y0,0,h-1))*w+std::clamp(x0,0,w-1)];};
+                if(op.a[0]==0)v=at(nearest(py),nearest(px));
+                else { int y0=int(std::floor(py)),x0=int(std::floor(px));double fy=py-y0,fx=px-x0;
+                    v=float((1-fy)*((1-fx)*at(y0,x0)+fx*at(y0,x0+1))+fy*((1-fx)*at(y0+1,x0)+fx*at(y0+1,x0+1))); }
+                y.data[(size_t(c)*oh+iy)*ow+ix]=v;
+            }
+        }
+        return;
+    }
     if(op.code==3 || op.code==4) { conv(g,op);return; }
     if(op.code==22) { require(y.size()==x.size(),"reshape size"); y.data=x.data;return; }
     if(op.code==17) {
@@ -222,9 +271,9 @@ extern "C" const char *vh_face_error() { return error.c_str(); }
 extern "C" void vh_face_close(graph *g) { delete g; }
 extern "C" graph *vh_face_open(const char *path,int threads) {
     try {
-        require(threads>=1 && threads<=64,"invalid thread count");
+        require(threads>=1 && threads<=256,"invalid thread count");
         std::unique_ptr<FILE,close_file> f(fopen(path,"rb"));require(bool(f),"cannot open native graph");
-        char magic[8];require(fread(magic,1,8,f.get())==8 && !memcmp(magic,"VHFACE1\0",8),"invalid graph header");
+        char magic[8];require(fread(magic,1,8,f.get())==8 && (!memcmp(magic,"VHFACE1\0",8)||!memcmp(magic,"VHFACE2\0",8)),"invalid graph header");
         int nt=read_int(f.get()),nn=read_int(f.get()),ni=read_int(f.get()),no=read_int(f.get());
         require(nt>0 && nt<=2048 && nn>0 && nn<=1024 && ni==1 && no>0 && no<=8,"invalid graph counts");
         auto g=std::make_unique<graph>();g->threads=threads;g->t.resize(nt);

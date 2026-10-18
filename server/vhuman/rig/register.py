@@ -8,7 +8,7 @@
    and landmark correspondences; far regions do not move.
 3. Surface: every skin vertex is cast from the centre C along its direction
    onto the subject's outermost surface (a max-radius map over the chart).
-4. Refinement (PyTorch): vertex positions minimise point-to-plane distance
+4. Refinement (native FP64): vertex positions minimise point-to-plane distance
    to the subject surface, edge lengths matching the template's (scaled),
    and a bending term, with ring 0 fixed. Nearest surface points are
    re-queried periodically (a k-d tree over the dense subject vertices).
@@ -233,78 +233,52 @@ def _template_edge_lengths(tmpl: T.Template, pos: np.ndarray, edges: np.ndarray)
 
 def refine(tmpl: T.Template, subj, pos: np.ndarray, fixed: np.ndarray, skin: np.ndarray, iters: int = 400,
            device: str | None = None, log=None) -> tuple[np.ndarray, dict]:
-    import torch
     from scipy.spatial import cKDTree
-    from .common import edges as edge_list
-    from ..runtime import torch_device
-    dev = torch.device(device if device is not None else torch_device(torch))
+    from .common import edges as edge_list, vertex_normals
+    from ..native_face_fit import Adam, registration
+    # This CPU implementation never discovers or initializes a GPU.
+    if device not in (None, "cpu"):
+        raise ValueError("native registration currently supports device='cpu'")
+    pos = np.ascontiguousarray(pos, dtype=np.float64)
+    if pos.ndim != 2 or pos.shape[1] != 3 or not np.isfinite(pos).all():
+        raise ValueError("registration requires finite vertex positions")
+    if iters < 0:
+        raise ValueError("registration iterations must be nonnegative")
     tris = tmpl.tris[tmpl.tri_mat == 0]
     E = edge_list(tris)
     L0 = _template_edge_lengths(tmpl, pos, E)
-    # the ring vertices' rest spacing comes from the subject's own contours
     tree = cKDTree(subj.positions)
     movable = skin & ~fixed
-    x = torch.tensor(pos, dtype=torch.float64, device=dev)
-    mv = torch.tensor(movable, device=dev)
-    var = torch.zeros((int(movable.sum()), 3), dtype=torch.float64, device=dev, requires_grad=True)
-    idx = torch.tensor(np.flatnonzero(movable), device=dev)
-    Et = torch.tensor(E, device=dev)
-    L0t = torch.tensor(L0, device=dev)
-    # the chart layout's shape is the target; the subject's scale is taken from the init
+    idx = np.flatnonzero(movable)
+    if not len(idx) or not len(E) or not len(subj.positions):
+        raise ValueError("registration needs movable vertices, edges and a subject surface")
+    var = np.zeros((len(idx), 3), dtype=np.float64)
     cur = np.linalg.norm(pos[E[:, 0]] - pos[E[:, 1]], axis=1)
     ok = np.isfinite(cur)
     scale = float(np.median(cur[ok] / np.maximum(L0[ok], 1e-9)))
-    L0t = L0t * scale
-    # uniform Laplacian (bending): neighbours' mean
-    n = len(pos)
-    deg = np.bincount(E.reshape(-1), minlength=n).astype(np.float64)
-    degt = torch.tensor(deg, device=dev).clamp(min=1)[:, None]
-    opt = torch.optim.Adam([var], lr=3e-4)
-    w_plane, w_point, w_edge, w_bend = 1.0, 0.05, 0.3, 0.05
-    q = n_ = None
-    actual_backend = "cpu" if dev.type == "cpu" else ("rocm" if torch.version.hip else "cuda")
-    stats = {"backend": actual_backend, "device": str(dev), "iters": iters}
+    L0 = L0 * scale
+    opt = Adam(var, 3e-4)
+    stats = {"backend": "cpu", "device": "cpu", "iters": iters}
     for it in range(iters):
+        X = pos.copy()
+        X[idx] += var
         if it % 25 == 0:
-            with torch.no_grad():
-                cur_x = x.clone()
-                cur_x[idx] += var
-                p = cur_x[idx].cpu().numpy()
-            # nearest subject point whose normal agrees with the template's
-            # (concavities such as the nostrils otherwise pull vertices inside)
-            from .common import vertex_normals
-            cur_n = vertex_normals(cur_x.cpu().numpy(), tris)[movable]
-            dk, jk = tree.query(p, k=8)
+            p = X[idx]
+            cur_n = vertex_normals(X, tris)[movable]
+            dk, jk = tree.query(p, k=list(range(1, min(8, len(subj.positions)) + 1)))
             agree = (subj.normals[jk] * cur_n[:, None]).sum(-1) > 0.3
             pick = np.argmin(np.where(agree, dk, dk + 1.0), 1)
             j = jk[np.arange(len(p)), pick]
             dist = dk[np.arange(len(p)), pick]
-            q = torch.tensor(subj.positions[j], device=dev)
-            n_ = torch.tensor(subj.normals[j], device=dev)
+            q, normal = subj.positions[j], subj.normals[j]
             if it == 0:
                 stats["initial_mean_dist_mm"] = round(float(dist.mean() * 1000), 3)
-        opt.zero_grad()
-        X = x.clone()
-        X[idx] = X[idx] + var
-        P = X[idx]
-        e_plane = (((P - q) * n_).sum(1) ** 2).mean()
-        e_point = ((P - q) ** 2).sum(1).mean()
-        el = (X[Et[:, 0]] - X[Et[:, 1]]).norm(dim=1)
-        e_edge = ((el - L0t) ** 2).mean()
-        acc = torch.zeros_like(X)
-        acc.index_add_(0, Et[:, 0], X[Et[:, 1]])
-        acc.index_add_(0, Et[:, 1], X[Et[:, 0]])
-        lap = acc / degt - X
-        e_bend = (lap[idx] ** 2).sum(1).mean()
-        loss = (w_plane * e_plane + w_point * e_point + w_edge * e_edge + w_bend * e_bend) * 1e6
-        loss.backward()
-        opt.step()
+        _, gradient, energy = registration(X, idx, q, normal, E, L0)
+        opt.step(gradient[idx])
         if log and it % 100 == 0:
-            log(f"refine {it}: plane {e_plane.item() ** .5 * 1e3:.3f} mm, edge {e_edge.item() ** .5 * 1e3:.3f} mm")
-    with torch.no_grad():
-        X = x.clone()
-        X[idx] += var
-        out = X.cpu().numpy()
+            log(f"refine {it}: plane {energy[0] ** .5 * 1e3:.3f} mm, edge {energy[2] ** .5 * 1e3:.3f} mm")
+    out = pos.copy()
+    out[idx] += var
     dist, _ = tree.query(out[movable])
     stats.update({"final_mean_dist_mm": round(float(dist.mean() * 1000), 3),
                   "final_p95_dist_mm": round(float(np.percentile(dist, 95) * 1000), 3),

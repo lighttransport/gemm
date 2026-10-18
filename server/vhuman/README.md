@@ -22,6 +22,42 @@ portable glTF export, portrait-based eye fitting and optional Qwen/Pixal3D jobs.
 The runtime requires no Unreal Engine installation, source, content or measured
 character data. Engine-specific import/export adapters are not included.
 
+## Native face computation (CPU port in progress)
+
+Build the framework-free face components with:
+
+```sh
+make -C cpu/vhuman libvhuman_face.so libvhuman_landmarks.so
+python -m unittest server.vhuman.test_native_face server.vhuman.test_native_landmarks
+```
+
+`native_face.py` exposes a C ABI through ctypes, using NumPy arrays. The C++
+core implements sampled/full GNM forward evaluation and explicit parameter
+gradients, Rodrigues derivatives, image sampling, detector decoding, fitting
+losses, Adam and strong-Wolfe L-BFGS. CPU GEMM uses repository AVX2/FMA kernels
+when supported and a portable fallback otherwise. Registration uses native
+FP64 gradients and Adam; nearest-surface correspondence still uses SciPy.
+GNM full-surface replay uses the same native model evaluator.
+
+Face parsing now lowers the checksum-pinned ONNX file to a bounded native
+graph using a stdlib/NumPy converter. Production parsing and landmark inference
+do not import ONNX Runtime, OpenCV, MediaPipe or Torch. Conversion retains the
+original weights; it does not download or execute a model. Converted parsing
+assets and their checksum receipt are stored beside the model by default, or
+at the explicit `FaceParser(assets=...)` location.
+
+This is **not yet the complete minimal-dependency fitting profile**. The staged
+GNM solver and semantic-control retargeting still use Torch. Wiring all native
+objective gradients into those optimizers, providing the dedicated minimal
+environment, and adding CUDA/ROCm adapters with explicit repository/vendor GEMM
+selection remain outstanding. Native registration currently accepts CPU only.
+Existing generation environments are unchanged. GPU execution and GPU parity
+validation have not been performed for this port.
+
+The native test module runs without model assets where possible. Optional
+Torch/OpenCV comparisons are development oracles; they are not runtime
+dependencies. Model-dependent tests skip when their pinned fixtures are absent.
+
 ## Portrait expression videos
 
 The head page can queue silent expression clips through the experimental

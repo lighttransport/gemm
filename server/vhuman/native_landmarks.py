@@ -1,6 +1,6 @@
 """Pinned MediaPipe face model inference through the repository C++ executor.
 
-NumPy/OpenCV implement image sampling and detector postprocessing. No inference
+Repository C++ implements image sampling and detector postprocessing. No inference
 framework is imported. Models and the landmark index/name mapping originate from
 Google MediaPipe (Apache-2.0); see the source attribution beside the mapping.
 """
@@ -77,40 +77,13 @@ class Graph:
 
 
 def sample(image, center, size, angle, resolution, zero_border=False):
-    import cv2
-    corners = cv2.boxPoints((tuple(map(float,center)),tuple(map(float,size)),float(angle*180/np.pi)))
-    target = np.array([[0,resolution],[0,0],[resolution,0],[resolution,resolution]],np.float32)
-    matrix = cv2.getPerspectiveTransform(corners,target)
-    crop = cv2.warpPerspective(image,matrix,(resolution,resolution),flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_CONSTANT if zero_border else cv2.BORDER_REPLICATE)
-    return crop.astype(np.float32)/255
+    from .native_face import sample as native_sample
+    return native_sample(image,center,size,angle,resolution,zero_border)
 
 
 def detections(output, threshold=.5):
-    boxes, logits = output[:896*16].reshape(896,16), output[896*16:]
-    anchors=[]
-    for grid,repeat in ((16,2),(8,6)):
-        for y in range(grid):
-            for x in range(grid):
-                anchors.extend([[(x+.5)/grid,(y+.5)/grid]]*repeat)
-    anchors=np.asarray(anchors,np.float32)
-    scores=1/(1+np.exp(-np.clip(logits,-80,80)))
-    ids=np.flatnonzero(scores>=threshold)
-    ids=ids[np.argsort(-scores[ids],kind='stable')]
-    decoded=boxes.copy()/128
-    decoded[:,:2]+=anchors
-    decoded[:,4:]+=np.tile(anchors,(1,6))
-    rects=np.concatenate((decoded[:,:2]-decoded[:,2:4]/2,decoded[:,:2]+decoded[:,2:4]/2),axis=1)
-    result=[]
-    while len(ids):
-        top=ids[0]; area=np.maximum(0,rects[:,2:]-rects[:,:2]).prod(1)
-        intersection=np.maximum(0,np.minimum(rects[top,2:],rects[ids,2:])-np.maximum(rects[top,:2],rects[ids,:2])).prod(1)
-        iou=intersection/np.maximum(area[top]+area[ids]-intersection,1e-12)
-        selected=iou>.3;selected[0]=True
-        overlap=ids[selected];weights=scores[overlap]
-        result.append((np.sum(decoded[overlap]*weights[:,None],axis=0)/weights.sum(),float(scores[top])))
-        ids=ids[~selected]
-    return result
+    from .native_face import detections as native_detections
+    return native_detections(output,threshold)
 
 
 class FaceLandmarker:
