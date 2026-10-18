@@ -10,10 +10,10 @@ function context(extra={}) {
       replaceChildren(...items){this.items=items;},addEventListener(event,cb){handlers.set(`${id}:${event}`,cb);}});
     return nodes.get(id);
   };
-  const c = vm.createContext({$,handlers,state:{speechAvailable:true,bodyAvailable:true},
+  const c = vm.createContext({$,handlers,state:{speechAvailable:true,bodyAvailable:true,runtimeEyes:[]},
     loadGen:0,selectionGen:0,speechLoadGen:0,emotionKeys:[],URLSearchParams,location:{search:''},
     Option:function(text,value){this.text=text;this.value=value;},stopAnim(){},renderHeads(){},showFacts(){},
-    async loadTakes(){},async loadMotions(){},...extra});
+    async loadTakes(){},async loadMotions(){},async attachRuntimeEyes(){},...extra});
   vm.runInContext(source('function acceptedTarget()', 'function renderEmotionKeys()'), c);
   return c;
 }

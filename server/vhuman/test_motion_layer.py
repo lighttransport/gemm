@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -139,6 +140,27 @@ class MotionLayerTest(unittest.TestCase):
         self.assertNotEqual(merged[4], 0.1)                           # head micro-motion added
         with self.assertRaises(ValueError):
             native.sample(1.0)
+
+        # Inserted silence holds speech position, but procedural motion must advance.
+        from .realtime.src.audio.clock import SampleClock
+        clock = SampleClock()
+        clock.submit(24000, 0)
+        clock.observe(24000, 24000, 1_000_000_000)
+        native.reset()
+        controls = np.zeros(len(names), np.float32)
+        with patch('server.vhuman.realtime.src.animation.idle_layer.time.monotonic_ns',
+                   side_effect=[1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000]):
+            first = native.apply_realtime(controls, names)
+            clock.submit(24000)
+            clock.observe(48000, 24000, 2_000_000_000)
+            self.assertEqual(clock.position(), 24000)
+            silent = native.apply_realtime(controls, names)
+            self.assertFalse(np.array_equal(first, silent))
+            clock.reset(1)
+            resumed = native.apply_realtime(controls, names)
+            self.assertTrue(np.isfinite(resumed).all())
+            native.reset()
+            np.testing.assert_array_equal(native.apply_realtime(controls, names), first)
 
 
 if __name__ == "__main__":

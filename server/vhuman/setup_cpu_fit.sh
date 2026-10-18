@@ -22,12 +22,14 @@ PY
 # https://pytorch.org/get-started/previous-versions/#v291
 uv pip install --python tmp/vhuman-cpu-venv/bin/python 'torch==2.9.1+cpu' --index-url https://download.pytorch.org/whl/cpu
 uv pip install --python tmp/vhuman-cpu-venv/bin/python -r server/vhuman/requirements-cpu-fit.lock
-make -C cpu/vhuman libvhuman_landmarks.so libvhuman_training.so
+make -C cpu/vhuman libvhuman_face.so libvhuman_landmarks.so libvhuman_training.so
 tmp/vhuman-cpu-venv/bin/python -B - <<'PY'
 import torch
 assert torch.version.cuda is None and torch.version.hip is None, 'CPU Torch wheel required'
 from server.vhuman import gpu
 with gpu.execution('cpu'):
+    from server.vhuman.native_face import library
+    library()
     from server.vhuman.face_assets import asset_path
     for name in ('gnm','mediapipe','parsing'):
         if not asset_path(name).is_file():

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes as C
 from pathlib import Path
+import time
 
 import numpy as np
 
@@ -37,9 +38,18 @@ class NativeMotionLayer:
         self.lib.vhml_init(self.state, int(seed), None)
         self.out = (C.c_double * len(CONTROLS))()
         self.gaze = (C.c_double * 2)()
+        self.realtime_origin = None
 
     def reset(self):
         self.lib.vhml_reset(self.state)
+        self.realtime_origin = None
+
+    def apply_realtime(self, controls: np.ndarray, names, **kw) -> np.ndarray:
+        """Advance idle motion through silence, independently of the speech clock."""
+        now = time.monotonic_ns()
+        if self.realtime_origin is None:
+            self.realtime_origin = now
+        return self.apply(controls, names, (now - self.realtime_origin) / 1e9, **kw)
 
     def sample(self, t: float, *, head_yaw=0.0, head_pitch=0.0, focus_yaw=0.0, focus_pitch=0.0, focus_distance=0.6,
                speaking=False, light=0.5, pauses=(), idle=True) -> dict:

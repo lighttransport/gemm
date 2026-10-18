@@ -1732,7 +1732,7 @@ measurement is treated as independently verified anatomy.
 
 `setup_cpu_fit.sh` creates `tmp/vhuman-cpu-venv` with the pinned CPU-only
 Torch wheel and locked NumPy/SciPy, CPU ONNX Runtime, OpenCV and threadpool
-packages. It builds the repository CPU landmark and corrective libraries.
+packages. It builds the repository CPU face, landmark and corrective libraries.
 Python 3.11/3.12, `uv`, GCC/G++, and FFmpeg are required. Existing hash-pinned
 GNM, landmark and parsing assets are reused; image/video generation is separate.
 
