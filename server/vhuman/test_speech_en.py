@@ -50,6 +50,24 @@ class EnglishFramesTest(unittest.TestCase):
         self.assertGreater(at(0.5333333333333333).get("tongueUp", 0), 0.2)   # l: tongue contact
         self.assertGreater(at(0.6333333333333333).get("tongueOut", 0), 0.05)  # th: tongue tip forward
 
+    def test_dominance_coarticulation(self):
+        import numpy as np
+        times = np.arange(0, 1.0, 1 / 30)
+        intervals = [{"s": "ɑː", "start": 0.1, "end": 0.4, "viseme": "aa"},
+                     {"s": "m", "start": 0.4, "end": 0.46, "viseme": "PP"},
+                     {"s": "ɑː", "start": 0.46, "end": 0.8, "viseme": "aa"},
+                     {"s": "k", "start": 0.8, "end": 0.85, "viseme": "kk"}]
+        w = speech.coarticulate(intervals, times)
+        self.assertTrue(np.allclose(w.sum(1), 1.0))
+        pp, aa, kk, sil = (speech.VISEMES.index(v) for v in ("PP", "aa", "kk", "sil"))
+        centre = int(round(0.43 * 30))
+        self.assertGreater(w[centre, pp], w[centre, aa])              # the lip closure dominates the vowels around it
+        self.assertGreater(w[int(round(0.25 * 30)), aa], 0.95)         # a long vowel is pure in its middle
+        k = int(round(0.825 * 30))
+        self.assertLess(w[k, kk], w[k, aa] + w[k, sil] + 0.5)          # a short velar yields to its surroundings
+        self.assertEqual(w[0, sil], 1.0)                               # silence before speech
+        self.assertLess(abs(w[int(round(0.1 * 30)), aa] - w[int(round(0.1 * 30)) - 1, aa]), 0.6)   # flanks are smooth
+
     @unittest.skipUnless(MODEL.is_file() and BINARY.is_file(), "English aligner model or binary unavailable")
     def test_forced_alignment_of_a_synthesized_sentence(self):
         wav = ROOT / "tmp" / "en-align" / "fox.wav"

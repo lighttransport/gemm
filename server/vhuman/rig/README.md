@@ -496,8 +496,13 @@ The web `/rig` panel creates and
 rebuilds takes with the same job queue. The server accepts text and existing
 take IDs; filesystem WAV paths and reference voice files are CLI-only.
 
-The converter samples `ja_align.v1`'s 15 visemes at its 30 fps frame times,
-uses the rig's vowel poses, and applies a three-frame symmetric filter. The
+The converter rebuilds the 15 viseme weights at 30 fps from the aligner's
+phone intervals with a dominance coarticulation model (`speech.coarticulate`:
+per-viseme attack/release flanks and dominance, lip closures and labiodentals
+winning over the vowels around them, other consonants yielding to the vowel
+shape, silence blending softly), then uses the rig's vowel poses; the
+aligner's own linear ramps and a three-frame filter remain the fallback when
+no intervals are present. The
 aligner's RMS varies vowel aperture, while voiced F0 adds a small pitch-accent
 brow lift and head pitch. Phone intervals distinguish bilabial closures
 (`m/p/b`) from Japanese `n/N`, which use tongue contact without lip closure.

@@ -166,8 +166,8 @@ def _prosody(aux: dict, times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _phone_at(aux: dict, t: float, frame_index: int, fps: float) -> tuple[str, float]:
     intervals = aux.get("intervals") or ()
     best_phone, best_score = "", (0.0, -1)
-    bilabial = {"p", "py", "b", "by", "m", "my"}
-    lingual = {"n", "ny", "N", "t", "ty", "d", "dy"}
+    bilabial = {"p", "py", "b", "by", "m", "my", "pʰ", "bʰ", "mʲ", "pʲ", "bʲ"}          # Japanese + IPA
+    lingual = {"n", "ny", "N", "t", "ty", "d", "dy", "l", "ɾ", "n̩", "l̩", "t̪", "d̪", "tʰ", "dʰ"}
     for i, interval in enumerate(intervals):
         start, end = float(interval["start"]), float(interval["end"])
         if end <= start or t < start - .025 or t > end + .03:
@@ -190,6 +190,46 @@ def _phone_at(aux: dict, t: float, frame_index: int, fps: float) -> tuple[str, f
         if score > best_score:
             best_phone, best_score = phone, score
     return best_phone, best_score[0]
+
+
+# Coarticulation: per-viseme attack/release (seconds) and dominance. Lip closures and
+# labiodentals must win over neighbouring vowels; other consonants yield to the vowel
+# shape around them; silence blends softly. Our own constants, in the spirit of
+# dominance-function coarticulation models.
+COARTICULATION = {
+    "sil": (.08, .08, .3), "PP": (.04, .04, 1.4), "FF": (.04, .05, 1.2), "TH": (.03, .04, .7),
+    "DD": (.03, .04, .6), "kk": (.03, .04, .5), "CH": (.04, .05, .8), "SS": (.04, .05, .8),
+    "nn": (.03, .04, .6), "RR": (.04, .05, .7),
+    "aa": (.06, .08, 1.0), "E": (.06, .08, 1.0), "ih": (.06, .08, 1.0), "oh": (.06, .08, 1.0), "ou": (.06, .08, 1.0),
+}
+
+
+def coarticulate(intervals: list[dict], times: np.ndarray) -> np.ndarray:
+    """Viseme weights (frames x visemes) from phone intervals: each interval
+    contributes its viseme's dominance over its span with smoothstep attack
+    and release flanks; the mix is normalised per frame. Devoiced (uppercase
+    Japanese) vowels count half."""
+    out = np.zeros((len(times), len(VISEMES)))
+    for item in intervals:
+        name = item.get("viseme")
+        if name not in VISEMES:
+            continue
+        attack, release, dominance = COARTICULATION[name]
+        start, end = float(item["start"]), float(item["end"])
+        if end <= start:
+            continue
+        sym = str(item.get("s", ""))
+        if sym[:1].isupper() and sym[:1] != "N":
+            dominance *= .5
+        rise = np.clip((times - (start - attack)) / attack, 0, 1)
+        fall = np.clip(((end + release) - times) / release, 0, 1)
+        w = rise * rise * (3 - 2 * rise) * fall * fall * (3 - 2 * fall)
+        out[:, VISEMES.index(name)] += dominance * w
+    total = out.sum(1, keepdims=True)
+    silent = total[:, 0] <= 1e-6
+    out[silent, 0] = 1.0
+    total[silent] = 1.0
+    return out / total
 
 
 def _pauses(aux: dict, duration: float) -> list[float]:
@@ -250,11 +290,16 @@ def build_frames(aux: dict, emotion_keyframes=None, speech_strength: float = 1.0
     keys = validate_emotions(emotion_keyframes, duration)
     names = rigdef.CONTROLS
     matrix = np.array([[VISEME_POSES[v].get(n, 0) for n in names] for v in VISEMES], np.float64)
+    times = np.minimum(np.arange(len(values)) / fps, duration)
+    intervals = aux.get("intervals") or []
+    if intervals:
+        # dominance coarticulation over the phone intervals (replaces the aligner's linear ramps)
+        values = coarticulate(intervals, times)
     speech = values @ matrix
-    # Symmetric three-frame filter adds no offset to the offline timeline.
-    speech = np.pad(speech, ((1, 1), (0, 0)), mode="edge")
-    speech = .25 * speech[:-2] + .5 * speech[1:-1] + .25 * speech[2:]
-    times = np.minimum(np.arange(len(speech)) / fps, duration)
+    if not intervals:
+        # Symmetric three-frame filter adds no offset to the offline timeline.
+        speech = np.pad(speech, ((1, 1), (0, 0)), mode="edge")
+        speech = .25 * speech[:-2] + .5 * speech[1:-1] + .25 * speech[2:]
     energy, pitch = _prosody(aux, times)
     speaking = values[:, VISEMES.index("sil")] < .5
     secondary = _secondary(times, duration, secondary_seed, aux, speaking)
