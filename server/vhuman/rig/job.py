@@ -23,6 +23,7 @@ RIG_FILES = ("rig.glb", "rig.json", "rig.usda", "rig_usd.zip", "preview.png", "r
              "rig_lod1.usda", "rig_lod2.usda", "rig_deformer_lod1.safetensors", "rig_deformer_lod2.safetensors",
              "viz_lod1.json", "viz_lod2.json")
 RIG_FILES += ("gnm_bind.npz", "gnm_bind.json")
+RIG_FILES += ('anatomy/anatomy.json','anatomy/anatomy.npz','anatomy/socket_fit.json','anatomy/mouth_fit.json')
 RIG_FILES += ("soft_deformer.safetensors", "soft_deformer_lod1.safetensors",
               "soft_deformer_lod2.safetensors", "soft_deformer_report.json")
 RIG_FILES += ("skin_material.json", "rig_coverage.png", "rig_confidence.png", "rig_specular.png")

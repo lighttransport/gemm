@@ -411,6 +411,9 @@ class EyeService:
             "emotion": "emotion.json", "soft_tissue": "soft_tissue.usda",
             "soft_tissue_report": "soft_tissue_report.json", "fit_report": "fit_report.json", "gnm_motion": "motion.npz", "gnm_report": "motion.json",
             "fit_overlay": "fit_overlay.mp4", "mesh_preview": "mesh_preview.png",
+            "physics":"physics.usda","physics_report":"physics_report.json","physics_state":"physics_state.npz",
+            "physics_review":"physics_review.mp4","physics_preview":"physics_preview.png",
+            "articulation":"articulation.json",
         }.items() if (self.work / "heads" / hid / "rig" / "takes" / take_id / name).is_file()}
         return manifest
 

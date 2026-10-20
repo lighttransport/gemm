@@ -105,6 +105,11 @@ previous dimensions retain them through the `legacy_v1` profile.
 
 ## Offline facial soft tissue
 
+For complete CPU face/mouth muscle simulation, geometry fitting and exact
+speech bakes, see [BIOMECHANICS.md](BIOMECHANICS.md). Full mode uses a separate
+versioned anatomy package and native ABI; the patch workflow below remains
+available for older deformer-training takes.
+
 `rig-soft-tissue` takes an existing speech or face-video performance (`animation.json`) and
 evaluates the native facial rig, then simulates a cheek, perioral and chin
 patch in LightGeom. The runner retriangulates the patch, extrudes a 5 mm

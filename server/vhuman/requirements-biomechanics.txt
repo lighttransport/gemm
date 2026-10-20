@@ -1,0 +1,4 @@
+# Optional offline CPU tetrahedral preparation. Never imported for playback.
+wildmeshing==0.4.1
+svgwrite==1.4.3
+usd-core==26.8

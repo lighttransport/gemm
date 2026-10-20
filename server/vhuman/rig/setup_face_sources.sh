@@ -63,8 +63,12 @@ checkout() { # label URL revision destination
         current=$(git -C "$destination" rev-parse HEAD)
         [ "$current" = "$revision" ] ||
             die "$label is at $current, expected $revision; move the checkout aside first"
-        [ -z "$(git -C "$destination" status --porcelain --untracked-files=no)" ] ||
-            die "$label has tracked changes; move or commit them first"
+        if [ -n "$(git -C "$destination" status --porcelain --untracked-files=no)" ]; then
+            if [ "$label" != LightGeom ] ||
+                ! python3 "$root/server/vhuman/rig/lightgeom_patch.py" --verify "$destination"; then
+                die "$label has unrelated tracked changes; move or commit them first"
+            fi
+        fi
     else
         mkdir -p "$(dirname "$destination")"
         staging="$destination.clone.$$"
@@ -109,6 +113,7 @@ checkout 'ICT-FaceKit' "$ict_url" "$ict_rev" "$models/ict-facekit/source"
 fi
 
 checkout 'LightGeom' "$lightgeom_url" "$lightgeom_rev" "$lightgeom"
+python3 "$root/server/vhuman/rig/lightgeom_patch.py" "$lightgeom"
 [ -f "$lightgeom/examples/lightphysics_vhuman_face/main.c" ] ||
     die 'LightGeom facial solver is missing from the pinned commit'
 

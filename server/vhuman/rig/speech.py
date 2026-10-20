@@ -33,6 +33,8 @@ FPS = 30
 VISEMES = ("sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou")
 TAKE_FILES = ("manifest.json", "audio.wav", "align.json", "animation.json", "animation.usda", "lightrig.txt",
               "emotion.json", "soft_tissue.usda", "soft_tissue_report.json", "fit_report.json", "motion.npz", "motion.json", "fit_overlay.mp4", "mesh_preview.png")
+TAKE_FILES += ('physics.usda','physics_report.json','physics_state.npz','physics_review.mp4','physics_preview.png',
+               'articulation.json','articulation.npz') + tuple(f'physics_points_{i:04d}.npz' for i in range(29))
 
 
 def availability(model=DEFAULT_MODEL, aligner=DEFAULT_ALIGNER, backend="auto") -> dict:
@@ -388,10 +390,25 @@ def _run(cmd: list[str], cancel, progress) -> None:
 
 
 def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL, aligner=DEFAULT_ALIGNER,
-               backend="auto", allow_wav=False, emotion_runner=None, emotion_model=None) -> dict:
+               backend="auto", allow_wav=False, emotion_runner=None, emotion_model=None,python=None) -> dict:
     """Generate a take; model paths come from server options, never HTTP JSON."""
     head = request.get("head_id")
     rig_path = service.rig_file(head, "rig.json")
+    motion_model=request.get('motion_model','rig')
+    if motion_model not in ('rig','biomechanics'):
+        raise ValueError('motion_model must be rig or biomechanics')
+    if motion_model=='biomechanics':
+        if backend not in ('auto','cpu'):
+            raise ValueError('biomechanics speech requires the CPU backend')
+        from .biomechanics_trials import validate_workers,validate_iterations,validate_reuse_frames,validate_probe_substeps,validate_state_precision,validate_mechanics_solver
+        validate_workers(request.get('inverse_workers',1),request.get('threads',4))
+        validate_iterations(request.get('inverse_iterations',2))
+        validate_reuse_frames(request.get('sensitivity_reuse_frames',0))
+        validate_probe_substeps(request.get('sensitivity_probe_substeps',0))
+        validate_state_precision(request.get('state_precision','auto'))
+        validate_mechanics_solver(request.get('mechanics_solver','partitioned'),request.get('state_precision','auto'))
+        from . import anatomy
+        anatomy.load(rig_path.parent)
     text = request.get("text")
     wav = request.get("wav")
     source_take = request.get("source_take")
@@ -424,7 +441,7 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
         emotion_model = emotion_model or emotion.DEFAULT_MODEL
         if not emotion.availability(emotion_runner, emotion_model)["available"]:
             raise ValueError("SenseVoice runtime or model missing; see server/vhuman/rig/README.md")
-    selected = gpu.backend() if backend == "auto" else backend
+    selected = 'cpu' if motion_model=='biomechanics' else gpu.backend() if backend == "auto" else backend
     if selected not in ("cpu", "cuda", "rocm"):
         raise ValueError("backend must be auto, cpu, cuda or rocm")
     out_root = rig_path.parent / "takes"
@@ -537,6 +554,25 @@ def speech_job(service, request: dict, progress, cancel, *, model=DEFAULT_MODEL,
                     "emotion_model_author": analysis["model_author"] if auto_emotion else None,
                     "rig_sha256": hashlib.sha256(rig_bytes).hexdigest()[:16]}
         (stage / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+        if motion_model=='biomechanics':
+            try:
+                anatomy.run_worker('server.vhuman.rig.biomechanics',
+                    [rig_path.parent,stage,'--threads',request.get('threads',4),
+                     '--inverse-workers',request.get('inverse_workers',1),'--iterations',request.get('inverse_iterations',2),
+                     '--sensitivity-reuse-frames',request.get('sensitivity_reuse_frames',0),
+                     '--sensitivity-probe-substeps',request.get('sensitivity_probe_substeps',0),
+                     '--state-precision',request.get('state_precision','auto'),
+                     '--mechanics-solver',request.get('mechanics_solver','partitioned')],python=python,
+                    progress=lambda f,t:progress(.82+.17*f,t),cancel=cancel)
+            except BaseException:
+                failed=out_root/('.failed-'+take_id)
+                stage.rename(failed)
+                raise RuntimeError(f'biomechanics speech failed; diagnostics retained at {failed}')
+            physics=json.loads((stage/'physics_report.json').read_text())
+            manifest.update(motion_model=motion_model,geometry='physics.usda',geometry_review_required=physics['review_required'],
+                            geometry_status=physics['status'],geometry_quality_gate=physics['quality_gate'],
+                            rig_package_sha256=physics['rig_package_sha256'],anatomy_sha256=physics['anatomy_sha256'])
+            (stage/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
         progress(.99, "take ready")
         stage.rename(final)
         return service.take_summary(head, take_id)

@@ -1,5 +1,13 @@
 # Third-party notices
 
+Optional full-face CPU volume preparation uses separately installed
+`wildmeshing==0.4.1` bindings and fTetWild. The bindings and underlying mesher
+retain their upstream licenses (including fTetWild's MPL-2.0); no mesher source
+or binary is bundled here. Sources: https://github.com/wildmeshing/wildmeshing-python
+and https://github.com/wildmeshing/fTetWild. CPU USD validation uses the separately
+installed `usd-core==26.8` distribution. LightGeom changes are distributed as an
+Apache-2.0 source patch against the pinned upstream checkout.
+
 The optional native mobile player links the separately installed
 [Google Filament 1.77.2 SDK](https://github.com/google/filament/releases/tag/v1.77.2),
 licensed under Apache-2.0. Preserve the SDK's LICENSE and bundled third-party

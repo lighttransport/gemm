@@ -289,6 +289,12 @@ def simulate(rig_dir: Path, take_dir: Path, runner: Path = DEFAULT_RUNNER,
 
 def soft_tissue_job(service, request: dict, progress, cancel, *, python=None,
                     runner: Path = DEFAULT_RUNNER) -> dict:
+    mode=request.get('mode','patch')
+    if mode=='full':
+        from .biomechanics import simulate_job
+        return simulate_job(service,request,progress,cancel,python=python)
+    if mode!='patch':
+        raise ValueError('soft-tissue mode must be patch or full')
     from .job import DEFAULT_PYTHON
     head_id, take_id = request.get("head_id"), request.get("take_id")
     rig_dir = service.rig_file(head_id, "rig.json").parent

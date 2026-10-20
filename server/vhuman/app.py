@@ -177,7 +177,7 @@ class App:
         self.service = EyeService(Path(args.work))
         from . import qwen, baseline, video, portrait
         from .head import pipeline as head_pipeline
-        from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue, soft_deformer, video_fit
+        from .rig import emotion as rig_emotion, exprdata, job as rig_job, speech as rig_speech, soft_tissue, soft_deformer, video_fit, anatomy
         from .body import job as body_job, motion as body_motion
         from .genia import job as genia_job
         from .reconstruction.job import reconstruction_job
@@ -231,26 +231,33 @@ class App:
             "rig_speech": lambda req, prog, cancel: rig_speech.speech_job(
                 self.service, req, prog, cancel, model=getattr(args, "tts_model", None) or rig_speech.DEFAULT_MODEL,
                 aligner=getattr(args, "aligner", None) or rig_speech.DEFAULT_ALIGNER,
-                backend=getattr(args, "tts_backend", "auto"),
+                backend="cpu" if req.get("motion_model")=="biomechanics" else getattr(args, "tts_backend", "auto"),
                 emotion_runner=getattr(args, "emotion_runner", None) or rig_emotion.DEFAULT_RUNNER,
-                emotion_model=getattr(args, "emotion_model", None) or rig_emotion.DEFAULT_MODEL),
+                emotion_model=getattr(args, "emotion_model", None) or rig_emotion.DEFAULT_MODEL,
+                python=getattr(args,"rig_python",None)),
             "rig_soft_tissue": lambda req, prog, cancel: soft_tissue.soft_tissue_job(
                 self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
+            "rig_fit_anatomy":lambda req,prog,cancel:anatomy.anatomy_job(
+                self.service,req,prog,cancel,python=getattr(args,"rig_python",None)),
             "rig_train_deformer": lambda req, prog, cancel: soft_deformer.train_job(
                 self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
             "rig_fit_video": lambda req, prog, cancel: video_fit.fit_job(
                 self.service, req, prog, cancel, python=getattr(args, "rig_python", None)),
         }
-        def configured(handler):
+        def configured(kind,handler):
             def run(request, progress, cancel):
-                with gpu.execution(getattr(args, "inference_backend", "auto"),
+                full_cpu=(kind=='rig_fit_anatomy' or
+                          (kind=='rig_soft_tissue' and request.get('mode')=='full') or
+                          (kind=='rig_speech' and request.get('motion_model')=='biomechanics'))
+                backend='cpu' if full_cpu else getattr(args,"inference_backend","auto")
+                with gpu.execution(backend,
                                    getattr(args, "device", 0), getattr(args, "models_root", str(MODELS_ROOT))) as selected:
                     result = handler(request, progress, cancel)
                     result.setdefault("backend", "mock" if args.mock else selected)
-                    result.setdefault("device", gpu.device_index())
+                    result.setdefault("device", "cpu" if full_cpu else gpu.device_index())
                     return result
             return run
-        self.jobs = Jobs(Path(args.work) / "jobs", {name: configured(fn) for name, fn in handlers.items()})
+        self.jobs = Jobs(Path(args.work) / "jobs", {name: configured(name,fn) for name, fn in handlers.items()})
 
     def health(self) -> dict:
         with gpu.execution(getattr(self.args, "inference_backend", "auto"),

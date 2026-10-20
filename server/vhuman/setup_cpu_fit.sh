@@ -1,6 +1,16 @@
 #!/bin/sh
 # Run from any directory. All environments/caches/build files stay in the repo.
 set -eu
+full=0
+python_version=python3.12
+for argument in "$@"; do
+    case "$argument" in
+        --full) full=1 ;;
+        --help|-h) echo 'usage: setup_cpu_fit.sh [python3.12] [--full]'; exit 0 ;;
+        --*) echo "unknown option: $argument" >&2; exit 2 ;;
+        *) python_version=$argument ;;
+    esac
+done
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
 mkdir -p tmp/vhuman-cpu-build tmp/uv-cpufit
@@ -12,7 +22,7 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 if [ ! -x tmp/vhuman-cpu-venv/bin/python ]; then
-    uv venv --python "${1:-python3.12}" tmp/vhuman-cpu-venv
+    uv venv --python "$python_version" tmp/vhuman-cpu-venv
 fi
 tmp/vhuman-cpu-venv/bin/python -B - <<'PY'
 import sys
@@ -22,6 +32,14 @@ PY
 # https://pytorch.org/get-started/previous-versions/#v291
 uv pip install --python tmp/vhuman-cpu-venv/bin/python 'torch==2.9.1+cpu' --index-url https://download.pytorch.org/whl/cpu
 uv pip install --python tmp/vhuman-cpu-venv/bin/python -r server/vhuman/requirements-cpu-fit.lock
+if [ "$full" -eq 1 ]; then
+    uv pip install --python tmp/vhuman-cpu-venv/bin/python -r server/vhuman/requirements-biomechanics.txt
+    [ -f third_party/LightGeom/examples/lightphysics_vhuman_face/full.c ] || {
+        echo 'Full biomechanics needs the updated LightGeom checkout; run setup_face_sources.sh.' >&2
+        exit 1
+    }
+    sh server/vhuman/rig/build_full_cpu.sh
+fi
 make -C cpu/vhuman libvhuman_face.so libvhuman_landmarks.so libvhuman_training.so
 tmp/vhuman-cpu-venv/bin/python -B - <<'PY'
 import torch

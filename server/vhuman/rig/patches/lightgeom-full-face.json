@@ -1,0 +1,23 @@
+{
+  "schema": "vhuman.lightgeom_patch.v1",
+  "base_revision": "db64640cbbbb44d73c5ee3ffa3c3b405dee2cec1",
+  "patch_sha256": "e96fd6c14157139a25e6a9c93ea6300c99b8635173f5b5904dd757617736bf42",
+  "files": {
+    "CMakeLists.txt": "b57cae9cf4534a7e5b1a412c01307a3c8fbb2c3b35e5114f4f805cbe455297e8",
+    "examples/lightphysics_vhuman_face/CMakeLists.txt": "012f8ad5f5e4d497d765b93d191762aecd5d638c7682f0cfab00877fdfd35bbd",
+    "examples/lightphysics_vhuman_face/README.md": "218dc88cb306e546cc99175f94fa1ef3c5b971571cb24027377cd4888ed1bf68",
+    "include/lightphysics_deformable.h": "249a6a269c0a37c0d9d977f0beeb6d6aa6cc7e68df65344f603b331e0aeb1a2d",
+    "src/lightphysics/lightphysics_deformable.c": "ca27d15f280605c984892ba78608e80c20c175054c9777756cc351ac744074e2",
+    "tests/lightphysics/test_deformable.c": "0cb2814b65d194cdd8afce84421f0a9d775497f50f7ec10d0e757cb0ec70c5cb",
+    "examples/lightphysics_vhuman_face/full.c": "c774311b79df95b58d5a74eba4762aaff21d08fb2690f392cad84ac35dc95572",
+    "examples/lightphysics_vhuman_face/full.exports": "1d9ad1bc9fcdd49bd6324f26cd3972c1e058d126b03fecdc1693f6c6a5be5362",
+    "examples/lightphysics_vhuman_face/full.h": "4da08e7e86460e593ed216ab63b041afb35d0047fd89a864c5524b7b011b6e04",
+    "include/lightphysics_active_tissue.h": "3aaba088ee7bc6a9378f3391fa4dda015b424e37f12304c21b4dcc670288c4ac",
+    "include/lightphysics_surface_contact.h": "6647c69497c849d03162a929af1a5e7f7dac7dead6ebc8d83ff6885f6ff2dc43",
+    "src/lightphysics/lightphysics_active_tissue.c": "309b0656d9ca9e855ec91f7feffda88acef02f47306f151e49cf5e933665a1f9",
+    "src/lightphysics/lightphysics_surface_contact.c": "33eb458a7b9c13ec758d4c7d970ade0cafe029dcc33c857a0deceaef200ef076",
+    "include/lightphysics.h": "40d133cf2edb95fa1fce7e93ea53809e5b81c161fff70caa37b3d517310a347e",
+    "src/lightphysics/lightphysics.c": "eeb7c2ac87333b4661b45c9fa054188a0632c35516a702483a92f611c92900f7"
+  },
+  "license": "Apache-2.0"
+}

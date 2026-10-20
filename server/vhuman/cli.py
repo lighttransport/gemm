@@ -391,19 +391,32 @@ def cmd_rig_speech(args) -> dict:
            "transcript": args.transcript, "seed": args.seed,
            "ref_wav": args.ref_wav, "ref_text": args.ref_text, "xvec_only": args.xvec_only,
            "emotion_keyframes": emotions, "auto_emotion": args.auto_emotion, "speech_strength": args.speech_strength,
-           "emotion_strength": args.emotion_strength, "secondary_strength": args.secondary_strength}
+           "emotion_strength": args.emotion_strength, "secondary_strength": args.secondary_strength,
+           "motion_model":args.motion_model,"threads":args.threads,"inverse_workers":args.inverse_workers,
+           "inverse_iterations":args.inverse_iterations,"sensitivity_reuse_frames":args.sensitivity_reuse_frames,
+           "sensitivity_probe_substeps":args.sensitivity_probe_substeps,"state_precision":args.state_precision,"mechanics_solver":args.mechanics_solver}
     return speech.speech_job(svc, req, _progress, threading.Event(), model=args.tts_model or speech.DEFAULT_MODEL,
                              aligner=args.aligner or speech.DEFAULT_ALIGNER, backend=args.backend, allow_wav=True,
                              emotion_runner=args.emotion_runner or emotion.DEFAULT_RUNNER,
-                             emotion_model=args.emotion_model or emotion.DEFAULT_MODEL)
+                             emotion_model=args.emotion_model or emotion.DEFAULT_MODEL,python=args.rig_python)
 
 
 def cmd_rig_soft_tissue(args) -> dict:
     from .rig import soft_tissue
     svc = EyeService(Path(args.work))
-    return soft_tissue.soft_tissue_job(svc, {"head_id": args.head, "take_id": args.take},
+    return soft_tissue.soft_tissue_job(svc, {"head_id": args.head, "take_id": args.take,"mode":args.mode,
+                                      "threads":args.threads,"inverse_workers":args.inverse_workers,
+                                      "inverse_iterations":args.inverse_iterations,
+                                      "sensitivity_reuse_frames":args.sensitivity_reuse_frames,
+                                      "sensitivity_probe_substeps":args.sensitivity_probe_substeps,"state_precision":args.state_precision,"mechanics_solver":args.mechanics_solver},
                                       _progress, threading.Event(), python=args.rig_python,
                                       runner=Path(args.lightgeom_runner) if args.lightgeom_runner else soft_tissue.DEFAULT_RUNNER)
+
+
+def cmd_rig_fit_anatomy(args) -> dict:
+    from .rig import anatomy
+    return anatomy.anatomy_job(EyeService(Path(args.work)),
+        dict(head_id=args.head,take_ids=args.captures,threads=args.threads,fit_sockets=args.fit_sockets,fit_mouth=args.fit_mouth,fit_dentition=args.fit_dentition,fit_tongue=args.fit_tongue,fit_tongue_root=args.fit_tongue_root,sliding_skin=args.sliding_skin,tangent_fibers=args.tangent_fibers,harmonic_tongue_fibers=args.harmonic_tongue_fibers,extrinsic_tongue_cables=args.extrinsic_tongue_cables,mouth_fairing=args.mouth_fairing,mesh_timeout=args.mesh_timeout),_progress,threading.Event(),python=args.rig_python)
 
 
 def cmd_rig_train_deformer(args) -> dict:
@@ -685,6 +698,20 @@ def main(argv=None) -> int:
     sp.add_argument("--tts-model")
     sp.add_argument("--aligner")
     sp.add_argument("--backend", choices=("auto", "cpu", "cuda", "rocm"), default="auto")
+    sp.add_argument("--motion-model",choices=("rig","biomechanics"),default="rig")
+    sp.add_argument("--threads",type=int,default=4)
+    sp.add_argument("--inverse-workers",type=int,default=1,
+                    help="independent CPU muscle trials for biomechanics (1..threads)")
+    sp.add_argument("--inverse-iterations",type=int,default=2,
+                    help="bounded muscle fitting iterations for biomechanics (0..20)")
+    sp.add_argument("--sensitivity-reuse-frames",type=int,default=0,
+                    help="subsequent frames allowed to reuse muscle sensitivities, with native trial validation (0..60)")
+    sp.add_argument("--sensitivity-probe-substeps",type=int,default=0,
+                    help="short native muscle probes, calibrated against a full-duration trial (0=full interval; 1..48)")
+    sp.add_argument("--state-precision",choices=("auto","float32","float64"),default="auto",
+                    help="native state transport precision for full biomechanics")
+    sp.add_argument("--mechanics-solver",choices=("partitioned","coupled","block"),default="partitioned",
+                    help="experimental CPU coupled mechanics; block solves jaw attachments simultaneously")
     sp.add_argument("--speech-strength", type=float, default=1.0)
     sp.add_argument("--emotion-strength", type=float, default=.6)
     sp.add_argument("--secondary-strength", type=float, default=1.0,
@@ -698,7 +725,37 @@ def main(argv=None) -> int:
     sp.add_argument("--head", required=True)
     sp.add_argument("--take", required=True)
     sp.add_argument("--lightgeom-runner")
+    sp.add_argument("--mode",choices=("patch","full"),default="patch")
+    sp.add_argument("--threads",type=int,default=4)
+    sp.add_argument("--inverse-workers",type=int,default=1,
+                    help="independent CPU muscle trials in full mode (1..threads)")
+    sp.add_argument("--inverse-iterations",type=int,default=2,
+                    help="bounded muscle fitting iterations in full mode (0..20)")
+    sp.add_argument("--sensitivity-reuse-frames",type=int,default=0,
+                    help="subsequent frames allowed to reuse muscle sensitivities, with native trial validation (0..60)")
+    sp.add_argument("--sensitivity-probe-substeps",type=int,default=0,
+                    help="short native muscle probes, calibrated against a full-duration trial (0=full interval; 1..48)")
+    sp.add_argument("--state-precision",choices=("auto","float32","float64"),default="auto",
+                    help="native state transport precision for full biomechanics")
+    sp.add_argument("--mechanics-solver",choices=("partitioned","coupled","block"),default="partitioned",
+                    help="experimental CPU coupled mechanics; block solves jaw attachments simultaneously")
     sp.set_defaults(fn=cmd_rig_soft_tissue)
+    sp = sub.add_parser("rig-fit-anatomy",help="fit complete face/mouth anatomy for native CPU muscle simulation")
+    sp.add_argument("--head",required=True)
+    sp.add_argument("--captures",nargs="*",default=[],help="same-subject fitted take IDs")
+    sp.add_argument("--fit-sockets",action="store_true",help="condition ocular cavities and bounded eyelid clearance")
+    sp.add_argument("--fit-mouth",action="store_true",help="separate overlapping lips and fit inferred oral lining")
+    sp.add_argument("--mouth-fairing",type=float,default=0.,help="optional hidden-lining fairing (0..0.5); requires --fit-mouth")
+    sp.add_argument("--mesh-timeout",type=int,default=3600,help="per-region CPU meshing timeout in seconds (60..7200)")
+    sp.add_argument("--fit-dentition",action="store_true",help="separate overlapping tooth crowns by bounded rigid translations")
+    sp.add_argument("--fit-tongue",action="store_true",help="untangle local tongue folds while preserving triangle orientation")
+    sp.add_argument("--fit-tongue-root",action="store_true",help="condition inferred tongue base against the lower arch; includes fold fitting")
+    sp.add_argument("--sliding-skin",action="store_true",help="use authored tangential skin tethers along inferred skull support")
+    sp.add_argument("--tangent-fibers",action="store_true",help="fit facial muscle directions to exterior skin tangents")
+    sp.add_argument("--harmonic-tongue-fibers",action="store_true",help="fit authored tongue compartments and harmonic directions on CPU")
+    sp.add_argument("--extrinsic-tongue-cables",action="store_true",help="add authored external tongue muscle paths with distributed tissue insertions")
+    sp.add_argument("--threads",type=int,default=4)
+    sp.set_defaults(fn=cmd_rig_fit_anatomy)
     sp = sub.add_parser("rig-train-deformer", help="distil LightGeom tissue takes into a browser corrective")
     sp.add_argument("--head", required=True)
     sp.add_argument("--takes", nargs="*", help="take ids with rig-soft-tissue samples; default: recent completed takes")
@@ -725,6 +782,13 @@ def main(argv=None) -> int:
     sub.add_parser("replate", help="re-extract the plate library from its source images").set_defaults(fn=cmd_replate)
     sub.add_parser("bench", help="timing targets").set_defaults(fn=cmd_bench)
     args = ap.parse_args(argv)
+    full_cpu=(args.cmd=='rig-fit-anatomy' or
+              (args.cmd=='rig-soft-tissue' and args.mode=='full') or
+              (args.cmd=='rig-speech' and args.motion_model=='biomechanics'))
+    if full_cpu:
+        if args.inference_backend not in ('auto','cpu'):
+            ap.error('full face/mouth biomechanics requires --backend cpu')
+        args.inference_backend='cpu'
     from . import runtime
     runtime.configure_args(args)
     try:
