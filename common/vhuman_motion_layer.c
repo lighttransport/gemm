@@ -35,22 +35,26 @@ static double smoothstep(double x) {
     return x * x * (3.0 - 2.0 * x);
 }
 
-static uint32_t hash32(int32_t i, int32_t salt) {
+static uint32_t hash32(uint32_t i, uint32_t salt) {
     uint32_t x = (uint32_t)i * 0x9E3779B1u + (uint32_t)salt * 0x85EBCA77u;
     x ^= x >> 15; x *= 0x2C1B3C6Du; x ^= x >> 12; x *= 0x297A2D39u; x ^= x >> 15;
     return x;
 }
 
-double vhml_value_noise(double x, int32_t salt) {
+static double value_noise(double x, uint32_t salt) {
     double fl = floor(x);
     int32_t i = (int32_t)fl;
     double f = x - fl;
     double a = hash32(i, salt) / 4294967296.0 * 2.0 - 1.0;
-    double b = hash32(i + 1, salt) / 4294967296.0 * 2.0 - 1.0;
+    double b = hash32((uint32_t)i + 1u, salt) / 4294967296.0 * 2.0 - 1.0;
     return a + (b - a) * smoothstep(f);
 }
 
-static uint32_t rng_seed(int32_t seed) {
+double vhml_value_noise(double x, int32_t salt) {
+    return value_noise(x, (uint32_t)salt);
+}
+
+static uint32_t rng_seed(uint32_t seed) {
     uint32_t x = (uint32_t)seed * 2654435761u + 1013904223u;
     return x ? x : 0x9E3779B9u;
 }
@@ -64,7 +68,9 @@ static double rng_between(uint32_t *s, double lo, double hi) { return lo + (hi -
 
 void vhml_reset(vhml_layer *l) {
     const vhml_config *c = &l->cfg;
-    l->rng = rng_seed(l->seed); l->rng_blink = rng_seed(l->seed + 101); l->rng_micro = rng_seed(l->seed + 202);
+    /* Seed arithmetic wraps modulo 2^32, matching the Python/JS hash. */
+    uint32_t seed = (uint32_t)l->seed;
+    l->rng = rng_seed(seed); l->rng_blink = rng_seed(seed + 101u); l->rng_micro = rng_seed(seed + 202u);
     l->time = -1.0;
     l->fix[0] = l->fix[1] = l->prev_fix[0] = l->prev_fix[1] = 0.0;
     l->saccade_start = -1.0; l->saccade_duration = 0.0;
@@ -153,6 +159,7 @@ static double clamp01(double v) { return v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v; }
 int vhml_sample(vhml_layer *l, double t, const vhml_input *in, double out[VHML_COUNT], double gaze_deg[2]) {
     const vhml_config *c = &l->cfg;
     double s, m, gx, gy, yaw, pitch, blink, verge, hippus, narrow;
+    uint32_t salt = (uint32_t)l->seed * 7u;
     if (t < l->time) return -1;
     l->time = t;
     advance(l, t, in->speaking, in->pauses, in->pause_count);
@@ -162,8 +169,8 @@ int vhml_sample(vhml_layer *l, double t, const vhml_input *in, double out[VHML_C
     m = l->micro_start >= 0.0 ? smoothstep((t - l->micro_start) / c->micro_duration) : 1.0;
     gx += l->micro_prev[0] + (l->micro[0] - l->micro_prev[0]) * m;
     gy += l->micro_prev[1] + (l->micro[1] - l->micro_prev[1]) * m;
-    gx += c->drift_deg * vhml_value_noise(t * c->drift_hz, l->seed * 7 + 1);
-    gy += c->drift_deg * 0.6 * vhml_value_noise(t * c->drift_hz, l->seed * 7 + 2);
+    gx += c->drift_deg * value_noise(t * c->drift_hz, salt + 1u);
+    gy += c->drift_deg * 0.6 * value_noise(t * c->drift_hz, salt + 2u);
     yaw = in->focus_yaw + gx - in->head_yaw * DEG_HEAD_YAW;
     pitch = in->focus_pitch + gy - in->head_pitch * DEG_HEAD_PITCH;
     blink = blink_at(l, t);
@@ -179,17 +186,17 @@ int vhml_sample(vhml_layer *l, double t, const vhml_input *in, double out[VHML_C
         out[base + 4] = blink;
         out[base + 5] = clamp01(0.25 * pitch / DEG_UP) * (1.0 - blink);
     }
-    hippus = c->hippus * vhml_value_noise(t * c->hippus_hz, l->seed * 7 + 3);
+    hippus = c->hippus * value_noise(t * c->hippus_hz, salt + 3u);
     narrow = 0.6 * in->light + 0.3 * (verge / 8.0 < 1.0 ? verge / 8.0 : 1.0) + hippus - 0.3;
     out[VHML_PUPIL_NARROW] = clamp01(narrow);
     out[VHML_PUPIL_WIDE] = clamp01(-narrow);
     out[VHML_HEAD_YAW] = out[VHML_HEAD_PITCH] = out[VHML_HEAD_ROLL] = 0.0;
     if (in->idle) {
         double u = fmod(t * c->breath_hz, 1.0), breath = u < 0.5 ? smoothstep(u * 2.0) : smoothstep(2.0 - u * 2.0);
-        out[VHML_HEAD_YAW] = c->head_noise_deg[0] * vhml_value_noise(t * c->head_noise_hz, l->seed * 7 + 4) / DEG_HEAD_YAW;
-        out[VHML_HEAD_PITCH] = (c->head_noise_deg[1] * vhml_value_noise(t * c->head_noise_hz, l->seed * 7 + 5)
+        out[VHML_HEAD_YAW] = c->head_noise_deg[0] * value_noise(t * c->head_noise_hz, salt + 4u) / DEG_HEAD_YAW;
+        out[VHML_HEAD_PITCH] = (c->head_noise_deg[1] * value_noise(t * c->head_noise_hz, salt + 5u)
                                 + c->breath_deg * (breath - 0.5)) / DEG_HEAD_PITCH;
-        out[VHML_HEAD_ROLL] = c->head_noise_deg[2] * vhml_value_noise(t * c->head_noise_hz, l->seed * 7 + 6) / DEG_HEAD_ROLL;
+        out[VHML_HEAD_ROLL] = c->head_noise_deg[2] * value_noise(t * c->head_noise_hz, salt + 6u) / DEG_HEAD_ROLL;
     }
     if (gaze_deg) { gaze_deg[0] = yaw; gaze_deg[1] = pitch; }
     return 0;

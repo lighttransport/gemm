@@ -106,15 +106,17 @@ class MotionLayerTest(unittest.TestCase):
                                capture_output=True, text=True)
         if build.returncode != 0:
             self.skipTest("cannot build the native motion layer: " + build.stderr[-500:])
-        c = json.loads(subprocess.run([str(ROOT / "cpu" / "vhuman" / "test_motion_layer")],
-                                      capture_output=True, text=True, check=True).stdout)
-        layer = ML.MotionLayer(5)
-        for i, frame in enumerate(c):
-            t = i / 30
-            py = layer.sample(t, head_yaw=0.2 * ML.value_noise(t * 0.5, 99), head_pitch=0.1, focus_distance=0.5,
-                              speaking=i > 100, light=0.7, pauses=(3.0, 6.5))
-            for k, v in frame.items():
-                self.assertAlmostEqual(py[k], v, places=9, msg=(i, k))
+        for seed in (5, 1000000000, 2**31 - 1, -2**31, -1):
+            with self.subTest(seed=seed):
+                c = json.loads(subprocess.run([str(ROOT / "cpu" / "vhuman" / "test_motion_layer"), str(seed)],
+                                              capture_output=True, text=True, check=True).stdout)
+                layer = ML.MotionLayer(seed)
+                for i, frame in enumerate(c):
+                    t = i / 30
+                    py = layer.sample(t, head_yaw=0.2 * ML.value_noise(t * 0.5, 99), head_pitch=0.1, focus_distance=0.5,
+                                      speaking=i > 100, light=0.7, pauses=(3.0, 6.5))
+                    for k, v in frame.items():
+                        self.assertAlmostEqual(py[k], v, places=9, msg=(i, k))
 
 
     def test_native_library_binding(self):

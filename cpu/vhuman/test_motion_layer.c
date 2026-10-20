@@ -1,12 +1,23 @@
 /* Prints the motion layer's control tracks for the parity fixture of
- * server/vhuman/test_motion_layer.py (seed 5, 301 frames at 30 fps). */
+ * server/vhuman/test_motion_layer.py (optional seed, 301 frames at 30 fps). */
 #include "../../common/vhuman_motion_layer.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
 
-int main(void) {
+int main(int argc, char **argv) {
+    int32_t seed = 5;
+    if (argc > 2) return 2;
+    if (argc == 2) {
+        char *end;
+        errno = 0;
+        long long value = strtoll(argv[1], &end, 10);
+        if (errno || !*argv[1] || *end || value < INT32_MIN || value > INT32_MAX) return 2;
+        seed = (int32_t)value;
+    }
     vhml_layer layer; vhml_input in; double out[VHML_COUNT];
     const double pauses[2] = {3.0, 6.5};
-    vhml_init(&layer, 5, NULL);
+    vhml_init(&layer, seed, NULL);
     vhml_default_input(&in);
     in.focus_distance = 0.5; in.light = 0.7; in.pauses = pauses; in.pause_count = 2; in.head_pitch = 0.1;
     printf("[");
