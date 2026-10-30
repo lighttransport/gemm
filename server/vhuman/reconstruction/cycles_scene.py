@@ -120,6 +120,49 @@ def animate(scene, request, config, data, objects):
     scene.frame_set(request.get('frame',1))
 
 
+def full_skin_graph(skin,node,bound,out,request):
+    """Quality-candidate skin: region templates (roughness/specular/cavity/lips), two specular lobes (coat),
+    random-walk skin subsurface, tiled micro-normal and true displacement. Maps come from skin_templates.build."""
+    nodes,links=skin.node_tree.nodes,skin.node_tree.links
+    maps=np.load(out/'skin_templates.npz',allow_pickle=False)
+    tex={k:float_image(nodes,'template_'+k,maps[k]) for k in ('roughness','specular','cavity','lips','micro_strength')}
+    def channel(name):
+        sep=nodes.new('ShaderNodeSeparateColor');links.new(tex[name].outputs['Color'],sep.inputs['Color']);return sep.outputs['Red']
+    rough,spec,cavity,lips,micro=[channel(k) for k in ('roughness','specular','cavity','lips','micro_strength')]
+    def math(op,a,b=None,*,value=None,clamp=False):
+        m=nodes.new('ShaderNodeMath');m.operation=op;m.use_clamp=clamp
+        links.new(a,m.inputs[0]) if not isinstance(a,(int,float)) else m.inputs[0].__setattr__('default_value',a)
+        if b is not None:
+            links.new(b,m.inputs[1]) if not isinstance(b,(int,float)) else m.inputs[1].__setattr__('default_value',b)
+        elif value is not None:m.inputs[1].default_value=value
+        return m.outputs[0]
+    # roughness = template*(1+.6 cavity), lips wetter: -0.12*lips
+    r=math('MULTIPLY',rough,math('MULTIPLY_ADD',cavity,.6,value=1) if False else math('ADD',math('MULTIPLY',cavity,.6),1))
+    r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True);links.new(r,node.inputs['Roughness'])
+    # specular level = template*(1-.7 cavity)
+    sp=math('MULTIPLY',spec,math('SUBTRACT',1.,math('MULTIPLY',cavity,.7)),clamp=True);links.new(sp,node.inputs['Specular IOR Level'])
+    # second lobe: coat .25(1-cavity)+.5 lips, roughness .15 -> .05 on lips
+    coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),.25),math('MULTIPLY',lips,.5),clamp=True);links.new(coat,node.inputs['Coat Weight'])
+    cr=math('SUBTRACT',.15,math('MULTIPLY',lips,.10),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
+    node.inputs['Coat IOR'].default_value=1.4
+    # random-walk skin subsurface (radii in metres, literature-scale skin profile)
+    node.subsurface_method='RANDOM_WALK_SKIN'
+    node.inputs['Subsurface Weight'].default_value=.6;node.inputs['Subsurface Scale'].default_value=.5
+    node.inputs['Subsurface Radius'].default_value=(.00367,.00137,.00068);node.inputs['Subsurface IOR'].default_value=1.4
+    # tiled micro normal (pores), strength scaled by the region mask
+    micro_img=image_node(nodes,out/'skin_micro_normal.png',linear=True)
+    uvn=nodes.new('ShaderNodeUVMap');uvn.uv_map='UVMap';mapping=nodes.new('ShaderNodeMapping');mapping.inputs['Scale'].default_value=(12,12,1)
+    links.new(uvn.outputs['UV'],mapping.inputs['Vector']);links.new(mapping.outputs['Vector'],micro_img.inputs['Vector'])
+    nm=nodes.new('ShaderNodeNormalMap');nm.space='TANGENT';nm.uv_map='UVMap'
+    links.new(micro_img.outputs['Color'],nm.inputs['Color']);links.new(math('MULTIPLY',micro,.6),nm.inputs['Strength'])
+    links.new(nm.outputs['Normal'],node.inputs['Normal'])
+    # true displacement with a wider clamp for the wrinkle library
+    bound.inputs['Min'].default_value=-.0015;bound.inputs['Max'].default_value=.0015
+    skin.displacement_method='DISPLACEMENT'
+    skin['quality_shader']=json.dumps(dict(templates=str(out/'skin_templates.json'),subsurface='random_walk_skin',
+        coat='second specular lobe',micro_normal='tiled procedural pores',displacement='true, adaptive'))
+
+
 def image_node(nodes,path, *, linear=False):
     node=nodes.new('ShaderNodeTexImage')
     node.image=bpy.data.images.load(str(path),check_existing=True)
@@ -203,14 +246,35 @@ def run(request):
         scene.cycles.device='GPU';device_name=devices[request.get('gpu_index',0)].name
     else:
         scene.cycles.device='CPU';device_name='CPU'
-    scene.cycles.samples=32 if request['preset']=='draft' else 256
+    presets={'draft':(512,32),'final':(1024,256),'hero':(2048,1024),'crop':(1024,1024)}
+    resolution,samples=presets[request['preset']]
+    resolution=int(request.get('resolution') or resolution);samples=int(request.get('samples') or samples)
+    scene.cycles.samples=samples
     scene.cycles.use_denoising=True;scene.cycles.denoiser='OPENIMAGEDENOISE'
     if hasattr(scene.cycles,'denoising_use_gpu'):scene.cycles.denoising_use_gpu=False
     scene.cycles.max_bounces=12;scene.cycles.transmission_bounces=8
-    resolution=512 if request['preset']=='draft' else 1024
+    if request['preset']=='hero':scene.cycles.max_bounces=16;scene.cycles.transmission_bounces=12
     scene.render.resolution_x=resolution;scene.render.resolution_y=resolution;scene.render.resolution_percentage=100
     scene.render.film_transparent=True
     scene.view_settings.exposure=request.get('exposure',-1.5)
+    for transform in ('Standard',):
+        try:scene.view_settings.view_transform=transform;scene.view_settings.look='None';break
+        except TypeError:pass
+    noisy_output=None
+    if request.get('noisy',True):
+        # One render yields both: the denoised beauty through the group output and the raw 'Noisy Image'
+        # pass through a File Output node (Blender 5 compositor node group API).
+        view_layer=bpy.context.view_layer;view_layer.cycles.denoising_store_passes=True
+        group=bpy.data.node_groups.new('beauty_compositor','CompositorNodeTree');scene.compositing_node_group=group
+        if hasattr(scene,'use_nodes'):scene.use_nodes=True
+        group.interface.new_socket('Image',in_out='OUTPUT',socket_type='NodeSocketColor')
+        layers=group.nodes.new('CompositorNodeRLayers');output=group.nodes.new('NodeGroupOutput')
+        group.links.new(layers.outputs['Image'],output.inputs[0])
+        files=group.nodes.new('CompositorNodeOutputFile');files.directory=str(out);files.file_name='beauty_noisy'
+        files.format.file_format='OPEN_EXR_MULTILAYER';files.format.color_depth='16'   # the 5.2 File Output node only offers multilayer EXR
+        if not len(files.file_output_items):files.file_output_items.new('RGBA','Image')
+        group.links.new(layers.outputs['Noisy Image'],files.inputs[0])
+        noisy_output='beauty_noisy.exr'
     scene['skin_lighting_prior']=json.dumps(dict(sss_weight=request.get('sss_weight',.08),exposure=request.get('exposure',-1.5),status='authored studio preset'))
     config=json.loads((out/'scene.json').read_text());candidate=Path(config['candidate'])
     data=np.load(out/'scene_assets.npz',allow_pickle=False)
@@ -261,6 +325,9 @@ def run(request):
     links.new(bound.outputs[0],displacement.inputs['Height'])
     links.new(displacement.outputs[0],nodes.get('Material Output').inputs['Displacement'])
     skin.displacement_method='BOTH';materials['skin']=skin
+    full=request.get('quality','baseline')=='full';ablate=set(request.get('ablate',[]))
+    skin_full=full and '2c' not in ablate and (out/'skin_templates.npz').is_file()
+    if skin_full:full_skin_graph(skin,node,bound,out,request)
     for name,color,roughness in [('teeth',(.65,.6,.5),.25),('gums',(.35,.08,.07),.35),
         ('tongue',(.4,.09,.08),.4),('cavity',(.33,.09,.09),.45),('sclera',(.7,.65,.6),.25),
         ('iris',(.12,.065,.035),.55),('frame',(.12,.045,.025),.25),('pupil',(.001,.001,.001),1),('lash',(.025,.018,.012),.45)]:
@@ -312,6 +379,10 @@ def run(request):
         for polygon in mesh.polygons:polygon.use_smooth=part['material'] not in ('glass',)
         if part['material']=='skin':
             modifier=obj.modifiers.new('skin_subdivision','SUBSURF');modifier.levels=1;modifier.render_levels=2
+            if skin_full and hasattr(modifier,'use_adaptive_subdivision'):
+                # True displacement: dice to ~1 px (hero) / 2 px at render time instead of a fixed 2 levels.
+                modifier.use_adaptive_subdivision=True;modifier.render_levels=3
+                scene.cycles.dicing_rate=1. if request['preset']=='hero' else 2.;scene.cycles.preview_dicing_rate=8
         if part['material']=='glass':
             modifier=obj.modifiers.new('lens_thickness_prior','SOLIDIFY');modifier.thickness=.001
     hair=bpy.data.materials.new('source_hair_color_prior');hair.use_nodes=True
@@ -333,14 +404,29 @@ def run(request):
     camera_data.shift_x=(width/2-camera['cx'])/height;camera_data.shift_y=(camera['cy']-height/2)/height
     rotation=np.asarray(camera['rotation']).T
     transform=np.eye(4);transform[:3,:3]=rotation;transform[:3,3]=camera['origin'];camera_obj.matrix_world=Matrix(transform.tolist())
-    if request.get('yaw'):
-        angle=np.deg2rad(request['yaw']);orbit=rotations_from_vectors([0,angle,0])
-        pivot=np.array([0,.02,0])
-        transform[:3,:3]=orbit@transform[:3,:3];transform[:3,3]=orbit@(transform[:3,3]-pivot)+pivot
-        camera_obj.matrix_world=Matrix(transform.tolist())
+    preset_name=request.get('camera','portrait');camera_record=dict(preset=preset_name,yaw=request.get('yaw',0),pitch=request.get('pitch',0))
+    if preset_name!='portrait' or request.get('yaw') or request.get('pitch'):
+        if __package__:
+            from . import render_cameras
+        else:
+            sys.path.insert(0,str(Path(__file__).parent));import render_cameras
+        eyes={side:data[f'{side}_cornea_positions'] for side in ('left','right') if f'{side}_cornea_positions' in data}
+        ears={side:data[f'ear_{side}_positions'] for side in ('left','right') if f'ear_{side}_positions' in data}
+        points=render_cameras.targets(data['skin_positions'],eyes=eyes,ears=ears)
+        name='front' if preset_name=='portrait' else preset_name
+        origin,rows,focal=render_cameras.place(name,camera['origin'],camera['rotation'],camera['focal'],points,
+            yaw=request.get('yaw') if (request.get('yaw') or name=='front') else None,
+            pitch=request.get('pitch') if (request.get('pitch') or name=='front') else None,
+            distance_scale=request.get('distance_scale'),focal_scale=request.get('focal_scale'))
+        # Close-ups aim at the part centre: drop the portrait's principal-point shift so the target is centred.
+        if render_cameras.CAMERAS[name][4]!='head':camera_data.shift_x=0;camera_data.shift_y=0
+        camera_data.lens=36*focal/height
+        transform[:3,:3]=np.asarray(rows).T;transform[:3,3]=origin;camera_obj.matrix_world=Matrix(transform.tolist())
+        camera_record.update(target=render_cameras.CAMERAS[name][4],origin=[float(v) for v in origin],focal_px=float(focal),
+                             rotation=np.asarray(rows).tolist(),targets={k:[float(x) for x in v] for k,v in points.items()})
     camera_data.clip_start=.01;camera_data.clip_end=10
-    for name,position,power,size in [('key',(-.35,.35,.45),35,.35),('fill',(.35,.1,.35),12,.3),('rim',(.2,.3,-.3),20,.25)]:
-        lighting=request.get('lighting','studio')
+    lighting=request.get('lighting','studio')
+    for name,position,power,size in ([] if lighting=='hdri' else [('key',(-.35,.35,.45),35,.35),('fill',(.35,.1,.35),12,.3),('rim',(.2,.3,-.3),20,.25)]):
         if lighting=='left':power={'key':45,'fill':2,'rim':8}[name]
         elif lighting=='right':
             position=(-position[0],position[1],position[2]);power={'key':45,'fill':2,'rim':8}[name]
@@ -348,9 +434,20 @@ def run(request):
         light=bpy.data.lights.new(name,'AREA');light.energy=power;light.shape='DISK';light.size=size
         obj=bpy.data.objects.new(name,light);bpy.context.collection.objects.link(obj);obj.location=position
         obj.rotation_euler=(Vector((0,0,0))-obj.location).to_track_quat('-Z','Y').to_euler()
-    world=bpy.data.worlds.new('studio');scene.world=world;world.use_nodes=True
-    world.node_tree.nodes['Background'].inputs['Color'].default_value=(.1,.1,.1,1)
-    world.node_tree.nodes['Background'].inputs['Strength'].default_value=.15
+    world=bpy.data.worlds.new('studio' if lighting!='hdri' else 'hdri');scene.world=world;world.use_nodes=True
+    if lighting=='hdri':
+        hdri=request['hdri'];wn=world.node_tree.nodes;wl=world.node_tree.links
+        environment=wn.new('ShaderNodeTexEnvironment');environment.image=bpy.data.images.load(hdri['path'],check_existing=True)
+        environment.image.pack()
+        mapping=wn.new('ShaderNodeMapping');coords=wn.new('ShaderNodeTexCoord')
+        mapping.inputs['Rotation'].default_value=(0,0,np.deg2rad(hdri.get('rotation_deg',0)))
+        wl.new(coords.outputs['Generated'],mapping.inputs['Vector']);wl.new(mapping.outputs['Vector'],environment.inputs['Vector'])
+        wl.new(environment.outputs['Color'],wn['Background'].inputs['Color'])
+        wn['Background'].inputs['Strength'].default_value=hdri.get('strength',1.)
+        world['hdri_sha256']=hdri['sha256'];world['hdri_license']=hdri.get('license','')
+    else:
+        world.node_tree.nodes['Background'].inputs['Color'].default_value=(.1,.1,.1,1)
+        world.node_tree.nodes['Background'].inputs['Strength'].default_value=.15
     scene['vhuman_provenance']='Single-portrait reconstruction; hidden anatomy, material amplitudes and accessories contain priors'
     scene['inferred_artifacts']=json.dumps(dict(accessories=config['accessories'],hair=config['hair'],
         detail=config['detail'],material=config['material']))
@@ -360,9 +457,16 @@ def run(request):
     scene.render.filepath=str(out/'beauty.exr');bpy.ops.render.render(write_still=True)
     scene.render.image_settings.file_format='PNG';scene.render.image_settings.color_depth='8'
     bpy.data.images['Render Result'].save_render(str(out/'beauty.png'),scene=scene)
+    if noisy_output:
+        # The File Output node appends the frame number; keep a stable name beside the denoised beauty.
+        written=sorted(out.glob('beauty_noisy*.exr'))
+        if written and written[-1].name!=noisy_output:written[-1].replace(out/noisy_output)
+        if not (out/noisy_output).is_file():raise RuntimeError('noisy beauty output missing')
     result=dict(device=device_name,backend=request['device'],resolution=resolution,samples=scene.cycles.samples,
-                seconds=time.perf_counter()-started,blend='head.blend',exr='beauty.exr',preview='beauty.png',
-                lighting=request.get('lighting','studio'),yaw=request.get('yaw',0),frame=scene.frame_current,exposure=scene.view_settings.exposure,sss_weight=request.get('sss_weight',.08))
+                seconds=time.perf_counter()-started,blend='head.blend',exr='beauty.exr',preview='beauty.png',noisy_exr=noisy_output,
+                lighting=lighting,hdri=request.get('hdri'),camera=camera_record,preset=request['preset'],
+                quality=request.get('quality','baseline'),ablate=request.get('ablate',[]),
+                yaw=request.get('yaw',0),frame=scene.frame_current,exposure=scene.view_settings.exposure,sss_weight=request.get('sss_weight',.08))
     (out/'render_result.json').write_text(json.dumps(result,indent=2))
 
 

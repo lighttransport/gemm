@@ -245,7 +245,7 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
             cavity=model.group('mouth_sock')[tri].all(1)
             skin_faces=selected&~cavity
             if ear is not None:
-                skin_faces[ear['ear_removed_triangles']]=False
+                skin_faces[ear['removed_triangles']]=False
             part('skin',full,tri[skin_faces],uv[skin_faces],'skin',native=True)
             if ear is not None:append_bound('skin',ear)
             cavity_faces=selected&cavity

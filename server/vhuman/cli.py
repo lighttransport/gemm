@@ -294,6 +294,8 @@ def cmd_rig_render(args):
                   accessories=args.accessories, detail_preset=args.detail_preset,
                   gpu_index=args.device, motion=args.motion, frame=args.frame, appearance=args.appearance,
                   lighting=args.lighting,yaw=args.yaw,exposure=args.exposure,sss_weight=args.sss_weight,
+                  camera=args.camera,pitch=args.pitch,hdri=args.hdri,samples=args.samples,resolution=args.resolution,
+                  quality=args.quality,ablate=tuple(args.ablate or ()),noisy=args.noisy,
                   **({'blender':args.blender} if args.blender else {}))
 
 
@@ -643,13 +645,19 @@ def main(argv=None) -> int:
     sp.add_argument('--candidate', required=True, help='completed reconstruction run directory')
     sp.add_argument('--out', required=True, help='empty artifact directory')
     sp.add_argument('--render-device', choices=('hip','cpu'), default='hip')
-    sp.add_argument('--preset', choices=('draft','final'), default='draft')
+    sp.add_argument('--preset', choices=('draft','final','hero','crop'), default='draft')
+    sp.add_argument('--samples',type=int);sp.add_argument('--resolution',type=int)
+    sp.add_argument('--camera',default='portrait',help='render_cameras preset (front, yaw_p40, ear_left, eye_right, mouth, ...)')
+    sp.add_argument('--pitch',type=float,default=0.)
+    sp.add_argument('--hdri',help='environment EXR for --lighting hdri')
+    sp.add_argument('--quality',choices=('baseline','full'),default='baseline');sp.add_argument('--ablate',nargs='*')
+    sp.add_argument('--no-noisy',dest='noisy',action='store_false')
     sp.add_argument('--accessories', choices=('keep','omit'), default='keep')
     sp.add_argument('--detail-preset', choices=('source','mature'), default='mature')
     sp.add_argument('--motion',help='native GNM motion directory')
     sp.add_argument('--frame',type=int,default=1)
     sp.add_argument('--appearance',help='gated I2V appearance directory')
-    sp.add_argument('--lighting',choices=('studio','left','right','rim'),default='studio')
+    sp.add_argument('--lighting',choices=('studio','left','right','rim','hdri'),default='studio')
     sp.add_argument('--yaw',type=float,default=0)
     sp.add_argument('--exposure',type=float,default=-1.5,help='display exposure in EV')
     sp.add_argument('--sss-weight',type=float,default=.08,help='authored subsurface weight')

@@ -1,6 +1,7 @@
 """Portable offline head scene and explicitly selected Cycles GPU rendering."""
 import argparse
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,19 +16,47 @@ from .offline_assets import prepare
 DEFAULT_BLENDER = Path(os.environ.get('VHUMAN_BLENDER', str(Path.home()/'local/blender-5.2.2-linux-x64/blender')))
 
 
+PRESETS = {'draft': (512, 32), 'final': (1024, 256), 'hero': (2048, 1024), 'crop': (1024, 1024)}
+LIGHTING = ('studio', 'left', 'right', 'rim', 'hdri')
+DEFAULT_HDRI = Path(__file__).resolve().parents[3] / 'ref/pixal3d/upstream/assets/hdri/interior.exr'   # CC0, Poly Haven hotel_room 1K
+QUALITY = ('baseline', 'full')
+ABLATIONS = ('2a', '2b', '2c', '2d', '2e', '2f')
+
+
 def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            detail_preset='mature', blender=DEFAULT_BLENDER, gpu_index=0,
            hard_limit_mib=14336, cancel=None, motion=None, frame=1, appearance=None,
            lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08,head_fit=None,parsing_model=None,
-           include_hair=True,fit_eyes=False):
-    if device not in ('hip', 'cuda', 'optix', 'cpu') or preset not in ('draft', 'final'):
+           include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
+           hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
+           ablate=(), noisy=True):
+    """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
+    lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
+    preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
+    un-denoised beauty (beauty_noisy.exr) from the same render. quality/ablate select the material set
+    ('full' = A/B study candidate B; ablate lists stages removed, e.g. ('2d',))."""
+    from .render_cameras import CAMERAS
+    if device not in ('hip', 'cuda', 'optix', 'cpu') or preset not in PRESETS:
         raise ValueError('invalid render device or preset')
     if not 1024 <= hard_limit_mib <= 14336:
         raise ValueError('hard GPU limit must be 1024..14336 MiB')
-    if lighting not in ('studio','left','right','rim') or not -60<=yaw<=60:
-        raise ValueError('invalid lighting or yaw')
+    if lighting not in LIGHTING or not -180<=yaw<=180 or not -89<=pitch<=89:
+        raise ValueError('invalid lighting, yaw or pitch')
+    if camera not in CAMERAS:
+        raise ValueError('unknown camera preset: '+str(camera))
     if not -3<=exposure<=3 or not 0<=sss_weight<=1:
         raise ValueError('exposure must be -3..3 EV and SSS weight 0..1')
+    if quality not in QUALITY or any(a not in ABLATIONS for a in ablate):
+        raise ValueError('quality must be baseline/full; ablate entries must be stage ids 2a..2f')
+    if samples is not None and not 1<=samples<=8192:raise ValueError('samples must be 1..8192')
+    if resolution is not None and not (256<=resolution<=4096 and resolution%64==0):raise ValueError('resolution must be a multiple of 64 in 256..4096')
+    hdri_record=None
+    if lighting=='hdri':
+        hdri=Path(hdri or DEFAULT_HDRI).resolve()
+        if not hdri.is_file():raise FileNotFoundError(f'HDRI not found: {hdri}')
+        if not 0<hdri_strength<=16:raise ValueError('hdri_strength must be in (0, 16]')
+        hdri_record=dict(path=str(hdri),sha256=hashlib.sha256(hdri.read_bytes()).hexdigest(),strength=hdri_strength,
+                         rotation_deg=hdri_rotation,license='CC0 (Poly Haven, via ref/pixal3d/upstream/assets/hdri/license.txt)')
     candidate, out = Path(candidate).resolve(), Path(out).resolve()
     blender = Path(blender).resolve()
     if not blender.is_file():
@@ -39,6 +68,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
         raise RuntimeError('offline rendering requires 4 GiB free disk headroom')
     prepare(candidate, out, accessories=accessories, detail_preset=detail_preset,head_fit=head_fit,
             parsing_model=parsing_model,include_hair=include_hair,fit_eyes=fit_eyes)
+    if quality=='full' and '2c' not in ablate:
+        from .skin_templates import build as build_templates
+        build_templates(candidate,out,res=2048 if preset=='hero' else 1024)
     if appearance:
         appearance=Path(appearance).resolve()
         from .observations import sha256
@@ -47,7 +79,10 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
             raise ValueError('appearance belongs to a different reconstruction')
         for name in ('expression_appearance.npz','expression_appearance.json'):
             shutil.copyfile(appearance/name,out/name)
-    request = dict(out=str(out), device=device, preset=preset, gpu_index=gpu_index,lighting=lighting,yaw=yaw,exposure=exposure,sss_weight=sss_weight)
+    res_px,spp=PRESETS[preset]
+    request = dict(out=str(out), device=device, preset=preset, gpu_index=gpu_index,lighting=lighting,yaw=yaw,exposure=exposure,sss_weight=sss_weight,
+                   camera=camera,pitch=pitch,distance_scale=distance_scale,focal_scale=focal_scale,hdri=hdri_record,
+                   samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy))
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())
@@ -113,7 +148,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     result = json.loads((out/'render_result.json').read_text())
     result['float_map_storage']=validation['storage']
     result['asset_reload_validated']=validation['passed']
-    result.update(elapsed_seconds=time.monotonic()-started, peak_device_used_mib=peak,
+    result.update(elapsed_seconds=time.monotonic()-started, peak_device_used_mib=peak, vram_peak_mib=peak,
+                  render_seconds=result.get('seconds'), hdri=hdri_record, hdri_sha256=hdri_record['sha256'] if hdri_record else None,
+                  quality=quality, ablate=list(ablate),
                   target_12gib_met=peak <= 12288 if backend!='cpu' else None,
                   memory_measurement=('whole-device NVIDIA usage, sampled every 500 ms' if backend=='cuda' else
                     'whole-device AMD sysfs usage, sampled every 50 ms' if backend=='rocm' else 'CPU'),
@@ -129,7 +166,14 @@ def main():
     parser.add_argument('--head-fit');parser.add_argument('--parsing-model')
     parser.add_argument('--no-hair',dest='include_hair',action='store_false')
     parser.add_argument('--fit-eyes',action='store_true')
-    parser.add_argument('--preset', choices=('draft','final'), default='draft')
+    parser.add_argument('--preset', choices=tuple(PRESETS), default='draft')
+    parser.add_argument('--samples',type=int);parser.add_argument('--resolution',type=int)
+    parser.add_argument('--camera',default='portrait',help='render_cameras preset name')
+    parser.add_argument('--pitch',type=float,default=0.);parser.add_argument('--distance-scale',type=float);parser.add_argument('--focal-scale',type=float)
+    parser.add_argument('--hdri',type=Path,help='environment EXR for --lighting hdri (default: repo interior.exr)')
+    parser.add_argument('--hdri-strength',type=float,default=1.);parser.add_argument('--hdri-rotation',type=float,default=0.)
+    parser.add_argument('--quality',choices=QUALITY,default='baseline');parser.add_argument('--ablate',nargs='*',default=())
+    parser.add_argument('--no-noisy',dest='noisy',action='store_false',help='skip the un-denoised beauty output')
     parser.add_argument('--accessories', choices=('keep','omit'), default='keep')
     parser.add_argument('--detail-preset', choices=('source','mature'), default='mature')
     parser.add_argument('--blender', type=Path, default=DEFAULT_BLENDER)
@@ -137,7 +181,7 @@ def main():
     parser.add_argument('--motion',type=Path,help='native GNM motion directory')
     parser.add_argument('--frame',type=int,default=1)
     parser.add_argument('--appearance',type=Path,help='gated expression appearance directory')
-    parser.add_argument('--lighting',choices=('studio','left','right','rim'),default='studio')
+    parser.add_argument('--lighting',choices=LIGHTING,default='studio')
     parser.add_argument('--yaw',type=float,default=0)
     parser.add_argument('--exposure',type=float,default=-1.5,help='display exposure in EV')
     parser.add_argument('--sss-weight',type=float,default=.08,help='authored subsurface weight')
