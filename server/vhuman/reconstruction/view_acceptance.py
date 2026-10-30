@@ -119,6 +119,22 @@ def evaluate(front, views, *, arcface=None, parser=None, yaw_estimates=None, thr
     return report
 
 
+def turn_direction(image, threads=4):
+    """Signed horizontal nose offset from the eye midpoint, in inter-pupillary distances (MediaPipe anchors).
+
+    Positive offset = nose toward image right = negative yaw in ANGLES. Returns dict(offset, yaw_sign) or
+    None when landmarks fail (profiles). |offset| ~0.45 at 40 degrees on generated portraits."""
+    from .observations import observe
+    try:
+        a = observe(image, threads=threads)['views'][0]['anchors']
+    except Exception:
+        return None
+    n, el, er = (np.array(a[k]['xy'], float) for k in ('nose_tip', 'eye_left', 'eye_right'))
+    ipd = max(float(np.linalg.norm(el - er)), 1e-6)
+    offset = float((n[0] - (el[0] + er[0]) / 2) / ipd)
+    return dict(offset=offset, yaw_sign=0 if abs(offset) < .1 else (-1 if offset > 0 else 1))
+
+
 def yaw_estimates_from_review(review):
     """generated_multiview_review.v1 -> {view_id: estimated_yaw_deg}."""
     return {r['view_id']: r['estimated_yaw_deg'] for r in review.get('views', []) if r.get('estimated_yaw_deg') is not None}
