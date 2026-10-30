@@ -179,6 +179,22 @@ def runtime_eye_parts(part, side, joint, eye_params, profile, place_eye, lid_pol
                 cap_alpha_max=float(alpha.max()), cap_alpha_min=float(alpha.min()))
 
 
+def enamel_tip(positions, triangles, *, upper):
+    """Connected-component (per crown) normalised height: 1 at the incisal edge, 0 at the cervical margin."""
+    parent=np.arange(len(positions))
+    def root(i):
+        while parent[i]!=i:
+            parent[i]=parent[parent[i]];i=parent[i]
+        return i
+    for a,b,c in triangles:
+        for x in (b,c):parent[root(int(x))]=root(int(a))
+    labels=np.array([root(i) for i in range(len(positions))]);factor=np.zeros(len(positions),np.float32)
+    for component in np.unique(labels):
+        ids=np.flatnonzero(labels==component);y=positions[ids,1];f=(y-y.min())/max(float(np.ptp(y)),1e-6)
+        factor[ids]=1-f if upper else f
+    return factor
+
+
 def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_fit=None,parsing_model=None,
             include_hair=True,fit_eyes=False,eyes=None):
     """eyes: optional eye_personalize output directory (eyes.json [+ iris_plate.npz]); its eye_param_overrides are
@@ -469,6 +485,12 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
     arrays['hair_root_weights']=np.asarray(hair_weights,np.float32).reshape(-1,3)
     arrays['rest_joints']=joints
     for name,path in curves.items():arrays[name]=path.astype(np.float32)
+    # Per-vertex shading attributes for the quality mouth materials (authored priors, not measurements):
+    # enamel_tip = normalised crown height toward the incisal edge per connected tooth; tongue_axis = tip(0)..root(1).
+    for name in [p['name'] for p in parts if p['material']=='teeth']:
+        arrays[name+'_enamel_tip']=enamel_tip(arrays[name+'_positions'],arrays[name+'_triangles'],upper=name.startswith('upper'))
+    for name in [p['name'] for p in parts if p['material']=='tongue']:
+        v=arrays[name+'_positions'];z=v[:,2];arrays[name+'_tongue_axis']=((z.max()-z)/max(float(np.ptp(z)),1e-6)).astype(np.float32)
     np.savez_compressed(out/'scene_assets.npz',**arrays)
     detail=build(candidate,out,preset=detail_preset)
     (out/'eye_params.json').write_text(json.dumps(eye_params,indent=1))

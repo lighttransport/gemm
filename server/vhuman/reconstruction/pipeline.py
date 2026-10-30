@@ -90,7 +90,9 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
         res=512, iterations=400, build_rig=False, rig_iters=80, depth_installation=None,
         gaussian_count=0, run_id=None, roughness=.55, f0=.028, detail_um=0., spatial_materials=False, auto_exclusions=False,
         occlusion_mode='manual', texture_res=None, input_provenance=None, fit_seed=None,
-        fixed_pose_views=(), protect_front=False, front_gate=None, threads=16):
+        fixed_pose_views=(), protect_front=False, front_gate=None, threads=16, texture_images=None):
+    """texture_images: optional {requested_yaw_deg(str): image path} of delit copies used ONLY for texture baking;
+    landmarks, cameras and geometry keep the original photographs (stage 2a of the quality study)."""
     folder = Path(folder)
     if occlusion_mode not in ('auto','manual'):
         raise ValueError('occlusion mode must be auto or manual')
@@ -169,6 +171,15 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
                 Image.open(v['silhouette_mask_path']).convert('L').save(staging/mask)
                 v['silhouette_mask'] = mask
                 v['silhouette_mask_sha256'] = observations.sha256(staging/mask)
+        texture_sources=[]
+        if texture_images:
+            for i,v in enumerate(doc['views']):
+                key=str(int(round(v.get('requested_yaw_deg',0))))
+                path=texture_images.get(key)
+                if path:
+                    v['texture_image_path']=str(Path(path).resolve());v['texture_source_sha256']=observations.sha256(path)
+                    name=f'texture_{i}.png';Image.open(path).convert('RGBA').save(staging/name);v['texture_image']=name
+                    texture_sources.append(dict(view=i,requested_yaw_deg=key,source=v['texture_image_path'],sha256=v['texture_source_sha256']))
         shutil.copyfile(subject.portrait,staging/'portrait.png')
         serial = {k:v for k,v in doc.items()}
         serial['views'] = [{k:v for k,v in view.items() if not k.endswith('_path')} for view in doc['views']]
@@ -239,8 +250,11 @@ def run(folder, *, observation_file=None, profile='full', face_model='gnm_v3',
                 expression_dim=full.expression_dim,unsupported_identity_modes='eye and tooth parameters remain neutral priors')
         np.savez_compressed(staging/'geometry.npz',neutral=neutral,captured=captured,
                             triangles=src.triangles,triangle_uvs=src.triangle_uvs,scale=scale,rotation=rotation,**anatomy)
-        material = materials.bake_portrait(captured,src.triangles,src.triangle_uvs,doc['views'],cams,staging,res=texture_res,roughness=roughness,f0=f0,spatial_materials=spatial_materials,
+        bake_views=[dict(v,image_path=v.get('texture_image_path',v['image_path'])) for v in doc['views']]
+        material = materials.bake_portrait(captured,src.triangles,src.triangle_uvs,bake_views,cams,staging,res=texture_res,roughness=roughness,f0=f0,spatial_materials=spatial_materials,
                                           protect_front=protect_front)
+        if texture_sources:
+            material['texture_sources']=dict(status='delit copies used for texture baking only; geometry/landmarks from originals',views=texture_sources)
         if detail_um:
             from .detail import atlas
             normal,detail=atlas(neutral,src.triangles,src.triangle_uvs,res,detail_um)
@@ -301,12 +315,14 @@ def main():
     ap.add_argument('--spatial-materials',action='store_true',help='regional reflectance fitting only with calibrated multi-light observations')
     ap.add_argument('--auto-exclusions',action='store_true',help='optional photo/model-derived occlusion heuristic for texture baking')
     ap.add_argument('--occlusion-mode',choices=['auto','manual'],default='auto')
+    ap.add_argument('--texture-images',type=Path,help='json {requested_yaw_deg: delit image} used only for texture baking')
     a = ap.parse_args()
     if a.portrait:
         direct_seed(Path(a.portrait),Path(a.folder),a.face_model,threads=a.threads)
     options = dict(observation_file=a.observations,profile=a.profile,face_model=a.face_model,
                  res=a.res,texture_res=a.texture_res,iterations=a.iterations,threads=a.threads,build_rig=a.rig,depth_installation=a.depth_installation,
-                 gaussian_count=a.gaussians,run_id=a.run_id,roughness=a.roughness,f0=a.f0,detail_um=a.detail_um,spatial_materials=a.spatial_materials,auto_exclusions=a.auto_exclusions,occlusion_mode=a.occlusion_mode)
+                 gaussian_count=a.gaussians,run_id=a.run_id,roughness=a.roughness,f0=a.f0,detail_um=a.detail_um,spatial_materials=a.spatial_materials,auto_exclusions=a.auto_exclusions,occlusion_mode=a.occlusion_mode,
+                 texture_images=json.loads(a.texture_images.read_text()) if a.texture_images else None)
     if a.generated_input:
         from .multiview import run_generated
         result = run_generated(Path(a.folder), a.generated_input, **options)

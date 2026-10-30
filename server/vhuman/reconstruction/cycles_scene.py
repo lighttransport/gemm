@@ -156,11 +156,87 @@ def full_skin_graph(skin,node,bound,out,request):
     nm=nodes.new('ShaderNodeNormalMap');nm.space='TANGENT';nm.uv_map='UVMap'
     links.new(micro_img.outputs['Color'],nm.inputs['Color']);links.new(math('MULTIPLY',micro,.6),nm.inputs['Strength'])
     links.new(nm.outputs['Normal'],node.inputs['Normal'])
+    # dynamic facial colour (hemoglobin prior): compressed regions flush, stretched regions blanch.
+    # hb = sum_r gain_r * mask_r * wrinkle_r  (wrinkle_r = regional compression in -1..1 driven by motion)
+    detail=np.load(out/'skin_detail.npz',allow_pickle=False);masks=detail['region_masks']
+    gains={'left_cheek_region':.6,'right_cheek_region':.6,'nose_region':.4,'forehead_region':.3,'chin_region':.3,
+           'left_infraorbital_region':.3,'right_infraorbital_region':.3,'middle_brow_region':.3}
+    scene=bpy.context.scene;hb=None
+    for i,name in enumerate(('forehead_region','middle_brow_region','left_orbital_region','right_orbital_region',
+        'left_infraorbital_region','right_infraorbital_region','nose_region','left_cheek_region','right_cheek_region',
+        'upper_lip_region','lower_lip_region','chin_region')):
+        gain=gains.get(name,.15)
+        tex_mask=float_image(nodes,f'hemoglobin_mask_{i}',(masks[i]*gain).astype(np.float32))
+        sep=nodes.new('ShaderNodeSeparateColor');links.new(tex_mask.outputs['Color'],sep.inputs['Color'])
+        drive=nodes.new('ShaderNodeMath');drive.operation='MULTIPLY';links.new(sep.outputs['Red'],drive.inputs[0])
+        driver=drive.inputs[1].driver_add('default_value').driver;driver.expression='activation'
+        variable=driver.variables.new();variable.name='activation';variable.targets[0].id_type='SCENE'
+        variable.targets[0].id=scene;variable.targets[0].data_path=f'["wrinkle_{i}"]'
+        hb=drive.outputs[0] if hb is None else math('ADD',hb,drive.outputs[0])
+    # colour factor = 1 + k*hb*(-.10,.14,.12) with k=.5 (authored); applied multiplicatively after the appearance deltas
+    scale=nodes.new('ShaderNodeVectorMath');scale.operation='SCALE';scale.inputs[0].default_value=(-.10,.14,.12)
+    links.new(math('MULTIPLY',hb,.5),scale.inputs['Scale'])
+    one=nodes.new('ShaderNodeVectorMath');one.operation='ADD';one.inputs[1].default_value=(1,1,1);links.new(scale.outputs[0],one.inputs[0])
+    current=node.inputs['Base Color'].links[0].from_socket if node.inputs['Base Color'].links else None
+    tint=nodes.new('ShaderNodeVectorMath');tint.operation='MULTIPLY'
+    if current is not None:links.new(current,tint.inputs[0])
+    links.new(one.outputs[0],tint.inputs[1])
+    clampv=nodes.new('ShaderNodeVectorMath');clampv.operation='MINIMUM';clampv.inputs[1].default_value=(1,1,1)
+    links.new(tint.outputs[0],clampv.inputs[0]);links.new(clampv.outputs[0],node.inputs['Base Color'])
     # true displacement with a wider clamp for the wrinkle library
     bound.inputs['Min'].default_value=-.0015;bound.inputs['Max'].default_value=.0015
     skin.displacement_method='DISPLACEMENT'
     skin['quality_shader']=json.dumps(dict(templates=str(out/'skin_templates.json'),subsurface='random_walk_skin',
         coat='second specular lobe',micro_normal='tiled procedural pores',displacement='true, adaptive'))
+
+
+def full_mouth_materials(materials,out,request):
+    """Quality-candidate teeth (two-layer enamel/dentin approximation on a VITA shade), gums (wet coat, cervical
+    darkening) and tongue (papillae bump, tip-to-root colour, wet coat, red subsurface). Colours are priors
+    unless out/teeth.json carries a measured shade."""
+    shade=dict(shade='A2',body_rgb=(.60,.486,.329),cervical_rgb=(.559,.419,.252),incisal_rgb=(.593,.526,.411),source='prior only')
+    teeth_file=out/'teeth.json'
+    if teeth_file.is_file():shade=json.loads(teeth_file.read_text()).get('colors',shade)
+    def fresh(name):
+        mat=materials[name];nodes=mat.node_tree.nodes;links=mat.node_tree.links
+        node=nodes.get('Principled BSDF');return mat,nodes,links,node
+    # teeth
+    mat,nodes,links,node=fresh('teeth')
+    tip=nodes.new('ShaderNodeAttribute');tip.attribute_name='enamel_tip'
+    ramp=nodes.new('ShaderNodeValToRGB');ramp.color_ramp.elements[0].position=.15;ramp.color_ramp.elements[0].color=(*shade['cervical_rgb'],1)
+    ramp.color_ramp.elements[1].position=.85;ramp.color_ramp.elements[1].color=(*shade['incisal_rgb'],1)
+    mid=ramp.color_ramp.elements.new(.5);mid.color=(*shade['body_rgb'],1)
+    links.new(tip.outputs['Fac'],ramp.inputs['Fac']);links.new(ramp.outputs['Color'],node.inputs['Base Color'])
+    node.inputs['Roughness'].default_value=.18;node.inputs['IOR'].default_value=1.58
+    node.inputs['Coat Weight'].default_value=1.;node.inputs['Coat Roughness'].default_value=.08;node.inputs['Coat IOR'].default_value=1.5
+    node.subsurface_method='RANDOM_WALK';node.inputs['Subsurface Weight'].default_value=.35;node.inputs['Subsurface Scale'].default_value=1.
+    node.inputs['Subsurface Radius'].default_value=(.0010,.0007,.0005)
+    # translucent incisal edge: transmission rises with enamel_tip^2 (dentin core blocks it elsewhere)
+    sq=nodes.new('ShaderNodeMath');sq.operation='POWER';sq.inputs[1].default_value=2.;links.new(tip.outputs['Fac'],sq.inputs[0])
+    tr=nodes.new('ShaderNodeMath');tr.operation='MULTIPLY';tr.inputs[1].default_value=.18;links.new(sq.outputs[0],tr.inputs[0])
+    links.new(tr.outputs[0],node.inputs['Transmission Weight'])
+    mat['quality_shader']=json.dumps(dict(shade=shade['shade'],source=shade.get('source'),model='enamel/dentin two-layer approximation; authored'))
+    # gums
+    mat,nodes,links,node=fresh('gums')
+    node.inputs['Base Color'].default_value=(.55,.22,.20,1);node.inputs['Roughness'].default_value=.35
+    node.inputs['Coat Weight'].default_value=.5;node.inputs['Coat Roughness'].default_value=.08
+    node.subsurface_method='RANDOM_WALK';node.inputs['Subsurface Weight'].default_value=.3;node.inputs['Subsurface Radius'].default_value=(.0012,.0004,.0003)
+    ao=nodes.new('ShaderNodeAmbientOcclusion');ao.inputs['Distance'].default_value=.004;ao.samples=8
+    dark=nodes.new('ShaderNodeMixRGB');dark.blend_type='MULTIPLY';dark.inputs['Fac'].default_value=.6
+    dark.inputs['Color1'].default_value=(.55,.22,.20,1);links.new(ao.outputs['Color'],dark.inputs['Color2'])
+    links.new(dark.outputs['Color'],node.inputs['Base Color'])   # cervical line: occlusion against the crowns
+    # tongue
+    mat,nodes,links,node=fresh('tongue')
+    axis=nodes.new('ShaderNodeAttribute');axis.attribute_name='tongue_axis'
+    ramp=nodes.new('ShaderNodeValToRGB');ramp.color_ramp.elements[0].position=.0;ramp.color_ramp.elements[0].color=(.52,.12,.10,1)
+    ramp.color_ramp.elements[1].position=1.;ramp.color_ramp.elements[1].color=(.50,.30,.26,1)   # pale coating toward the root
+    links.new(axis.outputs['Fac'],ramp.inputs['Fac']);links.new(ramp.outputs['Color'],node.inputs['Base Color'])
+    node.inputs['Roughness'].default_value=.45;node.inputs['Coat Weight'].default_value=.4;node.inputs['Coat Roughness'].default_value=.12
+    node.subsurface_method='RANDOM_WALK';node.inputs['Subsurface Weight'].default_value=.5;node.inputs['Subsurface Radius'].default_value=(.0012,.0003,.0002)
+    noise=nodes.new('ShaderNodeTexNoise');noise.inputs['Scale'].default_value=600.;noise.inputs['Detail'].default_value=3.
+    bump=nodes.new('ShaderNodeBump');bump.inputs['Strength'].default_value=.35;bump.inputs['Distance'].default_value=.0002
+    links.new(noise.outputs['Fac'],bump.inputs['Height']);links.new(bump.outputs['Normal'],node.inputs['Normal'])   # filiform papillae
+    mat['quality_shader']='authored papillae/coating priors'
 
 
 def image_node(nodes,path, *, linear=False):
@@ -339,6 +415,7 @@ def run(request):
         if name in ('sclera','iris'):
             texture=image_node(materials[name].node_tree.nodes,out/('sclera.png' if name=='sclera' else 'iris.png'))
             materials[name].node_tree.links.new(texture.outputs['Color'],principled.inputs['Base Color'])
+    if full and '2e' not in ablate:full_mouth_materials(materials,out,request)
     materials['cornea'],_=material('cornea',(1,1,1),.025,1,config['optical_eyes']['ior'])
     materials['glass'],_=material('glass',(1,1,1),.025,1,1.5)
     materials['tear'],_=material('tear_film',(1,1,1),.02,1,1.336)
@@ -367,6 +444,9 @@ def run(request):
         mesh.from_pydata(data[name+'_positions'].tolist(),[],data[name+'_triangles'].tolist());mesh.update()
         uv=mesh.uv_layers.new(name='UVMap');values=data[name+'_uvs'].reshape(-1,2).copy();values[:,1]=1-values[:,1]
         uv.data.foreach_set('uv',values.ravel())
+        for key in ('enamel_tip','tongue_axis'):
+            if name+'_'+key in data:
+                attribute=mesh.attributes.new(key,'FLOAT','POINT');attribute.data.foreach_set('value',data[name+'_'+key].astype(np.float32))
         if name=='skin' and 'skin_hair_crown' in data:
             field=mesh.attributes.new('hair_crown_coverage','FLOAT','POINT')
             field.data.foreach_set('value',data['skin_hair_crown'])

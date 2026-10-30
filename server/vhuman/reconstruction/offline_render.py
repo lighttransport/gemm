@@ -72,6 +72,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     if quality=='full' and '2c' not in ablate:
         from .skin_templates import build as build_templates
         build_templates(candidate,out,res=2048 if preset=='hero' else 1024)
+    if quality=='full' and '2f' not in ablate:
+        from .wrinkle_library import augment
+        augment(out/'skin_detail.npz')   # appends strain-driven wrinkle channels + drivers (wrinkle_library.json)
     if appearance:
         appearance=Path(appearance).resolve()
         from .observations import sha256
