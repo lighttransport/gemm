@@ -12,6 +12,7 @@ condition grid (verified on the right view: 512 zooms, 1024 is pixel-aligned).
 from pathlib import Path
 from server.model_paths import MODELS_ROOT
 import hashlib
+import re
 import time
 
 import numpy as np
@@ -60,8 +61,33 @@ def reference_areas(areas):
     plus._area_queue = list(areas)
 
 
-def make_editor(backend=None, model_root=ROOT, offload_blocks=0):
-    """Select explicitly, or use native only with a ROCm Torch runtime and its assets."""
+def parse_lora_spec(spec):
+    """'path[:weight[:adapter]]' or dict(path, weight=1.0, adapter=None) -> dict."""
+    if isinstance(spec,dict):
+        path=Path(spec['path']);weight=float(spec.get('weight',1.));adapter=spec.get('adapter')
+    else:
+        parts=str(spec).rsplit(':',2)
+        # a bare path may contain ':' only in exotic cases; weights/adapters are short tokens
+        path=Path(parts[0]);weight=float(parts[1]) if len(parts)>1 and parts[1] else 1.
+        adapter=parts[2] if len(parts)>2 and parts[2] else None
+    if not path.is_file():raise FileNotFoundError(f'LoRA weights not found: {path}')
+    return dict(path=path,weight=weight,adapter=adapter or re.sub(r'[^A-Za-z0-9_]+','_',path.stem))
+
+
+def host_peak_rss():
+    """Peak resident set size of this process in bytes (Linux VmHWM)."""
+    try:
+        for line in open('/proc/self/status'):
+            if line.startswith('VmHWM:'):return int(line.split()[1])*1024
+    except OSError:pass
+    return None
+
+
+def make_editor(backend=None, model_root=ROOT, offload_blocks=0, *, loras=None, encoder_dtype='bfloat16'):
+    """Select explicitly, or use native only with a ROCm Torch runtime and its assets.
+
+    loras: optional LoRA specs (see parse_lora_spec); only the GGUF editor can apply them.
+    encoder_dtype: CPU dtype of the Qwen2.5-VL prompt encoder for the GGUF editor ('bfloat16' halves host RSS)."""
     import os
     import torch
     backend=backend or os.environ.get('QWEN_EDIT_BACKEND','auto')
@@ -72,12 +98,16 @@ def make_editor(backend=None, model_root=ROOT, offload_blocks=0):
         raise ValueError('native Edit-2511 requires ROCm Torch, the HIP library and the mixed INT4 weights')
     if backend=='native' or (backend=='auto' and native):
         if offload_blocks:raise ValueError('block offloading is only supported by the GGUF editor')
+        if loras:raise ValueError('LoRA adapters are only supported by the GGUF editor')
         return NativeEditor(model_root)
-    return Editor(model_root,offload_blocks=offload_blocks)
+    return Editor(model_root,offload_blocks=offload_blocks,loras=loras,encoder_dtype=encoder_dtype)
 
 
 class NativeEditor:
     generator=NATIVE_GENERATOR
+
+    def load_loras(self, specs):
+        raise NotImplementedError('the native INT4 editor has no LoRA path; use backend=gguf')
 
     def __init__(self, model_root=ROOT):
         import sys,torch
@@ -126,7 +156,7 @@ class NativeEditor:
         out=self.pipe(image=images,prompt_embeds=move(pos),prompt_embeds_mask=move(pos_mask),
             negative_prompt_embeds=move(neg),negative_prompt_embeds_mask=move(neg_mask),
             true_cfg_scale=cfg,height=size,width=size,num_inference_steps=steps,
-            generator=torch.Generator(device='cuda').manual_seed(seed)).images[0]
+            generator=torch.Generator(device=self.device).manual_seed(seed)).images[0]
         total=time.time()-started;dit=self.pipe.native.seconds-dit0
         print(f'[qwen_edit] total {total:.1f}s native DiT {dit:.1f}s prompt_encode {encode:.1f}s other {total-dit-encode:.1f}s',flush=True)
         return np.asarray(out.convert('RGB')),total
@@ -135,25 +165,28 @@ class NativeEditor:
 class Editor:
     generator=GENERATOR
 
-    def __init__(self, model_root=ROOT, *, offload_blocks=0):
+    def __init__(self, model_root=ROOT, *, offload_blocks=0, loras=None, encoder_dtype='bfloat16'):
         import torch
         from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel, GGUFQuantizationConfig
         from .observations import sha256
+        if encoder_dtype not in ('bfloat16','float32'):raise ValueError('encoder_dtype must be bfloat16 or float32')
         self.torch=torch;self.prompt_cache={};model_root=Path(model_root);weights=model_root/GGUF.name
         if offload_blocks<0:raise ValueError('offload_blocks must be nonnegative')
-        self.offload_blocks=offload_blocks
+        self.offload_blocks=offload_blocks;self.device=torch.device('cuda')
         self.metadata=dict(backend='gguf',model_root=str(model_root.resolve()),weights=weights.name,
-                           weights_sha256=sha256(weights),encoder_dtype='float32',offload_blocks=offload_blocks,
-                           prompt_preprocessing='pipeline_condition_images')
+                           weights_sha256=sha256(weights),encoder_dtype=encoder_dtype,offload_blocks=offload_blocks,
+                           prompt_preprocessing='pipeline_condition_images',loras=[])
         transformer=QwenImageTransformer2DModel.from_single_file(str(weights),
             quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
             config=str(model_root/'base'),subfolder='transformer',torch_dtype=torch.bfloat16,local_files_only=True)
         self.pipe=QwenImageEditPlusPipeline.from_pretrained(str(model_root/'base'),transformer=transformer,
                                                         torch_dtype=torch.bfloat16,local_files_only=True)
-        self.pipe.vae.to('cuda');self.pipe.vae.enable_tiling()
-        self.pipe.text_encoder.to(device='cpu',dtype=torch.float32)
+        self.pipe.vae.to(self.device);self.pipe.vae.enable_tiling()
+        # Zen 2 has no native BF16 but PyTorch emulates it on the CPU; the encoder runs once per cached prompt.
+        self.pipe.text_encoder.to(device='cpu',dtype=getattr(torch,encoder_dtype))
+        if loras:self.load_loras(loras)   # PEFT injection must precede group-offload hooks
         if offload_blocks:
-            transformer.enable_group_offload(onload_device=torch.device('cuda'),offload_device=torch.device('cpu'),
+            transformer.enable_group_offload(onload_device=self.device,offload_device=torch.device('cpu'),
                                              offload_type='block_level',num_blocks_per_group=offload_blocks)
         else:
             # Decode after releasing the resident DiT; reload it for the next view.
@@ -162,6 +195,28 @@ class Editor:
                 self.pipe.transformer.to('cpu');torch.cuda.empty_cache()
                 return decode(*args,**kwargs)
             self.pipe.vae.decode=decode_without_transformer
+
+    def load_loras(self, specs):
+        """Attach LoRA adapters to the GGUF transformer (diffusers dequantizes GGUF weights under PEFT layers).
+
+        Records path, sha256, weight and the number of injected LoRA modules so receipts show whether
+        an adapter actually bound to the model (a 2509-trained adapter on 2511 is only accepted if it binds)."""
+        from .observations import sha256
+        if self.offload_blocks and any(getattr(m,'_diffusers_hook',None) for m in self.pipe.transformer.modules()):
+            raise RuntimeError('load LoRAs before enabling group offload')
+        names,weights=[],[]
+        for spec in specs:
+            spec=parse_lora_spec(spec)
+            before=sum(1 for n,_ in self.pipe.transformer.named_modules() if n.endswith('lora_A'))
+            self.pipe.load_lora_weights(str(spec['path']),adapter_name=spec['adapter'])
+            after=sum(1 for n,_ in self.pipe.transformer.named_modules() if n.endswith('lora_A'))
+            if after<=before:raise RuntimeError(f"LoRA {spec['path'].name} injected no modules into the transformer")
+            names.append(spec['adapter']);weights.append(spec['weight'])
+            self.metadata['loras'].append(dict(path=str(spec['path'].resolve()),sha256=sha256(spec['path']),
+                                               adapter=spec['adapter'],weight=spec['weight'],lora_modules=after-before))
+            print(f"[qwen_edit] LoRA {spec['path'].name}: {after-before} modules, weight {spec['weight']}",flush=True)
+        self.pipe.set_adapters(names,weights)
+        return self.metadata['loras']
 
     def _encode_prompt(self, prompt, images):
         # Bounded, per-editor CPU cache: the sweep shares negative prompts and a smoke-test recipe.
@@ -186,17 +241,55 @@ class Editor:
         pos,neg=pos.to(torch.bfloat16),neg.to(torch.bfloat16)
         encode=time.time()-started
         print(f'[qwen_edit] prompt encode {encode:.1f}s; starting {steps} denoising steps',flush=True)
-        if not self.offload_blocks:self.pipe.transformer.to('cuda')
-        move=lambda t:None if t is None else t.to('cuda')
+        if not self.offload_blocks:self.pipe.transformer.to(self.device)
+        move=lambda t:None if t is None else t.to(self.device)
         out=self.pipe(image=images,prompt_embeds=move(pos),prompt_embeds_mask=move(pos_mask),
             negative_prompt_embeds=move(neg),negative_prompt_embeds_mask=move(neg_mask),
             true_cfg_scale=cfg,height=size,width=size,num_inference_steps=steps,
-            generator=torch.Generator(device='cuda').manual_seed(seed)).images[0]
+            generator=torch.Generator(device=self.device).manual_seed(seed)).images[0]
         torch.cuda.synchronize()
         total=time.time()-started
         self.last_metrics=dict(seconds=total,prompt_encode_seconds=encode,
                                prompt_image_sizes=[list(i.size) for i in conditions],
                                peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-                               peak_reserved_bytes=torch.cuda.max_memory_reserved())
+                               peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                               host_peak_rss_bytes=host_peak_rss())
         print(f'[qwen_edit] {self.last_metrics}',flush=True)
         return np.asarray(out.convert('RGB')),total
+
+
+def main(argv=None):
+    """Smoke test: one edit with receipts for VRAM and host RSS (budget gates for the 8 GB / 32 GB host)."""
+    import argparse,json,os
+    ap=argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('images',nargs='+',help='condition images; the target view is LAST')
+    ap.add_argument('--out',required=True,help='output directory (created)')
+    ap.add_argument('--prompt',required=True)
+    ap.add_argument('--negative',default='blurry, hair, hat, glasses, text, extra ears, shadows, highlights')
+    ap.add_argument('--backend',choices=('auto','native','gguf'),default=None)
+    ap.add_argument('--offload-blocks',type=int,default=0)
+    ap.add_argument('--encoder-dtype',choices=('bfloat16','float32'),default='bfloat16')
+    ap.add_argument('--lora',action='append',default=[],help='path[:weight[:adapter]] (repeatable, GGUF only)')
+    ap.add_argument('--size',type=int,default=1024);ap.add_argument('--steps',type=int,default=12)
+    ap.add_argument('--seed',type=int,default=317);ap.add_argument('--cfg',type=float,default=4.)
+    ap.add_argument('--max-vram-mib',type=int,default=8192);ap.add_argument('--max-rss-mib',type=int,default=32768)
+    args=ap.parse_args(argv)
+    out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
+    editor=make_editor(args.backend,offload_blocks=args.offload_blocks,loras=args.lora or None,encoder_dtype=args.encoder_dtype)
+    images=[Image.open(p).convert('RGB') for p in args.images]
+    result,seconds=editor(images,args.prompt,steps=args.steps,seed=args.seed,cfg=args.cfg,size=args.size,negative=args.negative)
+    Image.fromarray(result).save(out/'edit.png')
+    metrics=dict(getattr(editor,'last_metrics',{}));metrics.update(seconds=seconds,metadata=editor.metadata,
+        prompt=args.prompt,negative=args.negative,steps=args.steps,seed=args.seed,cfg=args.cfg,size=args.size,
+        inputs=[str(Path(p).resolve()) for p in args.images],license=LICENSE,generator=editor.generator)
+    vram=metrics.get('peak_reserved_bytes');rss=metrics.get('host_peak_rss_bytes') or host_peak_rss()
+    metrics['host_peak_rss_bytes']=rss
+    metrics['budget']=dict(max_vram_mib=args.max_vram_mib,max_rss_mib=args.max_rss_mib,
+        vram_ok=None if vram is None else vram<=args.max_vram_mib<<20,rss_ok=None if rss is None else rss<=args.max_rss_mib<<20)
+    (out/'editor_metrics.json').write_text(json.dumps(metrics,indent=2,default=str)+'\n')
+    print(json.dumps(metrics['budget']),flush=True)
+    return 0 if all(v is not False for v in metrics['budget'].values()) else 1
+
+
+if __name__=='__main__':
+    raise SystemExit(main())

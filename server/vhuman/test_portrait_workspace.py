@@ -109,6 +109,34 @@ class SessionTests(unittest.TestCase):
                                       self.progress, self.cancel, python=sys.executable)
             backend.assert_not_called()
 
+    def test_forty_degree_views_keep_seeds_and_hold_out_profiles(self):
+        doc = self.approve(self.generate(seed=100))
+        req = dict(session_id=doc['id'], revision=doc['active_revision'])
+        # Existing angles keep their seeds (seed + index in ANGLES); the appended +/-40 pair follows.
+        run = portrait.views_job(self.service, dict(req, seed=100, angles=[45, -45, 90, -90, 40, -40]), self.progress,
+                                 self.cancel, mock=True)['session']['view_runs'][-1]
+        self.assertEqual([v['seed'] for v in run['views']], [100, 101, 102, 103, 104, 105])
+        self.assertEqual(run['held_out'], [])
+        # Edit-2511 route: Apache licence, +/-90 held out for evaluation only, prompts carry the LoRA grammar.
+        run = portrait.views_job(self.service, dict(req, method='edit2511', angles=[40, -40, 90, -90],
+                                 held_out=[90, -90]), self.progress, self.cancel, mock=True)['session']['view_runs'][-1]
+        self.assertEqual(run['license'], 'apache-2.0')
+        self.assertEqual(run['model'], 'Qwen-Image-Edit-2511')
+        self.assertEqual([v['held_out'] for v in run['views']], [False, False, True, True])
+        self.assertTrue(all(v['prompt'].startswith('<sks> ') for v in run['views']))
+        self.assertIn('front-left quarter view', run['views'][0]['prompt'])
+        self.assertIn('right side view', run['views'][3]['prompt'])
+        # The 40-degree sheet is a valid joint set; a mixed set is not.
+        sheet = portrait.views_job(self.service, dict(req, method='sheet', angles=[40, -40, 90, -90]), self.progress,
+                                   self.cancel, mock=True)['session']['view_runs'][-1]
+        self.assertEqual([v['yaw_deg'] for v in sheet['views']], [40, -40, 90, -90])
+        with self.assertRaises(ServiceError):
+            portrait.views_job(self.service, dict(req, method='sheet', angles=[40, -45, 90, -90]), self.progress, self.cancel, mock=True)
+        with self.assertRaises(ServiceError):
+            portrait.views_job(self.service, dict(req, angles=[40], held_out=[90]), self.progress, self.cancel, mock=True)
+        with self.assertRaises(ServiceError):
+            portrait.views_job(self.service, dict(req, method='edit2511', angles=[40], angle_lora='bogus'), self.progress, self.cancel, mock=True)
+
     def test_invalid_angles_and_duplicate_selected_angle(self):
         doc = self.approve(self.generate())
         req = dict(session_id=doc['id'], revision=doc['active_revision'])

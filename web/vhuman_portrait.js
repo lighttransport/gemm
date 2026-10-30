@@ -1,6 +1,6 @@
 // Portrait review is independent of the optional Three.js head viewer.
 const $ = id => document.getElementById(id);
-const angles = [[45, 'Left three-quarter'], [-45, 'Right three-quarter'], [90, 'Left profile'], [-90, 'Right profile']];
+const angles = [[45, 'Left three-quarter'], [-45, 'Right three-quarter'], [90, 'Left profile'], [-90, 'Right profile'], [40, 'Left 40-degree view'], [-40, 'Right 40-degree view']];
 const state = {session: null, sessions: [], job: null, starting: false, saving: false, health: null, candidates: {}, model: 'qwen-image21', steps: {'qwen-image21': 24, klein3: 16}};
 const pendingKey = 'vhuman.portrait.pending.v1', sessionKey = 'vhuman.portrait.session.v1';
 const busy = () => !!(state.job || state.starting || state.saving);

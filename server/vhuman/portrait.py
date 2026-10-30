@@ -18,7 +18,19 @@ from .service import ServiceError
 
 FORMAT = 'vhuman.portrait_session.v1'
 ANGLES = ((45, 'Left three-quarter'), (-45, 'Right three-quarter'),
-          (90, 'Left profile'), (-90, 'Right profile'))
+          (90, 'Left profile'), (-90, 'Right profile'),
+          (40, 'Left 40-degree view'), (-40, 'Right 40-degree view'))
+# Joint sheets regenerate one of these four-angle sets together (2x2 panels in this order).
+SHEET_SETS = ([45, -45, 90, -90], [40, -40, 90, -90])
+# Apache-2.0 route: Qwen-Image-Edit-2511 (GGUF) with a camera-angle LoRA. Keys are request 'angle_lora' values.
+ANGLE_LORAS = {
+    'fal-2511': ('/mnt/nvme01/models/loras/qie2511-multiple-angles.safetensors:1.0:angles2511',),
+    'dx-2509': ('/mnt/nvme01/models/loras/qie2509-multiple-angles.safetensors:1.0:angles2509',),
+    'none': (),
+}
+EDIT_MIN_FREE_MIB = 4096
+EDIT_NEGATIVE = ('blurry, illustration, plastic skin, beauty retouching, dramatic lighting, open mouth, '
+                 'glasses, jewellery, hat, text, watermark, different person')
 NEGATIVE = ('blur, illustration, plastic skin, beauty retouching, dramatic lighting, '
             'open mouth, glasses, jewellery, text, watermark')
 PORTRAIT = ('Photorealistic studio head-and-neck portrait of {subject}. Camera centred at eye level, '
@@ -31,6 +43,37 @@ PRESERVE = ('Exactly the same person as the reference portrait: preserve facial 
             'asymmetry, age, skin colour, eye colour, hairline, hairstyle and facial details. '
             'Head and upper neck only, neutral expression, closed mouth, open eyes, level camera. '
             'Same soft even lighting and light grey background. No beautification, text or labels.')
+
+
+def sheet_prompt(angles):
+    """2x2 joint sheet prompt for one SHEET_SETS entry (panel order: top-left, top-right, bottom-left, bottom-right)."""
+    quarter = 40 if 40 in angles else 45
+    return ('A precise 2 by 2 portrait reference sheet. Four separate panels, one head per panel, '
+            f'no overlap, equal framing and size. Top left: the person\'s left three-quarter view turned {quarter} degrees. '
+            f'Top right: right three-quarter view turned {quarter} degrees. Bottom left: left profile facing image left. '
+            'Bottom right: right profile facing image right. '+PRESERVE)
+
+
+def individual_prompt(angle):
+    """Qwen-Image 2.1 reference-edit prompt for one ANGLES entry."""
+    prompt = f'{dict(ANGLES)[angle]} of the person in the reference portrait. '+PRESERVE
+    if abs(angle) == 90:
+        prompt += ' Exact side profile; nose points to image '+('left.' if angle > 0 else 'right.')
+    return prompt
+
+
+def angle_prompt(angle, lora='fal-2511'):
+    """Camera-angle instruction for Edit-2511. Positive yaw matches ANGLES ('Left ...': the subject's left side
+    turns toward the camera, nose points to image left as in the Qwen 2.1 prompts)."""
+    side = 'left' if angle > 0 else 'right'
+    if lora == 'fal-2511':
+        azimuth = f'{side} side view' if abs(angle) >= 90 else f'front-{side} quarter view'
+        return f'<sks> {azimuth} eye-level shot medium shot'
+    if lora == 'dx-2509':
+        zh = '左' if angle > 0 else '右'
+        return f'将镜头向{zh}旋转{abs(angle)}度 (Rotate the camera {abs(angle)} degrees to the {side}, same eye level).'
+    label = dict(ANGLES)[angle]
+    return f'{label} of the person in the reference portrait, camera rotated {abs(angle)} degrees to the {side}.'
 
 
 def _id(value):
@@ -296,13 +339,22 @@ def views_job(service, request, progress, cancel, *, python=None, mock=False):
     seed, steps, preset = _parameters(request)
     sid = _id(request.get('session_id'))
     method = request.get('method', 'individual')
-    if method not in ('individual', 'sheet'):
-        raise ServiceError('view method must be individual or sheet')
-    angles = request.get('angles', [a for a, _ in ANGLES])
+    if method not in ('individual', 'sheet', 'edit2511'):
+        raise ServiceError('view method must be individual, sheet or edit2511')
+    angles = request.get('angles', SHEET_SETS[0])
     if not isinstance(angles, list) or not angles or any(type(a) is not int or a not in dict(ANGLES) for a in angles) or len(set(angles)) != len(angles):
-        raise ServiceError('angles must be distinct members of -90, -45, 45, 90')
-    if method == 'sheet' and angles != [a for a, _ in ANGLES]:
-        raise ServiceError('a joint sheet regenerates all four angles together')
+        raise ServiceError('angles must be distinct members of -90, -45, -40, 40, 45, 90')
+    if method == 'sheet' and angles not in SHEET_SETS:
+        raise ServiceError('a joint sheet regenerates one four-angle set together: 45/-45/90/-90 or 40/-40/90/-90')
+    held_out = request.get('held_out', [])
+    if not isinstance(held_out, list) or any(a not in angles for a in held_out):
+        raise ServiceError('held_out must list requested angles that are evaluation-only')
+    angle_lora = request.get('angle_lora', 'fal-2511')
+    if angle_lora not in ANGLE_LORAS:
+        raise ServiceError('angle_lora must be one of ' + ', '.join(ANGLE_LORAS))
+    offload_blocks = request.get('offload_blocks', 1)
+    if type(offload_blocks) is not int or offload_blocks < 0:
+        raise ServiceError('offload_blocks must be a non-negative integer')
     with service._lock('portrait-'+sid):
         doc = load(service, sid)
         revision, _ = _selected(doc, dict(request, view_ids=[]))
@@ -319,21 +371,48 @@ def views_job(service, request, progress, cancel, *, python=None, mock=False):
         records = []
         try:
             _check(cancel)
-            if not mock:
+            if not mock and method != 'edit2511':
                 ready = qwen.availability(python=python)
                 if not ready['available']:
                     raise ServiceError(ready['reason'])
             progress(.02, 'waiting for image generation device')
-            with gpu.device_session(gpu.QWEN_LOW8_MIN_FREE_MIB if preset == 'low8' else gpu.QWEN_MIN_FREE_MIB,
-                                    cancel, check_memory=not mock):
-                if not mock:
+            minimum = EDIT_MIN_FREE_MIB if method == 'edit2511' else (
+                gpu.QWEN_LOW8_MIN_FREE_MIB if preset == 'low8' else gpu.QWEN_MIN_FREE_MIB)
+            editor_metadata = {}
+            with gpu.device_session(minimum, cancel, check_memory=not mock):
+                if not mock and method != 'edit2511':
                     backend = qwen.make_backend(python, preset=preset, cancel=cancel)
                     from qimg21_i23d.backends import GenRequest
-                if method == 'sheet':
-                    prompt = ('A precise 2 by 2 portrait reference sheet. Four separate panels, one head per panel, '
-                              'no overlap, equal framing and size. Top left: the person\'s left three-quarter view. '
-                              'Top right: right three-quarter view. Bottom left: left profile facing image left. '
-                              'Bottom right: right profile facing image right. '+PRESERVE)
+                if method == 'edit2511':
+                    from .reconstruction import qwen_edit_backend
+                    editor = None
+                    if not mock:
+                        progress(.05, 'Qwen-Image-Edit-2511: loading GGUF editor' + (f' + LoRA {angle_lora}' if ANGLE_LORAS[angle_lora] else ''))
+                        editor = qwen_edit_backend.make_editor('gguf', offload_blocks=offload_blocks,
+                                                               loras=ANGLE_LORAS[angle_lora] or None)
+                        editor_metadata = editor.metadata
+                    for i, angle in enumerate(angles):
+                        _check(cancel)
+                        label = dict(ANGLES)[angle]
+                        prompt = angle_prompt(angle, angle_lora)
+                        if request.get('preserve', True):
+                            prompt += ' ' + PRESERVE
+                        progress(.1+.8*i/len(angles), 'Qwen-Image-Edit-2511: '+label.lower())
+                        view_seed = (seed+[a for a, _ in ANGLES].index(angle)) % 2**32
+                        metrics = None
+                        if mock:
+                            shutil.copyfile(reference, staging/f'{angle}.png')
+                        else:
+                            with Image.open(reference) as im:
+                                result, _ = editor([im.convert('RGB')], prompt, steps=steps, seed=view_seed, cfg=4.,
+                                                   size=1024, negative=EDIT_NEGATIVE)
+                            Image.fromarray(result).save(staging/f'{angle}.png')
+                            metrics = {k: v for k, v in editor.last_metrics.items() if k != 'prompt_image_sizes'}
+                        records.append(dict(id=uuid.uuid4().hex[:24], yaw_deg=angle, label=label,
+                                            prompt=prompt, seed=view_seed, angle_lora=angle_lora, editor_metrics=metrics))
+                    del editor
+                elif method == 'sheet':
+                    prompt = sheet_prompt(angles)
                     progress(.1, 'Qwen-Image 2.1: joint four-view sheet')
                     if mock:
                         sheet = Image.new('RGBA', (1024, 1024))
@@ -348,7 +427,8 @@ def views_job(service, request, progress, cancel, *, python=None, mock=False):
                     with Image.open(staging/'sheet.png') as sheet:
                         if sheet.size != (1024, 1024):
                             raise ServiceError('joint sheet has unexpected dimensions')
-                        for i, (angle, label) in enumerate(ANGLES):
+                        for i, angle in enumerate(angles):
+                            label = dict(ANGLES)[angle]
                             box = ((i % 2)*512, (i//2)*512, (i % 2+1)*512, (i//2+1)*512)
                             sheet.crop(box).save(staging/f'{angle}.png')
                             records.append(dict(id=uuid.uuid4().hex[:24], yaw_deg=angle, label=label,
@@ -357,9 +437,7 @@ def views_job(service, request, progress, cancel, *, python=None, mock=False):
                     for i, angle in enumerate(angles):
                         _check(cancel)
                         label = dict(ANGLES)[angle]
-                        prompt = f'{label} of the person in the reference portrait. '+PRESERVE
-                        if abs(angle) == 90:
-                            prompt += ' Exact side profile; nose points to image '+('left.' if angle > 0 else 'right.')
+                        prompt = individual_prompt(angle)
                         progress(.1+.8*i/len(angles), 'Qwen-Image 2.1: '+label.lower())
                         view_seed = (seed+[a for a, _ in ANGLES].index(angle)) % 2**32
                         if mock:
@@ -375,15 +453,23 @@ def views_job(service, request, progress, cancel, *, python=None, mock=False):
             _check(cancel)
             final = root/'views'/rid
             staging.replace(final)
+            for r in records:
+                r['held_out'] = r['yaw_deg'] in held_out
             records = [_record(final/f"{r['yaw_deg']}.png", root, **r) for r in records]
+            edit = method == 'edit2511'
             run = dict(id=rid, revision=revision, reference_sha256=front['sha256'], method=method,
-                       portrait_model='qwen-image21', backend='mock' if mock else gpu.backend(),
-                       generation={} if mock else dict(
+                       portrait_model='qwen-image-edit-2511' if edit else 'qwen-image21',
+                       backend='mock' if mock else gpu.backend(),
+                       generation={} if mock else editor_metadata if edit else dict(
                            checkpoint=generators.receipt(gpu.model_path('qimg-21-fast/int8-smooth-a0.6/blocks.bin')),
                            package_manifest=generators.receipt(gpu.model_path('qimg-21-fast/int8-smooth-a0.6/manifest.json'))),
-                       steps=steps, cfg=4., negative_prompt=NEGATIVE, preset=preset, views=records,
-                       attention='mock' if mock else 'flash' if gpu.backend() == 'cuda' else 'sage',
-                       condition_resolution=1024, model='Qwen-Image 2.1', license=qwen.LICENSE,
+                       steps=steps, cfg=4., negative_prompt=EDIT_NEGATIVE if edit else NEGATIVE,
+                       preset='gguf-q4_k_m' if edit else preset, views=records, held_out=held_out,
+                       attention='mock' if mock else 'sdpa' if edit else 'flash' if gpu.backend() == 'cuda' else 'sage',
+                       condition_resolution=1024,
+                       model='Qwen-Image-Edit-2511' if edit else 'Qwen-Image 2.1',
+                       license='apache-2.0' if edit else qwen.LICENSE,
+                       angle_lora=angle_lora if edit else None,
                        sheet=str((final/'sheet.png').relative_to(root)) if method == 'sheet' else None,
                        seconds=round(time.perf_counter()-started, 2), synthetic=True,
                        camera_parameters='requested angles, not calibrated cameras')

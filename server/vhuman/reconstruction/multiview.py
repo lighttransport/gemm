@@ -158,6 +158,11 @@ def run_generated(folder, input_file, **options):
             views = [front]
             for row in inputs['views'][1:]:
                 record = dict(view_id=row['id'], requested_yaw_deg=row['yaw_deg'])
+                if row.get('held_out'):
+                    # Evaluation-only views (e.g. +/-90 profiles) never enter the fit or the texture bake.
+                    record.update(accepted=False, held_out=True, reason='held out for evaluation')
+                    review['views'].append(record)
+                    continue
                 try:
                     image = input_file.parent/row['file']
                     view = observations.observe(image, dense=True)['views'][0]

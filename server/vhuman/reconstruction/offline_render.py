@@ -12,7 +12,7 @@ import time
 from .. import gpu
 from .offline_assets import prepare
 
-DEFAULT_BLENDER = Path('/mnt/disk01/data/vhuman/tools/blender-4.5.14-linux-x64/blender')
+DEFAULT_BLENDER = Path(os.environ.get('VHUMAN_BLENDER', str(Path.home()/'local/blender-5.2.2-linux-x64/blender')))
 
 
 def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
