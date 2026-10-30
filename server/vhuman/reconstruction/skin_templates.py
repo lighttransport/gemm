@@ -110,7 +110,7 @@ def build(candidate, out, *, res=2048, oiliness=1., age=1., seed=7):
                     status='authored region priors on fixed GNM topology; cavity is geometric concavity of the fitted mesh, not a measurement',
                     files=dict(maps='skin_templates.npz', micro_normal='skin_micro_normal.png'),
                     shader=dict(roughness='template * (1 + 0.6 cavity)', specular_ior_level='template * (1 - 0.7 cavity)',
-                                coat='0.25 (1 - cavity) + 0.5 lips, roughness 0.15 -> 0.05 on lips',
+                                coat='0.10 (1 - cavity) + 0.35 lips, roughness 0.30 -> 0.12 on lips',
                                 subsurface='random_walk_skin, radius (3.67, 1.37, 0.68) mm, scale 0.5, weight 0.6',
                                 micro_normal='tiled 12x, strength 0.6 * micro_strength', displacement='true displacement, adaptive subdivision'))
     (out / 'skin_templates.json').write_text(json.dumps(manifest, indent=2) + '\n')

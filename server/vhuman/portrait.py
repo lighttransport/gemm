@@ -67,7 +67,10 @@ def angle_prompt(angle, lora='fal-2511'):
     turns toward the camera, nose points to image left as in the Qwen 2.1 prompts)."""
     side = 'left' if angle > 0 else 'right'
     if lora == 'fal-2511':
-        azimuth = f'{side} side view' if abs(angle) >= 90 else f'front-{side} quarter view'
+        # The LoRA names the camera position from the viewer's side: 'front-left' puts the nose toward image
+        # right (verified 2026-10-31), i.e. negative yaw in ANGLES, so the descriptor side is mirrored here.
+        cam = 'right' if angle > 0 else 'left'
+        azimuth = f'{cam} side view' if abs(angle) >= 90 else f'front-{cam} quarter view'
         return f'<sks> {azimuth} eye-level shot medium shot'
     if lora == 'dx-2509':
         zh = '左' if angle > 0 else '右'

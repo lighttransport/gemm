@@ -141,9 +141,10 @@ def full_skin_graph(skin,node,bound,out,request):
     r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True);links.new(r,node.inputs['Roughness'])
     # specular level = template*(1-.7 cavity)
     sp=math('MULTIPLY',spec,math('SUBTRACT',1.,math('MULTIPLY',cavity,.7)),clamp=True);links.new(sp,node.inputs['Specular IOR Level'])
-    # second lobe: coat .25(1-cavity)+.5 lips, roughness .15 -> .05 on lips
-    coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),.25),math('MULTIPLY',lips,.5),clamp=True);links.new(coat,node.inputs['Coat Weight'])
-    cr=math('SUBTRACT',.15,math('MULTIPLY',lips,.10),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
+    # second (sharper) lobe kept small so skin reads oily, not wet: coat .10(1-cavity)+.35 lips,
+    # roughness .30 -> .12 on lips (the moist lip band)
+    coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),.10),math('MULTIPLY',lips,.35),clamp=True);links.new(coat,node.inputs['Coat Weight'])
+    cr=math('SUBTRACT',.30,math('MULTIPLY',lips,.18),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
     node.inputs['Coat IOR'].default_value=1.4
     # random-walk skin subsurface (radii in metres, literature-scale skin profile)
     node.subsurface_method='RANDOM_WALK_SKIN'

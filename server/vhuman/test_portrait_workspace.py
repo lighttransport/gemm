@@ -124,8 +124,8 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(run['model'], 'Qwen-Image-Edit-2511')
         self.assertEqual([v['held_out'] for v in run['views']], [False, False, True, True])
         self.assertTrue(all(v['prompt'].startswith('<sks> ') for v in run['views']))
-        self.assertIn('front-left quarter view', run['views'][0]['prompt'])
-        self.assertIn('right side view', run['views'][3]['prompt'])
+        self.assertIn('front-right quarter view', run['views'][0]['prompt'])
+        self.assertIn('left side view', run['views'][3]['prompt'])
         # The 40-degree sheet is a valid joint set; a mixed set is not.
         sheet = portrait.views_job(self.service, dict(req, method='sheet', angles=[40, -40, 90, -90]), self.progress,
                                    self.cancel, mock=True)['session']['view_runs'][-1]
