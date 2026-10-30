@@ -295,7 +295,7 @@ def cmd_rig_render(args):
                   gpu_index=args.device, motion=args.motion, frame=args.frame, appearance=args.appearance,
                   lighting=args.lighting,yaw=args.yaw,exposure=args.exposure,sss_weight=args.sss_weight,
                   camera=args.camera,pitch=args.pitch,hdri=args.hdri,samples=args.samples,resolution=args.resolution,
-                  quality=args.quality,ablate=tuple(args.ablate or ()),noisy=args.noisy,
+                  quality=args.quality,ablate=tuple(args.ablate or ()),noisy=args.noisy,eyes=args.eyes,
                   **({'blender':args.blender} if args.blender else {}))
 
 
@@ -652,6 +652,7 @@ def main(argv=None) -> int:
     sp.add_argument('--hdri',help='environment EXR for --lighting hdri')
     sp.add_argument('--quality',choices=('baseline','full'),default='baseline');sp.add_argument('--ablate',nargs='*')
     sp.add_argument('--no-noisy',dest='noisy',action='store_false')
+    sp.add_argument('--eyes',help='eye_personalize output directory')
     sp.add_argument('--accessories', choices=('keep','omit'), default='keep')
     sp.add_argument('--detail-preset', choices=('source','mature'), default='mature')
     sp.add_argument('--motion',help='native GNM motion directory')

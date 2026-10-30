@@ -29,7 +29,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08,head_fit=None,parsing_model=None,
            include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
-           ablate=(), noisy=True):
+           ablate=(), noisy=True, eyes=None):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
@@ -66,8 +66,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     out.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(out).free < 4 * 1024**3:
         raise RuntimeError('offline rendering requires 4 GiB free disk headroom')
+    eyes_dir=None if (eyes is None or '2d' in ablate or quality!='full') else Path(eyes).resolve()
     prepare(candidate, out, accessories=accessories, detail_preset=detail_preset,head_fit=head_fit,
-            parsing_model=parsing_model,include_hair=include_hair,fit_eyes=fit_eyes)
+            parsing_model=parsing_model,include_hair=include_hair,fit_eyes=fit_eyes,eyes=eyes_dir)
     if quality=='full' and '2c' not in ablate:
         from .skin_templates import build as build_templates
         build_templates(candidate,out,res=2048 if preset=='hero' else 1024)
@@ -174,6 +175,7 @@ def main():
     parser.add_argument('--hdri-strength',type=float,default=1.);parser.add_argument('--hdri-rotation',type=float,default=0.)
     parser.add_argument('--quality',choices=QUALITY,default='baseline');parser.add_argument('--ablate',nargs='*',default=())
     parser.add_argument('--no-noisy',dest='noisy',action='store_false',help='skip the un-denoised beauty output')
+    parser.add_argument('--eyes',type=Path,help='eye_personalize output directory (quality full only)')
     parser.add_argument('--accessories', choices=('keep','omit'), default='keep')
     parser.add_argument('--detail-preset', choices=('source','mature'), default='mature')
     parser.add_argument('--blender', type=Path, default=DEFAULT_BLENDER)

@@ -180,7 +180,9 @@ def runtime_eye_parts(part, side, joint, eye_params, profile, place_eye, lid_pol
 
 
 def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_fit=None,parsing_model=None,
-            include_hair=True,fit_eyes=False):
+            include_hair=True,fit_eyes=False,eyes=None):
+    """eyes: optional eye_personalize output directory (eyes.json [+ iris_plate.npz]); its eye_param_overrides are
+    applied before validation and the photo iris plate replaces the procedural iris structure."""
     import cv2
     from ..face_parsing import FaceParser
     from ..rig.gnm_model import GNMModel
@@ -264,6 +266,14 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
     from .observations import sha256
     fit_document=json.loads(fit_path.read_text())
     eye_params=fit_document['eye_params']
+    eye_personalization=None;iris_plate=None
+    if eyes is not None:
+        eyes=Path(eyes);eye_personalization=json.loads((eyes/'eyes.json').read_text())
+        for group,values in eye_personalization.get('eye_param_overrides',{}).items():
+            eye_params.setdefault(group,{}).update(values)
+        if eye_personalization.get('plate'):
+            with np.load(eyes/eye_personalization['plate'],allow_pickle=False) as plate:
+                iris_plate=dict(masks=plate['masks'].astype(np.float32),photo=plate['photo'].astype(np.float32))
     eye_params=params_module.validate(eye_params)
     image=np.asarray(Image.open(candidate/'portrait.png').convert('RGB'))
     Image.fromarray(image).save(out/'accessory_source.png')
@@ -275,8 +285,14 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         eye_params['pupil']['dilation']=1.;eye_params['pupil']['scale']=1.
         pupil_status='authored 0.30 ratio under glasses; no pupil boundary measurement'
     profile=optics.profile_from_params(eye_params)
-    it,st=assets.structures(eye_params,512)
-    Image.fromarray(assets.srgb_u8(iris.bake_color(it,eye_params,512,sclera.sampler(st,eye_params)))).save(out/'iris.png')
+    iris_res=512
+    if iris_plate is not None:
+        iris_res=int(iris_plate['masks'].shape[0])
+        iris_tex=iris.IrisTextures(iris_res,iris_plate['masks'],iris.noise.normal_map(iris_plate['masks'][...,0]*.6,strength=iris_res/64.),None,0.,iris_plate['photo'])
+        it,st=assets.structures(eye_params,iris_res,iris_tex=iris_tex)
+    else:
+        it,st=assets.structures(eye_params,512)
+    Image.fromarray(assets.srgb_u8(iris.bake_color(it,eye_params,iris_res,sclera.sampler(st,eye_params)))).save(out/'iris.png')
     Image.fromarray(assets.shell_textures(eye_params,st,512)['base']).save(out/'sclera.png')
     ocular_reports={};runtime_eye_reports={}
     from .dense_landmarks import attachments
@@ -466,6 +482,9 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
             runtime='welded runtime shell (analytic mesh material), coarse iris and pupil, head-bound occlusion cap',
             runtime_reports=runtime_eye_reports,eye_params='eye_params.json',
             fitting=ocular_reports,head_fit_source=str(fit_path.resolve()),head_fit_sha256=sha256(fit_path),
+            personalization=None if eye_personalization is None else dict(source=str(eyes.resolve()),status=eye_personalization.get('status'),
+                plate=eye_personalization.get('plate'),plate_sha256=sha256(eyes/eye_personalization['plate']) if eye_personalization.get('plate') else None,
+                sclera=eye_personalization.get('sclera'),overrides=eye_personalization.get('eye_param_overrides')),
             pupil_ratio=params_module.pupil_ratio(eye_params),pupil_status=pupil_status,
             ior=eye_params['optics']['ior_cornea'] if 'ior_cornea' in eye_params['optics'] else 1.376),
         detail=detail,material=manifest['material'])
