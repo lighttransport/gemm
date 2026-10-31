@@ -34,3 +34,16 @@ Goal: kill the FP8 DiT's block-streaming (20.4 GB) by keeping a ~4-bit DiT VRAM-
 
 Estimated linears per 1024² step (60 blocks): about 3.5 s, down from about 18 s. Still 15–30 TFLOPS of the 195 peak.
 Next levers: `lora_down` at K=12288 (6 ms), and larger tiles with an async LDS pipeline.
+
+## 2026-10-31: Edit-2511 step profile and two experiments
+
+Synthetic pack (exact names/shapes, random values) at 1024^2 + one 1024^2 reference (8,492 tokens), one DiT call:
+3.52 s = attention `fa_db_vt` 1.53 s (~35 TFLOPS), INT4 linears 0.90 s, INT8 linears 0.64 s, rest ~0.45 s.
+
+- **SageAttention (kept, opt-in `QIMG_SAGE=1`)**: INT8 QK / FP8 PV via `rdna4/qimg21/libq21_hip_fast_sage.so`
+  (`q21f_sage_attention_hnd`). 3.52 -> 2.88 s per call; DiT output rel_l2 1.6% vs fa16 on the synthetic pack.
+  Needs the plugin and rocew on one HIP runtime instance (`ROCEW_ROCM_LIB`; the runner refuses otherwise).
+  Quality on real weights still to be judged against the 1.4% fast-exp change that was reverted for identity loss.
+- **W4A8 (rejected)**: per-token INT8 activations x INT4-g64 weights on INT8 WMMA (`bench_w4a8.hip`).
+  1.06-1.40x faster than W4A16 per linear (incl. activation quantization) but 2.1-2.4% rel error vs exact f32
+  against 0.22% for W4A16, on activations with a few 4x outlier channels; compounding over 60 blocks is not worth it.
