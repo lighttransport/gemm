@@ -112,34 +112,51 @@ class HostModulation:
     weights stay in host RAM, are streamed per block to the GPU, and the vectors are cached per timestep.
     """
 
-    def __init__(self, base, source=None, loras=()):
+    def __init__(self, base, source=None, loras=(), cache_dir=None):
         """source: BF16 transformer dir (index + shards); default <base>/transformer. loras: 'path[:weight]' specs whose
-        img_mod.1 / txt_mod.1 deltas are merged here (the INT4 pack carries the rest of the same LoRA)."""
-        import json
+        img_mod.1 / txt_mod.1 deltas are merged here (the INT4 pack carries the rest of the same LoRA).
+
+        The vectors depend only on the timestep (and the merged LoRA), so they are also cached on disk under
+        cache_dir (default <repo>/tmp/qimg-modcache), keyed by the source and LoRA files. The 13.6 GB of BF16
+        modulation weights are read only when a timestep misses that cache."""
+        import hashlib, json, os
+        self.tdir = Path(source) if source else Path(base) / 'transformer'
+        self.loras = list(loras)
+        self.where = json.load(open(self.tdir / 'diffusion_pytorch_model.safetensors.index.json'))['weight_map']
+        self.n = 1 + max(int(k.split('.')[1]) for k in self.where if k.startswith('transformer_blocks.'))
+        ident = [str(self.tdir.resolve()), os.path.getmtime(self.tdir / 'diffusion_pytorch_model.safetensors.index.json')]
+        for spec in self.loras:
+            path, _, weight = spec.partition(':')
+            st = os.stat(path); ident.append([os.path.realpath(path), st.st_size, st.st_mtime, weight or '1.0'])
+        key = hashlib.sha256(json.dumps(ident).encode()).hexdigest()[:16]
+        root = Path(cache_dir) if cache_dir else Path(__file__).resolve().parents[2] / 'tmp/qimg-modcache'
+        self.disk = root / key
+        self.w = None; self.emb = None; self.merged = None
+        self.cache = {}
+        self.stats = dict(disk_hits=0, computed=0)
+
+    def _get(self, name, files={}):
         from safetensors import safe_open
+        f = self.where[name]
+        if f not in files:
+            files[f] = safe_open(str(self.tdir / f), 'pt', 'cpu')
+        return files[f].get_tensor(name)
+
+    def _load_weights(self):
         from diffusers.models.embeddings import Timesteps, TimestepEmbedding
-        tdir = Path(source) if source else Path(base) / 'transformer'
-        where = json.load(open(tdir / 'diffusion_pytorch_model.safetensors.index.json'))['weight_map']
-        files = {}
-        def get(name):
-            f = where[name]
-            if f not in files:
-                files[f] = safe_open(str(tdir / f), 'pt', 'cpu')
-            return files[f].get_tensor(name)
-        self.n = 1 + max(int(k.split('.')[1]) for k in where if k.startswith('transformer_blocks.'))
         self.proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)
         self.emb = TimestepEmbedding(in_channels=256, time_embed_dim=3072)
-        self.emb.load_state_dict({k.split('timestep_embedder.', 1)[1]: get(k) for k in where
+        self.emb.load_state_dict({k.split('timestep_embedder.', 1)[1]: self._get(k) for k in self.where
                                   if k.startswith('time_text_embed.timestep_embedder.')})
         self.emb = self.emb.to('cuda', torch.bfloat16)
-        self.w = {kind: [(get(f'transformer_blocks.{b}.{kind}.1.weight'), get(f'transformer_blocks.{b}.{kind}.1.bias'))
+        self.w = {kind: [(self._get(f'transformer_blocks.{b}.{kind}.1.weight'), self._get(f'transformer_blocks.{b}.{kind}.1.bias'))
                          for b in range(self.n)] for kind in ('img_mod', 'txt_mod')}
         self.merged = 0
-        if loras:
+        if self.loras:
             import sys
             sys.path.insert(0, str(Path(__file__).resolve().parent / 'tools'))
             from svdquant_from_bf16 import LoraMerge
-            merge = LoraMerge(list(loras))
+            merge = LoraMerge(self.loras)
             for kind in ('img_mod', 'txt_mod'):
                 for b in range(self.n):
                     name = f'transformer_blocks.{b}.{kind}.1'
@@ -147,22 +164,35 @@ class HostModulation:
                         w, bias = self.w[kind][b]
                         self.w[kind][b] = (merge.apply(name, w.float()).to(w.dtype), bias)
                         self.merged += 1
-        self.cache = {}
 
     @torch.no_grad()
     def prefetch(self, ts):
-        """Compute and cache all timesteps in one pass over the streamed weights (13 x 6.8 B MACs, one transfer)."""
+        """Load cached vectors from disk; compute the rest in one pass over the streamed weights and store them."""
         ts = sorted({tkey(t) for t in ts} | {0.0})
+        for t in [t for t in ts if t not in self.cache]:
+            f = self.disk / f'{t:.5f}.npz'
+            if f.is_file():
+                with np.load(f) as z:
+                    self.cache[t] = (z['img'], z['txt']); self.stats['disk_hits'] += 1
         todo = [t for t in ts if t not in self.cache]
         if not todo:
             return
+        if self.w is None:
+            self._load_weights()
         x = torch.nn.functional.silu(self.emb(self.proj(torch.tensor(todo, device='cuda')).to(torch.bfloat16)))
         res = {}
         for kind in ('img_mod', 'txt_mod'):
             res[kind] = torch.stack([torch.nn.functional.linear(x, w.to('cuda', non_blocking=True), b.to('cuda')).float()
                                      for w, b in self.w[kind]], 1).cpu().numpy()          # [len(todo), n_blocks, 6*dim]
+        self.disk.mkdir(parents=True, exist_ok=True)
         for i, t in enumerate(todo):
-            self.cache[t] = (res['img_mod'][i], res['txt_mod'][i])
+            self.cache[t] = (res['img_mod'][i], res['txt_mod'][i]); self.stats['computed'] += 1
+            tmp = self.disk / f'.{t:.5f}.{os.getpid()}.npz'
+            np.savez(tmp, img=self.cache[t][0], txt=self.cache[t][1]); tmp.replace(self.disk / f'{t:.5f}.npz')
+
+    def release(self):
+        """Drop the BF16 weights once the schedule's vectors are cached."""
+        self.w = None
 
     def __call__(self, t):
         key = tkey(t)

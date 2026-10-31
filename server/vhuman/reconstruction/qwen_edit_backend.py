@@ -190,7 +190,7 @@ class NativeEditor:
                                 mod_loras=[f"{s['path']}:{s['weight']}" for s in specs])
         self.metadata=dict(backend='native',model_root=str(model_root.resolve()),weights=pack['file'],
                            weights_sha256=pack.get('sha256'),pack_recipe=pack.get('recipe'),encoder_device=encoder_device,
-                           host_modulation_source=mod_source,host_modulation_lora_merged=getattr(self.pipe.host_mod,'merged',None),
+                           host_modulation_source=mod_source,host_modulation_cache=str(getattr(self.pipe.host_mod,'disk','')),
                            loras=[dict(path=str(s['path'].resolve()),sha256=sha256(s['path']),adapter=s['adapter'],weight=s['weight'],
                                        merged='pack + host modulation') for s in specs])
         encoder=self.pipe.text_encoder
@@ -227,7 +227,10 @@ class NativeEditor:
             true_cfg_scale=cfg,height=size,width=size,num_inference_steps=steps,
             generator=torch.Generator(device=self.device).manual_seed(seed)).images[0]
         total=time.time()-started;dit=self.pipe.native.seconds-dit0
+        mods=getattr(self.pipe,'host_mod',None)
+        if mods is not None:mods.release()   # schedule cached in RAM/disk; drop the 13.6 GB BF16 modulation weights
         self.last_metrics=dict(seconds=total,prompt_encode_seconds=encode,native_dit_seconds=dit,
+                               host_modulation=None if mods is None else dict(mods.stats,lora_merged_modules=mods.merged),
                                peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                                peak_reserved_bytes=torch.cuda.max_memory_reserved(),host_peak_rss_bytes=host_peak_rss())
         print(f'[qwen_edit] total {total:.1f}s native DiT {dit:.1f}s prompt_encode {encode:.1f}s other {total-dit-encode:.1f}s',flush=True)
