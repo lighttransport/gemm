@@ -306,6 +306,14 @@ def curve_object(name,paths,mat,radius, *, cyclic=False):
     return obj
 
 
+# ColorChecker calibration (2026-11-01, color_chart.py, chart 2 cm in front of the face, -1.5 EV Standard view):
+# the authored lamp rig read 1.36 EV too bright (exposure -2.86 needed), so its energies are scaled by 2^-1.36 and
+# -1.5 EV now shows the neutral patches at their reflectance. The default HDRI (interior.exr) read -0.82 EV with a warm
+# cast; its environment is multiplied by the neutralising gains and 2^0.68. Other HDRIs are left as given.
+STUDIO_ENERGY_SCALE=2.0**-1.3632
+CALIBRATED_HDRI={'e945ff5c1ddd7a3aaf05e9fb5c3bc9cb93c5518414febd44ed2c394e013f0cbd':(.8351,1.,1.4483,2.0**.6840)}
+
+
 def add_color_chart(scene,camera_obj,data,out,lighting):
     """24-patch matte ColorChecker 2 cm in front of the face, facing the camera, under the scene's lights.
     Writes chart.json (patch names, reference linear albedo, pixel centres) for color_chart.calibrate_render."""
@@ -549,7 +557,7 @@ def run(request):
         elif lighting=='right':
             position=(-position[0],position[1],position[2]);power={'key':45,'fill':2,'rim':8}[name]
         elif lighting=='rim':power={'key':3,'fill':3,'rim':55}[name]
-        light=bpy.data.lights.new(name,'AREA');light.energy=power;light.shape='DISK';light.size=size
+        light=bpy.data.lights.new(name,'AREA');light.energy=power*STUDIO_ENERGY_SCALE;light.shape='DISK';light.size=size
         obj=bpy.data.objects.new(name,light);bpy.context.collection.objects.link(obj);obj.location=position
         obj.rotation_euler=(Vector((0,0,0))-obj.location).to_track_quat('-Z','Y').to_euler()
     world=bpy.data.worlds.new('studio' if lighting!='hdri' else 'hdri');scene.world=world;world.use_nodes=True
@@ -560,7 +568,14 @@ def run(request):
         mapping=wn.new('ShaderNodeMapping');coords=wn.new('ShaderNodeTexCoord')
         mapping.inputs['Rotation'].default_value=(0,0,np.deg2rad(hdri.get('rotation_deg',0)))
         wl.new(coords.outputs['Generated'],mapping.inputs['Vector']);wl.new(mapping.outputs['Vector'],environment.inputs['Vector'])
-        wl.new(environment.outputs['Color'],wn['Background'].inputs['Color'])
+        cal=CALIBRATED_HDRI.get(hdri.get('sha256'))
+        if cal:   # neutralise the measured cast and exposure of the default HDRI (color_chart)
+            tint=wn.new('ShaderNodeMix');tint.data_type='RGBA';tint.blend_type='MULTIPLY';tint.inputs['Factor'].default_value=1.
+            tint.inputs[7].default_value=(cal[0]*cal[3],cal[1]*cal[3],cal[2]*cal[3],1.)   # RGBA 'B' (Mix has one A/B pair per type)
+            wl.new(environment.outputs['Color'],tint.inputs[6]);wl.new(tint.outputs[2],wn['Background'].inputs['Color'])
+            world['hdri_calibration']=json.dumps(dict(gains=cal[:3],scale=cal[3],source='color_chart 2026-11-01'))
+        else:
+            wl.new(environment.outputs['Color'],wn['Background'].inputs['Color'])
         wn['Background'].inputs['Strength'].default_value=hdri.get('strength',1.)
         world['hdri_sha256']=hdri['sha256'];world['hdri_license']=hdri.get('license','')
     else:
