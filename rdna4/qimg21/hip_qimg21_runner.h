@@ -15,6 +15,7 @@
 #include "../../common/safetensors.h"
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
+#include "../../tmp/qimg21/vae_conv_tiled.inc"   /* q21v_* tiled VAE conv (vae_conv_tiled.hip) */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -69,6 +70,8 @@ typedef struct cuda_qimg_runner {
     CUfunction euler_step;
     CUfunction vae_conv2d;
     CUfunction vae_conv2d_3x3_wmma;
+    CUfunction vae_pack_hwc, vae_pack_w3x3, vae_conv3x3_tiled;   /* tiled path; NULL -> per-wave kernel */
+    void *vae_xb, *vae_wb; size_t vae_xb_cap, vae_wb_cap;
     CUfunction vae_conv2d_1x1_wmma;
     CUfunction vae_rmsnorm;
     CUfunction vae_silu;
@@ -192,13 +195,14 @@ static int hip_qimg21_init_kernels(cuda_qimg_runner *r) {
     }
 
     size_t a = strlen(hip_kernels_common_src), b = strlen(hip_qimg_specific_kernels),
-           c = strlen(hip_qimg21_vae_extra_src);
-    char *vae_src = (char *)malloc(a + b + c + 1);
+           c = strlen(hip_qimg21_vae_extra_src), d = strlen(vae_conv_tiled_source);
+    char *vae_src = (char *)malloc(a + b + c + d + 1);
     if (!vae_src) return -1;
     memcpy(vae_src, hip_kernels_common_src, a);
     memcpy(vae_src + a, hip_qimg_specific_kernels, b);
     memcpy(vae_src + a + b, hip_qimg21_vae_extra_src, c);
-    vae_src[a + b + c] = 0;
+    memcpy(vae_src + a + b + c, vae_conv_tiled_source, d);
+    vae_src[a + b + c + d] = 0;
     int vrc = hip_compile_kernels(&r->vae_module, r->device, vae_src,
                                   "qimg21_hip_vae.hip", r->verbose,
                                   "qimg21-hip-vae");
@@ -227,6 +231,11 @@ static int hip_qimg21_init_kernels(cuda_qimg_runner *r) {
     VAE_GET(r->vae_transpose_sc_to_chw, "q21_transpose_sc_to_chw");
     VAE_GET(r->vae_attn_sc, "q21_vae_attn_sc");
 #undef VAE_GET
+    if (!getenv("QIMG21_VAE_CONV_LEGACY") &&   /* tiled implicit-GEMM 3x3 conv: 13-22x the per-wave kernel */
+        (hipModuleGetFunction(&r->vae_pack_hwc, r->vae_module, "q21v_pack_hwc") != hipSuccess ||
+         hipModuleGetFunction(&r->vae_pack_w3x3, r->vae_module, "q21v_pack_w3x3") != hipSuccess ||
+         hipModuleGetFunction(&r->vae_conv3x3_tiled, r->vae_module, "q21v_conv3x3_tiled") != hipSuccess))
+        r->vae_pack_hwc = r->vae_pack_w3x3 = r->vae_conv3x3_tiled = NULL;
     return 0;
 }
 
@@ -249,6 +258,8 @@ static cuda_qimg_runner *cuda_qimg_init(int device_id, int verbose) {
 
 static void cuda_qimg_free(cuda_qimg_runner *r) {
     if (!r) return;
+    if (r->vae_xb) hipFree(r->vae_xb);
+    if (r->vae_wb) hipFree(r->vae_wb);
     if (r->wmma_module) hipModuleUnload(r->wmma_module);
     if (r->vae_module) hipModuleUnload(r->vae_module);
     if (r->common_module) hipModuleUnload(r->common_module);
@@ -267,6 +278,23 @@ static void vae_op_conv2d(cuda_qimg_runner *r, void *out, void *inp, void *w, vo
     int n = co * h * ws;
     if ((ci % 16) == 0 && (co % 16) == 0 && (h * ws % 16) == 0) {
         unsigned gx = (unsigned)(co / 16), gy = (unsigned)(h * ws / 16);
+        if (kh == 3 && kw == 3 && r->vae_conv3x3_tiled && (ci % 32) == 0) {
+            int sp = h * ws; size_t xbytes = (size_t)ci * sp * 2, wbytes = (size_t)co * ci * 9 * 2;
+            if (xbytes > r->vae_xb_cap || wbytes > r->vae_wb_cap) {   /* grow the shared pack scratch (rare) */
+                hipStreamSynchronize(r->stream);
+                if (xbytes > r->vae_xb_cap) { if (r->vae_xb) hipFree(r->vae_xb); r->vae_xb = checked_cuMemAlloc(xbytes); r->vae_xb_cap = r->vae_xb ? xbytes : 0; }
+                if (wbytes > r->vae_wb_cap) { if (r->vae_wb) hipFree(r->vae_wb); r->vae_wb = checked_cuMemAlloc(wbytes); r->vae_wb_cap = r->vae_wb ? wbytes : 0; }
+            }
+            if (r->vae_xb && r->vae_wb) {
+                void *pa[] = {&r->vae_xb, &inp, &ci, &sp};
+                hipModuleLaunchKernel(r->vae_pack_hwc, (unsigned)((sp + 31) / 32), (unsigned)((ci + 31) / 32), 1, 32, 8, 1, 0, r->stream, pa, NULL);
+                long nw = (long)co * ci * 9; void *wa[] = {&r->vae_wb, &w, &co, &ci};
+                hipModuleLaunchKernel(r->vae_pack_w3x3, (unsigned)((nw + 255) / 256), 1, 1, 256, 1, 1, 0, r->stream, wa, NULL);
+                void *ca[] = {&out, &r->vae_xb, &r->vae_wb, &b, &ci, &h, &ws, &co, &rep};
+                hipModuleLaunchKernel(r->vae_conv3x3_tiled, (unsigned)((sp + 127) / 128), (unsigned)((co + 127) / 128), 1, 256, 1, 1, 0, r->stream, ca, NULL);
+                return;
+            }
+        }
         if (kh == 3 && kw == 3) {
             void *args[] = {&out,&inp,&w,&b,&ci,&h,&ws,&co,&rep};
             hipModuleLaunchKernel(r->vae_conv2d_3x3_wmma,gx,gy,1,32,1,1,0,r->stream,args,NULL);

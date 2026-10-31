@@ -693,3 +693,21 @@ A 1024x1024 reference edit with CFG went from 27.7 to 2.3 s per denoising
 step under both low8 (6.3 GiB device allocations) and fast12 (10.3 GiB);
 weight streaming now hides behind compute, so low8 costs no speed. A full
 24-step view is about 100 s end to end, of which VAE decode is 18 s.
+
+## Tiled VAE 3x3 convolution (2026-10-31)
+
+The VAE's per-wave `vae_conv2d_3x3_wmma_f32` (one 16x16 tile per wave, scalar f32 gathers, truncated BF16
+operands) ran at 2-3 TFLOPS. `vae_conv_tiled.hip` packs the input to pixel-major BF16 and the weights to
+`[co][tap][ci]`, then runs a 128x128 implicit GEMM (BK = one tap x 32 channels, 16-byte loads, padded
+double-buffered LDS) with round-to-nearest operands; `vae_op_conv2d` uses it whenever `ci % 32 == 0`.
+`QIMG21_VAE_CONV_LEGACY=1` restores the old kernel. Parity and speed: `bench_vae_conv.hip`.
+
+| conv (ci -> co, size) | old | tiled (incl. packs) |
+|---|---|---|
+| 384 -> 384, 256^2, replicate | 67.7 ms | 3.0 ms |
+| 192 -> 192, 512^2 | 65.1 ms | 5.1 ms |
+| 96 -> 96, 1024^2, replicate | 82.1 ms | 4.7 ms |
+
+Relative error vs an exact f32 convolution drops from 0.61% to 0.23% per conv. A full 1024^2 decode takes
+7.3 s instead of 18.5 s; against the diffusers BF16 decode of the same latents both native paths sit at
+cos 0.99848 (tiled) / 0.99846 (legacy), mean error 2.35 / 2.37 levels of 255.

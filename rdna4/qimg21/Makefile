@@ -25,33 +25,33 @@ libq21_hip_attention.so: hip_attention_plugin.hip ../../tmp/pixal3d/wmma_attenti
 	$(HIPCC) -std=c++17 -O3 -ffp-contract=off --offload-arch=$(GPU_ARCH) -fPIC -shared $< -o $@.new
 	mv $@.new $@
 
-test_hip_qimg21_native: $(SRC) hip_qimg21_runner.h edit_runtime.h edit_kernels.h mma64_kernels.h \
+test_hip_qimg21_native: $(SRC) hip_qimg21_runner.h ../../tmp/qimg21/vae_conv_tiled.inc edit_runtime.h edit_kernels.h mma64_kernels.h \
            norm_vector_kernels.h rope_table_kernels.h quant_weights.h \
            ../../common/safetensors.h ../rocew.h ../hip_runner_common.h \
            ../hip_kernels_common.h ../qimg/hip_qimg_kernels.h
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
 test_hip_qimg21_text: test_hip_qimg21_text.c test_hip_qimg21_native.c \
-                      text_kernels.h qwen_tokenizer_json.h hip_qimg21_runner.h \
+                      text_kernels.h qwen_tokenizer_json.h hip_qimg21_runner.h ../../tmp/qimg21/vae_conv_tiled.inc \
                       ../../common/gguf_loader.h ../../common/bpe_tokenizer.h \
                       ../hip_kernels_common.h ../qimg/hip_qimg_kernels.h
 	$(CC) $(CFLAGS) -o $@ test_hip_qimg21_text.c ../rocew.c $(LDFLAGS)
 
 test_hip_qimg21_vision: test_hip_qimg21_vision.c test_hip_qimg21_native.c \
-                        hip_qimg21_runner.h joint_layout.h edit_kernels.h \
+                        hip_qimg21_runner.h ../../tmp/qimg21/vae_conv_tiled.inc joint_layout.h edit_kernels.h \
                         ../hip_kernels_common.h ../qimg/hip_qimg_kernels.h
 	$(CC) $(CFLAGS) -o $@ test_hip_qimg21_vision.c ../rocew.c $(LDFLAGS)
 
 test_hip_qimg21_vae: test_hip_qimg21_vae.c test_hip_qimg21_native.c \
-                     hip_qimg21_runner.h ../hip_kernels_common.h ../qimg/hip_qimg_kernels.h
+                     hip_qimg21_runner.h ../../tmp/qimg21/vae_conv_tiled.inc ../hip_kernels_common.h ../qimg/hip_qimg_kernels.h
 	$(CC) $(CFLAGS) -o $@ test_hip_qimg21_vae.c ../rocew.c $(LDFLAGS)
 
 test_hip_qimg21_vae_encode: test_hip_qimg21_vae_encode.c test_hip_qimg21_vae.c \
-                            hip_qimg21_runner.h ../hip_kernels_common.h \
+                            hip_qimg21_runner.h ../../tmp/qimg21/vae_conv_tiled.inc ../hip_kernels_common.h \
                             ../qimg/hip_qimg_kernels.h ../../common/stb_image.h
 	$(CC) $(CFLAGS) -o $@ test_hip_qimg21_vae_encode.c ../rocew.c $(LDFLAGS)
 
-test_hip_qimg21_wmma: test_hip_qimg21_wmma.c hip_qimg21_runner.h ../rocew.c ../rocew.h
+test_hip_qimg21_wmma: test_hip_qimg21_wmma.c hip_qimg21_runner.h ../../tmp/qimg21/vae_conv_tiled.inc ../rocew.c ../rocew.h
 	$(CC) $(CFLAGS) -o $@ test_hip_qimg21_wmma.c ../rocew.c $(LDFLAGS)
 
 probe: $(TARGET)
@@ -76,6 +76,10 @@ libq21_hip_fast_gemm.so: fast_gemm.hip
 bench-fast-gemm: bench_fast_gemm.hip libq21_hip_fast_gemm.so
 	$(HIPCC) -std=c++17 -O2 --offload-arch=$(GPU_ARCH) bench_fast_gemm.hip -ldl -o ../../tmp/qimg21/bench_fast_gemm
 	../../tmp/qimg21/bench_fast_gemm ./libq21_hip_fast_gemm.so
+
+../../tmp/qimg21/vae_conv_tiled.inc: vae_conv_tiled.hip
+	mkdir -p ../../tmp/qimg21
+	python3 -c 'import json,pathlib,sys; print("static const char vae_conv_tiled_source[] = " + json.dumps(pathlib.Path("vae_conv_tiled.hip").read_text()) + ";")' > $@
 
 ../../tmp/qimg21/sage_device.inc: extract_sage.py
 	python3 $< $@
