@@ -204,3 +204,18 @@ Other exact build/verification commands and saved recipes are in the workspace.
 - Artifacts: tmp/vhuman-ear-synth/{reconstruction_contact,contact_scene,contact_stress_scene,contact_*_usd,contact_mobile,contact_player}.
 - Rebuild order: build_candidate_contact.py -> contact_assets.py -> build_contact_scene.py (Blender) -> bake_gi.py -> fit_transfer.py -> fit_gi.py <mobile_scene> <candidate> -> export/preprocess/browser.
 - Open: iOS/Filament lacks oral shader + contact deformer; no phone test; deep lining 2.3% penetration (hidden).
+
+## Cycles quality A/B study (2026-10-31 / 11-01)
+
+- Workspace `tmp/vhuman-ab-cycles/` (decisions and timeline: `RESUME.md`; research: `research-2026-11-01.md`).
+  Write-up: `server/vhuman/QUALITY_ITERATIONS.md` "Cycles quality A/B study". Review page: serve `tmp/` on localhost and
+  open `vhuman-ab-cycles/review/` (calibrated display); metrics in `metrics/<s>/metrics.json`.
+- Candidates: `candidates/<s>/candidates.json` (A = `A_fit`, B = `B/reconstruction/ears01`, ablations B-2b..B-2f).
+  Renders on nvme01 (`renders` symlink, ~30 GB); `beauty.png` = chart-calibrated display, `beauty_ev-1.50.png` = original.
+- Re-run chain: `scripts/stage2.sh` (fits) -> `stage3_ears.sh` -> `create.py` expressions -> `write_candidates.py` ->
+  `render_matrix.py` -> `calibrate_scene.py` (CPU venv for EXR reads) -> `redisplay.py` -> `stage5_report.py`.
+  Blender HIP needs `VHUMAN_BLENDER_LD_LIBRARY_PATH=/opt/rocm/core-10.1/lib`.
+- Next, in order: (1) PixelSmile phase B: Wan I2V from each keyframe toward neutral, frames reversed, refit motion, re-render
+  expressions; (2) ear close-ups via depth/normal-conditioned generation (edit models copy their input; SDEdit failed);
+  (3) calibrate the studio preset itself (about -2.86 EV or AgX) instead of re-displaying; (4) B's mouth/iris materials
+  lose to A on LPIPS: compare crops and tune.
