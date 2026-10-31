@@ -119,12 +119,14 @@ class NativeBackend:
     name = "native"
     max_references = 1
     OPTIONS = ("model", "preset", "attention", "condition_resolution", "cache_dir", "keep_work",
-               "resident_socket", "resident_vae_socket", "python", "resident", "exact_prompts", "backend", "device", "quant_package", "cancel")
+               "resident_socket", "resident_vae_socket", "python", "resident", "exact_prompts", "backend", "device", "quant_package", "cancel",
+               "deblock")
 
     def __init__(self, model=DEFAULT_MODEL, preset: str | None = "fast12", attention: str | None = None,
                  condition_resolution: int = 1024, cache_dir=None, keep_work: bool = False,
                  resident_socket=None, resident_vae_socket=None, python=None, resident: bool = True,
-                 exact_prompts: bool = False, backend: str = "cuda", device: int = 0, quant_package=None, cancel=None):
+                 exact_prompts: bool = False, backend: str = "cuda", device: int = 0, quant_package=None, cancel=None,
+                 deblock: bool = False):
         if preset is not None and preset not in PRESET_WEIGHTS:
             raise BackendError(f"preset must be one of {', '.join(PRESET_WEIGHTS)}, got {preset!r}")
         if attention is not None and attention not in ATTENTION:
@@ -150,6 +152,7 @@ class NativeBackend:
         self.condition_resolution = condition_resolution
         self.cache_dir = Path(cache_dir) if cache_dir else ROOT / "tmp/qimg21-prompt-cache"
         self.keep_work = keep_work
+        self.deblock = deblock   # post-decode removal of the VAE's 16-px cell pattern (qimg21_i23d.deblock)
         self.resident_socket, self.resident_vae_socket = resident_socket, resident_vae_socket
         self.python = str(python or sys.executable)
         self.resident = resident and preset is not None
@@ -328,6 +331,8 @@ class NativeBackend:
                "--steps", str(request.steps), "--seed", str(request.seed), "--dtype", "bf16",
                "--native-vae", "--prompt-cache", str(self.cache_dir), "--work-dir", str(work / "run"),
                "--out", str(request.out)]
+        if self.deblock:
+            cmd += ["--deblock"]
         if self.preset:
             cmd += ["--runner", "fast", "--preset", self.preset, "--native-bin", str(self.fast)]
             if self.backend == "cuda":
@@ -384,7 +389,7 @@ class NativeBackend:
         resident = {"requests": text.count("+ resident "), "fallbacks": text.count("resident: run not taken")}
         return GenResult(Path(request.out), time.perf_counter() - started, self.name,
                          {"timings": timings, "resident": resident, "mask_shown_as_reference": mask_shown,
-                          "preset": self.preset, "attention": self.attention,
+                          "preset": self.preset, "attention": self.attention, "deblock": self.deblock,
                           "condition_resolution": self.fit_condition_resolution(request.references[0])
                           if request.references else None})
 

@@ -406,6 +406,8 @@ def main() -> int:
     ap.add_argument("--int8-bf16-tail-blocks", type=int, default=0,
                     help="reconstruct this many final transformer blocks to BF16")
     ap.add_argument("--native-vae", action="store_true", help="Decode with the native F32 VAE (experimental)")
+    ap.add_argument("--deblock", action="store_true",
+                    help="with --native-vae: remove the VAE decoder's 16-px latent-cell pattern (qimg21_i23d.deblock)")
     ap.add_argument("--native-vae-conv", choices=("direct", "cudnn"), default=None,
                     help="native VAE convolutions: direct F32 kernel (parity) or cuDNN F32 "
                          "(default: cudnn with --runner fast, direct otherwise)")
@@ -1120,6 +1122,10 @@ def main() -> int:
         decoded = np.load(decoded_path)
         if decoded.shape != (4, args.height, args.width) or not np.isfinite(decoded).all():
             raise SystemExit("native VAE returned an invalid RGBA tensor")
+        if args.deblock:
+            from qimg21_i23d.deblock import deblock
+            decoded = np.concatenate([deblock(decoded[:3], scale=2.0), decoded[3:]])
+            print("deblock: removed the VAE's 16-px cell pattern", file=sys.stderr)
         pixels = np.rint(np.clip(decoded * 0.5 + 0.5, 0, 1) * 255).astype(np.uint8)
         out.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(pixels.transpose(1, 2, 0)).save(out)
