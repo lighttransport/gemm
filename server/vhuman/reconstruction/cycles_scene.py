@@ -155,7 +155,7 @@ def full_skin_graph(skin,node,bound,out,request):
     uvn=nodes.new('ShaderNodeUVMap');uvn.uv_map='UVMap';mapping=nodes.new('ShaderNodeMapping');mapping.inputs['Scale'].default_value=(12,12,1)
     links.new(uvn.outputs['UV'],mapping.inputs['Vector']);links.new(mapping.outputs['Vector'],micro_img.inputs['Vector'])
     nm=nodes.new('ShaderNodeNormalMap');nm.space='TANGENT';nm.uv_map='UVMap'
-    links.new(micro_img.outputs['Color'],nm.inputs['Color']);links.new(math('MULTIPLY',micro,.6),nm.inputs['Strength'])
+    links.new(micro_img.outputs['Color'],nm.inputs['Color']);links.new(math('MULTIPLY',micro,.6*float(request.get('micro_scale',1.))),nm.inputs['Strength'])
     links.new(nm.outputs['Normal'],node.inputs['Normal'])
     # dynamic facial colour (hemoglobin prior): compressed regions flush, stretched regions blanch.
     # hb = sum_r gain_r * mask_r * wrinkle_r  (wrinkle_r = regional compression in -1..1 driven by motion)
@@ -186,6 +186,8 @@ def full_skin_graph(skin,node,bound,out,request):
     links.new(tint.outputs[0],clampv.inputs[0]);links.new(clampv.outputs[0],node.inputs['Base Color'])
     # true displacement with a wider clamp for the wrinkle library
     bound.inputs['Min'].default_value=-.0015;bound.inputs['Max'].default_value=.0015
+    for n in nodes:   # displacement_scale: height-map amplitude of the true displacement (1 = authored)
+        if n.type=='DISPLACEMENT':n.inputs['Scale'].default_value=float(request.get('displacement_scale',1.))
     skin.displacement_method='DISPLACEMENT'
     skin['quality_shader']=json.dumps(dict(templates=str(out/'skin_templates.json'),subsurface='random_walk_skin',
         coat='second specular lobe',micro_normal='tiled procedural pores',displacement='true, adaptive'))

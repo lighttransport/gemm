@@ -29,7 +29,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08,head_fit=None,parsing_model=None,
            include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
-           ablate=(), noisy=True, eyes=None, chart=False):
+           ablate=(), noisy=True, eyes=None, chart=False, displacement_scale=1., micro_scale=1., save_blend=True):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
@@ -87,7 +87,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     request = dict(out=str(out), device=device, preset=preset, gpu_index=gpu_index,lighting=lighting,yaw=yaw,exposure=exposure,sss_weight=sss_weight,
                    camera=camera,pitch=pitch,distance_scale=distance_scale,focal_scale=focal_scale,hdri=hdri_record,
                    samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy),
-                   chart=bool(chart))
+                   chart=bool(chart),displacement_scale=float(displacement_scale),micro_scale=float(micro_scale),save_blend=bool(save_blend))
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())
@@ -155,6 +155,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
             stdout=log,stderr=subprocess.STDOUT,env=env,check=True)
     validation=json.loads((out/'asset_validation.json').read_text())
     result = json.loads((out/'render_result.json').read_text())
+    if not save_blend:   # validated above; drop the ~30 MB scene for bulk renders (request.json regenerates it)
+        (out/'head.blend').unlink(missing_ok=True);result['blend']=None
     result['float_map_storage']=validation['storage']
     result['asset_reload_validated']=validation['passed']
     result.update(elapsed_seconds=time.monotonic()-started, peak_device_used_mib=peak, vram_peak_mib=peak,
