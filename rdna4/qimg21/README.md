@@ -671,3 +671,25 @@ mkdir -p tmp/qimg21-compiler
 TMPDIR="$PWD/tmp/qimg21-compiler" LD_LIBRARY_PATH=/opt/rocm/core/lib \
  tmp/vhuman-rocm-venv/bin/python -B rdna4/qimg21/test_fast_plugins.py
 ```
+
+## Tiled INT8 W8A8 GEMM for the fast runner (2026-10-31)
+
+The low8/fast12 presets spent 96% of GPU time in `gemm_w8a8_wmma` (byte-wise
+global loads, BK=16, two barriers per K slice): about 4 TOPS on the RX 9070 XT.
+`fast_gemm.hip` now dispatches `gemm_w8a8_wmma_tiled` (128x128 tile, BK=64,
+16-byte loads, padded double-buffered LDS, same WMMA fragment mapping and
+epilogue) whenever K is a multiple of 64 and operands are 16-byte aligned;
+`Q21F_I8_LEGACY=1` selects the old kernel. INT32 accumulation is exact, so the
+outputs are bit-identical (`make -C rdna4/qimg21 bench-fast-gemm`).
+
+| Shape (tokens x out x in) | Old | Tiled |
+|---|---|---|
+| 8320 x 4096 x 4096 | 59 ms | 2.2 ms (128 TOPS) |
+| 8320 x 12288 x 4096 | 198 ms | 6.9 ms |
+| 8320 x 24576 x 4096 | 408 ms | 15.1 ms |
+| 8320 x 4096 x 12288 | 196 ms | 6.2 ms |
+
+A 1024x1024 reference edit with CFG went from 27.7 to 2.3 s per denoising
+step under both low8 (6.3 GiB device allocations) and fast12 (10.3 GiB);
+weight streaming now hides behind compute, so low8 costs no speed. A full
+24-step view is about 100 s end to end, of which VAE decode is 18 s.

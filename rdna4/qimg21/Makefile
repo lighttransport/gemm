@@ -11,7 +11,7 @@ LDFLAGS ?= -ldl -lm -lpthread
 TARGET = test_hip_qimg21_native test_hip_qimg21_text test_hip_qimg21_vision test_hip_qimg21_vae test_hip_qimg21_vae_encode test_hip_qimg21_wmma
 SRC = test_hip_qimg21_native.c ../rocew.c
 
-.PHONY: all clean probe rocew-probe fused
+.PHONY: all clean probe rocew-probe fused bench-fast-gemm
 
 all: $(TARGET) libq21_hip_attention.so
 
@@ -71,6 +71,11 @@ test_hip_qimg21_fast: test_hip_qimg21_fast.c ../../cuda/qimg21/test_cuda_qimg21_
 
 libq21_hip_fast_gemm.so: fast_gemm.hip
 	$(HIPCC) -std=c++17 -O3 -ffp-contract=off --offload-arch=$(GPU_ARCH) -fPIC -shared $< -o $@
+
+# Parity (bit-identical to the reference W8A8 kernel) and throughput check for the tiled INT8 GEMM.
+bench-fast-gemm: bench_fast_gemm.hip libq21_hip_fast_gemm.so
+	$(HIPCC) -std=c++17 -O2 --offload-arch=$(GPU_ARCH) bench_fast_gemm.hip -ldl -o ../../tmp/qimg21/bench_fast_gemm
+	../../tmp/qimg21/bench_fast_gemm ./libq21_hip_fast_gemm.so
 
 ../../tmp/qimg21/sage_device.inc: extract_sage.py
 	python3 $< $@

@@ -1,5 +1,7 @@
 /* gfx12 WMMA kernels adapted from the native Qwen runners. SPDX-License-Identifier: MIT */
 #include <hip/hip_runtime.h>
+#include <cstdlib>
+#include <cstdint>
 typedef int wm_i32x8 __attribute__((ext_vector_type(8)));
 typedef unsigned wm_u32x2 __attribute__((ext_vector_type(2)));
 __device__ unsigned wm_pack4_i8(signed char a,signed char b,signed char c,signed char d) { return (unsigned char)a|((unsigned)(unsigned char)b<<8)|((unsigned)(unsigned char)c<<16)|((unsigned)(unsigned char)d<<24); }
@@ -30,11 +32,98 @@ __global__ void gemm_w8a8_wmma(unsigned short *Y, const signed char *Wq, const f
     int wm0=cta_m0+wM*64,wn0=cta_n0+wN*32; wm_i32x8 *ac[8]={&cv00,&cv01,&cv10,&cv11,&cv20,&cv21,&cv30,&cv31}; int ms[8]={0,0,16,16,32,32,48,48},ns[8]={0,16,0,16,0,16,0,16};
     for(int t=0;t<8;t++){int col=wn0+ns[t]+idx; if(col>=n_out)continue; float wsc=wscale[col],bv=bias?bias[col]:0.f; wm_i32x8 acc=*ac[t]; for(int i=0;i<8;i++){int row=wm0+ms[t]+half*8+i; if(row<n_tok)Y[(long)row*ldy+col]=f2b((float)acc[i]*xscale[row]*wsc+bv);}}
 }
+
+/* Tiled W8A8 GEMM for gfx12 (RDNA4). Same math and output as gemm_w8a8_wmma (exact INT32 accumulation, identical
+ * epilogue), restructured for memory throughput: 128x128 block tile, BK=64, 16-byte global loads, padded LDS rows
+ * (80 B) and a register-staged double buffer so the next K tile is fetched while WMMAs run on the current one.
+ * Fragment mapping per 16x16x16 WMMA is unchanged: lane&15 selects the row, lane>>4 the 8-byte K half. */
+#define TW_BM 128
+#define TW_BN 128
+#define TW_BK 64
+#define TW_LD 80
+__global__ __launch_bounds__(256) void gemm_w8a8_wmma_tiled(unsigned short *Y, const signed char *Wq, const float *wscale,
+        const signed char *Xq, const float *xscale, const float *bias, int n_out, int n_in, int n_tok, int ldy) {
+    __shared__ __attribute__((aligned(16))) signed char As[2][TW_BM * TW_LD];
+    __shared__ __attribute__((aligned(16))) signed char Bs[2][TW_BN * TW_LD];
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, wM = wave & 1, wN = wave >> 1;
+    const int half = lane >> 4, idx = lane & 15;
+    const int m0 = blockIdx.y * TW_BM, n0 = blockIdx.x * TW_BN;
+    /* each thread moves two 16-byte chunks of A and two of B per K tile: chunk c -> row c>>2, column (c&3)*16 */
+    int4 ra[2], rb[2];
+    auto load = [&](int k) {
+        for (int i = 0; i < 2; i++) {
+            int c = tid + i * 256, r = c >> 2, col = (c & 3) * 16;
+            int row = m0 + r;
+            ra[i] = row < n_tok ? *(const int4 *)(Xq + (long)row * n_in + k + col) : make_int4(0, 0, 0, 0);
+            int orow = n0 + r;
+            rb[i] = orow < n_out ? *(const int4 *)(Wq + (long)orow * n_in + k + col) : make_int4(0, 0, 0, 0);
+        }
+    };
+    auto store = [&](int buf) {
+        for (int i = 0; i < 2; i++) {
+            int c = tid + i * 256, r = c >> 2, col = (c & 3) * 16;
+            *(int4 *)(&As[buf][r * TW_LD + col]) = ra[i];
+            *(int4 *)(&Bs[buf][r * TW_LD + col]) = rb[i];
+        }
+    };
+    wm_i32x8 acc[4][2];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 2; j++) acc[i][j] = (wm_i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+    load(0); store(0); __syncthreads();
+    int buf = 0;
+    for (int k = 0; k < n_in; k += TW_BK) {
+        const bool more = k + TW_BK < n_in;
+        if (more) load(k + TW_BK);
+        const signed char *A = As[buf], *B = Bs[buf];
+#pragma unroll
+        for (int ks = 0; ks < TW_BK; ks += 16) {
+            wm_u32x2 a[4], b[2];
+#pragma unroll
+            for (int i = 0; i < 4; i++) a[i] = *(const wm_u32x2 *)(A + (wM * 64 + i * 16 + idx) * TW_LD + ks + half * 8);
+#pragma unroll
+            for (int j = 0; j < 2; j++) b[j] = *(const wm_u32x2 *)(B + (wN * 32 + j * 16 + idx) * TW_LD + ks + half * 8);
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+                    acc[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a[i], true, b[j], acc[i][j], false);
+        }
+        if (more) { store(buf ^ 1); __syncthreads(); buf ^= 1; }
+    }
+    const int wm0 = m0 + wM * 64, wn0 = n0 + wN * 32;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++) {
+            int col = wn0 + j * 16 + idx;
+            if (col >= n_out) continue;
+            float wsc = wscale[col], bv = bias ? bias[col] : 0.f;
+            wm_i32x8 v = acc[i][j];
+            for (int e = 0; e < 8; e++) {
+                int row = wm0 + i * 16 + half * 8 + e;
+                if (row < n_tok) Y[(long)row * ldy + col] = f2b((float)v[e] * xscale[row] * wsc + bv);
+            }
+        }
+}
+
 extern "C" int q21f_bf16_gemm(void*y,int ldy,const void*w,const void*x,int ldx,int m,int n,int k,void*s) {
  q21_gemm_bf16_wmma<<<dim3((n+127)/128,(m+127)/128),256,0,(hipStream_t)s>>>((unsigned short*)y,(const unsigned short*)w,(const unsigned short*)x,n,k,m,ldx,ldy);
  return hipGetLastError();
 }
+static int q21f_i8_legacy = -1;
 extern "C" int q21f_i8_gemm(void*y,int ldy,const void*x,const float*xs,const void*w,const float*ws,int m,int n,int k,int,void*s) {
+ if (q21f_i8_legacy < 0) { const char *e = getenv("Q21F_I8_LEGACY"); q21f_i8_legacy = e && *e == '1'; }
+ /* The tiled kernel needs 16-byte aligned rows and whole 64-wide K tiles; otherwise keep the reference kernel. */
+ if (!q21f_i8_legacy && k % TW_BK == 0 && ((uintptr_t)x & 15) == 0 && ((uintptr_t)w & 15) == 0)
+  gemm_w8a8_wmma_tiled<<<dim3((n+TW_BN-1)/TW_BN,(m+TW_BM-1)/TW_BM),256,0,(hipStream_t)s>>>((unsigned short*)y,(const signed char*)w,ws,(const signed char*)x,xs,nullptr,n,k,m,ldy);
+ else
+  gemm_w8a8_wmma<<<dim3((n+127)/128,(m+127)/128),256,0,(hipStream_t)s>>>((unsigned short*)y,(const signed char*)w,ws,(const signed char*)x,xs,nullptr,n,k,m,ldy);
+ return hipGetLastError();
+}
+/* Diagnostic entry points for the standalone parity/throughput test (bench_fast_gemm.hip). */
+extern "C" int q21f_i8_gemm_reference(void*y,int ldy,const void*x,const float*xs,const void*w,const float*ws,int m,int n,int k,void*s) {
  gemm_w8a8_wmma<<<dim3((n+127)/128,(m+127)/128),256,0,(hipStream_t)s>>>((unsigned short*)y,(const signed char*)w,ws,(const signed char*)x,xs,nullptr,n,k,m,ldy);
+ return hipGetLastError();
+}
+extern "C" int q21f_i8_gemm_tiled(void*y,int ldy,const void*x,const float*xs,const void*w,const float*ws,int m,int n,int k,void*s) {
+ if (k % TW_BK) return -1;
+ gemm_w8a8_wmma_tiled<<<dim3((n+TW_BN-1)/TW_BN,(m+TW_BM-1)/TW_BM),256,0,(hipStream_t)s>>>((unsigned short*)y,(const signed char*)w,ws,(const signed char*)x,xs,nullptr,n,k,m,ldy);
  return hipGetLastError();
 }

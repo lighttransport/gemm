@@ -238,7 +238,7 @@ def _parameters(request, default_steps=24):
     seed, steps = request.get('seed', 11), request.get('steps', default_steps)
     if type(seed) is not int or not 0 <= seed < 2**32 or type(steps) is not int or not 1 <= steps <= 100:
         raise ServiceError('seed must be a uint32; steps must be 1..100')
-    preset = request.get('qwen_preset', 'low8')
+    preset = request.get('qwen_preset', 'fast12')   # low8 is the opt-in 8 GB low-memory preset
     if preset not in ('low8', 'fast12'):
         raise ServiceError('qwen_preset must be low8 or fast12')
     return seed, steps, preset
