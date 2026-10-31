@@ -32,7 +32,7 @@ all: $(TARGET) $(VERIFY_DIT)
 
 # Shared library for the Python (ctypes) Qwen-Image-Edit driver: qimg_edit_native.py
 libhip_qimg.so: libhip_qimg_impl.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
-	$(CC) $(CFLAGS) -fPIC -shared -fopenmp -o $@ libhip_qimg_impl.c $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
+	$(CC) $(CFLAGS) -fPIC -shared -fopenmp -include omp.h -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-function-declaration -o $@ libhip_qimg_impl.c $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
 # Tiled WMMA GEMM (ported from rdna4/llm/gemm_wmma.hip), embedded for HIPRTC.
 %.inc: %.hip

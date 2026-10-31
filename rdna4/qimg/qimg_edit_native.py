@@ -18,7 +18,7 @@ LIB = Path(__file__).resolve().parent / 'libhip_qimg.so'
 
 # No shipped MIOpen find-db for gfx1201 here ("fdb.txt unreadable"): every new process re-searched the VAE's
 # conv3d kernels. Persist MIOpen's user db / kernel cache and use the fast find mode.
-_MIOPEN_CACHE = Path(os.environ.get('QIMG_MIOPEN_CACHE', '/mnt/disk01/tmp/miopen-cache'))
+_MIOPEN_CACHE = Path(os.environ.get('QIMG_MIOPEN_CACHE', str(Path(__file__).resolve().parents[2] / 'tmp/miopen-cache')))
 os.environ.setdefault('MIOPEN_USER_DB_PATH', str(_MIOPEN_CACHE / 'db'))
 os.environ.setdefault('MIOPEN_CUSTOM_CACHE_DIR', str(_MIOPEN_CACHE / 'kernels'))
 os.environ.setdefault('MIOPEN_FIND_MODE', 'FAST')
@@ -95,11 +95,13 @@ class HostModulation:
     weights stay in host RAM, are streamed per block to the GPU, and the vectors are cached per timestep.
     """
 
-    def __init__(self, base):
+    def __init__(self, base, source=None, loras=()):
+        """source: BF16 transformer dir (index + shards); default <base>/transformer. loras: 'path[:weight]' specs whose
+        img_mod.1 / txt_mod.1 deltas are merged here (the INT4 pack carries the rest of the same LoRA)."""
         import json
         from safetensors import safe_open
         from diffusers.models.embeddings import Timesteps, TimestepEmbedding
-        tdir = Path(base) / 'transformer'
+        tdir = Path(source) if source else Path(base) / 'transformer'
         where = json.load(open(tdir / 'diffusion_pytorch_model.safetensors.index.json'))['weight_map']
         files = {}
         def get(name):
@@ -115,6 +117,19 @@ class HostModulation:
         self.emb = self.emb.to('cuda', torch.bfloat16)
         self.w = {kind: [(get(f'transformer_blocks.{b}.{kind}.1.weight'), get(f'transformer_blocks.{b}.{kind}.1.bias'))
                          for b in range(self.n)] for kind in ('img_mod', 'txt_mod')}
+        self.merged = 0
+        if loras:
+            import sys
+            sys.path.insert(0, str(Path(__file__).resolve().parent / 'tools'))
+            from svdquant_from_bf16 import LoraMerge
+            merge = LoraMerge(list(loras))
+            for kind in ('img_mod', 'txt_mod'):
+                for b in range(self.n):
+                    name = f'transformer_blocks.{b}.{kind}.1'
+                    if name in merge.by_module:
+                        w, bias = self.w[kind][b]
+                        self.w[kind][b] = (merge.apply(name, w.float()).to(w.dtype), bias)
+                        self.merged += 1
         self.cache = {}
 
     @torch.no_grad()
@@ -139,7 +154,7 @@ class HostModulation:
         return self.cache[key][0], self.cache[key][1], self.cache[0.0][0]
 
 
-def load_pipeline(base, int4_path, *, zero_cond_t=None):
+def load_pipeline(base, int4_path, *, zero_cond_t=None, mod_source=None, mod_loras=()):
     """Edit-Plus pipeline (cuda device, tiled cuda VAE, CPU text encoder) whose transformer forward is NativeDiT.
 
     This is the GGUF editor's flow, which preserved identity; an earlier CPU-device flow with VAE/vision
@@ -154,7 +169,7 @@ def load_pipeline(base, int4_path, *, zero_cond_t=None):
     zc = bool(config.get('zero_cond_t', False)) if zero_cond_t is None else zero_cond_t
     host_mod = os.environ.setdefault('QIMG_HOST_MOD', '1') == '1'   # read by hip_qimg_load_dit_int4
     native = NativeDiT(int4_path)
-    mods = HostModulation(base) if host_mod else None
+    mods = HostModulation(base, mod_source, mod_loras) if host_mod else None
     holder = {}
 
     def forward(hidden_states, encoder_hidden_states=None, encoder_hidden_states_mask=None, timestep=None,
@@ -187,5 +202,6 @@ def load_pipeline(base, int4_path, *, zero_cond_t=None):
     pipe.vae.to('cuda'); pipe.vae.enable_tiling()
     type(pipe)._execution_device = property(lambda self: torch.device('cuda'))
     pipe.native = native
+    pipe.host_mod = mods
     holder['pipe'] = pipe
     return pipe

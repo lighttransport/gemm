@@ -106,6 +106,50 @@ def reconstruct_and_check(W, lam, lora_up, lora_down_emit, qint4, wscale, group=
     return cos, rel
 
 
+class LoraMerge:
+    """Fold LoRA deltas into BF16 weights before packing (the native runner has no adapter path).
+
+    Accepts diffusers/PEFT keys (`[transformer.]<module>.lora_A/.lora_B.weight`, alpha from the
+    `lora_adapter_metadata` header, default alpha=r) and kohya/lightx2v keys (`<module>.lora_down/.lora_up.weight`
+    with an optional `<module>.alpha`). delta = weight * (alpha/r) * B @ A in f32."""
+    def __init__(self, specs):
+        import json
+        self.by_module = {}
+        self.records = []
+        for spec in specs:
+            path, _, weight = spec.partition(":")
+            weight = float(weight or 1.0)
+            f = safe_open(path, "pt", "cpu")
+            meta = f.metadata() or {}
+            peft_alpha = None
+            if "lora_adapter_metadata" in meta:
+                m = json.loads(meta["lora_adapter_metadata"])
+                peft_alpha = m.get("transformer.lora_alpha", m.get("lora_alpha"))
+            keys = list(f.keys()); n = 0
+            for k in keys:
+                for a_suf, b_suf in ((".lora_A.weight", ".lora_B.weight"), (".lora_down.weight", ".lora_up.weight")):
+                    if not k.endswith(a_suf):
+                        continue
+                    mod = k[: -len(a_suf)]
+                    bk = mod + b_suf
+                    if bk not in keys:
+                        continue
+                    A = f.get_tensor(k).float(); B = f.get_tensor(bk).float(); r = A.shape[0]
+                    alpha = f.get_tensor(mod + ".alpha").float().item() if (mod + ".alpha") in keys else (peft_alpha or r)
+                    name = mod[len("transformer."):] if mod.startswith("transformer.") else mod
+                    name = name[len("diffusion_model."):] if name.startswith("diffusion_model.") else name
+                    self.by_module.setdefault(name, []).append((A, B, weight * alpha / r)); n += 1
+            self.records.append(dict(path=path, weight=weight, modules=n))
+            print(f"[lora] {path}: {n} modules, weight {weight}", file=sys.stderr)
+        self.used = set()
+
+    def apply(self, name, W):
+        for A, B, scale in self.by_module.get(name, []):
+            W = W + scale * (B @ A)
+            self.used.add(name)
+        return W
+
+
 class ShardedSource:
     """safe_open-like view over a diffusers sharded dir (e.g. Qwen-Image-Edit-2511/transformer)."""
     def __init__(self, directory):
@@ -139,7 +183,9 @@ def main():
     ap.add_argument("--no-smooth", action="store_true")
     ap.add_argument("--mod-rtn", action="store_true", help="quantize modulation with plain RTN (old behavior) instead of SVDQuant")
     ap.add_argument("--check", action="store_true", help="print per-linear reconstruction cosine")
+    ap.add_argument("--lora", action="append", default=[], help="path[:weight] LoRA merged into BF16 before packing (repeatable)")
     a = ap.parse_args()
+    lora = LoraMerge(a.lora)
     torch.manual_seed(0)
 
     calib = {} if a.no_smooth else load_calib(a.calib)
@@ -163,7 +209,7 @@ def main():
     for bi, b in enumerate(blocks):
         p = f"transformer_blocks.{b}."
         for suf in MAIN:
-            W = src.get_tensor(p + suf + ".weight").float()                    # [out,in]
+            W = lora.apply(p + suf, src.get_tensor(p + suf + ".weight").float())  # [out,in]
             if suf in int8_set:                                                # Q4_K_M-style: sensitive tensors at 8 bit
                 g = W.reshape(W.shape[0], -1, a.group)
                 scale = (g.abs().amax(dim=2, keepdim=True) / 127.0).clamp(min=1e-12)
@@ -196,7 +242,7 @@ def main():
                 cos_acc.append(cos)
                 print(f"  b{b:02d} {suf:18s} out={W.shape[0]:5d} in={W.shape[1]:5d} r={r} cos={cos:.5f} rel={rel:.4f}", file=sys.stderr)
         for suf in ([] if a.no_mod else MOD):                                  # SVDQuant rank-r (weight-only) — was RTN
-            W = src.get_tensor(p + suf + ".weight").float()                    # [6*hidden, hidden]
+            W = lora.apply(p + suf, src.get_tensor(p + suf + ".weight").float())  # [6*hidden, hidden]
             if a.mod_rtn:
                 qint4, wscale = quant_int4_g64(W, a.group)
                 out_t[p + suf + ".qint4"] = qint4; out_t[p + suf + ".wscale"] = wscale
@@ -222,9 +268,17 @@ def main():
     if cos_acc:
         print(f"[check] mean per-linear cosine over {len(cos_acc)} linears = {np.mean(cos_acc):.5f} "
               f"(min {np.min(cos_acc):.5f})", file=sys.stderr)
+    import json
+    unused = sorted(set(lora.by_module) - lora.used)
+    if a.lora:
+        print(f"[lora] merged into {len(lora.used)} packed linears; {len(unused)} LoRA modules not in the pack "
+              f"(e.g. modulation computed on the host): {unused[:4]}", file=sys.stderr)
     print(f"writing {len(out_t)} tensors -> {a.out}", file=sys.stderr)
     save_file(out_t, a.out, metadata={"format": "rdna4-logical-int4-w4a16", "group_size": str(a.group),
-                                      "rank": str(a.rank), "source": "bf16-svdquant", "alpha": str(a.alpha)})
+                                      "rank": str(a.rank), "source": "bf16-svdquant", "alpha": str(a.alpha),
+                                      "int8": a.int8, "smooth": "off" if a.no_smooth else "on",
+                                      "host_mod": str(a.no_mod), "loras": json.dumps(lora.records),
+                                      "lora_modules_not_packed": json.dumps(unused)})
     print(f"done in {time.time()-t0:.0f}s", file=sys.stderr)
 
 

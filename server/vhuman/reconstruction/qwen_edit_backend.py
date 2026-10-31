@@ -93,20 +93,30 @@ def make_editor(backend=None, model_root=ROOT, offload_blocks=0, *, loras=None, 
     backend=backend or os.environ.get('QWEN_EDIT_BACKEND','auto')
     if backend not in ('auto','native','gguf'):raise ValueError('unknown Edit-2511 backend: '+backend)
     model_root=Path(model_root)
-    native=bool(torch.version.hip) and (model_root/INT4.name).is_file() and (REPO/'rdna4/qimg/libhip_qimg.so').is_file()
+    native=bool(torch.version.hip) and ((model_root/INT4.name).is_file() or (model_root/NATIVE_PACKS).is_file()) \
+        and (REPO/'rdna4/qimg/libhip_qimg.so').is_file()
     if backend=='native' and not native:
         raise ValueError('native Edit-2511 requires ROCm Torch, the HIP library and the mixed INT4 weights')
+    if native and backend in ('native','auto') and loras:
+        try:
+            select_native_pack(model_root,[parse_lora_spec(s) for s in loras])
+        except ValueError:
+            if backend=='native':raise
+            native=False   # auto: no pack with these LoRAs -> GGUF + PEFT adapters
     if backend=='native' or (backend=='auto' and native):
-        if offload_blocks:raise ValueError('block offloading is only supported by the GGUF editor')
-        if loras:raise ValueError('LoRA adapters are only supported by the GGUF editor')
-        return NativeEditor(model_root)
+        return NativeEditor(model_root,loras=loras,encoder_device=encoder_device)
     return Editor(model_root,offload_blocks=offload_blocks,loras=loras,encoder_dtype=encoder_dtype,encoder_device=encoder_device)
 
 
 def stream_decoder_layers(encoder, device):
     """Keep a Qwen2.5-VL encoder's small modules on `device` and stream its decoder layers from pinned host memory."""
+    import torch
     language=encoder.model.language_model
-    for module in (encoder.model.visual,language.embed_tokens,language.norm,language.rotary_emb,encoder.lm_head):
+    # Prompt embeddings come from the last hidden state; the 152k-vocabulary LM head only produces unused logits.
+    encoder.lm_head=torch.nn.Identity()
+    encoder._vhuman_resident=(encoder.model.visual,language.embed_tokens,language.norm,language.rotary_emb)
+    encoder._vhuman_device=device
+    for module in encoder._vhuman_resident:
         module.to(device)
     import torch
     host={}
@@ -129,61 +139,82 @@ def stream_decoder_layers(encoder, device):
     return host
 
 
+NATIVE_PACKS='native_packs.json'   # model_root registry: {"bf16_transformer": dir, "packs": [{"file", "sha256", "loras": [{"sha256", "weight"}], ...}]}
+
+
+def select_native_pack(model_root, specs):
+    """The native DiT has no adapter path: LoRAs are merged at pack time, so pick the pack built with exactly these
+    LoRAs (by file sha256 and weight). Returns (pack record, registry)."""
+    import json
+    from .observations import sha256
+    registry_file=Path(model_root)/NATIVE_PACKS
+    registry=json.loads(registry_file.read_text()) if registry_file.is_file() else dict(packs=[dict(file=INT4.name,loras=[])])
+    want=sorted((sha256(s['path']),round(float(s['weight']),4)) for s in specs)
+    for pack in registry['packs']:
+        have=sorted((l['sha256'],round(float(l['weight']),4)) for l in pack.get('loras',[]))
+        if have==want and (Path(model_root)/pack['file']).is_file():return pack,registry
+    raise ValueError('no native Edit-2511 pack was built with these LoRAs: '+', '.join(Path(s['path']).name for s in specs))
+
+
 class NativeEditor:
+    """Qwen-Image-Edit-2511 on the native RDNA4 mixed INT4/INT8 DiT (rdna4/qimg). LoRAs are merged into the pack
+    (main linears) and into the host BF16 modulation weights; the prompt encoder streams on the GPU like Editor."""
     generator=NATIVE_GENERATOR
 
-    def load_loras(self, specs):
-        raise NotImplementedError('the native INT4 editor has no LoRA path; use backend=gguf')
-
-    def __init__(self, model_root=ROOT):
-        import sys,torch
+    def __init__(self, model_root=ROOT, *, loras=None, encoder_device='cuda'):
+        import os,sys,torch
+        os.environ.setdefault('QIMG_MIOPEN_CACHE',str(REPO/'tmp/miopen-cache'))
         sys.path.insert(0,str(REPO/'rdna4/qimg'))
         from qimg_edit_native import load_pipeline
-        self.torch=torch
-        model_root=Path(model_root)
-        self.pipe=load_pipeline(str(model_root/'base'),str(model_root/INT4.name))
-        self.metadata=dict(backend='native',model_root=str(model_root.resolve()),weights=INT4.name)
-        import os
-        if os.environ.get('QIMG_ENCODER_DTYPE','fp32')=='fp32':   # identity-checked; 3.8x faster on Zen 2
-            self.pipe.text_encoder.to(torch.float32)
-        if os.environ.get('QIMG_VISION_CACHE')=='1':
-            # positive and negative encodes see the same images: reuse the vision tower output (copies, since
-            # transformers mutates pooler_output in place)
-            import copy,hashlib
-            visual=self.pipe.text_encoder.model.visual;fwd=visual.forward;cache={}
-            def cached(pixel_values,grid_thw=None,**kw):
-                key=(hashlib.sha1(pixel_values.detach().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest(),
-                     None if grid_thw is None else tuple(grid_thw.flatten().tolist()))
-                if key not in cache:
-                    if len(cache)>=4:cache.pop(next(iter(cache)))
-                    cache[key]=copy.copy(fwd(pixel_values,grid_thw=grid_thw,**kw))
-                return copy.copy(cache[key])
-            visual.forward=cached
+        from .observations import sha256
+        self.torch=torch;self.device=torch.device('cuda');self.prompt_cache={}
+        model_root=Path(model_root);specs=[parse_lora_spec(s) for s in (loras or [])]
+        pack,registry=select_native_pack(model_root,specs)
+        mod_source=registry.get('bf16_transformer')
+        self.pipe=load_pipeline(str(model_root/'base'),str(model_root/pack['file']),mod_source=mod_source,
+                                mod_loras=[f"{s['path']}:{s['weight']}" for s in specs])
+        self.metadata=dict(backend='native',model_root=str(model_root.resolve()),weights=pack['file'],
+                           weights_sha256=pack.get('sha256'),pack_recipe=pack.get('recipe'),encoder_device=encoder_device,
+                           host_modulation_source=mod_source,host_modulation_lora_merged=getattr(self.pipe.host_mod,'merged',None),
+                           loras=[dict(path=str(s['path'].resolve()),sha256=sha256(s['path']),adapter=s['adapter'],weight=s['weight'],
+                                       merged='pack + host modulation') for s in specs])
+        encoder=self.pipe.text_encoder
+        if encoder_device=='cuda':
+            encoder.to(device='cpu',dtype=torch.bfloat16);stream_decoder_layers(encoder,self.device)
+            self.encoder_device=self.device;self.park_encoder=True   # the resident native DiT needs the room
+            for module in encoder._vhuman_resident:module.to('cpu')
+        else:
+            encoder.to(torch.float32);self.encoder_device=torch.device('cpu');self.park_encoder=False
+
+    def load_loras(self, specs):
+        raise NotImplementedError('native packs merge LoRAs at build time; pass loras= to make_editor')
 
     def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
                  negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
-        """Same flow as Editor (GGUF), which preserves identity: CPU prompt encode, cuda pipeline + generator."""
+        """Same flow as Editor (GGUF), which preserves identity: prompt encode, cuda pipeline + generator."""
         torch=self.torch;condition_size(size)
         import os
         ref_side=int(os.environ.get('QIMG_REF_SIDE','0'))   # e.g. 512: references at 512^2, target at size^2
         if ref_side:
             reference_areas([ref_side*ref_side]*(len(images)-1)+[size*size])
+        torch.cuda.reset_peak_memory_stats()
         started=time.time();dit0=self.pipe.native.seconds
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
         conditions=prompt_images(self.pipe,images)
         with torch.no_grad():
-            pos,pos_mask=self.pipe.encode_prompt(prompt=prompt,image=conditions,device=torch.device('cpu'))
-            neg,neg_mask=self.pipe.encode_prompt(prompt=negative,image=conditions,device=torch.device('cpu'))
-        # QIMG_ENCODER_DTYPE=fp32 only changes the encoder arithmetic (Zen 2 has no native BF16); embeddings go back to
-        # BF16 so the pipeline sees exactly the dtypes of the identity-verified flow.
+            pos,pos_mask=self._encode_prompt(prompt,conditions)
+            neg,neg_mask=self._encode_prompt(negative,conditions)
         pos,neg=pos.to(torch.bfloat16),neg.to(torch.bfloat16)
         encode=time.time()-started
-        move=lambda t:None if t is None else t.to('cuda')
+        move=lambda t:None if t is None else t.to(self.device)
         out=self.pipe(image=images,prompt_embeds=move(pos),prompt_embeds_mask=move(pos_mask),
             negative_prompt_embeds=move(neg),negative_prompt_embeds_mask=move(neg_mask),
             true_cfg_scale=cfg,height=size,width=size,num_inference_steps=steps,
             generator=torch.Generator(device=self.device).manual_seed(seed)).images[0]
         total=time.time()-started;dit=self.pipe.native.seconds-dit0
+        self.last_metrics=dict(seconds=total,prompt_encode_seconds=encode,native_dit_seconds=dit,
+                               peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                               peak_reserved_bytes=torch.cuda.max_memory_reserved(),host_peak_rss_bytes=host_peak_rss())
         print(f'[qwen_edit] total {total:.1f}s native DiT {dit:.1f}s prompt_encode {encode:.1f}s other {total-dit-encode:.1f}s',flush=True)
         return np.asarray(out.convert('RGB')),total
 
@@ -216,6 +247,11 @@ class Editor:
         encoder=self.pipe.text_encoder;encoder.to(device='cpu',dtype=getattr(torch,encoder_dtype))
         self.encoder_device=torch.device('cuda') if encoder_device=='cuda' else torch.device('cpu')
         if encoder_device=='cuda':stream_decoder_layers(encoder,self.encoder_device)
+        # With a resident DiT (offload_blocks=0) the encoder's GPU-resident modules are parked in host RAM between
+        # encodes so the ~13 GB Q4 transformer and its activations fit on a 16 GB card.
+        self.park_encoder=offload_blocks==0
+        if self.park_encoder and encoder_device=='cuda':
+            for module in encoder._vhuman_resident:module.to('cpu')
         if loras:self.load_loras(loras)   # PEFT injection must precede group-offload hooks
         if offload_blocks:
             transformer.enable_group_offload(onload_device=self.device,offload_device=torch.device('cpu'),
@@ -239,9 +275,9 @@ class Editor:
         names,weights=[],[]
         for spec in specs:
             spec=parse_lora_spec(spec)
-            before=sum(1 for n,_ in self.pipe.transformer.named_modules() if n.endswith('lora_A'))
             self.pipe.load_lora_weights(str(spec['path']),adapter_name=spec['adapter'])
-            after=sum(1 for n,_ in self.pipe.transformer.named_modules() if n.endswith('lora_A'))
+            # PEFT layers hold one lora_A entry per adapter, so count this adapter's entries.
+            before,after=0,sum(1 for n,_ in self.pipe.transformer.named_modules() if n.endswith('lora_A.'+spec['adapter']))
             if after<=before:raise RuntimeError(f"LoRA {spec['path'].name} injected no modules into the transformer")
             names.append(spec['adapter']);weights.append(spec['weight'])
             self.metadata['loras'].append(dict(path=str(spec['path'].resolve()),sha256=sha256(spec['path']),
@@ -255,7 +291,13 @@ class Editor:
         key=(prompt,tuple((im.mode,im.size,hashlib.sha256(im.tobytes()).digest()) for im in images))
         if key not in self.prompt_cache:
             print(f'[qwen_edit] encoding prompt on {self.encoder_device.type}',flush=True)
+            encoder=self.pipe.text_encoder;park=getattr(self,'park_encoder',False) and self.encoder_device.type=='cuda'
+            if park:
+                for module in encoder._vhuman_resident:module.to(self.encoder_device)
             value=self.pipe.encode_prompt(prompt=prompt,image=images,device=self.encoder_device)
+            if park:   # free ~3.3 GB for a resident DiT; re-uploaded (~0.5 s) on the next cache miss
+                for module in encoder._vhuman_resident:module.to('cpu')
+                self.torch.cuda.empty_cache()
             value=tuple(None if v is None else v.to('cpu') for v in value)   # cache on host; moved per call
             if len(self.prompt_cache)>=4:self.prompt_cache.pop(next(iter(self.prompt_cache)))
             self.prompt_cache[key]=value
@@ -288,6 +330,9 @@ class Editor:
                                host_peak_rss_bytes=host_peak_rss())
         print(f'[qwen_edit] {self.last_metrics}',flush=True)
         return np.asarray(out.convert('RGB')),total
+
+
+NativeEditor._encode_prompt=Editor._encode_prompt   # same cached GPU/CPU prompt encoding
 
 
 def main(argv=None):
@@ -326,3 +371,4 @@ def main(argv=None):
 
 if __name__=='__main__':
     raise SystemExit(main())
+
