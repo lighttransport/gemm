@@ -47,3 +47,21 @@ Synthetic pack (exact names/shapes, random values) at 1024^2 + one 1024^2 refere
 - **W4A8 (rejected)**: per-token INT8 activations x INT4-g64 weights on INT8 WMMA (`bench_w4a8.hip`).
   1.06-1.40x faster than W4A16 per linear (incl. activation quantization) but 2.1-2.4% rel error vs exact f32
   against 0.22% for W4A16, on activations with a few 4x outlier channels; compounding over 60 blocks is not worth it.
+
+## 2026-10-31: hipBLASLt for the large quantized linears (default when built; `QIMG_BLASLT=0` disables)
+
+`bench_qgemm.hip` (M = 8192, random data) shows the tiled loop itself is the ceiling, not the INT4 decode: dense
+BF16 weights in the same loop reach only 51-100 TF, the INT4/INT8 loaders 63-87 TF. hipBLASLt BF16 on the same
+shapes: 103-149 TF. `libqimg_blaslt.so` (`qimg_blaslt.hip`, dlopened like the Sage plugin, same-runtime guard)
+dequantizes the weight to a BF16 scratch (same RNE values as the tiled loaders) and calls hipBLASLt; the LoRA up
+(+bias, +GELU) then accumulates with the tiled kernel (`accum` bit 0), or `ew_bias_act4` applies bias/GELU.
+
+- Algorithms are tuned once per (N, K, M): candidates whose two runs differ bit-wise are dropped, the fastest
+  survivor's heuristic rank goes to `tmp/qimg-blaslt-algos.txt`, so outputs are reproducible across processes.
+  Heuristic #0 alone is poor on 3072^2 (1.80 vs 1.04 ms).
+- Self-test (`QIMG_TILED_SELFTEST=1`) on the hipBLASLt path: cos 0.999993 vs the legacy oracle, as the tiled path.
+- In isolation the fused tiled GEMM still wins INT4+LoRA at K = 3072, but inside the DiT routing every large
+  linear through hipBLASLt is fastest: real angles pack, 1024^2 + one reference: 3.74 -> 3.38-3.47 s per call
+  (INT8 + K >= 8192 only: 3.60 s; all but MLP-up: 3.51 s).
+- Real +40 view (same front, prompt, seed): DiT 156.8 -> 142.1 s, image vs fa16 46.5 dB / 0.56 levels mean,
+  ArcFace between the two 0.997, same turn direction.

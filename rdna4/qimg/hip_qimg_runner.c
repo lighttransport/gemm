@@ -235,6 +235,9 @@ struct hip_qimg_runner {
     hipFunction_t fn_nrp_bf16; int (*sage_hnd)(float *, const void *, void *, const void *, int, int, int, int, int, void *);
     void *sage_lib, *sage_buf; size_t sage_cap;
     hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4w_w8, fn_qg_i8_w8, fn_qg_i8_64, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
+    /* QIMG_BLASLT=1: dequantize-then-hipBLASLt for the large quantized linears (libqimg_blaslt.so) */
+    void *blaslt_lib, *blaslt_ctx; hipFunction_t fn_bias_act;
+    int (*blaslt_qgemm)(void *, float *, const void *, const unsigned char *, const unsigned short *, int, int, int, int);
     unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
     /* INT8 SmoothQuant (W8A8) path: int8 weights stream via the fp8 byte path (same 1 B/param);
@@ -1253,6 +1256,31 @@ static void qimg_tiled_int4_linear(hip_qimg_runner *r, void *Y, void *X, const q
     int act = r->pending_gelu ? 2 : 0;   /* caller asked for GELU fused into this linear's epilogue */
     if (qimg_tl_reserve(r, (size_t)nx, (size_t)(rk > 0 ? rk : 1) * n_tok, need_xb) != 0) { r->tiled_oom = 1; return; }
     qimg_tl_cast(r, r->tl_xs, X, L->smooth, n_in, nx);                       /* bf16(X / smooth) */
+    /* hipBLASLt (QIMG_BLASLT=1): Y = (X/s) . dequant(W)^T, then the rank-r LoRA up (+bias, +GELU) accumulates
+     * with the tiled kernel, or bias/GELU alone run in ew_bias_act4. In isolation the fused tiled GEMM still wins
+     * the INT4+LoRA linears at K = 3072, but inside the DiT routing every large linear here is fastest
+     * (1024^2 + one reference, real pack: 3.74 -> 3.47 s per call; INT8/INT4-only routing 3.60 s). */
+    int use_bl = r->blaslt_qgemm && n_tok >= 1024 && n_out % 4 == 0 && n_in % 64 == 0 && !need_xb;
+    if (use_bl) {
+        if (r->blaslt_qgemm(r->blaslt_ctx, (float *)Y, r->tl_xs, (const unsigned char *)L->qint4, (const unsigned short *)L->wscale,
+                            L->bits == 8 ? 8 : 4, n_out, n_in, n_tok) == 0) {
+            if (L->bits != 8 && rk > 0 && L->lora_down) {
+                int splits = n_in >= 2048 ? QIMG_LORA_SPLITS : 1; long nd = (long)n_tok * rk;
+                qimg_tl_gemm_split(r, 0, r->i4_dt, L->lora_down, NULL, r->tl_xs, NULL, rk, n_in, n_tok, 0, splits);
+                void *ra[] = {&r->tl_dtb, &r->i4_dt, &splits, &nd};
+                hipModuleLaunchKernel(r->fn_splitk_bf16, (unsigned)((nd + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ra, NULL);
+                qimg_tl_gemm(r, 0, Y, L->lora_up, NULL, r->tl_dtb, L->bias, n_out, rk, n_tok, 1 | act);
+            } else if (L->bias || act) {
+                long ny = (long)n_tok * n_out; const void *b = L->bias; int no = n_out;
+                void *ba[] = {&Y, (void *)&b, &no, &ny, &act};
+                hipModuleLaunchKernel(r->fn_bias_act, (unsigned)((ny / 4 + 255) / 256), 1, 1, 256, 1, 1, 0, NULL, ba, NULL);
+            }
+            if (act) r->gelu_fused = 1;
+            return;
+        }
+        fprintf(stderr, "hip_qimg: hipBLASLt linear failed (%d x %d, M=%d); tiled kernel from here on\n", n_out, n_in, n_tok);
+        r->blaslt_qgemm = NULL;
+    }
     if (L->bits == 8) {   /* plain int8-g64 weight, no low-rank branch */
         qimg_tl_gemm(r, 2, Y, L->qint4, L->wscale, r->tl_xs, L->bias, n_out, n_in, n_tok, act);
         if (act) r->gelu_fused = 1;
@@ -1983,6 +2011,28 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
           hipModuleGetFunction(&r->fn_qg_i4_256, r->mod_tiled, "qgemm_i4_128x256");
           hipModuleGetFunction(&r->fn_qg_bf16_w8, r->mod_tiled, "qgemm_bf16_128x128w8");
           { const char *v = getenv("QIMG_TILED_VARIANT"); r->tl_variant = v ? atoi(v) : 1; }
+          { const char *bl = getenv("QIMG_BLASLT");
+            if (bl && atoi(bl)) {
+                const char *path = getenv("QIMG_BLASLT_PLUGIN"); char buf[4096]; Dl_info info;
+                if (!path && dladdr((void *)hip_qimg_init, &info) && info.dli_fname) {
+                    snprintf(buf, sizeof buf, "%s", info.dli_fname); char *slash = strrchr(buf, '/');
+                    if (slash) { snprintf(slash + 1, sizeof buf - (size_t)(slash + 1 - buf), "libqimg_blaslt.so"); path = buf; }
+                }
+                r->blaslt_lib = path ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : NULL;
+                int (*create)(void **) = NULL;
+                if (r->blaslt_lib) { *(void **)&create = dlsym(r->blaslt_lib, "qimg_blaslt_create");
+                                     *(void **)&r->blaslt_qgemm = dlsym(r->blaslt_lib, "qimg_blaslt_qgemm"); }
+                if (create && r->blaslt_qgemm) {   /* one HIP runtime instance, as for the Sage plugin */
+                    void *plug = dlsym(r->blaslt_lib, "hipGetDevice"); Dl_info a, b;
+                    int same = plug && dladdr(plug, &a) && dladdr((void *)hipGetDevice, &b) && a.dli_fbase == b.dli_fbase;
+                    if (!same) fprintf(stderr, "hip_qimg: hipBLASLt path disabled: plugin and rocew use different HIP runtimes; "
+                                       "set ROCEW_ROCM_LIB to the ROCm lib dir already in use\n");
+                    if (!same || create(&r->blaslt_ctx) != 0) r->blaslt_qgemm = NULL;
+                } else r->blaslt_qgemm = NULL;
+                hipModuleGetFunction(&r->fn_bias_act, r->mod_tiled, "ew_bias_act4");
+                if (!r->fn_bias_act) r->blaslt_qgemm = NULL;
+                if (verbose) fprintf(stderr, "hip_qimg: hipBLASLt linears %s (%s)\n", r->blaslt_qgemm ? "enabled" : "UNAVAILABLE", path ? path : "no path");
+            } }
       } else r->use_tiled = 0;
       if (verbose) fprintf(stderr, "hip_qimg: int4 GEMM path: %s\n", r->use_tiled ? "tiled WMMA" : "legacy"); }
     { const char *a = getenv("QIMG_ATTN");   /* fa16 (default) | legacy */
@@ -2816,6 +2866,11 @@ void hip_qimg_free(hip_qimg_runner *r) {
     if (!r) return;
     qimg_print_gemm_summary(r);
     qimg_calib_dump(r);
+    if (r->blaslt_ctx && r->blaslt_lib) {
+        void (*destroy)(void *) = NULL; *(void **)&destroy = dlsym(r->blaslt_lib, "qimg_blaslt_destroy");
+        if (destroy) destroy(r->blaslt_ctx);
+        r->blaslt_ctx = NULL; r->blaslt_qgemm = NULL;
+    }
     for (int idx = 0; idx < QIMG_CALIB_MAXSLOT; idx++)
         if (r->calib_amax[idx]) { hipFree(r->calib_amax[idx]); r->calib_amax[idx] = NULL; }
     for (int b = 0; b < 64; b++)

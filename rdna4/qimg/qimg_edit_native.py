@@ -32,6 +32,11 @@ def pin_hip_runtime():
         pass
     return None
 
+# Large quantized linears through hipBLASLt (libqimg_blaslt.so, built by `make libqimg_blaslt.so`): DiT 156.8 ->
+# 142.1 s per 20-step CFG view, same image to 46.5 dB. Default on when the plugin is built; QIMG_BLASLT=0 disables.
+if (Path(__file__).resolve().parent / 'libqimg_blaslt.so').is_file():
+    os.environ.setdefault('QIMG_BLASLT', '1')
+
 # No shipped MIOpen find-db for gfx1201 here ("fdb.txt unreadable"): every new process re-searched the VAE's
 # conv3d kernels. Persist MIOpen's user db / kernel cache and use the fast find mode.
 _MIOPEN_CACHE = Path(os.environ.get('QIMG_MIOPEN_CACHE', str(Path(__file__).resolve().parents[2] / 'tmp/miopen-cache')))

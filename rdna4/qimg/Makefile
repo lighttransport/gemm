@@ -34,6 +34,14 @@ all: $(TARGET) $(VERIFY_DIT)
 libhip_qimg.so: libhip_qimg_impl.c $(RUNNER_SRC) $(ROCEW_SRC) $(COMMON_DEPS)
 	$(CC) $(CFLAGS) -fPIC -shared -fopenmp -include omp.h -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-function-declaration -o $@ libhip_qimg_impl.c $(RUNNER_SRC) $(LLM_SRC) $(ROCEW_SRC) $(LDFLAGS)
 
+# hipBLASLt plugin (QIMG_BLASLT=1), dlopened by libhip_qimg.so; needs hipcc + hipBLASLt.
+HIPCC ?= hipcc
+libqimg_blaslt.so: qimg_blaslt.hip
+	$(HIPCC) -std=c++17 -O3 --offload-arch=gfx1201 -fPIC -shared $< -lhipblaslt -ldl -o $@
+
+bench_qgemm: bench_qgemm.hip qimg_gemm_wmma.hip
+	$(HIPCC) -std=c++17 -O3 --offload-arch=gfx1201 $< -o ../../tmp/qimg/bench_qgemm
+
 # Tiled WMMA GEMM (ported from rdna4/llm/gemm_wmma.hip), embedded for HIPRTC.
 %.inc: %.hip
 	python3 -c 'import json,pathlib; print("static const char $*_source[] = " + json.dumps(pathlib.Path("$<").read_text()) + ";")' > $@

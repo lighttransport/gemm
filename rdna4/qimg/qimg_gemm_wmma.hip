@@ -397,6 +397,20 @@ extern "C" __global__ void ew_gelu4(float *x, long n) {
     *(float4 *)(x + i) = v;
 }
 
+/* Y[t,c] = act(Y[t,c] + bias[c]) for the hipBLASLt path (act 2 = tanh-GELU, as the fused epilogue). n % 4 == 0. */
+extern "C" __global__ void ew_bias_act4(float *Y, const float *bias, int N, long n, int act) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) return;
+    float4 v = *(float4 *)(Y + i);
+    float o[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        if (bias) o[j] += bias[(i + j) % N];
+        if (act & 2) { float u = 0.7978845608f * (o[j] + 0.044715f * o[j] * o[j] * o[j]); o[j] = o[j] / (1.0f + __expf(-2.0f * u)); }
+    }
+    *(float4 *)(Y + i) = make_float4(o[0], o[1], o[2], o[3]);
+}
+
 /* x[t,c] += gate[c] * proj[t,c], 4 per thread (dim % 4 == 0). */
 extern "C" __global__ void ew_gated_add4(float *x, const float *proj, const float *gate, int dim, long n) {
     long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
