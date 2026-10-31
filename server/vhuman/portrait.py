@@ -25,6 +25,8 @@ SHEET_SETS = ([45, -45, 90, -90], [40, -40, 90, -90])
 # Apache-2.0 route: Qwen-Image-Edit-2511 (GGUF) with a camera-angle LoRA. Keys are request 'angle_lora' values.
 ANGLE_LORAS = {
     'fal-2511': ('/mnt/nvme01/models/loras/qie2511-multiple-angles.safetensors:1.0:angles2511',),
+    # the LoRA card suggests starting at 0.9 (native pack 'angles09'); same prompt grammar as fal-2511
+    'fal-2511-0.9': ('/mnt/nvme01/models/loras/qie2511-multiple-angles.safetensors:0.9:angles2511',),
     'dx-2509': ('/mnt/nvme01/models/loras/qie2509-multiple-angles.safetensors:1.0:angles2509',),
     'none': (),
 }
@@ -66,7 +68,7 @@ def angle_prompt(angle, lora='fal-2511'):
     """Camera-angle instruction for Edit-2511. Positive yaw matches ANGLES ('Left ...': the subject's left side
     turns toward the camera, nose points to image left as in the Qwen 2.1 prompts)."""
     side = 'left' if angle > 0 else 'right'
-    if lora == 'fal-2511':
+    if lora in ('fal-2511', 'fal-2511-0.9'):
         # The LoRA names the camera position from the viewer's side: 'front-left' puts the nose toward image
         # right (verified 2026-10-31), i.e. negative yaw in ANGLES, so the descriptor side is mirrored here.
         cam = 'right' if angle > 0 else 'left'

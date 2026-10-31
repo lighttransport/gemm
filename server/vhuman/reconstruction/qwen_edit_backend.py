@@ -171,6 +171,33 @@ def select_native_pack(model_root, specs):
     raise ValueError('no native Edit-2511 pack was built with these LoRAs: '+', '.join(Path(s['path']).name for s in specs))
 
 
+def sdedit_args(pipe, init_image, strength, steps, size, seed, device):
+    """SDEdit start for the Edit-Plus pipeline: the target latents begin as `init_image` noised to the first sigma of
+    the default schedule's tail, so layout (e.g. an ear's outline in a condition render) is kept while detail is
+    regenerated. strength 1 = a free edit (plain noise), 0 = no change. Returns pipeline kwargs."""
+    import torch
+    from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import calculate_shift
+    if not 0 < strength <= 1:
+        raise ValueError('strength must be in (0, 1]')
+    full = np.linspace(1.0, 1 / steps, steps)
+    k = min(int(round((1 - strength) * steps)), steps - 1)
+    tail = full[k:]
+    seq = (size // 16) ** 2
+    cfg = pipe.scheduler.config
+    mu = calculate_shift(seq, cfg.get('base_image_seq_len', 256), cfg.get('max_image_seq_len', 4096),
+                         cfg.get('base_shift', .5), cfg.get('max_shift', 1.15))
+    s0 = float(np.exp(mu) / (np.exp(mu) + (1 / tail[0] - 1)))      # the scheduler's exponential time shift
+    image = init_image if isinstance(init_image, Image.Image) else Image.fromarray(np.asarray(init_image))
+    x = pipe.image_processor.preprocess(image.convert('RGB'), size, size).unsqueeze(2).to(device, pipe.vae.dtype)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    with torch.no_grad():
+        z = pipe._encode_vae_image(image=x, generator=generator)                    # normalised [1, C, 1, h, w]
+    c, h, w = z.shape[1], z.shape[3], z.shape[4]
+    z = pipe._pack_latents(z, 1, c, h, w)
+    noise = torch.randn(z.shape, generator=generator, device=device, dtype=z.dtype)
+    return dict(latents=((1 - s0) * z + s0 * noise).to(torch.bfloat16), sigmas=list(tail), num_inference_steps=len(tail))
+
+
 class NativeEditor:
     """Qwen-Image-Edit-2511 on the native RDNA4 mixed INT4/INT8 DiT (rdna4/qimg). LoRAs are merged into the pack
     (main linears) and into the host BF16 modulation weights; the prompt encoder streams on the GPU like Editor."""
@@ -205,7 +232,7 @@ class NativeEditor:
         raise NotImplementedError('native packs merge LoRAs at build time; pass loras= to make_editor')
 
     def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
-                 negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
+                 negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights', init_image=None, strength=None):
         """Same flow as Editor (GGUF), which preserves identity: prompt encode, cuda pipeline + generator."""
         torch=self.torch;condition_size(size)
         import os
@@ -224,7 +251,9 @@ class NativeEditor:
         move=lambda t:None if t is None else t.to(self.device)
         out=self.pipe(image=images,prompt_embeds=move(pos),prompt_embeds_mask=move(pos_mask),
             negative_prompt_embeds=move(neg),negative_prompt_embeds_mask=move(neg_mask),
-            true_cfg_scale=cfg,height=size,width=size,num_inference_steps=steps,
+            true_cfg_scale=cfg,height=size,width=size,
+            **(sdedit_args(self.pipe,init_image,strength,steps,size,seed,self.device) if init_image is not None and strength is not None
+               else dict(num_inference_steps=steps)),
             generator=torch.Generator(device=self.device).manual_seed(seed)).images[0]
         total=time.time()-started;dit=self.pipe.native.seconds-dit0
         mods=getattr(self.pipe,'host_mod',None)
@@ -322,7 +351,7 @@ class Editor:
         return self.prompt_cache[key]
 
     def __call__(self, images, prompt, *, steps=20, seed=317, cfg=4., size=1024,
-                 negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights'):
+                 negative='blurry, hair, hat, glasses, text, extra ears, shadows, highlights', init_image=None, strength=None):
         torch=self.torch;started=time.time();condition_size(size)
         torch.cuda.reset_peak_memory_stats()
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
@@ -337,7 +366,9 @@ class Editor:
         move=lambda t:None if t is None else t.to(self.device)
         out=self.pipe(image=images,prompt_embeds=move(pos),prompt_embeds_mask=move(pos_mask),
             negative_prompt_embeds=move(neg),negative_prompt_embeds_mask=move(neg_mask),
-            true_cfg_scale=cfg,height=size,width=size,num_inference_steps=steps,
+            true_cfg_scale=cfg,height=size,width=size,
+            **(sdedit_args(self.pipe,init_image,strength,steps,size,seed,self.device) if init_image is not None and strength is not None
+               else dict(num_inference_steps=steps)),
             generator=torch.Generator(device=self.device).manual_seed(seed)).images[0]
         torch.cuda.synchronize()
         total=time.time()-started
