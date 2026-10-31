@@ -23,7 +23,7 @@ class DeblockTest(unittest.TestCase):
         img = np.stack([base + fine + pattern] * 3)
         out = deblock(img)
         before = cell_pattern_std(img[0]); after = cell_pattern_std(out[0])
-        self.assertLess(after, 0.5 * before)
+        self.assertLess(after, 0.25 * before)
         self.assertLess(np.sqrt(((out - img - (-pattern)) ** 2).mean()), np.sqrt((pattern ** 2).mean()))
 
     def test_pattern_free_image_barely_changes(self):
@@ -32,6 +32,20 @@ class DeblockTest(unittest.TestCase):
         out = deblock(img)
         self.assertLess(np.abs(out - img).max(), 3.0 + 1e-9)
         self.assertLess(np.sqrt(((out - img) ** 2).mean()), 0.3)
+
+    def test_drifting_pattern_reaches_noise_floor(self):
+        base, fine, amp = _texture(4)
+        rng = np.random.default_rng(5)
+        a, b = rng.normal(0, 1, (2, 16, 16)); a -= a.mean(); b -= b.mean()
+        t = np.linspace(0, 1, 512)[None, :]                      # pattern shape drifts left -> right
+        pattern = (np.tile(a, (32, 32)) * (1 - t) + np.tile(b, (32, 32)) * t) * amp * 0.8
+        out = deblock(np.stack([base + fine + pattern] * 3))[0]
+        self.assertLess(cell_pattern_std(out), 1.5 * max(cell_pattern_std(out, 15), cell_pattern_std(out, 17)))
+
+    def test_odd_sizes_cover_every_pixel(self):
+        base, fine, _ = _texture(6, 600)
+        x = np.stack([(base + fine)[:300, :600]] * 3)
+        self.assertTrue(np.isfinite(deblock(x)).all())
 
     def test_scale_and_shape(self):
         img = np.zeros((3, 20, 20))

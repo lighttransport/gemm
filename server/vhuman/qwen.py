@@ -147,7 +147,7 @@ def native_available():
                for name in ("fast", "text", "vision", "vae", "vae_encode")) and gpu.model_path("qimg-21").is_dir()
 
 
-def make_backend(python=None, mock=False, preset="fast12", cancel=None):
+def make_backend(python=None, mock=False, preset="fast12", cancel=None, deblock=False):
     _import_qimg21()
     if mock:
         return SyntheticIrisBackend()
@@ -157,7 +157,7 @@ def make_backend(python=None, mock=False, preset="fast12", cancel=None):
     return NativeBackend(model=gpu.model_path("qimg-21"), python=python, preset=preset, cancel=cancel,
                          attention='flash' if gpu.backend() == 'cuda' else None,
                          resident=preset != "low8", backend=gpu.backend(), device=gpu.device_index(),
-                         quant_package=gpu.model_path("qimg-21-fast/int8-smooth-a0.6"))
+                         quant_package=gpu.model_path("qimg-21-fast/int8-smooth-a0.6"), deblock=deblock)
 
 
 def _thumb(photo: np.ndarray, size: int = 160) -> Image.Image:
