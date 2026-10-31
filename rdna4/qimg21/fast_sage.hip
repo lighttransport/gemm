@@ -31,17 +31,23 @@ __global__ void unpack_hnd_padded(__hip_bfloat16*out,const __hip_bfloat16*in,int
  if(i<(long)rows*heads*128){int d=i%128,r=(i/128)%rows,h=i/(128*rows);out[(long)r*stride+h*128+d]=in[((long)h*padded+r)*128+d];}
 }
 /* Parallel column statistics over [heads][rows][128] (the serial per-head versions below cost ~2.8 ms and
- * ~1.8 ms at 8k rows): each block reduces a row chunk of one head; partials meet through atomics. */
+ * ~1.8 ms at 8k rows): each block reduces a row chunk of one head. Sums go to per-chunk partials that
+ * sum_partials adds in chunk order, so results are bit-reproducible (a float atomicAdd made the K mean, and
+ * with it every INT8 rounding, vary from run to run: 0.5% latent drift per step). Max is order-free. */
 constexpr int kStatChunk=128;
 /* The attention kernel consumes K/V in 64-row tiles: with nk % 64 != 0 the last tile of the last head reads past
  * the INT8 K / FP8 V buffers. Zeroed slack keeps those reads finite (masked logits * NaN would still be NaN). */
 constexpr size_t kSlack=(size_t)128*128*4;
-__global__ void column_stats(float *sum,unsigned *absmax,const __hip_bfloat16 *x,int rows) {
+__global__ void column_stats(float *partial,unsigned *absmax,const __hip_bfloat16 *x,int rows) {
     int d=threadIdx.x,h=blockIdx.y,r0=blockIdx.x*kStatChunk,r1=min(rows,r0+kStatChunk);
     float s=0,m=0;
     for(int r=r0;r<r1;r++){float v=__bfloat162float(x[((long)h*rows+r)*128+d]);s+=v;m=fmaxf(m,fabsf(v));}
-    if(sum)atomicAdd(sum+h*128+d,s);
+    if(partial)partial[((long)blockIdx.x*gridDim.y+h)*128+d]=s;
     if(absmax)atomicMax(absmax+h*128+d,__float_as_uint(m));   /* non-negative floats order like their bits */
+}
+__global__ void sum_partials(float *sum,const float *partial,int chunks,int heads) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<heads*128){float s=0;for(int c=0;c<chunks;c++)s+=partial[(long)c*heads*128+i];sum[i]=s;}
 }
 __global__ void subtract_mean(__hip_bfloat16 *k,const float *sum,int rows,int heads) {
     long i=(long)blockIdx.x*blockDim.x+threadIdx.x;
@@ -73,7 +79,8 @@ extern "C" int q21f_sage_attention(void*out,const void*q,const void*k,const void
     int padded_q=(nq+127)/128*128;
     size_t qn=(size_t)padded_q*heads*128,kn=(size_t)nk*heads*128;
     int qgroups=(padded_q+31)/32,kgroups=(nk+63)/64;
-    size_t bytes=qn*5+kn*6+2*kSlack+(size_t)heads*(qgroups+kgroups+128)*4+(size_t)heads*128*8+4096;
+    int chunks=(nk+kStatChunk-1)/kStatChunk;
+    size_t bytes=qn*5+kn*6+2*kSlack+(size_t)heads*(qgroups+kgroups+128)*4+(size_t)heads*128*8+(size_t)chunks*heads*128*4+4096;
     if(work.device!=dev||work.bytes<bytes) {
         if(work.ptr){rc=hipDeviceSynchronize();if(rc)return rc;rc=hipFree(work.ptr);if(rc)return rc;work.ptr=nullptr;}
         rc=hipMalloc(&work.ptr,bytes);if(rc)return rc;work.bytes=bytes;work.device=dev;
@@ -88,12 +95,14 @@ extern "C" int q21f_sage_attention(void*out,const void*q,const void*k,const void
     pack_hnd<<<(kn+255)/256,256,0,stream>>>(kh,(const __hip_bfloat16*)k,nk,heads,ks);
     pack_hnd<<<(kn+255)/256,256,0,stream>>>(vh,(const __hip_bfloat16*)v,nk,heads,ks);
     auto ksum=(float*)alloc((size_t)heads*128*4);auto vmax=(unsigned*)alloc((size_t)heads*128*4);
+    auto kpart=(float*)alloc((size_t)chunks*heads*128*4);
     rc=hipMemsetAsync(k8+kn,0,kSlack,stream);if(rc)return rc;rc=hipMemsetAsync(v8+kn,0,kSlack,stream);if(rc)return rc;
-    rc=hipMemsetAsync(ksum,0,(size_t)heads*128*4,stream);if(rc)return rc;rc=hipMemsetAsync(vmax,0,(size_t)heads*128*4,stream);if(rc)return rc;
-    column_stats<<<dim3((nk+kStatChunk-1)/kStatChunk,heads),128,0,stream>>>(ksum,nullptr,kh,nk);
+    rc=hipMemsetAsync(vmax,0,(size_t)heads*128*4,stream);if(rc)return rc;
+    column_stats<<<dim3(chunks,heads),128,0,stream>>>(kpart,nullptr,kh,nk);
+    sum_partials<<<(heads*128+255)/256,256,0,stream>>>(ksum,kpart,chunks,heads);
     subtract_mean<<<(kn+255)/256,256,0,stream>>>(kh,ksum,nk,heads);
     quant_qk_int8_hnd_kernel<__hip_bfloat16,128><<<dim3(qgroups+kgroups,heads),256,0,stream>>>(qh,kh,q8,k8,qscale,kscale,1,heads,heads,padded_q,nk,qgroups,kgroups);
-    column_stats<<<dim3((nk+kStatChunk-1)/kStatChunk,heads),128,0,stream>>>(nullptr,vmax,vh,nk);
+    column_stats<<<dim3(chunks,heads),128,0,stream>>>(nullptr,vmax,vh,nk);
     scales_from_absmax<<<(heads*128+255)/256,256,0,stream>>>(vs,vmax,heads*128);
     transpose_value_fp8_scaled_hnd_kernel<__hip_bfloat16><<<dim3((nk+127)/128,8,heads),256,0,stream>>>(vh,vs,v8,heads,nk,128);
     qk_int8_sv_f8_native_2q_kernel<64,128,0,8,true,128,true,false,__hip_bfloat16><<<dim3((nq+127)/128,heads),128,0,stream>>>(q8,k8,v8,oh,qscale,kscale,vs,1,padded_q,nk,heads,heads,
@@ -114,7 +123,8 @@ extern "C" int q21f_sage_attention_hnd(float*out,const void*qh_,void*kh_,const v
     auto qh=(const __hip_bfloat16*)qh_;auto kh=(__hip_bfloat16*)kh_;auto vh=(const __hip_bfloat16*)vh_;
     size_t qn=(size_t)padded_q*heads*128,kn=(size_t)nk*heads*128;
     int qgroups=(padded_q+31)/32,kgroups=(nk+63)/64;
-    size_t bytes=qn*3+kn*2+2*kSlack+(size_t)heads*(qgroups+kgroups+128)*4+(size_t)heads*128*8+4096;
+    int chunks=(nk+kStatChunk-1)/kStatChunk;
+    size_t bytes=qn*3+kn*2+2*kSlack+(size_t)heads*(qgroups+kgroups+128)*4+(size_t)heads*128*8+(size_t)chunks*heads*128*4+4096;
     if(work.device!=dev||work.bytes<bytes) {
         if(work.ptr){rc=hipDeviceSynchronize();if(rc)return rc;rc=hipFree(work.ptr);if(rc)return rc;work.ptr=nullptr;}
         rc=hipMalloc(&work.ptr,bytes);if(rc)return rc;work.bytes=bytes;work.device=dev;
@@ -124,12 +134,14 @@ extern "C" int q21f_sage_attention_hnd(float*out,const void*qh_,void*kh_,const v
     auto oh=(__hip_bfloat16*)alloc(qn*2);auto q8=(int8_t*)alloc(qn);auto k8=(int8_t*)alloc(kn+kSlack);auto v8=(uint8_t*)alloc(kn+kSlack);
     auto qscale=(float*)alloc((size_t)heads*qgroups*4);auto kscale=(float*)alloc((size_t)heads*kgroups*4);auto vs=(float*)alloc((size_t)heads*128*4);
     auto ksum=(float*)alloc((size_t)heads*128*4);auto vmax=(unsigned*)alloc((size_t)heads*128*4);
+    auto kpart=(float*)alloc((size_t)chunks*heads*128*4);
     rc=hipMemsetAsync(k8+kn,0,kSlack,stream);if(rc)return rc;rc=hipMemsetAsync(v8+kn,0,kSlack,stream);if(rc)return rc;
-    rc=hipMemsetAsync(ksum,0,(size_t)heads*128*4,stream);if(rc)return rc;rc=hipMemsetAsync(vmax,0,(size_t)heads*128*4,stream);if(rc)return rc;
-    column_stats<<<dim3((nk+kStatChunk-1)/kStatChunk,heads),128,0,stream>>>(ksum,nullptr,kh,nk);
+    rc=hipMemsetAsync(vmax,0,(size_t)heads*128*4,stream);if(rc)return rc;
+    column_stats<<<dim3(chunks,heads),128,0,stream>>>(kpart,nullptr,kh,nk);
+    sum_partials<<<(heads*128+255)/256,256,0,stream>>>(ksum,kpart,chunks,heads);
     subtract_mean<<<(kn+255)/256,256,0,stream>>>(kh,ksum,nk,heads);
     quant_qk_int8_hnd_kernel<__hip_bfloat16,128><<<dim3(qgroups+kgroups,heads),256,0,stream>>>(qh,kh,q8,k8,qscale,kscale,1,heads,heads,padded_q,nk,qgroups,kgroups);
-    column_stats<<<dim3((nk+kStatChunk-1)/kStatChunk,heads),128,0,stream>>>(nullptr,vmax,vh,nk);
+    column_stats<<<dim3(chunks,heads),128,0,stream>>>(nullptr,vmax,vh,nk);
     scales_from_absmax<<<(heads*128+255)/256,256,0,stream>>>(vs,vmax,heads*128);
     transpose_value_fp8_scaled_hnd_kernel<__hip_bfloat16><<<dim3((nk+127)/128,8,heads),256,0,stream>>>(vh,vs,v8,heads,nk,128);
     qk_int8_sv_f8_native_2q_kernel<64,128,0,8,true,128,true,false,__hip_bfloat16><<<dim3((nq+127)/128,heads),128,0,stream>>>(q8,k8,v8,oh,qscale,kscale,vs,1,padded_q,nk,heads,heads,
