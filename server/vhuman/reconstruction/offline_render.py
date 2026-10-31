@@ -29,7 +29,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08,head_fit=None,parsing_model=None,
            include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
-           ablate=(), noisy=True, eyes=None, chart=False, displacement_scale=1., micro_scale=1., save_blend=True):
+           ablate=(), noisy=True, eyes=None, chart=False, displacement_scale=1., micro_scale=1., save_blend=True,
+           lip_coat_scale=1.):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
@@ -87,7 +88,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     request = dict(out=str(out), device=device, preset=preset, gpu_index=gpu_index,lighting=lighting,yaw=yaw,exposure=exposure,sss_weight=sss_weight,
                    camera=camera,pitch=pitch,distance_scale=distance_scale,focal_scale=focal_scale,hdri=hdri_record,
                    samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy),
-                   chart=bool(chart),displacement_scale=float(displacement_scale),micro_scale=float(micro_scale),save_blend=bool(save_blend))
+                   chart=bool(chart),displacement_scale=float(displacement_scale),micro_scale=float(micro_scale),save_blend=bool(save_blend),
+                   lip_coat_scale=float(lip_coat_scale))
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())
@@ -100,6 +102,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
             raise ValueError('motion lacks the native skin topology gate; refit this legacy track')
         if not 1<=frame<=track['frames']:raise ValueError('render frame outside motion range')
         request.update(motion=str(motion),frame=frame)
+    # A measured tooth shade travels with the candidate (cycles_scene.full_mouth_materials reads out/teeth.json).
+    if (Path(candidate)/'teeth.json').is_file():
+        shutil.copyfile(Path(candidate)/'teeth.json',out/'teeth.json');request['teeth']=str((Path(candidate)/'teeth.json').resolve())
     (out/'request.json').write_text(json.dumps(request, indent=2))
     started = time.monotonic()
     peak = 0

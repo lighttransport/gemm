@@ -143,7 +143,7 @@ def full_skin_graph(skin,node,bound,out,request):
     sp=math('MULTIPLY',spec,math('SUBTRACT',1.,math('MULTIPLY',cavity,.7)),clamp=True);links.new(sp,node.inputs['Specular IOR Level'])
     # second (sharper) lobe kept small so skin reads oily, not wet: coat .10(1-cavity)+.35 lips,
     # roughness .30 -> .12 on lips (the moist lip band)
-    coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),.10),math('MULTIPLY',lips,.35),clamp=True);links.new(coat,node.inputs['Coat Weight'])
+    coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),.10),math('MULTIPLY',lips,.35*float(request.get('lip_coat_scale',1.))),clamp=True);links.new(coat,node.inputs['Coat Weight'])
     cr=math('SUBTRACT',.30,math('MULTIPLY',lips,.18),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
     node.inputs['Coat IOR'].default_value=1.4
     # random-walk skin subsurface (radii in metres, literature-scale skin profile)
