@@ -19,13 +19,19 @@ from .view_acceptance import ArcFace, srgb_to_lab
 LORAS = {
     'v2': '/mnt/nvme01/models/loras/qie2509-light-restoration-v2.safetensors',
     'v1': '/mnt/nvme01/models/loras/qie2509-light-restoration-v1.safetensors',
+    # 2511-native studio relight LoRA (Apache-2.0, prithivMLmods/QIE-2511-Studio-DeLight, 5000-step checkpoint)
+    'studio': '/mnt/nvme02/models/loras-extra/studio-delight/QIE-2511-Studio-DeLight-5000.safetensors',
 }
+# Adapters trained on a fixed trigger prompt; the generic PROMPT is used for the others.
+TRIGGERS = {'studio': 'Neutral uniform lighting Preserve identity and composition'}
 PROMPT = ('Remove all lighting and shadows from this photo of the person: flat, even, shadowless studio lighting as '
           'if lit by a softbox from every direction, no specular highlights, no cast shadows, no light gradients '
           'across the skin. Keep the exact same person, pose, framing, hair, skin colour and every skin detail; '
           'keep the plain light grey background. Photorealistic, sharp.')
 NEGATIVE = 'shadows, highlights, dramatic lighting, rim light, blur, different person, makeup, retouching, text'
-THRESHOLDS = dict(arcface_min=.6, min_shading_drop=.2, max_hue_shift_deg=6.)
+# Lightness/chroma bounds: removing shading must not bleach the skin (QIE-2511-Studio-DeLight passed shading + hue but
+# returned a lighter, desaturated person; another adapter returned a near-white ghost).
+THRESHOLDS = dict(arcface_min=.6, min_shading_drop=.2, max_hue_shift_deg=6., max_lightness_shift=8., min_chroma_ratio=.8)
 
 
 def skin_stats(rgb, parser):
@@ -51,7 +57,8 @@ def delight(inputs, out, *, lora='v2', steps=20, seed=4242, offload_blocks=1, pa
         views = [v for v in views if v['yaw_deg'] in only_yaws]
     parser = FaceParser(model=parsing_model); arcface = arcface or ArcFace()
     lora_spec = None if lora == 'none' else [f'{LORAS[lora]}:1.0:light_restoration_{lora}']
-    report = dict(format='vhuman.delight_input.v1', inputs=str(inputs.resolve()), adapter=lora, prompt=PROMPT, negative=NEGATIVE,
+    prompt = TRIGGERS.get(lora, PROMPT)
+    report = dict(format='vhuman.delight_input.v1', inputs=str(inputs.resolve()), adapter=lora, prompt=prompt, negative=NEGATIVE,
                   steps=steps, seed=seed, thresholds=thresholds, views=[], texture_images={})
     if editor is None:
         try:
@@ -66,7 +73,7 @@ def delight(inputs, out, *, lora='v2', steps=20, seed=4242, offload_blocks=1, pa
         original = np.asarray(Image.open(src).convert('RGB'))
         target = out / f"{view['yaw_deg']}.png"
         if not target.is_file():
-            result, seconds = editor([Image.fromarray(original)], PROMPT, steps=steps, seed=seed + int(view['yaw_deg']) % 97, cfg=4., size=1024, negative=NEGATIVE)
+            result, seconds = editor([Image.fromarray(original)], prompt, steps=steps, seed=seed + int(view['yaw_deg']) % 97, cfg=4., size=1024, negative=NEGATIVE)
             Image.fromarray(result).save(target)
         delit = np.asarray(Image.open(target).convert('RGB'))
         e0, _, _ = arcface.embed(original); e1, _, _ = arcface.embed(delit)
@@ -79,7 +86,13 @@ def delight(inputs, out, *, lora='v2', steps=20, seed=4242, offload_blocks=1, pa
         if s0 and s1:
             drop = 1 - s1['l_std'] / max(s0['l_std'], 1e-6)
             hue = abs((s1['hue_deg'] - s0['hue_deg'] + 180) % 360 - 180)
-            row.update(shading_drop=drop, hue_shift_deg=hue)
+            dl = s1['median_lab'][0] - s0['median_lab'][0]
+            chroma = np.hypot(*s1['median_lab'][1:]) / max(np.hypot(*s0['median_lab'][1:]), 1e-6)
+            row.update(shading_drop=drop, hue_shift_deg=hue, lightness_shift=float(dl), chroma_ratio=float(chroma))
+            if abs(dl) > thresholds.get('max_lightness_shift', 1e9):
+                failures.append(f'lightness shift {dl:+.1f}')
+            if chroma < thresholds.get('min_chroma_ratio', 0):
+                failures.append(f'chroma ratio {chroma:.2f}')
             if drop < thresholds['min_shading_drop']:
                 failures.append(f'shading drop {drop:.2f}')
             if hue > thresholds['max_hue_shift_deg']:
@@ -98,7 +111,7 @@ def delight(inputs, out, *, lora='v2', steps=20, seed=4242, offload_blocks=1, pa
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--inputs', required=True, help='generated_face_inputs.v1 json (front + side views)')
-    ap.add_argument('--out', required=True); ap.add_argument('--lora', choices=('v2', 'v1', 'none'), default='v2')
+    ap.add_argument('--out', required=True); ap.add_argument('--lora', choices=('v2', 'v1', 'studio', 'none'), default='v2')
     ap.add_argument('--steps', type=int, default=20); ap.add_argument('--seed', type=int, default=4242)
     ap.add_argument('--offload-blocks', type=int, default=1); ap.add_argument('--parsing-model')
     ap.add_argument('--yaws', type=int, nargs='*', help='restrict to these yaw angles')
