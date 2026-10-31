@@ -160,3 +160,36 @@ extern "C" __global__ void fa16_vt(wt *Vt2, const wt *Vt, int N, int H, int Np) 
   int t = (int)(e % Np), d = (int)((e / Np) % HD), h = (int)(e / ((long)Np * HD));
   Vt2[e] = t < N ? Vt[((long)h * N + t) * HD + d] : (wt)0;
 }
+
+/* Sage-attention variant of fa16_norm_rope_pack: same RMSNorm + 3-axis RoPE, BF16 (RNE) outputs, all three in
+ * head-major [H][rows][HD] (Q with Np rows per head; rows >= N are zeroed by the caller). */
+__device__ __forceinline__ unsigned short bf16_rne(float f){union{float f;u32 i;}u;u.f=f;u32 x=u.i;return (unsigned short)((x+0x7FFFu+((x>>16)&1u))>>16);}
+extern "C" __global__ void nrp_bf16_hnd(unsigned short *Qh, unsigned short *Kh, unsigned short *Vh, const float *q, const float *k,
+        const float *v, int N, int Np, int H, int n_txt, const float *wq_img, const float *wk_img, const float *wq_txt,
+        const float *wk_txt, const int *pos_img, int txt_start, int t_dim, int h_dim, int w_dim, float theta) {
+  int wave = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (wave >= N * H) return;
+  int tok = wave / H, h = wave % H, dim = H * HD;
+  long src = (long)tok * dim + h * HD + lane * 4;
+  float4 qv = *(const float4 *)(q + src), kv = *(const float4 *)(k + src), vv = *(const float4 *)(v + src);
+  int txt = tok < n_txt;
+  const float *wq = (txt ? wq_txt : wq_img) + lane * 4, *wk = (txt ? wk_txt : wk_img) + lane * 4;
+  float sq = qv.x*qv.x + qv.y*qv.y + qv.z*qv.z + qv.w*qv.w, sk = kv.x*kv.x + kv.y*kv.y + kv.z*kv.z + kv.w*kv.w;
+  for (int m = 16; m > 0; m >>= 1) { sq += __shfl_xor(sq, m, 32); sk += __shfl_xor(sk, m, 32); }
+  float iq = rsqrtf(sq / HD + 1e-6f), ik = rsqrtf(sk / HD + 1e-6f);
+  float Q[4] = {qv.x*iq*wq[0], qv.y*iq*wq[1], qv.z*iq*wq[2], qv.w*iq*wq[3]};
+  float K[4] = {kv.x*ik*wk[0], kv.y*ik*wk[1], kv.z*ik*wk[2], kv.w*ik*wk[3]};
+  for (int pp = 0; pp < 2; pp++) {
+    int p = lane * 2 + pp, axis, i, dimA;
+    if (p < t_dim / 2) { axis = 0; i = p; dimA = t_dim; }
+    else if (p < (t_dim + h_dim) / 2) { axis = 1; i = p - t_dim / 2; dimA = h_dim; }
+    else { axis = 2; i = p - (t_dim + h_dim) / 2; dimA = w_dim; }
+    float position = txt ? (float)(txt_start + tok) : (float)pos_img[(tok - n_txt) * 3 + axis];
+    float ang = position / powf(theta, 2.0f * (float)i / (float)dimA), cs = cosf(ang), sn = sinf(ang);
+    float q0 = Q[2*pp], q1 = Q[2*pp+1], k0 = K[2*pp], k1 = K[2*pp+1];
+    Q[2*pp] = q0*cs - q1*sn; Q[2*pp+1] = q0*sn + q1*cs; K[2*pp] = k0*cs - k1*sn; K[2*pp+1] = k0*sn + k1*cs;
+  }
+  long hq = ((long)h * Np + tok) * HD + lane * 4, hk = ((long)h * N + tok) * HD + lane * 4;
+  float V[4] = {vv.x, vv.y, vv.z, vv.w};
+  for (int j = 0; j < 4; j++) { Qh[hq + j] = bf16_rne(Q[j]); Kh[hk + j] = bf16_rne(K[j]); Vh[hk + j] = bf16_rne(V[j]); }
+}

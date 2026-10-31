@@ -16,6 +16,22 @@ import torch
 
 LIB = Path(__file__).resolve().parent / 'libhip_qimg.so'
 
+
+def pin_hip_runtime():
+    """Point rocew at the HIP runtime this process already loaded (e.g. PyTorch's), so the runner and its plugins
+    (SageAttention) share one runtime instance; two libamdhip64 builds in one process do not order each other's work."""
+    if 'ROCEW_ROCM_LIB' in os.environ:
+        return os.environ['ROCEW_ROCM_LIB']
+    try:
+        for line in open('/proc/self/maps'):
+            path = line.split()[-1] if line.strip() else ''
+            if '/libamdhip64.so' in path:
+                os.environ['ROCEW_ROCM_LIB'] = str(Path(path).parent)
+                return os.environ['ROCEW_ROCM_LIB']
+    except OSError:
+        pass
+    return None
+
 # No shipped MIOpen find-db for gfx1201 here ("fdb.txt unreadable"): every new process re-searched the VAE's
 # conv3d kernels. Persist MIOpen's user db / kernel cache and use the fast find mode.
 _MIOPEN_CACHE = Path(os.environ.get('QIMG_MIOPEN_CACHE', str(Path(__file__).resolve().parents[2] / 'tmp/miopen-cache')))
@@ -31,6 +47,7 @@ for _d in ('db', 'kernels'):
 
 class NativeDiT:
     def __init__(self, int4_path, device=0, verbose=1):
+        pin_hip_runtime()
         self.lib = ctypes.CDLL(str(LIB))
         L = self.lib
         L.hip_qimg_init.restype = ctypes.c_void_p

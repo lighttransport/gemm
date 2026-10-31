@@ -27,6 +27,8 @@
 #define HIP_RUNNER_COMMON_IMPLEMENTATION
 #include "../hip_runner_common.h"
 
+#define _GNU_SOURCE 1
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -229,6 +231,9 @@ struct hip_qimg_runner {
     hipModule_t mod_tiled; int use_tiled, tiled_oom, step_error, pending_gelu, gelu_fused;
     int fast_attn, fast_ew;   /* fa16 / vectorized elementwise: on for the INT4 (edit) DiT; QIMG_ATTN=fa16, QIMG_EW=1 force */
     hipModule_t mod_fa16; hipFunction_t fn_fa16, fn_fa16_pack, fn_fa16_nrp, fn_fa16_vt, fn_fa16_dbvt; void *fa16_buf; size_t fa16_cap; void *fa16_vt_buf; size_t fa16_vt_cap;  /* QIMG_ATTN=fa16 */
+    /* QIMG_SAGE=1: INT8-QK / FP8-PV SageAttention from rdna4/qimg21/libq21_hip_fast_sage.so on BF16 head-major Q/K/V */
+    hipFunction_t fn_nrp_bf16; int (*sage_hnd)(float *, const void *, void *, const void *, int, int, int, int, int, void *);
+    void *sage_lib, *sage_buf; size_t sage_cap;
     hipFunction_t fn_ew_gelu, fn_ew_gadd, fn_ew_trunc, fn_ew_rms, fn_ew_adaln, fn_splitk_bf16, fn_qg_bf16_128, fn_qg_bf16_64, fn_qg_i4_128, fn_qg_i4_64, fn_cast_bf16, fn_qg_bf16_64x64, fn_qg_i4_w8, fn_qg_i4w_w8, fn_qg_i8_w8, fn_qg_i8_64, fn_qg_i4_256, fn_qg_bf16_w8; int tl_variant;
     unsigned short *tl_xs, *tl_xb, *tl_dtb; size_t tl_x_cap, tl_dt_cap;
     int use_int4;                    /* 1 when a logical-int4 DiT was loaded */
@@ -1853,6 +1858,7 @@ static void qimg_tiled_selftest(hip_qimg_runner *r) {
     }
     int shapes[][2]={{3072,3072},{12288,3072},{3072,12288}};
     int Ms[2]={4096+300, 300};
+    if (getenv("QIMG_TILED_SELFTEST_M")) Ms[0] = atoi(getenv("QIMG_TILED_SELFTEST_M"));   /* e.g. 8192: 1024^2 edit, one reference */
     for(int t=0;t<2;t++)for(int i=0;i<3;i++)qimg_tiled_selftest_one(r,Ms[t],shapes[i][1],shapes[i][0]);
 }
 
@@ -1985,6 +1991,28 @@ hip_qimg_runner *hip_qimg_init(int device_id, int verbose) {
           hipModuleGetFunction(&r->fn_fa16, r->mod_fa16, "fa_db");
           hipModuleGetFunction(&r->fn_fa16_pack, r->mod_fa16, "fa16_pack");
           if (!getenv("QIMG_NO_FUSED_QKV")) hipModuleGetFunction(&r->fn_fa16_nrp, r->mod_fa16, "fa16_norm_rope_pack");
+          hipModuleGetFunction(&r->fn_nrp_bf16, r->mod_fa16, "nrp_bf16_hnd");
+          { const char *sg = getenv("QIMG_SAGE");
+            if (sg && atoi(sg)) {
+                const char *path = getenv("QIMG_SAGE_PLUGIN"); char buf[4096]; Dl_info info;
+                if (!path && dladdr((void *)hip_qimg_init, &info) && info.dli_fname) {
+                    snprintf(buf, sizeof buf, "%s", info.dli_fname); char *slash = strrchr(buf, '/');
+                    if (slash) { snprintf(slash + 1, sizeof buf - (size_t)(slash + 1 - buf), "../qimg21/libq21_hip_fast_sage.so"); path = buf; }
+                }
+                r->sage_lib = path ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : NULL;
+                if (r->sage_lib) *(void **)&r->sage_hnd = dlsym(r->sage_lib, "q21f_sage_attention_hnd");
+                if (r->sage_hnd) {   /* the plugin must resolve to the same HIP runtime instance rocew loaded */
+                    void *plug = dlsym(r->sage_lib, "hipGetDevice"); Dl_info a, b;
+                    int same = plug && dladdr(plug, &a) && dladdr((void *)hipGetDevice, &b) && a.dli_fbase == b.dli_fbase;
+                    if (!same) {
+                        fprintf(stderr, "hip_qimg: SageAttention disabled: plugin and rocew use different HIP runtimes (%s vs %s); "
+                                "set ROCEW_ROCM_LIB to the ROCm lib dir already in use\n",
+                                plug && dladdr(plug, &a) ? a.dli_fname : "?", dladdr((void *)hipGetDevice, &b) ? b.dli_fname : "?");
+                        r->sage_hnd = NULL;
+                    }
+                }
+                if (verbose) fprintf(stderr, "hip_qimg: SageAttention %s (%s)\n", r->sage_hnd ? "enabled" : "UNAVAILABLE", path ? path : "no path");
+            } }
           { const char *vt = getenv("QIMG_FA_VT");
             if (!(vt && !strcmp(vt, "0"))) {
                 hipModuleGetFunction(&r->fn_fa16_vt, r->mod_fa16, "fa16_vt");
@@ -2883,8 +2911,62 @@ static int qimg_fused_qkv_attn(hip_qimg_runner *r, void *d_out, void *d_q, void 
         if (hipMalloc(&r->fa16_buf, need) != hipSuccess) return -1;
         r->fa16_cap = need;
     }
-    void *Qh = r->fa16_buf, *Kt = (char *)r->fa16_buf + ne * 2, *Vt = (char *)r->fa16_buf + ne * 4;
     int ts = r->edit_txt_start;
+    if (r->sage_hnd && r->fn_nrp_bf16) {
+        /* + zeroed slack: Sage's K quantization reads whole 64-row groups past the last head's rows */
+        int np = (n_tok + 127) / 128 * 128; size_t nq = (size_t)n_heads * 128 * np, slack = (size_t)128 * 128 * 2, need_s = (nq + 2 * ne) * 2 + slack;
+        if (need_s > r->sage_cap) {
+            hipDeviceSynchronize(); hipFree(r->sage_buf); r->sage_buf = NULL; r->sage_cap = 0;
+            if (hipMalloc(&r->sage_buf, need_s) != hipSuccess) return -1;
+            r->sage_cap = need_s;
+        }
+        void *Qs = r->sage_buf, *Ks = (char *)r->sage_buf + nq * 2, *Vs = (char *)Ks + ne * 2;
+        hipMemsetAsync(Qs, 0, nq * 2, NULL);   /* padded query rows */
+        hipMemsetAsync((char *)Vs + ne * 2, 0, slack, NULL);
+        void *a[] = {&Qs, &Ks, &Vs, &d_q, &d_k, &d_v, &n_tok, &np, &n_heads, &n_txt,
+                     (void *)&blk->norm_q_w, (void *)&blk->norm_k_w, (void *)&blk->norm_added_q_w, (void *)&blk->norm_added_k_w,
+                     &r->d_edit_pos, &ts, &t_dim, &h_dim, &w_dim, &theta};
+        hipModuleLaunchKernel(r->fn_nrp_bf16, (unsigned)(((long)n_tok * n_heads + 7) / 8), 1, 1, 256, 1, 1, 0, NULL, a, NULL);
+        static int sync_dbg = -1; if (sync_dbg < 0) sync_dbg = getenv("QIMG_SAGE_SYNC") ? 1 : 0;
+        if (sync_dbg) hipDeviceSynchronize();
+        int src = r->sage_hnd((float *)d_out, Qs, Ks, Vs, n_tok, np, n_tok, n_heads, n_heads * 128, NULL);
+        if (sync_dbg) hipDeviceSynchronize();
+        static int check_left = -1; if (check_left < 0) check_left = getenv("QIMG_SAGE_CHECK") ? atoi(getenv("QIMG_SAGE_CHECK")) : 0;
+        if (src == 0 && check_left > 0) {   /* debug: compare against fa16 on the same block */
+            check_left--; hipDeviceSynchronize();
+            size_t no = (size_t)n_tok * n_heads * 128; float *hs = (float *)malloc(no * 4), *hf = (float *)malloc(no * 4);
+            unsigned short *hk = (unsigned short *)malloc(ne * 2), *hv = (unsigned short *)malloc(ne * 2), *hq = (unsigned short *)malloc(nq * 2);
+            hipMemcpy(hs, d_out, no * 4, hipMemcpyDeviceToHost); hipMemcpy(hq, Qs, nq * 2, hipMemcpyDeviceToHost);
+            hipMemcpy(hk, Ks, ne * 2, hipMemcpyDeviceToHost); hipMemcpy(hv, Vs, ne * 2, hipMemcpyDeviceToHost);
+            void *tmp = NULL; hipMalloc(&tmp, no * 4);
+            void *keep = (void *)r->sage_hnd; r->sage_hnd = NULL;
+            qimg_fused_qkv_attn(r, tmp, d_q, d_k, d_v, n_tok, n_txt, n_heads, blk, t_dim, h_dim, w_dim, theta);
+            *(void **)&r->sage_hnd = keep; hipDeviceSynchronize(); hipMemcpy(hf, tmp, no * 4, hipMemcpyDeviceToHost); hipFree(tmp);
+            double d = 0, n = 0; long bad = 0, badf = 0;
+            for (size_t i = 0; i < no; i++) { if (!isfinite(hs[i])) { bad++; continue; } if (!isfinite(hf[i])) { badf++; continue; } d += (hs[i]-hf[i])*(double)(hs[i]-hf[i]); n += (double)hf[i]*hf[i]; }
+            float mq = 0, mk = 0, mv = 0; long nfq = 0, nfk = 0, nfv = 0;
+            #define BFV(x) ({ unsigned u_ = (unsigned)(x) << 16; float f_; memcpy(&f_, &u_, 4); f_; })
+            for (size_t i = 0; i < nq; i++) { float f = BFV(hq[i]); if (!isfinite(f)) nfq++; else mq = fmaxf(mq, fabsf(f)); }
+            for (size_t i = 0; i < ne; i++) { float f = BFV(hk[i]); if (!isfinite(f)) nfk++; else mk = fmaxf(mk, fabsf(f));
+                                              float g = BFV(hv[i]); if (!isfinite(g)) nfv++; else mv = fmaxf(mv, fabsf(g)); }
+            if (getenv("QIMG_SAGE_DUMP") && check_left == atoi(getenv("QIMG_SAGE_CHECK")) - 1) {   /* first checked block */
+                char nm[4096]; FILE *f;
+                snprintf(nm, sizeof nm, "%s_q.bin", getenv("QIMG_SAGE_DUMP")); f = fopen(nm, "wb"); fwrite(hq, 2, nq, f); fclose(f);
+                snprintf(nm, sizeof nm, "%s_k.bin", getenv("QIMG_SAGE_DUMP")); f = fopen(nm, "wb"); fwrite(hk, 2, ne, f); fclose(f);
+                snprintf(nm, sizeof nm, "%s_v.bin", getenv("QIMG_SAGE_DUMP")); f = fopen(nm, "wb"); fwrite(hv, 2, ne, f); fclose(f);
+                snprintf(nm, sizeof nm, "%s_fa16.bin", getenv("QIMG_SAGE_DUMP")); f = fopen(nm, "wb"); fwrite(hf, 4, no, f); fclose(f);
+                snprintf(nm, sizeof nm, "%s_sage.bin", getenv("QIMG_SAGE_DUMP")); f = fopen(nm, "wb"); fwrite(hs, 4, no, f); fclose(f);
+                fprintf(stderr, "sage-check: dumped n_tok=%d np=%d heads=%d\n", n_tok, np, n_heads);
+            }
+            fprintf(stderr, "sage-check: rel_l2=%.4f sage_nonfinite=%ld fa16_nonfinite=%ld |q|=%.3g(%ld) |k|=%.3g(%ld) |v|=%.3g(%ld)\n",
+                    sqrt(d / (n + 1e-30)), bad, badf, mq, nfq, mk, nfk, mv, nfv);
+            free(hs); free(hf); free(hk); free(hv); free(hq);
+            /* keep the sage result in d_out for the rest of the step */
+        }
+        if (src == 0) return 0;
+        fprintf(stderr, "hip_qimg: SageAttention failed; falling back to fa16\n"); r->sage_hnd = NULL;
+    }
+    void *Qh = r->fa16_buf, *Kt = (char *)r->fa16_buf + ne * 2, *Vt = (char *)r->fa16_buf + ne * 4;
     void *a[] = {&Qh, &Kt, &Vt, &d_q, &d_k, &d_v, &n_tok, &n_heads, &n_txt,
                  (void *)&blk->norm_q_w, (void *)&blk->norm_k_w, (void *)&blk->norm_added_q_w, (void *)&blk->norm_added_k_w,
                  &r->d_edit_pos, &ts, &t_dim, &h_dim, &w_dim, &theta};
