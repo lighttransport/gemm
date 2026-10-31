@@ -183,6 +183,8 @@ def fit(source, initial, views, *, scale=1., rotation=None, max_modes=24, iterat
         lo[off+3:off+6], hi[off+3:off+6] = -.8, .8
         if authored:
             lo[off+6:off+6+ne],hi[off+6:off+6+ne] = 0,1
+    # A seed from an earlier (differently bounded) solve may sit outside these bounds; least_squares rejects that.
+    x = np.clip(x, lo, hi)
     # Camera/pose first, then shared identity and expression.
     pose_ids = np.array([ni+j*(6+ne)+k for j in range(ng) for k in range(6)], int)
     fixed_groups = {group_index[i] for i in fixed_pose_views}
