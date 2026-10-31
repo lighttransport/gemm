@@ -55,11 +55,11 @@ def delight(inputs, out, *, lora='v2', steps=20, seed=4242, offload_blocks=1, pa
                   steps=steps, seed=seed, thresholds=thresholds, views=[], texture_images={})
     if editor is None:
         try:
-            editor = make_editor('gguf', offload_blocks=offload_blocks, loras=lora_spec)
+            editor = make_editor('auto', offload_blocks=offload_blocks, loras=lora_spec)   # native pack with this LoRA, else GGUF
             report['adapter_status'] = 'bound' if lora_spec else 'prompt only'
         except Exception as exc:
             report['adapter_status'] = f'LoRA failed to bind ({exc}); prompt only'
-            editor = make_editor('gguf', offload_blocks=offload_blocks)
+            editor = make_editor('auto', offload_blocks=offload_blocks)
     report['editor'] = editor.metadata
     for view in views:
         src = inputs.parent / view['file']
