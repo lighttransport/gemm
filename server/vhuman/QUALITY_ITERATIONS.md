@@ -2345,3 +2345,50 @@ statistics. Edit-2511: GPU prompt encoder (145–275 → 7 s), native INT4/INT8 
 - **Multiple-Angles at 0.9 (no effect)**: our prompt grammar already matches the card's vocabulary exactly; at the card's
   suggested 0.9 the same s2 +40 seeds turn the wrong way as at 1.0 (nose offset +0.40/+0.52 vs +0.39/+0.50). The
   direction is set by the seed and subject; the mirrored-input fallback stays the fix.
+
+### Next round (2026-11-01 morning): the four recommended items
+
+Simplified renders (studio, 1024² / 128 spp) to finish by 09:00; A and B are the earlier 2048² heroes downscaled for
+the metrics. Report section "next round" on the review page; numbers in `tmp/vhuman-ab-cycles/metrics/next_round.json`.
+
+- **Studio preset calibrated in the scene (17ae979a)**: lamps ×2^−1.36, default HDRI tinted by its chart gains; the
+  chart now needs −1.504 / −1.501 EV with unit white balance, so renders need no re-display.
+- **Skin (a2094a51)**: B's mouth/eye loss was not the lip/tooth/iris materials but a coarse "orange peel" from the
+  tiled micro-normal (and, less, the true displacement). Sweep on both subjects: micro 0.25 / displacement 0.25 lowers
+  face+mouth LPIPS 0.397 → 0.339 (A: 0.365). B2 = B with that setting.
+- **Ears from clay renders**: Edit-2511 on a grey shaded render of our own ear geometry keeps the layout (edge shift
+  0–1 px vs 13–250 px for albedo-render edits and SDEdit); 3 of 8 close-ups pass the guard + visual review (others:
+  waxy clay skin or odd helix folds; 90° views still fail the box-local silhouette check where generated hair meets
+  the head). Generated ear detail 57.7k (s1) / 31.0k (s2) texels → `ears02` (geometry byte-identical).
+- **PixelSmile phase B**: keyframes aligned to the portrait framing (similarity on MediaPipe eye/nose anchors), Wan I2V
+  toward neutral, frames reversed → catalog; A and B refit (all 7 motions per candidate pass the gate). Wan did not
+  relax the expressions (clips stay at the keyframe), so these are strong static expressions rather than onsets.
+
+LPIPS vs the portrait (face, eyes, mouth) and vs the held-out Edit-2511 ±90 views (ears); lower is better.
+
+| | face | eyes | mouth | ear +90 | ear −90 |
+|---|---|---|---|---|---|
+| s1 A | 0.446 | 0.299 | 0.239 | 0.726 | 0.739 |
+| s1 B | 0.430 | 0.296 | 0.280 | 0.608 | 0.574 |
+| s1 **B2** | 0.433 | **0.284** | **0.222** | 0.618 | 0.591 |
+| s2 A | 0.500 | 0.307 | 0.274 | 0.654 | 0.571 |
+| s2 B | 0.507 | 0.357 | 0.385 | 0.571 | 0.606 |
+| s2 **B2** | 0.508 | 0.313 | **0.261** | 0.597 | 0.579 |
+
+B2 removes B's mouth loss (now better than A on both subjects) and most of s2's eye loss; face unchanged; ears stay
+well ahead of A (within ±0.03 of B, partly resolution: B2 is 1024²/128 spp vs B's 2048² heroes).
+
+Expression amplitude in the front renders (similarity-aligned MediaPipe displacement from the candidate's neutral render):
+
+| | happy | sad | angry | fear | surprise | disgust |
+|---|---|---|---|---|---|---|
+| s1 A (Wan fast5) | 0.008 | 0.002 | 0.005 | 0.003 | 0.054 | 0.010 |
+| s1 A-ps / B2-ps | 0.093 / 0.087 | 0.018 / 0.015 | 0.078 / 0.077 | 0.076 / 0.070 | 0.065 / 0.061 | 0.018 / 0.015 |
+| s2 A (Wan fast5) | 0.015 | 0.002 | 0.004 | 0.006 | 0.006 | 0.006 |
+| s2 A-ps / B2-ps | 0.088 / 0.084 | 0.018 / 0.019 | 0.050 / 0.051 | 0.051 / 0.049 | 0.103 / 0.105 | 0.022 / 0.022 |
+
+PixelSmile-driven motions are ~4-20x stronger (happy shows teeth, angry bares teeth, surprise opens the mouth);
+sad/disgust remain subtle. Open mouths expose dull grey teeth: the mouth interior is the next visible weakness.
+
+Still open (pipeline review, `research-2026-11-01.md`): hair/scalp coverage (crown and back bald, s2's bun missing),
+background bleed at silhouettes, ragged view boundaries, inter-view colour seams.

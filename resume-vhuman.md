@@ -219,3 +219,7 @@ Other exact build/verification commands and saved recipes are in the workspace.
   expressions; (2) ear close-ups via depth/normal-conditioned generation (edit models copy their input; SDEdit failed);
   (3) calibrate the studio preset itself (about -2.86 EV or AgX) instead of re-displaying; (4) B's mouth/iris materials
   lose to A on LPIPS: compare crops and tune.
+- 2026-11-01 next round done: studio preset calibrated in-scene (17ae979a); B2 = clay-conditioned ear detail (`ears02`) +
+  skin micro/displacement 0.25 (a2094a51); PixelSmile phase B motions (A-ps, B2-ps; `expr/<s>_{A,B}_ps`). Renders for this
+  round: plan `next`/`next2` in render_matrix (studio 1024²/128), report `scripts/next_report.py`. Next: hair/scalp from
+  generated back views, silhouette background bleed, feathered view boundaries, colour seams, mouth-interior teeth.
