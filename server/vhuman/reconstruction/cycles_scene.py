@@ -306,6 +306,38 @@ def curve_object(name,paths,mat,radius, *, cyclic=False):
     return obj
 
 
+def add_color_chart(scene,camera_obj,data,out,lighting):
+    """24-patch matte ColorChecker 2 cm in front of the face, facing the camera, under the scene's lights.
+    Writes chart.json (patch names, reference linear albedo, pixel centres) for color_chart.calibrate_render."""
+    if __package__:
+        from . import color_chart
+    else:
+        sys.path.insert(0,str(Path(__file__).parent));import color_chart
+    from bpy_extras.object_utils import world_to_camera_view
+    m=np.asarray(camera_obj.matrix_world);origin=m[:3,3];right,up,back=m[:3,0],m[:3,1],m[:3,2];forward=-back
+    skin=np.asarray(data['skin_positions'],float).reshape(-1,3)
+    depth=float(((skin-origin)@forward).min())-.02
+    centre=origin+forward*depth
+    centres,size=color_chart.layout()
+    albedo=color_chart.reference_linear();patches=[]
+    rotation=Matrix(np.stack([right,up,back],1).tolist()).to_euler()
+    for i,((name,rgb),(cx,cy)) in enumerate(zip(color_chart.PATCHES,centres)):
+        mesh=bpy.data.meshes.new(f'chart_{i:02d}');h=size/2
+        mesh.from_pydata([(-h,-h,0),(h,-h,0),(h,h,0),(-h,h,0)],[],[(0,1,2,3)])
+        obj=bpy.data.objects.new(f'chart_{i:02d}',mesh);bpy.context.collection.objects.link(obj)
+        position=centre+right*cx+up*cy;obj.location=position.tolist();obj.rotation_euler=rotation
+        mat=bpy.data.materials.new(f'chart_{i:02d}');mat.use_nodes=True;bsdf=mat.node_tree.nodes['Principled BSDF']
+        bsdf.inputs['Base Color'].default_value=(*[float(v) for v in albedo[i]],1.);bsdf.inputs['Roughness'].default_value=1.
+        if 'Specular IOR Level' in bsdf.inputs:bsdf.inputs['Specular IOR Level'].default_value=0.
+        mesh.materials.append(mat)
+        res=(scene.render.resolution_x,scene.render.resolution_y)
+        c=world_to_camera_view(scene,camera_obj,Vector(position.tolist()))
+        e=world_to_camera_view(scene,camera_obj,Vector((position+right*h).tolist()))
+        patches.append(dict(name=name,srgb8=list(rgb),albedo_linear=[float(v) for v in albedo[i]],
+                            pixel_center=[float(c.x*res[0]),float((1-c.y)*res[1])],pixel_half_size=float(abs(e.x-c.x)*res[0])))
+    (out/'chart.json').write_text(json.dumps(dict(lighting=lighting,depth_m=depth,patches=patches),indent=2))
+
+
 def run(request):
     started=time.perf_counter();out=Path(request['out']);out.mkdir(parents=True,exist_ok=True)
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -538,6 +570,7 @@ def run(request):
     scene['inferred_artifacts']=json.dumps(dict(accessories=config['accessories'],hair=config['hair'],
         detail=config['detail'],material=config['material']))
     if request.get('motion'):animate(scene,request,config,data,objects)
+    if request.get('chart'):add_color_chart(scene,camera_obj,data,out,lighting)
     bpy.ops.wm.save_as_mainfile(filepath=str(out/'head.blend'))
     scene.render.image_settings.file_format='OPEN_EXR';scene.render.image_settings.color_mode='RGBA';scene.render.image_settings.color_depth='16'
     scene.render.filepath=str(out/'beauty.exr');bpy.ops.render.render(write_still=True)

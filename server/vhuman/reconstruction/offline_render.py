@@ -29,7 +29,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            lighting='studio', yaw=0., exposure=-1.5, sss_weight=.08,head_fit=None,parsing_model=None,
            include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
-           ablate=(), noisy=True, eyes=None):
+           ablate=(), noisy=True, eyes=None, chart=False):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
@@ -86,7 +86,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     res_px,spp=PRESETS[preset]
     request = dict(out=str(out), device=device, preset=preset, gpu_index=gpu_index,lighting=lighting,yaw=yaw,exposure=exposure,sss_weight=sss_weight,
                    camera=camera,pitch=pitch,distance_scale=distance_scale,focal_scale=focal_scale,hdri=hdri_record,
-                   samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy))
+                   samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy),
+                   chart=bool(chart))
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())
@@ -183,6 +184,7 @@ def main():
     parser.add_argument('--quality',choices=QUALITY,default='baseline');parser.add_argument('--ablate',nargs='*',default=())
     parser.add_argument('--no-noisy',dest='noisy',action='store_false',help='skip the un-denoised beauty output')
     parser.add_argument('--eyes',type=Path,help='eye_personalize output directory (quality full only)')
+    parser.add_argument('--chart',action='store_true',help='place a ColorChecker in front of the face (color_chart calibration)')
     parser.add_argument('--accessories', choices=('keep','omit'), default='keep')
     parser.add_argument('--detail-preset', choices=('source','mature'), default='mature')
     parser.add_argument('--blender', type=Path, default=DEFAULT_BLENDER)
