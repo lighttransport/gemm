@@ -464,6 +464,11 @@ def run(request):
                 # True displacement: dice to ~1 px (hero) / 2 px at render time instead of a fixed 2 levels.
                 modifier.use_adaptive_subdivision=True;modifier.render_levels=3
                 scene.cycles.dicing_rate=1. if request['preset']=='hero' else 2.;scene.cycles.preview_dicing_rate=8
+                # Close-up cameras (ear/eye/mouth) dice the visible region at 1 px but kept the off-screen head
+                # dense too and exceeded 14 GB on a 9070 XT: 2 px on-screen (still sub-mm at that distance), coarse
+                # off-screen geometry and a hard subdivision cap.
+                if str(request.get('camera','')).startswith(('ear_','eye_','mouth')):scene.cycles.dicing_rate=max(scene.cycles.dicing_rate,2.)
+                scene.cycles.offscreen_dicing_scale=16.;scene.cycles.max_subdivisions=8
         if part['material']=='glass':
             modifier=obj.modifiers.new('lens_thickness_prior','SOLIDIFY');modifier.thickness=.001
     hair=bpy.data.materials.new('source_hair_color_prior');hair.use_nodes=True
