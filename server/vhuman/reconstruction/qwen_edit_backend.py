@@ -83,7 +83,7 @@ def host_peak_rss():
     return None
 
 
-def make_editor(backend=None, model_root=ROOT, offload_blocks=0, *, loras=None, encoder_dtype='bfloat16'):
+def make_editor(backend=None, model_root=ROOT, offload_blocks=0, *, loras=None, encoder_dtype='bfloat16', encoder_device='cuda'):
     """Select explicitly, or use native only with a ROCm Torch runtime and its assets.
 
     loras: optional LoRA specs (see parse_lora_spec); only the GGUF editor can apply them.
@@ -100,7 +100,33 @@ def make_editor(backend=None, model_root=ROOT, offload_blocks=0, *, loras=None, 
         if offload_blocks:raise ValueError('block offloading is only supported by the GGUF editor')
         if loras:raise ValueError('LoRA adapters are only supported by the GGUF editor')
         return NativeEditor(model_root)
-    return Editor(model_root,offload_blocks=offload_blocks,loras=loras,encoder_dtype=encoder_dtype)
+    return Editor(model_root,offload_blocks=offload_blocks,loras=loras,encoder_dtype=encoder_dtype,encoder_device=encoder_device)
+
+
+def stream_decoder_layers(encoder, device):
+    """Keep a Qwen2.5-VL encoder's small modules on `device` and stream its decoder layers from pinned host memory."""
+    language=encoder.model.language_model
+    for module in (encoder.model.visual,language.embed_tokens,language.norm,language.rotary_emb,encoder.lm_head):
+        module.to(device)
+    import torch
+    host={}
+    for layer in language.layers:
+        # One pinned buffer per layer: PyTorch's pinned allocator rounds each allocation up to a power of two, so
+        # pinning tensors individually costs ~40% extra host RAM.
+        tensors=[t for t in list(layer.parameters())+list(layer.buffers())]
+        sizes=[t.numel()*t.element_size() for t in tensors]
+        flat=torch.empty(sum(sizes),dtype=torch.uint8,pin_memory=True);offset=0;pairs=[]
+        for t,size in zip(tensors,sizes):
+            view=flat[offset:offset+size].view(t.dtype).view(t.shape);view.copy_(t.data);t.data=view;offset+=size
+            pairs.append((t,view))
+        host[layer]=pairs
+    def onload(module,args,kwargs):
+        for t,pinned in host[module]:t.data=pinned.to(device,non_blocking=True)
+    def release(module,args,kwargs,output):
+        for t,pinned in host[module]:t.data=pinned
+    for layer in language.layers:
+        layer.register_forward_pre_hook(onload,with_kwargs=True);layer.register_forward_hook(release,with_kwargs=True)
+    return host
 
 
 class NativeEditor:
@@ -165,25 +191,31 @@ class NativeEditor:
 class Editor:
     generator=GENERATOR
 
-    def __init__(self, model_root=ROOT, *, offload_blocks=0, loras=None, encoder_dtype='bfloat16'):
+    def __init__(self, model_root=ROOT, *, offload_blocks=0, loras=None, encoder_dtype='bfloat16', encoder_device='cuda'):
         import torch
         from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel, GGUFQuantizationConfig
         from .observations import sha256
         if encoder_dtype not in ('bfloat16','float32'):raise ValueError('encoder_dtype must be bfloat16 or float32')
+        if encoder_device not in ('cuda','cpu'):raise ValueError('encoder_device must be cuda or cpu')
         self.torch=torch;self.prompt_cache={};model_root=Path(model_root);weights=model_root/GGUF.name
         if offload_blocks<0:raise ValueError('offload_blocks must be nonnegative')
         self.offload_blocks=offload_blocks;self.device=torch.device('cuda')
         self.metadata=dict(backend='gguf',model_root=str(model_root.resolve()),weights=weights.name,
                            weights_sha256=sha256(weights),encoder_dtype=encoder_dtype,offload_blocks=offload_blocks,
-                           prompt_preprocessing='pipeline_condition_images',loras=[])
+                           prompt_preprocessing='pipeline_condition_images',loras=[],encoder_device=encoder_device)
         transformer=QwenImageTransformer2DModel.from_single_file(str(weights),
             quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
             config=str(model_root/'base'),subfolder='transformer',torch_dtype=torch.bfloat16,local_files_only=True)
         self.pipe=QwenImageEditPlusPipeline.from_pretrained(str(model_root/'base'),transformer=transformer,
                                                         torch_dtype=torch.bfloat16,local_files_only=True)
         self.pipe.vae.to(self.device);self.pipe.vae.enable_tiling()
-        # Zen 2 has no native BF16 but PyTorch emulates it on the CPU; the encoder runs once per cached prompt.
-        self.pipe.text_encoder.to(device='cpu',dtype=getattr(torch,encoder_dtype))
+        # Prompt encoder (Qwen2.5-VL 7B, ~16 GB BF16). 'cuda': the vision tower, token embeddings, final norm and
+        # LM head live on the GPU (~3.3 GB); each of the 28 decoder layers is uploaded from pinned host memory just
+        # before it runs and its parameters re-point at the host copy afterwards (no copy-back). ~1 s per prompt on
+        # the RX 9070 XT at ~4.3 GB peak. 'cpu': the old CPU encoder (minutes per prompt without native BF16).
+        encoder=self.pipe.text_encoder;encoder.to(device='cpu',dtype=getattr(torch,encoder_dtype))
+        self.encoder_device=torch.device('cuda') if encoder_device=='cuda' else torch.device('cpu')
+        if encoder_device=='cuda':stream_decoder_layers(encoder,self.encoder_device)
         if loras:self.load_loras(loras)   # PEFT injection must precede group-offload hooks
         if offload_blocks:
             transformer.enable_group_offload(onload_device=self.device,offload_device=torch.device('cpu'),
@@ -222,8 +254,9 @@ class Editor:
         # Bounded, per-editor CPU cache: the sweep shares negative prompts and a smoke-test recipe.
         key=(prompt,tuple((im.mode,im.size,hashlib.sha256(im.tobytes()).digest()) for im in images))
         if key not in self.prompt_cache:
-            print('[qwen_edit] encoding prompt on CPU',flush=True)
-            value=self.pipe.encode_prompt(prompt=prompt,image=images,device=self.torch.device('cpu'))
+            print(f'[qwen_edit] encoding prompt on {self.encoder_device.type}',flush=True)
+            value=self.pipe.encode_prompt(prompt=prompt,image=images,device=self.encoder_device)
+            value=tuple(None if v is None else v.to('cpu') for v in value)   # cache on host; moved per call
             if len(self.prompt_cache)>=4:self.prompt_cache.pop(next(iter(self.prompt_cache)))
             self.prompt_cache[key]=value
         return self.prompt_cache[key]
@@ -235,7 +268,6 @@ class Editor:
         images=[Image.fromarray(i) if isinstance(i,np.ndarray) else i for i in images]
         conditions=prompt_images(self.pipe,images)
         with torch.no_grad():
-            # Encode on CPU (encoder too large to share the GPU with the transformer).
             pos,pos_mask=self._encode_prompt(prompt,conditions)
             neg,neg_mask=self._encode_prompt(negative,conditions)
         pos,neg=pos.to(torch.bfloat16),neg.to(torch.bfloat16)
@@ -269,13 +301,14 @@ def main(argv=None):
     ap.add_argument('--backend',choices=('auto','native','gguf'),default=None)
     ap.add_argument('--offload-blocks',type=int,default=0)
     ap.add_argument('--encoder-dtype',choices=('bfloat16','float32'),default='bfloat16')
+    ap.add_argument('--encoder-device',choices=('cuda','cpu'),default='cuda')
     ap.add_argument('--lora',action='append',default=[],help='path[:weight[:adapter]] (repeatable, GGUF only)')
     ap.add_argument('--size',type=int,default=1024);ap.add_argument('--steps',type=int,default=12)
     ap.add_argument('--seed',type=int,default=317);ap.add_argument('--cfg',type=float,default=4.)
     ap.add_argument('--max-vram-mib',type=int,default=8192);ap.add_argument('--max-rss-mib',type=int,default=32768)
     args=ap.parse_args(argv)
     out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
-    editor=make_editor(args.backend,offload_blocks=args.offload_blocks,loras=args.lora or None,encoder_dtype=args.encoder_dtype)
+    editor=make_editor(args.backend,offload_blocks=args.offload_blocks,loras=args.lora or None,encoder_dtype=args.encoder_dtype,encoder_device=args.encoder_device)
     images=[Image.open(p).convert('RGB') for p in args.images]
     result,seconds=editor(images,args.prompt,steps=args.steps,seed=args.seed,cfg=args.cfg,size=args.size,negative=args.negative)
     Image.fromarray(result).save(out/'edit.png')
