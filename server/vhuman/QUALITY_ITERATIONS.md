@@ -2246,3 +2246,102 @@ Remaining limits:
 - Bounce light uses albedo priors.
 - The iOS/Filament player lacks the oral shader and the contact deformer.
 - No phone was measured.
+
+## Cycles quality A/B study: baseline A vs quality candidate B (2026-10-31)
+
+Spec: `pixal3d-quality-ab-cycles-prompt.md`. Host: RX 9070 XT 16 GB (gfx1201), 128 GB RAM. Workspace
+`tmp/vhuman-ab-cycles/` (receipts, logs, `RESUME.md` with every decision). Review page
+`tmp/vhuman-ab-cycles/review/` (serve `tmp/` on localhost). Two synthetic subjects from Qwen-Image 2.1 (research licence,
+evaluation only): s1 man thirties, medium brown skin; s2 woman fifties, light skin.
+
+- **A (baseline)**: the default multiview path. Qwen-Image 2.1 "±45/±90" individual views, all fitted, 1024 texture,
+  baseline Cycles materials.
+- **B (quality)**: Edit-2511 + Multiple-Angles LoRA ±40 views (Apache-2.0), ±90 held out for ear evaluation, 2048 texture,
+  refined surface-bound ears + synthesized ear texture, photo iris plate, quality skin shader (region templates, coat,
+  random-walk SSS, adaptive true displacement), enamel/gum/tongue materials, wrinkle library, same expressions refitted to
+  B's geometry.
+- Ablations: B-2b (no refined ears), B-2c (no skin templates), B-2d (no personalised eyes), B-2e (no mouth materials),
+  B-2f (no wrinkle library). B-2a (delit texture source) had no effect and was not rendered (below).
+
+### Inputs and gates
+
+| | s1 | s2 |
+|---|---|---|
+| A "±45" views, measured yaw | 17° / −21° | 19° / −18° |
+| A view acceptance | all rejected (yaw error 22–33°, bleached skin dE 28–31 on +45/−90) | all rejected |
+| B ±40 views, measured yaw | 39° / −33° | 41° / −29° (−40 rejected on yaw only, kept: the fit estimates the camera) |
+| Turn direction | Edit-2511 ignores the prompt side per seed; MediaPipe nose-offset pool; s2 +40 needed a mirrored-input fallback | |
+
+Portraits and every view were deblocked (Qwen 2.1 / Edit VAE 16-px cell pattern, `qimg21_i23d.deblock`); all 42 images
+pass the cell-pattern check.
+
+### Results (front studio, held-out ±90 ears; LPIPS/DISTS lower is better)
+
+Display: every render re-displayed from its linear EXR with ColorChecker calibration (studio −2.86 EV, neutral white
+balance; HDRI −0.82 EV with R×0.84 B×1.45; rim uses studio). Metrics = LPIPS / DISTS / median-colour Lab ΔE between
+parsing-label crops of the render and the reference image (appearance, not registration).
+
+| Subject | Region (reference) | A | B |
+|---|---|---|---|
+| s1 | face (portrait) | 0.446 / 0.326 / 2.4 | 0.430 / 0.322 / 3.2 |
+| s1 | eyes (portrait) | 0.299 / 0.289 / 4.1 | 0.296 / 0.289 / 4.9 |
+| s1 | mouth (portrait) | 0.239 / 0.200 / 12.2 | 0.280 / 0.227 / 10.6 |
+| s1 | +40 view | 0.510 / 0.372 / 9.5 | 0.519 / 0.361 / 11.4 |
+| s1 | −40 view | 0.495 / 0.360 / 11.0 | 0.503 / 0.356 / 12.7 |
+| s1 | ear, held-out +90 | 0.726 / 0.410 / 22.7 | **0.608 / 0.373** / 24.3 |
+| s1 | ear, held-out −90 | 0.739 / 0.397 / 25.3 | **0.574 / 0.346** / 25.8 |
+| s2 | face | 0.500 / 0.326 / 2.8 | 0.507 / 0.323 / 4.0 |
+| s2 | eyes | 0.307 / 0.268 / 5.1 | 0.357 / 0.291 / 6.3 |
+| s2 | mouth | 0.274 / 0.220 / 14.2 | 0.385 / 0.290 / 14.5 |
+| s2 | +40 view | 0.556 / 0.381 / 12.1 | 0.562 / 0.380 / 13.7 |
+| s2 | −40 view | 0.519 / 0.350 / 5.4 | 0.534 / 0.369 / 7.6 |
+| s2 | ear, held-out +90 | 0.654 / 0.394 / 23.9 | **0.571 / 0.360** / 23.7 |
+| s2 | ear, held-out −90 | 0.571 / 0.339 / 15.8 | 0.606 / **0.329** / 18.5 |
+
+Reading: B's clear gain is ear structure on the held-out profiles (3 of 4 by LPIPS, 4 of 4 by DISTS). Face and ±40
+views are a draw. A wins the mouth on both subjects and s2's eyes: B's lip coat / tooth materials and the photo iris
+plate read less like the portrait at this scale. Colour against the portrait is within ΔE 2.4–4.0 for both once the
+display is calibrated (ΔE 23–29 before: the studio preset was ~1.3 EV too bright). Before calibration B's ear colour
+looked far closer (ΔE 2) — that was an artefact of clipping.
+
+Render cost: B ≈ 2× A render time; VRAM peak 13.4 GB (B, adaptive displacement, 2048 templates) vs 4.5 GB (A).
+
+### What did not work / was rejected
+
+- **Delighting (2a)**: Light_restoration v2 (2509 LoRA on 2511, native pack) removed almost no shading from the prompted
+  soft-lit inputs (gate: shading drop 0.00–0.04) and one seed came out a near-white ghost; no delit image accepted, so
+  B uses the original photos (B_fit = B0_fit). Delighting needs harder-lit inputs to show an effect.
+- **Generated ear close-ups**: native Edit-2511 close-ups look photoreal (no faces) but every one failed the projection
+  guard (ear shift 13–250 px, silhouette IoU 0.64 on 45° views, no visual approval); ear texture = photographed texels +
+  exemplar synthesis. Ear gains come from the refined shape and that synthesis.
+- **Expressions**: Wan 2.2 `fast5` clips are 9 frames; happy/sad/angry barely move (fitted departure 2.7–4.3 vs
+  surprise 10.1, disgust 7.5). The expression comparison is informative for surprise/disgust/fear only.
+- **Display exposure**: the authored studio preset is ~1.3 EV too bright for the −1.5 EV Standard view (skin L* 92–100
+  vs 67/83 in the portraits, albedo itself within dL 1). A portrait-cheek match gave −2.75 EV and the ColorChecker
+  (`offline_render --chart`, `color_chart.py`) −2.86 EV; all study renders are re-displayed from their linear EXRs with
+  the chart calibration (`redisplay.py`, originals kept as `beauty_ev-1.50.png`). The repo default is unchanged.
+- Sage attention in the native Edit-2511 runner: 17% faster but flips turn direction on the same seed; opt-in only.
+
+### Speed work done for the study (RDNA4)
+
+Qwen-Image 2.1: INT8 GEMM 27–34× (view 746 → ~75 s), VAE 3×3 conv 13–22× (decode 18.5 → 7.3 s), deterministic Sage
+statistics. Edit-2511: GPU prompt encoder (145–275 → 7 s), native INT4/INT8 packs with merged LoRAs (view ~9 min GGUF →
+163 s), disk-cached modulation (host RSS 55 → 30 GiB), hipBLASLt linears (DiT −9%).
+
+### Research follow-ups (2026-11-01, `tmp/vhuman-ab-cycles/research-2026-11-01.md`)
+
+- **ColorChecker (done, 563c8f8c)**: matte 24-patch chart under the scene's lights; studio −2.86 EV (patch ΔE 2.3),
+  HDRI −0.82 EV with a warm cast removed by per-channel gains (diagonal illuminant, ΔE ≈ 0).
+- **Texture-Fix-VAE (rejected)**: targets a 2-px grid; leaves the 16-px cell pattern (11 of 16 regions fail vs 0 with
+  `qimg21_i23d.deblock`). Qwen research licence.
+- **QIE-2511-Studio-DeLight (rejected for B, 9f1bcbb1)**: removes much more shading than the 2509 LoRA (0.39 vs 0.04) but
+  bleaches skin (L* +10.7, chroma ×0.46; −40 view grey clay). The delight gate now bounds lightness and chroma.
+- **Ear close-ups from the render (rejected, 84fb71c7)**: post-hoc ECC/flow alignment tears or barely moves the images;
+  SDEdit at strength .55–.9 returns the blurry render (the edit model preserves its input even from ~97% noise), 1.0
+  drifts again. Next: depth/normal-conditioned generation, or a photo reference with the render as layout only.
+- **PixelSmile keyframes (promising)**: full-intensity expression edits on Edit-2511 are 1.3–42× stronger than the Wan
+  fast5 peaks (similarity-aligned MediaPipe displacement), identity intact. Next: Wan I2V from each keyframe toward
+  neutral, frames reversed, as the motion source.
+- **Multiple-Angles at 0.9 (no effect)**: our prompt grammar already matches the card's vocabulary exactly; at the card's
+  suggested 0.9 the same s2 +40 seeds turn the wrong way as at 1.0 (nose offset +0.40/+0.52 vs +0.39/+0.50). The
+  direction is set by the seed and subject; the mirrored-input fallback stays the fix.
