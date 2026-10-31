@@ -111,6 +111,10 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
         session = gpu.device_session(4096, cancel) if backend!='cpu' else nullcontext()
         with session, (out/'cycles.log').open('w') as log:
             env = dict(os.environ, TMPDIR=str(out/'cache'), TEMP=str(out/'cache'), TMP=str(out/'cache'))
+            # Blender's HIP may need a different ROCm runtime than the calling (PyTorch) process: on the RX 9070 XT
+            # host core-10.0 aborts in rocclr thread creation inside Blender while core-10.1 works.
+            if os.environ.get('VHUMAN_BLENDER_LD_LIBRARY_PATH'):
+                env['LD_LIBRARY_PATH'] = os.environ['VHUMAN_BLENDER_LD_LIBRARY_PATH']
             (out/'cache').mkdir(exist_ok=True)
             process = subprocess.Popen([str(blender), '-b', '--factory-startup', '--python-exit-code', '1',
                 '--python', str(Path(__file__).with_name('cycles_scene.py')), '--', str(out/'request.json')],
