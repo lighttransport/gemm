@@ -108,6 +108,20 @@ def make_editor(backend=None, model_root=ROOT, offload_blocks=0, *, loras=None, 
     return Editor(model_root,offload_blocks=offload_blocks,loras=loras,encoder_dtype=encoder_dtype,encoder_device=encoder_device)
 
 
+def linear_patch_embed(visual):
+    """Qwen2.5-VL's patch embedding is a Conv3d whose stride equals its kernel (2x14x14): exactly a matmul over the
+    flattened (C, T, H, W) patch. Running it as one GEMM skips MIOpen's first-call algorithm search (~2.5 s per process
+    on gfx1201) and is numerically the same contraction."""
+    import torch
+    proj=visual.patch_embed.proj
+    if proj.stride!=proj.kernel_size or proj.bias is not None:return False
+    def forward(hidden_states):
+        weight=proj.weight.reshape(proj.out_channels,-1)   # view of the live conv weight (follows .to() moves)
+        return torch.nn.functional.linear(hidden_states.reshape(-1,weight.shape[1]).to(weight.dtype),weight)
+    visual.patch_embed.forward=forward
+    return True
+
+
 def stream_decoder_layers(encoder, device):
     """Keep a Qwen2.5-VL encoder's small modules on `device` and stream its decoder layers from pinned host memory."""
     import torch
@@ -118,6 +132,7 @@ def stream_decoder_layers(encoder, device):
     encoder._vhuman_device=device
     for module in encoder._vhuman_resident:
         module.to(device)
+    linear_patch_embed(encoder.model.visual)
     import torch
     host={}
     for layer in language.layers:
