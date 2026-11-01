@@ -567,6 +567,22 @@ def run(request):
         light=bpy.data.lights.new(name,'AREA');light.energy=power*STUDIO_ENERGY_SCALE;light.shape='DISK';light.size=size
         obj=bpy.data.objects.new(name,light);bpy.context.collection.objects.link(obj);obj.location=position
         obj.rotation_euler=(Vector((0,0,0))-obj.location).to_track_quat('-Z','Y').to_euler()
+    mouth_fill=float(request.get('mouth_fill',0.))
+    oral=[objects[n] for n in ('mouth_cavity','upper_teeth_and_gums_teeth','upper_teeth_and_gums_gums','lower_teeth_and_gums_teeth',
+                               'lower_teeth_and_gums_gums','tongue') if n in objects]
+    if mouth_fill>0 and skin_full and 'mouth_cavity' in objects:   # quality candidates only: baseline A keeps its flat mouth
+        # Light that reaches the teeth through the lips and cheeks. The head is a thin shell with no flesh behind the lips, so path
+        # tracing gathers almost nothing in the mouth (the runtime oral-GI model in tmp/vhuman-mouth-gi measures ~2-5% indirect
+        # irradiance there, but real mouths are lit by translucent tissue): a small warm point light at the cavity centroid,
+        # light-linked to the oral parts only so it never lights the lips or face.
+        centre=np.mean([v.co[:] for v in objects['mouth_cavity'].data.vertices],0)
+        light=bpy.data.lights.new('mouth_fill','POINT');light.energy=mouth_fill;light.shadow_soft_size=.01
+        light.color=tuple(float(c) for c in request.get('mouth_fill_color',(1.,.62,.48)))
+        fill=bpy.data.objects.new('mouth_fill',light);bpy.context.collection.objects.link(fill);fill.location=tuple(float(c) for c in centre)
+        receivers=bpy.data.collections.new('mouth_fill_receivers')
+        for o in oral:receivers.objects.link(o)
+        fill.light_linking.receiver_collection=receivers
+        scene['mouth_fill']=json.dumps(dict(energy_w=mouth_fill,position=[float(c) for c in centre],model='translucent-tissue stand-in'))
     world=bpy.data.worlds.new('studio' if lighting!='hdri' else 'hdri');scene.world=world;world.use_nodes=True
     if lighting=='hdri':
         hdri=request['hdri'];wn=world.node_tree.nodes;wl=world.node_tree.links
