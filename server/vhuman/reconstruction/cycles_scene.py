@@ -144,7 +144,7 @@ def full_skin_graph(skin,node,bound,out,request):
     # second (sharper) lobe kept small so skin reads oily, not wet: coat .10(1-cavity)+.35 lips,
     # roughness .30 -> .12 on lips (the moist lip band)
     coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),.10),math('MULTIPLY',lips,.35*float(request.get('lip_coat_scale',1.))),clamp=True);links.new(coat,node.inputs['Coat Weight'])
-    cr=math('SUBTRACT',.30,math('MULTIPLY',lips,.18),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
+    cr=math('SUBTRACT',.30,math('MULTIPLY',lips,.30-float(request.get('lip_coat_roughness',.12))),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
     node.inputs['Coat IOR'].default_value=1.4
     # random-walk skin subsurface (radii in metres, literature-scale skin profile)
     node.subsurface_method='RANDOM_WALK_SKIN'
@@ -214,6 +214,11 @@ def full_mouth_materials(materials,out,request):
     node.inputs['Coat Weight'].default_value=1.;node.inputs['Coat Roughness'].default_value=.08;node.inputs['Coat IOR'].default_value=1.5
     node.subsurface_method='RANDOM_WALK';node.inputs['Subsurface Weight'].default_value=.35;node.inputs['Subsurface Scale'].default_value=1.
     node.inputs['Subsurface Radius'].default_value=(.0010,.0007,.0005)
+    glow=float(request.get('teeth_glow',0.))
+    if glow>0:   # stand-in for mouth bounce light the path tracer cannot gather behind the lips: faint shade-coloured emission
+        em=nodes.new('ShaderNodeEmission');em.inputs['Color'].default_value=(*shade['body_rgb'],1);em.inputs['Strength'].default_value=glow
+        mixer=nodes.new('ShaderNodeAddShader');out_node=nodes['Material Output']
+        links.new(node.outputs['BSDF'],mixer.inputs[0]);links.new(em.outputs['Emission'],mixer.inputs[1]);links.new(mixer.outputs['Shader'],out_node.inputs['Surface'])
     # translucent incisal edge: transmission rises with enamel_tip^2 (dentin core blocks it elsewhere)
     sq=nodes.new('ShaderNodeMath');sq.operation='POWER';sq.inputs[1].default_value=2.;links.new(tip.outputs['Fac'],sq.inputs[0])
     tr=nodes.new('ShaderNodeMath');tr.operation='MULTIPLY';tr.inputs[1].default_value=.18;links.new(sq.outputs[0],tr.inputs[0])

@@ -30,7 +30,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
            ablate=(), noisy=True, eyes=None, chart=False, displacement_scale=1., micro_scale=1., save_blend=True,
-           lip_coat_scale=1.):
+           lip_coat_scale=.6, lip_coat_roughness=.30, teeth_glow=0.):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
@@ -89,7 +89,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
                    camera=camera,pitch=pitch,distance_scale=distance_scale,focal_scale=focal_scale,hdri=hdri_record,
                    samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy),
                    chart=bool(chart),displacement_scale=float(displacement_scale),micro_scale=float(micro_scale),save_blend=bool(save_blend),
-                   lip_coat_scale=float(lip_coat_scale))
+                   lip_coat_scale=float(lip_coat_scale), lip_coat_roughness=float(lip_coat_roughness), teeth_glow=float(teeth_glow))
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())
