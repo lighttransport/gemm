@@ -118,7 +118,20 @@ def fuse_samples(colors,confidence):
 
 
 def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=512, roughness=.55, f0=.028, spatial_materials=False,
-                  protect_front=False):
+                  protect_front=False, silhouette_guard_px=0., feather_px=0., gain_match=False, front_blend=False, background_reject=False):
+    """Bake the skin basecolor/ORM/specular atlas from the portrait (+ generated) views, fusing per-view delit albedo.
+
+    Opt-in multiview cleanup (all off by default; 2026-11-01 Cycles study):
+      silhouette_guard_px: zero a view's weight for texels projecting within this many source pixels of the mesh
+        silhouette, ramping to full weight over the next as many (background bled in as white blotches there);
+      feather_px: smooth each view's weight in texture space (Gaussian sigma, texels) so view contributions fade out
+        instead of ending along the aliased visibility edge (hatched boundaries);
+      gain_match: scale every other view's albedo per channel to view 0 on texels both see well before fusion (removes
+        the exposure step at the protected-front boundary and between views);
+      front_blend: with protect_front, keep front texels exact only where the front's confidence is high and
+        cross-fade to the fused colour over front confidence 0.2-0.5, instead of a hard switch (the seam ring).
+      background_reject: drop texels whose source pixel matches the view's border colour (backdrop seen past a misfit ear).
+      The guard and feathering also apply to the front-only bake that protect_front restores."""
     if not .08<=roughness<=1. or not .005<=f0<=.04:
         raise ValueError("roughness must be .08..1; F0 .005...04")
     from scipy.ndimage import distance_transform_edt
@@ -169,6 +182,29 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
                 raise ValueError('exclusion mask dimensions mismatch')
         sampled,support=sample_portrait(image,pixels,mask)
         conf = valid*(abs(depth[dy,dx]-z)<.002)*agree*support
+        if background_reject:
+            # generated views are opaque: where the model's ear/jaw silhouette misses the generated one, the texel samples the
+            # backdrop. Estimate the backdrop from the image border and drop texels whose (slightly dilated) pixel matches it.
+            rgb = image[..., :3].astype(float)
+            border = np.concatenate([rgb[:8].reshape(-1, 3), rgb[-8:].reshape(-1, 3), rgb[:, :8].reshape(-1, 3), rgb[:, -8:].reshape(-1, 3)])
+            bgc = np.median(border, 0)
+            near = np.abs(rgb - bgc).max(2) < 18
+            if near.mean() > .02:
+                from scipy.ndimage import binary_dilation as _dil
+                near = _dil(near, iterations=3)
+                conf = conf*~near[np.clip(iy, 0, h-1), np.clip(ix, 0, w-1)]
+        if silhouette_guard_px > 0:
+            # distance (source px) from the projected texel to the mesh silhouette in this view
+            inside = np.isfinite(depth) & (depth > 0)
+            dist = distance_transform_edt(inside) / s
+            g = float(silhouette_guard_px)
+            conf = conf*np.clip((dist[dy,dx]-g)/g,0,1)
+        if feather_px > 0:
+            from scipy.ndimage import gaussian_filter
+            grid = np.zeros((res,res)); grid[yy,xx] = conf
+            cover = np.zeros((res,res)); cover[yy,xx] = 1.
+            smooth = gaussian_filter(grid, feather_px)/np.maximum(gaussian_filter(cover, feather_px),1e-6)
+            conf = np.minimum(conf, smooth[yy,xx])*(conf > 0)
         rgb, light = estimate(sampled, n, conf)
         calibration=view.get("lighting")
         observations.append(srgb_to_linear(sampled/255.) / (calibration.get("exposure",1) if calibration else 1))
@@ -177,7 +213,19 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
         accum += rgb*conf[:,None]
         weight += conf
         lighting.append(light)
+    gains = None
+    if gain_match and len(albedos) > 1:
+        gains = [[1., 1., 1.]]
+        for vi in range(1, len(albedos)):
+            both = (confidences[0] > .3) & (confidences[vi] > .3)
+            if both.sum() < 200:
+                gains.append([1., 1., 1.]); continue
+            g = np.median(albedos[0][both], 0) / np.maximum(np.median(albedos[vi][both], 0), 1e-6)
+            g = np.clip(g, .7, 1.4); albedos[vi] = albedos[vi]*g; gains.append(g.tolist())
     fused,weight,fusion=fuse_samples(np.asarray(albedos),np.asarray(confidences))
+    if gains is not None or silhouette_guard_px > 0 or feather_px > 0:
+        fusion = dict(fusion, multiview_cleanup=dict(silhouette_guard_px=float(silhouette_guard_px), feather_px=float(feather_px),
+                                                     gain_match=bool(gain_match), view_gains=gains))
     accum=fused*weight[:,None]
     reflectance = dict(status='artist prior',reason='calibrated multi-light observations absent')
     spatial=None
@@ -235,7 +283,7 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
         try:
             front_report = bake_portrait(vertices[:1] if vertices.ndim == 3 else vertices,
                 triangles, triangle_uvs, views[:1], cameras[:1], front_dir, res=res,
-                roughness=roughness, f0=f0)
+                roughness=roughness, f0=f0, silhouette_guard_px=silhouette_guard_px, feather_px=feather_px, background_reject=background_reject)
             with Image.open(front_dir/'skin_coverage.png') as image:
                 front_mask = np.asarray(image)>0
             with Image.open(front_dir/'skin_basecolor.png') as image:
@@ -243,12 +291,16 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
             with Image.open(front_dir/'skin_confidence.png') as image:
                 front_confidence = np.asarray(image)
             generated = observed & ~front_mask
-            base[front_mask] = front_color[front_mask]
+            if front_blend:
+                a = np.clip((front_confidence.astype(float)/255-.2)/.3, 0, 1)[..., None]*front_mask[..., None]
+                base = np.uint8(np.clip(front_color*a + base*(1-a) + .5, 0, 255))
+            else:
+                base[front_mask] = front_color[front_mask]
             observed = front_mask
             confidence[:] = front_confidence
             Image.fromarray(np.uint8(generated)*255).save(out/'skin_generated_support.png')
             Image.fromarray(np.uint8(front_mask)*255).save(out/'skin_front_protected.png')
-            front_report = dict(policy='front protected; side views fill unseen skin only',
+            front_report = dict(policy='front protected; side views fill unseen skin only' + ('; cross-fade over front confidence .2-.5' if front_blend else ''),
                                 protected_texels=int(front_mask.sum()), generated_texels=int(generated.sum()),
                                 front_preserved=True, evidence='synthetic generated images, not captured scan data')
         finally:
