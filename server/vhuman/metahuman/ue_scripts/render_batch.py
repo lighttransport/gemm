@@ -58,6 +58,44 @@ def shoot(world, comp, rt, cam, source, show_only, path, name):
     return f'renders/{name}.exr'
 
 
+def spawn_replica(replica):
+    """vhuman studio lamps as equal-area RectLights (light_calibration.py plan/calibration records)."""
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem); lights = {}
+    for r in replica:
+        rot = unreal.MathLibrary.make_rot_from_x(unreal.Vector(*r['direction']))
+        a = eas.spawn_actor_from_class(unreal.RectLight, unreal.Vector(*r['location_cm']), rot)
+        c = a.rect_light_component
+        c.set_mobility(unreal.ComponentMobility.MOVABLE)
+        for k, v in (('source_width', r['width_cm']), ('source_height', r['width_cm']), ('barn_door_angle', 0.),
+                     ('barn_door_length', 0.), ('attenuation_radius', 2000.), ('use_temperature', False),
+                     ('intensity_units', unreal.LightUnits.CANDELAS), ('cast_shadows', True)):
+            c.set_editor_property(k, v)
+        c.set_light_color(unreal.LinearColor(1, 1, 1, 1))
+        a.set_actor_label(f'vh_{r["name"]}')
+        lights[r['name']] = (c, float(r['intensity_cd']))
+    return lights
+
+
+def hide_environment(world, keep):
+    """Hide every light, sky light and reflection capture of the loaded environment (keep: our own actors)."""
+    hidden = []
+    for a in unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Actor):
+        if a.get_actor_label() in keep:
+            continue
+        for cls in (unreal.LightComponentBase, unreal.ReflectionCaptureComponent):
+            for c in a.get_components_by_class(cls):
+                if c.is_visible():
+                    c.set_visibility(False); hidden.append(f'{a.get_actor_label()}:{c.get_class().get_name()}')
+    return hidden
+
+
+def place_replica(lights, records):
+    for r in records:
+        c, _ = lights[r['name']]
+        c.get_owner().set_actor_location_and_rotation(unreal.Vector(*r['location_cm']), unreal.MathLibrary.make_rot_from_x(unreal.Vector(*r['direction'])), False, True)
+        c.set_intensity(float(r['intensity_cd']))
+
+
 SETTLE_S = float(os.environ.get('MH_RENDER_SETTLE_S', '8'))      # after compilation finished: streaming / GPU texture synthesis
 SETTLE_TICKS = 30
 FINISH_ALL = ('Editor.AsyncAssetCompilationFinishAll', 'Editor.AsyncTextureCompilationFinishAll',
@@ -78,8 +116,8 @@ def settle(world):
         yield
 
 
-def render_sample(sid, world, comp, rt, env, rec_out):
-    """Generator (one step per editor tick)."""
+def render_sample(sid, world, comp, rt, env, rec_out, replica=None):
+    """Generator (one step per editor tick). replica: (lights, per-sample records) for the VHStudio env."""
     d = os.path.join(V1, 'samples', sid)
     params = json.load(open(os.path.join(d, 'params.json')))
     cams = json.load(open(os.path.join(d, 'cameras.json')))
@@ -98,11 +136,14 @@ def render_sample(sid, world, comp, rt, env, rec_out):
             sub.commit_skin_settings(character=character, skin_settings=gb.skin_settings_from_job(params['skin']))
             gb.apply_eyes(character, params['eyes'])
             actor = sub.spawn_meta_human_actor(character=character)
+            if replica:
+                place_replica(*replica)
             yield from settle(world)
             comp.clear_show_only_components(); comp.show_only_actor_components(actor, True)   # list property is template-locked
             for name, cam in cams['cameras'].items():
                 files.append(shoot(world, comp, rt, cam, unreal.SceneCaptureSource.SCS_FINAL_COLOR_HDR, False, out_dir, f'{name}__{env.lower()}'))
-                files.append(shoot(world, comp, rt, cam, unreal.SceneCaptureSource.SCS_BASE_COLOR, True, out_dir, f'{name}__basecolor'))
+                if not replica:      # base colour / coverage do not depend on the lights
+                    files.append(shoot(world, comp, rt, cam, unreal.SceneCaptureSource.SCS_BASE_COLOR, True, out_dir, f'{name}__basecolor'))
                 yield
             comp.clear_show_only_components()
             actor.destroy_actor()
@@ -110,23 +151,34 @@ def render_sample(sid, world, comp, rt, env, rec_out):
         mh.delete_asset(character)
     rec = dict(ok=True, id=sid, env=env, files=files, size=cams['size'], finished=time.time(), settle_s=SETTLE_S,
                sha256={f: gb.sha256(os.path.join(d, f)) for f in files if os.path.isfile(os.path.join(d, f))})
-    mh.write_json(os.path.join(out_dir, 'renders_done.json'), rec)
+    mh.write_json(os.path.join(out_dir, done_name(env)), rec)
     rec_out.append(rec)
 
 
+def done_name(env):
+    return 'renders_done.json' if env == 'Studio' else f'renders_done_{env.lower()}.json'
+
+
 def batch_steps(batch, results):
+    """env 'Studio' (MetaHuman lighting environment) or 'VHStudio': the Studio level with its lights hidden and the
+    calibrated vhuman lamp rig (batch['lights'][id], from light_calibration.replica_batch) placed around each head."""
     env = batch.get('env', 'Studio')
-    world = load_environment(env)
+    world = load_environment('Studio' if env == 'VHStudio' else env)
     size = int(batch.get('size', 1024))
     unreal.SystemLibrary.execute_console_command(world, 'r.Streaming.FullyLoadUsedTextures 1')
     cap, comp, rt = make_capture_actor(world, size)
+    lights = None
+    if env == 'VHStudio':
+        lights = spawn_replica(batch['lights'][batch['ids'][0]])
+        hidden = hide_environment(world, keep={a.get_actor_label() for a in [cap] + [c.get_owner() for c, _ in lights.values()]})
+        mh.log(f'VHStudio: hidden {hidden}')
     yield from settle(world)          # environment level materials
     for sid in batch['ids']:
-        done = os.path.join(V1, 'samples', sid, 'renders', 'renders_done.json')
+        done = os.path.join(V1, 'samples', sid, 'renders', done_name(env))
         if os.path.isfile(done) and json.load(open(done)).get('ok'):
             results[sid] = 'skip'; continue
         try:
-            yield from render_sample(sid, world, comp, rt, env, [])
+            yield from render_sample(sid, world, comp, rt, env, [], replica=(lights, batch['lights'][sid]) if lights else None)
             results[sid] = 'ok'
         except Exception:      # noqa: BLE001
             tb = traceback.format_exc(); mh.log(tb)

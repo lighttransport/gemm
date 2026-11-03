@@ -32,6 +32,7 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 | Ear fit with the prior | ear workspace env + `EAR_PRIOR=/mnt/nvme02/models/vhuman-mh/ear_prior_v1.npz EAR_PRIOR_MODES=3 EAR_CROSS_PENALTY=0.02`, then `fit_band_joint.py`, `shape_ears.py`, `synth_ear_texture.py` as in `stage3_ears.sh` (outputs via `EAR_FIT_OUT_DIR`, `EAR_FIT`, `EAR_SHAPE_OUT`) |
 | Reference-render cameras | `$P -m server.vhuman.metahuman.render_plan` then `launch render_batch.py <batch.json>` |
 | UE-vs-Cycles comparison | ROCm venv: `-m server.vhuman.metahuman.compare_render --every 10` (pseudo-candidates + Cycles renders with the reference cameras), then `--report` (CPU: `HIP_VISIBLE_DEVICES=`); outputs `/mnt/nvme01/data/vhuman-mh/compare_v1/` |
+| Light calibration | `-m server.vhuman.metahuman.light_calibration all` (ColorChecker probes: Cycles CPU + one UE session, then the fit), `batch` writes `render_batches/vhstudio.json`; `launch render_batch.py <vhstudio.json>` renders `<cam>__vhstudio.exr`; `compare_render --report --ue-env vhstudio`; outputs `/mnt/nvme01/data/vhuman-mh/light_calib_v1/` |
 | Use the skin prior | `bake_portrait(..., skin_prior=PATH)`; `tmp/vhuman-ab-cycles/scripts/rebake.py ... --skin-prior PATH` |
 | Tests | `$P -m pytest -q server/vhuman/test_metahuman_prior.py` |
 
@@ -141,5 +142,28 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   matched before LPIPS; it is consistent across heads (spread < .05), so the gap is the light rig, not the skin: the
   vhuman studio key sits on the subject's left (+yaw side, ~5x brighter than the -yaw side relative to UE Studio).
   Visual: Cycles skin is glossier and smoother (freckles/pores attenuated: flat normal, no MH cavity), eyes are the
-  template (brown iris, wide sclera, upward gaze). Next is the ColorChecker light calibration; skin metrics are not
-  meaningful before it.
+  template (brown iris, wide sclera, upward gaze). The ColorChecker light calibration below removes that.
+- ColorChecker light calibration (2026-11-04, `light_calibration.py`, `chart_probe_blender.py`, `ue_scripts/chart_probe.py`):
+  a matte 24-patch chart at the reference face, facing each wide reference camera, captured with that camera. The UE
+  'Studio' level is four lights (KeyLight/FillLight/BounceLight spots + an AmbientLight point; no sky light). The vhuman
+  rig replicated in UE (equal-area RectLights, same relative placement/aim, Studio lights hidden) converts with one
+  factor for all three lamps: UE candela = 0.501 x P_cycles / pi (key .501, fill .501, rim .502; spread over probes
+  1-6%); the calibrated replica reproduces the Cycles lamps within 0.4% on every probe, superposition holds (<0.4%),
+  and the Cycles studio world (no UE counterpart) is 0.6-1.8% of the chart. Studio/Cycles luma per probe: front .36,
+  +40 .24, -40 .50, +90 .11, -90 .56 (neutral colour in both): this is the first run's per-side gain. Render-batch env
+  `VHStudio` = the Studio level with its lights hidden plus the calibrated rig around each head.
+  Comparison rescored against VHStudio references (12 heads, `compare_v1/summary_vhstudio.json`; before -> after):
+
+  | camera | Cycles->UE gain | LPIPS | DISTS | dE |
+  |---|---|---|---|---|
+  | front | .31 -> 1.12 | .378 -> .142 | .288 -> .186 | 12.8 -> 5.7 |
+  | yaw +40 / -40 | .11/.37 -> 1.10/1.11 | .444/.372 -> .252/.112 | .332/.286 -> .206/.174 | 13.2/8.7 -> 9.2/5.2 |
+  | yaw +90 / -90 | .07/.37 -> 1.12/1.12 | .588/.542 -> .350/.365 | .377/.326 -> .216/.235 | 10.5/15.1 -> 10.6/12.5 |
+  | ear L / R | .09/.50 -> 1.10/1.23 | .250/.226 -> .179/.224 | .235/.203 -> .173/.199 | 9.3/6.2 -> 5.4/5.4 |
+  | eye L / R | .16/.35 -> 1.07/1.07 | .313/.301 -> .282/.285 | .226/.209 -> .207/.205 | 8.5/5.4 -> 4.5/4.9 |
+  | mouth | .31 -> 1.14 | .261 -> .254 | .202 -> .199 | 11.9 -> 5.6 |
+
+  The gain is now one number for every view (~1.1: same light, UE skin ~10% brighter), so the remaining differences are
+  material: Cycles skin has a stronger, broader forehead/cheek specular, less pore/freckle relief (flat normal, no MH
+  cavity) and slightly pinker lips; the eyes are the template. Next: MH tangent-normal conversion, MH eye parameters on
+  the Cycles side, then the material sweep against the VHStudio references.

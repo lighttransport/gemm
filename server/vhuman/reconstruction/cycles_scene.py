@@ -318,6 +318,10 @@ def curve_object(name,paths,mat,radius, *, cyclic=False):
 # -1.5 EV now shows the neutral patches at their reflectance. The default HDRI (interior.exr) read -0.82 EV with a warm
 # cast; its environment is multiplied by the neutralising gains and 2^0.68. Other HDRIs are left as given.
 STUDIO_ENERGY_SCALE=2.0**-1.3632
+# Studio lamp rig (name, position m, authored power W, disk diameter m); each disk aims at the world origin. Shared with
+# metahuman/chart_probe_blender.py (UE replica + ColorChecker light calibration). Studio world: grey .1 at strength .15.
+STUDIO_LIGHTS=(('key',(-.35,.35,.45),35,.35),('fill',(.35,.1,.35),12,.3),('rim',(.2,.3,-.3),20,.25))
+STUDIO_WORLD=(.1,.15)
 CALIBRATED_HDRI={'e945ff5c1ddd7a3aaf05e9fb5c3bc9cb93c5518414febd44ed2c394e013f0cbd':(.8351,1.,1.4483,2.0**.6840)}
 
 
@@ -564,7 +568,7 @@ def run(request):
         camera_record=dict(preset='explicit',origin=explicit['origin'],rotation=explicit['rotation'],focal_px=explicit['focal_px'],size=explicit['size'])
     camera_data.clip_start=.01;camera_data.clip_end=10
     lighting=request.get('lighting','studio')
-    for name,position,power,size in ([] if lighting=='hdri' else [('key',(-.35,.35,.45),35,.35),('fill',(.35,.1,.35),12,.3),('rim',(.2,.3,-.3),20,.25)]):
+    for name,position,power,size in ([] if lighting=='hdri' else STUDIO_LIGHTS):
         if lighting=='left':power={'key':45,'fill':2,'rim':8}[name]
         elif lighting=='right':
             position=(-position[0],position[1],position[2]);power={'key':45,'fill':2,'rim':8}[name]
@@ -607,8 +611,8 @@ def run(request):
         wn['Background'].inputs['Strength'].default_value=hdri.get('strength',1.)
         world['hdri_sha256']=hdri['sha256'];world['hdri_license']=hdri.get('license','')
     else:
-        world.node_tree.nodes['Background'].inputs['Color'].default_value=(.1,.1,.1,1)
-        world.node_tree.nodes['Background'].inputs['Strength'].default_value=.15
+        world.node_tree.nodes['Background'].inputs['Color'].default_value=(*(STUDIO_WORLD[0],)*3,1)
+        world.node_tree.nodes['Background'].inputs['Strength'].default_value=STUDIO_WORLD[1]
     scene['vhuman_provenance']='Single-portrait reconstruction; hidden anatomy, material amplitudes and accessories contain priors'
     scene['inferred_artifacts']=json.dumps(dict(accessories=config['accessories'],hair=config['hair'],
         detail=config['detail'],material=config['material']))

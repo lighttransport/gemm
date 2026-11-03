@@ -167,15 +167,16 @@ def render_sample(sid, cameras=CAMERAS):
     return done
 
 
-def report(ids, cameras=CAMERAS):
+def report(ids, cameras=CAMERAS, env='studio'):
     from ..face_parsing import FaceParser
     from ..reconstruction import ab_metrics as am
     parser = FaceParser(); rows = {}
+    suffix = '' if env == 'studio' else f'_{env}'
     for sid in ids:
         rec = {}
         for name in cameras:
             c = COMPARE_ROOT / sid / 'cycles' / name / 'beauty.exr'
-            ue = V1 / 'samples' / sid / 'renders' / f'{name}__studio.exr'
+            ue = V1 / 'samples' / sid / 'renders' / f'{name}__{env}.exr'
             ub = V1 / 'samples' / sid / 'renders' / f'{name}__basecolor.exr'
             if not (c.is_file() and ue.is_file()):
                 continue
@@ -195,16 +196,16 @@ def report(ids, cameras=CAMERAS):
             r.pop('crops', None)
             rec[name] = dict(silhouette_iou_head_rows=float(inter / max(union, 1)), cycles_to_ue_gain=gain,
                              lpips=r.get('lpips'), dists=r.get('dists'), delta_e=(r.get('delta_e') or {}).get('mean'), status=r['status'])
-            Image.fromarray(np.concatenate([a, b], 1)).save(COMPARE_ROOT / sid / f'{name}_ue_cycles.png')
+            Image.fromarray(np.concatenate([a, b], 1)).save(COMPARE_ROOT / sid / f'{name}_ue{suffix}_cycles.png')
         rows[sid] = rec
-        (COMPARE_ROOT / sid / 'compare.json').write_text(json.dumps(rec, indent=1) + '\n')
+        (COMPARE_ROOT / sid / f'compare{suffix}.json').write_text(json.dumps(rec, indent=1) + '\n')
     summary = {}
     for name in cameras:
         vals = [rows[s][name] for s in rows if name in rows[s]]
         if vals:
             summary[name] = {k: float(np.nanmean([v[k] for v in vals if isinstance(v.get(k), (int, float))] or [np.nan]))
                              for k in ('silhouette_iou_head_rows', 'cycles_to_ue_gain', 'lpips', 'dists', 'delta_e')} | dict(n=len(vals))
-    (COMPARE_ROOT / 'summary.json').write_text(json.dumps(dict(ids=list(rows), cameras=summary), indent=1) + '\n')
+    (COMPARE_ROOT / f'summary{suffix}.json').write_text(json.dumps(dict(ids=list(rows), env=env, cameras=summary), indent=1) + '\n')
     return summary
 
 
@@ -213,12 +214,13 @@ def main():
     ap.add_argument('--ids', default=''); ap.add_argument('--every', type=int, default=10)
     ap.add_argument('--cameras', default=','.join(CAMERAS)); ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--report', action='store_true')
+    ap.add_argument('--ue-env', default='studio', help="UE reference lighting: studio (MetaHuman Studio) or vhstudio (calibrated vhuman rig)")
     a = ap.parse_args()
     render_ids = sorted(json.loads((V1 / 'sampling.json').read_text())['render_ids'])
     ids = a.ids.split(',') if a.ids else render_ids[::a.every]
     cams = tuple(a.cameras.split(','))
     if a.report:
-        print(json.dumps(report(ids, cams), indent=1)); return
+        print(json.dumps(report(ids, cams, a.ue_env), indent=1)); return
     for sid in ids:
         if a.build_only:
             print(sid, build_candidate(sid, force=True), flush=True); continue
