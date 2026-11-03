@@ -4,6 +4,7 @@
 #include <arm_sve.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <omp.h>
@@ -51,6 +52,8 @@ static inline float glm53f_mhc_dot_bf16_sve(
     }
     return svaddv_f32(svptrue_b32(), acc);
 }
+
+#include "glm53f_mhc_team.h"
 
 /* mHC has only 24 projection rows. Keep all rows parallel while reusing each
  * BF16 weight vector across the four verification positions. */
@@ -140,11 +143,30 @@ static inline void glm53f_mhc_pre_batch_sve(
         glm53f_mhc_scratch *scratch, const float *streams,
         const glm53f_mhc_site *site, const uint16_t *norm, int tokens,
         size_t scratch_stride, float *normalized) {
+    if(getenv("GLM53F_MHC_BATCH_TEAM")&&atoi(getenv("GLM53F_MHC_BATCH_TEAM"))&&omp_get_max_threads()<=256){
+        glm53f_mhc_pre_team(scratch,streams,site,norm,tokens,scratch_stride,normalized);return;
+    }
     float inv[5],logits[5*GLM53F_MHC_MIX];
     for(int t=0;t<tokens;t++){double sumsq=0;const float*s=streams+(size_t)t*GLM53F_MHC_FLAT;
 #pragma omp parallel for reduction(+:sumsq)
         for(int i=0;i<GLM53F_MHC_FLAT;i++)sumsq+=(double)s[i]*s[i];inv[t]=1.0f/sqrtf((float)(sumsq/GLM53F_MHC_FLAT)+1e-5f);}
-    int n=tokens<5?tokens:4;glm53f_mhc_mv_batch4(logits,site->fn,streams,n);if(tokens==5){const float*s=streams+(size_t)4*GLM53F_MHC_FLAT;float*z=logits+(size_t)4*GLM53F_MHC_MIX;
+    int n=tokens<5?tokens:4;
+    if (getenv("GLM53F_MHC_BATCH_EXACT") &&
+        atoi(getenv("GLM53F_MHC_BATCH_EXACT"))) {
+#pragma omp parallel for schedule(static)
+        for (int zt = 0; zt < n * GLM53F_MHC_MIX; ++zt) {
+            int t = zt / GLM53F_MHC_MIX;
+            int m = zt - t * GLM53F_MHC_MIX;
+            logits[(size_t)t * GLM53F_MHC_MIX + m] =
+                glm53f_mhc_dot_bf16_sve(site->fn +
+                    (size_t)m * GLM53F_MHC_FLAT,
+                    streams + (size_t)t * GLM53F_MHC_FLAT,
+                    GLM53F_MHC_FLAT);
+        }
+    } else {
+        glm53f_mhc_mv_batch4(logits,site->fn,streams,n);
+    }
+    if(tokens==5){const float*s=streams+(size_t)4*GLM53F_MHC_FLAT;float*z=logits+(size_t)4*GLM53F_MHC_MIX;
 #pragma omp parallel for schedule(static)
         for(int m=0;m<GLM53F_MHC_MIX;m++)z[m]=glm53f_mhc_dot_bf16_sve(site->fn+(size_t)m*GLM53F_MHC_FLAT,s,GLM53F_MHC_FLAT);}
     for(int t=0;t<tokens;t++){glm53f_mhc_scratch*q=(glm53f_mhc_scratch*)((unsigned char*)scratch+(size_t)t*scratch_stride);const float*s=streams+(size_t)t*GLM53F_MHC_FLAT;float*z=logits+(size_t)t*GLM53F_MHC_MIX;for(int m=0;m<GLM53F_MHC_MIX;m++)z[m]*=inv[t];for(int k=0;k<GLM53F_MHC_STREAMS;k++){z[k]=glm53f_sigmoid(z[k]*site->scale[0]+site->base[k])+1e-6f;q->post[k]=2.0f*glm53f_sigmoid(z[GLM53F_MHC_STREAMS+k]*site->scale[1]+site->base[GLM53F_MHC_STREAMS+k]);}for(int m=0;m<GLM53F_MHC_STREAMS*GLM53F_MHC_STREAMS;m++)q->combine[m]=z[2*GLM53F_MHC_STREAMS+m]*site->scale[2]+site->base[2*GLM53F_MHC_STREAMS+m];glm53f_mhc_sinkhorn(q->combine,GLM53F_MHC_STREAMS,20,1e-6f);
@@ -179,16 +201,18 @@ static inline void glm53f_mhc_post_sve(
 static inline void glm53f_mhc_post_batch_sve(
         float *streams, const float *sublayer,
         const glm53f_mhc_scratch *scratch, int tokens, size_t stride) {
-#pragma omp parallel for collapse(2) schedule(static)
+    int chunks=getenv("GLM53F_MHC_POST_TILES")&&atoi(getenv("GLM53F_MHC_POST_TILES"))?16:1;
+#pragma omp parallel for collapse(3) schedule(static)
     for (int t = 0; t < tokens; ++t)
-        for (int k = 0; k < GLM53F_MHC_STREAMS; ++k) {
+        for (int k = 0; k < GLM53F_MHC_STREAMS; ++k)
+          for (int chunk = 0; chunk < chunks; ++chunk) {
             float *dst = streams + (size_t)t * GLM53F_MHC_FLAT +
                          (size_t)k * GLM53F_MHC_WIDTH;
             const float *res = (const float *)((const unsigned char *)scratch +
                               (size_t)t * stride + offsetof(glm53f_mhc_scratch, residual));
             const glm53f_mhc_scratch *s = (const glm53f_mhc_scratch *)
                               ((const unsigned char *)scratch + (size_t)t * stride);
-            for (int d = 0; d < GLM53F_MHC_WIDTH; ++d) {
+            for (int d = chunk*(GLM53F_MHC_WIDTH/chunks); d < (chunk+1)*(GLM53F_MHC_WIDTH/chunks); ++d) {
 #if GLM53F_MHC_POST_FLOAT
                 float v = s->post[k] * sublayer[(size_t)t * GLM53F_MHC_WIDTH + d];
                 for (int j = 0; j < GLM53F_MHC_STREAMS; ++j)

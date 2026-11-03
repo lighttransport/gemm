@@ -1,5 +1,6 @@
 #ifndef GLM53F_TARGET_MODEL_12N_H
 #define GLM53F_TARGET_MODEL_12N_H
+#include "glm53f_decode_options.h"
 
 typedef struct glm53f_target_model_12n glm53f_target_model_12n;
 typedef struct glm53f_target_snapshot_12n glm53f_target_snapshot_12n;
@@ -8,6 +9,10 @@ glm53f_target_model_12n *glm53f_target_model_create_12n(
     const char *model_dir, const char *routed_stage,
     const char *shared_stage, int capacity);
 void glm53f_target_model_free_12n(glm53f_target_model_12n *model);
+/* Set only at a clean prompt boundary; snapshots retain their policy. */
+int glm53f_target_set_decode_options_12n(glm53f_target_model_12n *model,
+    const glm53f_decode_options *options);
+void glm53f_target_model_reset_12n(glm53f_target_model_12n *model);
 int glm53f_target_model_step_12n(
     glm53f_target_model_12n *model, int input_token,
     int *next_token, float *next_logit, float *target_hidden);

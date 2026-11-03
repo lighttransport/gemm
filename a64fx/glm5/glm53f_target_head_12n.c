@@ -33,7 +33,16 @@ int glm53f_target_head_argmax_12n(glm53f_target_head_context_12n*c,const float*s
     for(int i=0;i<H;i++)c->x[i]=c->hidden[i]*inv*glm53f_bf16_to_f32(c->norm[i]);double t1=MPI_Wtime();
 #pragma omp parallel for schedule(static)
     for(int r=0;r<c->rn;r++)c->logits[r]=dot(c->head+(size_t)r*H,c->x,H);in.value=-INFINITY;in.index=-1;for(int r=0;r<c->rn;r++){int id=c->r0+r;if(c->logits[r]>in.value||(c->logits[r]==in.value&&id<in.index)){in.value=c->logits[r];in.index=id;}}double t2=MPI_Wtime();int rc=MPI_Allreduce(&in,&best,1,MPI_FLOAT_INT,MPI_MAXLOC,MPI_COMM_WORLD);double t3=MPI_Wtime();c->phase[0]=t1-t0;c->phase[1]=t2-t1;c->phase[2]=t3-t2;*token=best.index;*value=best.value;return rc==MPI_SUCCESS?0:-1;}
-int glm53f_target_head_argmax_batch_12n(glm53f_target_head_context_12n*c,const float*streams,int tokens,int*token,float*value){if(!c||!streams||!token||!value||tokens<1||tokens>5)return-1;struct pair{float value;int index;}in[5],best[5];double t0=MPI_Wtime();float invs[5];for(int t=0;t<tokens;t++){double ss=0;float*h=c->hidden+(size_t)t*H,*z=c->x+(size_t)t*H;const float*s=streams+(size_t)t*HC*H;
+int glm53f_target_head_argmax_batch_12n(glm53f_target_head_context_12n*c,const float*streams,int tokens,int*token,float*value){if(!c||!streams||!token||!value||tokens<1||tokens>5)return-1;struct pair{float value;int index;}in[5],best[5];
+    if (tokens > 1 && getenv("GLM53F_HEAD_BATCH_EXACT") &&
+        atoi(getenv("GLM53F_HEAD_BATCH_EXACT"))) {
+        for (int t = 0; t < tokens; ++t)
+            if (glm53f_target_head_argmax_12n(c,
+                    streams + (size_t)t * HC * H,
+                    token + t, value + t)) return -1;
+        return 0;
+    }
+double t0=MPI_Wtime();float invs[5];for(int t=0;t<tokens;t++){double ss=0;float*h=c->hidden+(size_t)t*H,*z=c->x+(size_t)t*H;const float*s=streams+(size_t)t*HC*H;
 #pragma omp parallel for reduction(+:ss)
         for(int i=0;i<H;i++){float v=0;for(int q=0;q<HC;q++)v+=s[(size_t)q*H+i];h[i]=v/HC;ss+=(double)h[i]*h[i];}invs[t]=1/sqrtf((float)(ss/H)+1e-5f);}
     /* Projection is independent across verification positions; flatten it

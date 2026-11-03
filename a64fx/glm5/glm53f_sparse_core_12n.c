@@ -37,7 +37,7 @@ static int mla_one(float*out,const float*q,const float*cache,const uint16_t*w,
     /* One head is owned by one OpenMP worker.  These scratch arrays are small
      * (about 16 KiB at TOPK=2048); keeping them on that worker's stack avoids
      * three allocator/lock round-trips for every head of every decode layer. */
-    float ql[LAT], va[LAT], log[2052]; /* TOPK(2048) + one KPOOL(4) tail */
+    float ql[LAT], va[LAT], log[2056]; /* TOPK(2048) + one KPOOL(4) tail */
     const uint16_t*wv=w+(size_t)KD*LAT;int vl=(int)svcntw();memset(ql,0,LAT*4);
     for(int j=0;j<KD;j++){float x=q[j]/sqrtf((float)KD);for(int d=0;d<LAT;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);svuint32_t z=svlsl_n_u32_x(p,svld1uh_u32(p,w+(size_t)j*LAT+d),16);svst1(p,ql+d,svmla_n_f32_x(p,svld1(p,ql+d),svreinterpret_f32_u32(z),x));}}
     float mx=-INFINITY,sum=0;for(int t=0;t<nt;t++){log[t]=f32dot(ql,cache+(size_t)sel[t]*LAT,LAT);if(log[t]>mx)mx=log[t];}for(int t=0;t<nt;t++){log[t]=expf(log[t]-mx);sum+=log[t];}memset(va,0,LAT*4);
@@ -57,16 +57,42 @@ static int mla_heads(float*out,const float*q,const float*z,const uint16_t*w,
 }
 static int mla_heads_sharded(float*out,const float*q,const float*z,const uint16_t*w,
         int nt,int nh,float*ql,float*log,float*part,float*va){enum{SHARDS=8};int vl=(int)svcntw();
+    int registers=getenv("GLM53F_SPARSE_MLA_REG")&&atoi(getenv("GLM53F_SPARSE_MLA_REG"));
 #pragma omp parallel
     {
+        if(registers){
+#pragma omp for collapse(2) schedule(static)
+            for(int h=0;h<nh;h++)for(int d=0;d<LAT;d+=vl){
+                const uint16_t *wh=w+(size_t)h*(KD+VD)*LAT;
+                svbool_t p=svwhilelt_b32(d,LAT);svfloat32_t acc=svdup_f32(0);
+                for(int j=0;j<KD;j++){
+                    float x=q[(size_t)h*KD+j]/sqrtf((float)KD);
+                    svuint32_t b=svlsl_n_u32_x(p,svld1uh_u32(p,wh+(size_t)j*LAT+d),16);
+                    acc=svmla_n_f32_x(p,acc,svreinterpret_f32_u32(b),x);
+                }
+                svst1(p,ql+(size_t)h*LAT+d,acc);
+            }
+        }else{
 #pragma omp for schedule(static)
         for(int h=0;h<nh;h++){const uint16_t*wh=w+(size_t)h*(KD+VD)*LAT;float*qh=ql+(size_t)h*LAT;memset(qh,0,LAT*4);for(int j=0;j<KD;j++){float x=q[(size_t)h*KD+j]/sqrtf((float)KD);for(int d=0;d<LAT;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);svuint32_t b=svlsl_n_u32_x(p,svld1uh_u32(p,wh+(size_t)j*LAT+d),16);svst1(p,qh+d,svmla_n_f32_x(p,svld1(p,qh+d),svreinterpret_f32_u32(b),x));}}}
+        }
 #pragma omp for collapse(2) schedule(static)
         for(int h=0;h<nh;h++)for(int t=0;t<nt;t++)log[(size_t)h*nt+t]=f32dot(ql+(size_t)h*LAT,z+(size_t)t*LAT,LAT);
 #pragma omp for schedule(static)
         for(int h=0;h<nh;h++){float*lh=log+(size_t)h*nt,mx=-INFINITY,sum=0;for(int t=0;t<nt;t++)if(lh[t]>mx)mx=lh[t];for(int t=0;t<nt;t++){lh[t]=expf(lh[t]-mx);sum+=lh[t];}for(int t=0;t<nt;t++)lh[t]/=sum;}
+        if(registers){
+#pragma omp for collapse(3) schedule(static)
+            for(int h=0;h<nh;h++)for(int s=0;s<SHARDS;s++)for(int d=0;d<LAT;d+=vl){
+                svbool_t p=svwhilelt_b32(d,LAT);svfloat32_t acc=svdup_f32(0);
+                int b=(int)((long long)nt*s/SHARDS),e=(int)((long long)nt*(s+1)/SHARDS);
+                for(int t=b;t<e;t++)acc=svmla_n_f32_x(p,acc,
+                    svld1(p,z+(size_t)t*LAT+d),log[(size_t)h*nt+t]);
+                svst1(p,part+((size_t)h*SHARDS+s)*LAT+d,acc);
+            }
+        }else{
 #pragma omp for collapse(2) schedule(static)
         for(int h=0;h<nh;h++)for(int s=0;s<SHARDS;s++){float*pv=part+((size_t)h*SHARDS+s)*LAT;memset(pv,0,LAT*4);int b=(int)((long long)nt*s/SHARDS),e=(int)((long long)nt*(s+1)/SHARDS);for(int t=b;t<e;t++){float a=log[(size_t)h*nt+t];const float*zt=z+(size_t)t*LAT;for(int d=0;d<LAT;d+=vl){svbool_t p=svwhilelt_b32(d,LAT);svst1(p,pv+d,svmla_n_f32_x(p,svld1(p,pv+d),svld1(p,zt+d),a));}}}
+        }
 #pragma omp for collapse(2) schedule(static)
         for(int h=0;h<nh;h++)for(int d=0;d<LAT;d++){float s=0;for(int k=0;k<SHARDS;k++)s+=part[((size_t)h*SHARDS+k)*LAT+d];va[(size_t)h*LAT+d]=s;}
 #pragma omp for collapse(2) schedule(static)

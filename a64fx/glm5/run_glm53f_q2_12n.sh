@@ -57,6 +57,11 @@ test "$(grep -l 'SENTINEL glm53f_rank_stage=' "$logdir"/shared-stage-$run_tag.*.
 ' sh "$core_source" "$core_stage" "$repo_glm5/glm53f_core_stage"
 test "$(grep -l 'SENTINEL glm53f_rank_stage=' "$logdir"/core-stage-$run_tag.*.* | wc -l)" -eq 12
 
+if [ "${GLM53F_STAGE_ONLY:-0}" = 1 ]; then
+    echo "SENTINEL glm53f_stage_only=OK logdir=$logdir"
+    exit 0
+fi
+
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-47}
 export OMP_DYNAMIC=false OMP_WAIT_POLICY=active
 export OMP_PROC_BIND=close OMP_PLACES=cores FLIB_BARRIER=HARD

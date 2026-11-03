@@ -103,6 +103,8 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" \
     "${ldflags[@]}" -o glm53f_sparse_batch_check
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_q2_stage.c \
     -o glm53f_q2_stage
+TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_decode_stage.c \
+    -lm -o glm53f_decode_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_core_stage.c \
     -o glm53f_core_stage
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_expert_decode_12n.c \
@@ -110,5 +112,9 @@ TMPDIR="$build_dir" "$cc" "${cflags[@]}" glm53f_expert_decode_12n.c \
     "${ldflags[@]}" -o glm53f_expert_decode_12n
 TMPDIR="$build_dir" "$cc" "${cflags[@]}" ../utofu-tests/tofu_topo_helper.c \
     -ltofucom -o ../utofu-tests/tofu_topo_helper
+
+for test in test_glm53f_kquant test_glm53f_mhc_team test_glm53f_q8_projection test_glm53f_kda_queue; do
+    TMPDIR="$build_dir" "$cc" "${cflags[@]}" "$test.c" -lm -lpthread -o "$test"
+done
 
 echo "SENTINEL glm53f_integrated_build_12n=OK cc=$cc build_dir=$build_dir"

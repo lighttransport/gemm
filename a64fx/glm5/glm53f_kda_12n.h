@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 typedef struct glm53f_kda_context_12n glm53f_kda_context_12n;
+int glm53f_kda_set_int8_12n(glm53f_kda_context_12n *context, int enabled);
 
 glm53f_kda_context_12n *glm53f_kda_create_12n(
     const char *model_dir, int layer);
@@ -17,6 +18,12 @@ int glm53f_kda_sublayer_batch_capture_12n(
     glm53f_kda_context_12n *context, float *output,
     const float *normalized_input, int tokens,
     void *state_after_each_token, size_t state_stride);
+/* Capture directly into separate caller-owned snapshots; NULL entries skip
+ * state materialization for verifier positions that can never be restored. */
+int glm53f_kda_sublayer_batch_capture_to_12n(
+    glm53f_kda_context_12n *context, float *output,
+    const float *normalized_input, int tokens,
+    void *const *state_after_each_token, size_t state_bytes);
 void glm53f_kda_last_phase_12n(
     const glm53f_kda_context_12n *context, double phase_seconds[3]);
 void glm53f_kda_last_detail_12n(

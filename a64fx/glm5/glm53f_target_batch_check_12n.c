@@ -21,12 +21,43 @@ int main(int argc, char **argv) {
             glm53f_collective_init_12n(topology, TOKENS * 4096))
         MPI_Abort(MPI_COMM_WORLD, 2);
     glm53f_target_model_12n *m = glm53f_target_model_create_12n(
-        argv[1], argv[2], argv[3], TOKENS + 1);
+        argv[1], argv[2], argv[3], 20000);
+    if(argc>4){
+        glm53f_decode_options o=glm53f_decode_options_default();
+        o.expert_top_k=4;o.sparse_top_k=512;o.index_refresh=4;o.kda_int8=1;
+        if(glm53f_target_set_decode_options_12n(m,&o))MPI_Abort(MPI_COMM_WORLD,2);
+    }
     glm53f_target_snapshot_12n *initial = glm53f_target_snapshot_create_12n(m);
     glm53f_target_snapshot_12n *seq_final = glm53f_target_snapshot_create_12n(m);
     glm53f_target_snapshot_12n *after[TOKENS];
     for (int t = 0; t < TOKENS; t++) after[t] = glm53f_target_snapshot_create_12n(m);
     if (!m || !initial || !seq_final) MPI_Abort(MPI_COMM_WORLD, 2);
+    int warmup = getenv("GLM53F_BATCH_WARMUP") ? atoi(getenv("GLM53F_BATCH_WARMUP")) : 0;
+    if (warmup < 0 || warmup > 20000) MPI_Abort(MPI_COMM_WORLD, 2);
+    int *warm_ids = NULL;
+    const char *warm_path = getenv("GLM53F_BATCH_WARMUP_FILE");
+    if (warm_path && *warm_path) {
+        if (!rank) {
+            FILE *wf = fopen(warm_path, "r");
+            if (!wf) MPI_Abort(MPI_COMM_WORLD, 2);
+            warm_ids = malloc((size_t)20000 * sizeof(*warm_ids));
+            while (warmup < 20000 && fscanf(wf, "%d", &warm_ids[warmup]) == 1)
+                warmup++;
+            fclose(wf);
+        }
+        MPI_Bcast(&warmup, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (rank) warm_ids = malloc((size_t)warmup * sizeof(*warm_ids));
+        if (!warm_ids) MPI_Abort(MPI_COMM_WORLD, 2);
+        MPI_Bcast(warm_ids, warmup, MPI_INT, 0, MPI_COMM_WORLD);
+    }
+    for (int i = 0; i < warmup; ++i) {
+        int ignored; float ignored_logit;
+        int warm_token = warm_ids ? warm_ids[i] : input[i % TOKENS];
+        if (glm53f_target_model_step_12n(m, warm_token,
+                                         &ignored, &ignored_logit, NULL))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+    free(warm_ids);
     for (int t = 0; t < TOKENS; t++)
         if (!after[t]) MPI_Abort(MPI_COMM_WORLD, 2);
     local_ok &= !glm53f_target_snapshot_save_12n(m, initial);
@@ -57,6 +88,25 @@ int main(int argc, char **argv) {
     local_ok &= probe_seq == probe_bat;
     local_ok &= fabsf(probe_seq_logit - probe_bat_logit) <=
                 2e-5f * fmaxf(1.0f, fabsf(probe_seq_logit));
+    if (getenv("GLM53F_SNAPSHOT_PROBE")) {
+        for (int t = 0; t + 1 < TOKENS; ++t) {
+            int probe;
+            float probe_logit;
+            local_ok &= !glm53f_target_snapshot_restore_12n(m, after[t]);
+            local_ok &= !glm53f_target_model_step_12n(
+                m, input[t + 1], &probe, &probe_logit, NULL);
+            local_ok &= probe == seq[t + 1];
+            local_ok &= fabsf(probe_logit - seq_logit[t + 1]) <=
+                        2e-5f * fmaxf(1.0f, fabsf(seq_logit[t + 1]));
+            if (!rank)
+                printf("GLM53F_SNAPSHOT_PROBE t=%d got=%d/%d logit=%.9g/%.9g %s\n",
+                       t, probe, seq[t + 1], probe_logit, seq_logit[t + 1],
+                       (probe == seq[t + 1] &&
+                        fabsf(probe_logit - seq_logit[t + 1]) <=
+                            2e-5f * fmaxf(1.0f, fabsf(seq_logit[t + 1]))) ?
+                       "PASS" : "FAIL");
+        }
+    }
     MPI_Allreduce(&local_ok, &ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     double seq_max, bat_max;
     MPI_Reduce(&seq_sec, &seq_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);

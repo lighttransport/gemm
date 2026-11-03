@@ -40,6 +40,11 @@ int main(int argc, char **argv) {
         local_ok &= !glm53f_sparse_sublayer_12n(
             cb, b, x + (size_t)t * HIDDEN);
     }
+    if(argc>4){
+        int top_k=atoi(argv[4]),refresh=argc>5?atoi(argv[5]):4;
+        local_ok &= !glm53f_sparse_set_policy_12n(ca,top_k,refresh);
+        local_ok &= !glm53f_sparse_set_policy_12n(cb,top_k,refresh);
+    }
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
     for (int t = 0; t < TOKENS; t++)
@@ -61,7 +66,12 @@ int main(int argc, char **argv) {
     double rel = sqrt(d2 / (r2 + 1e-30));
     local_ok &= rel < 3e-6;
     double rollback_d2=0.0,rollback_r2=0.0;
-    if(warm>=1){local_ok&=!glm53f_sparse_restore_length_12n(ca,warm+1);
+    if(warm>=1){glm53f_sparse_selection_state sa,sb;
+        glm53f_sparse_selection_at_12n(ca,warm+1,&sa);
+        glm53f_sparse_selection_at_12n(cb,warm+1,&sb);
+        glm53f_sparse_selection_restore_12n(ca,&sa);
+        glm53f_sparse_selection_restore_12n(cb,&sb);
+        local_ok&=!glm53f_sparse_restore_length_12n(ca,warm+1);
         local_ok&=!glm53f_sparse_restore_length_12n(cb,warm+1);
         for(int t=1;t<TOKENS;t++){local_ok&=!glm53f_sparse_sublayer_12n(ca,a,x+(size_t)(warm+t)*HIDDEN);local_ok&=!glm53f_sparse_sublayer_12n(cb,b,x+(size_t)(warm+t)*HIDDEN);for(int i=0;i<HIDDEN;i++){double d=(double)a[i]-b[i];rollback_d2+=d*d;rollback_r2+=(double)a[i]*a[i];}}}
     double rollback_rel=sqrt(rollback_d2/(rollback_r2+1e-30));

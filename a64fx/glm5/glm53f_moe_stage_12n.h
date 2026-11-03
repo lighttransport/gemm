@@ -2,6 +2,7 @@
 #define GLM53F_MOE_STAGE_12N_H
 
 typedef struct glm53f_moe_stage_context_12n glm53f_moe_stage_context_12n;
+int glm53f_moe_stage_set_top_k_12n(glm53f_moe_stage_context_12n *context, int top_k);
 
 glm53f_moe_stage_context_12n *glm53f_moe_stage_create_12n(
     const char *routed_stage, const char *shared_stage,

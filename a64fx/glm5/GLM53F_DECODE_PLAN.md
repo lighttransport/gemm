@@ -186,6 +186,13 @@ Verification snapshots contain every KDA recurrent/convolution state and every
 sparse-attention cache length. Rejection restores the selected target snapshot;
 the committed MTP suffix is replayed from exact target hidden states.
 
+The current speculative runner additionally treats the MTP cache as a
+pre-cycle state machine: a full acceptance appends only the final draft input,
+while rejection restores the pre-cycle length and replays each committed input
+once. Target snapshots are restored only for rejection. This avoids duplicating
+the first token during rollback and is covered by
+`test_glm53f_mtp_rebase.py`; an integrated 12-node rerun remains required.
+
 Correctness and stability evidence:
 
 - scalar versus five-position batched KDA output has relative L2

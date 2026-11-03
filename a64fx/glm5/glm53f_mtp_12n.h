@@ -1,5 +1,6 @@
 #ifndef GLM53F_MTP_12N_H
 #define GLM53F_MTP_12N_H
+#include "glm53f_sparse_12n.h"
 
 typedef struct glm53f_mtp_context_12n glm53f_mtp_context_12n;
 
@@ -18,5 +19,13 @@ int glm53f_mtp_cache_append_12n(
     const float *target_hidden);
 int glm53f_mtp_restore_length_12n(
     glm53f_mtp_context_12n *context, int length);
+int glm53f_mtp_save_selection_12n(
+    const glm53f_mtp_context_12n *context,
+    glm53f_sparse_selection_state *selection,
+    glm53f_sparse_selection_state history[8]);
+int glm53f_mtp_restore_selection_12n(
+    glm53f_mtp_context_12n *context,
+    const glm53f_sparse_selection_state *selection,
+    const glm53f_sparse_selection_state history[8]);
 
 #endif

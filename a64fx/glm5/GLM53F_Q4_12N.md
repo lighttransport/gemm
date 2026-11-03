@@ -186,3 +186,192 @@ same-state scalar/speculative validation is required before a quality claim.
 At this near-perfect acceptance, the measured cycle costs permit only about
 21.43 tok/s even at 100% acceptance. The 60 tok/s target remains unmet; target
 verification throughput, not first-draft acceptance, is the limiting factor.
+
+### Completed same-state check and continuation (job 51383005)
+
+The later `mtp-selfcheck8k.27.0` log in the previous remote checkout
+`~/work/gemm/q38nf/tmp/glm53f-q4-51370956` completes the missing check:
+7,189 delivered tokens, 21.723 tok/s, acceptance 2,379/2,405 (98.9189%),
+and `GLM53F_SPEC_REFERENCE checked=7189 delivered=7189 PASS`.
+The input fixture is `~/work/gemm/q38nf/tmp/glm53f-codegen-51336165/prompt_ids_header.txt`:
+8,379 IDs with 8,378 positions replayed before decode.
+
+The continuation uses the login4 allocation in the repository's `session.md`.
+Build and stage without starting target inference, then stage MTP:
+
+```sh
+GLM53F_STAGE_ONLY=1 bash a64fx/glm5/run_glm53f_q4_12n.sh
+bash a64fx/glm5/run_glm53f_mtp_stage_12n.sh
+```
+
+The integrated build now includes the MTP stager. The speculative launcher's
+optional fifth argument limits **delivered tokens**, independently of the cycle
+and draft counts. A supplied reference must cover every delivered token; short
+references fail. The launcher checks target/MTP blobs and manifests and the
+compact core on every rank, and wraps each inference rank in a 2 GiB
+`MemAvailable` guard with minimum-headroom reporting.
+
+Optional experiments, disabled unless explicitly selected:
+
+| Control | Experiment |
+| --- | --- |
+| `GLM53F_SPEC_CARRY=1` | Seed once, then draft from the verifier's pending token and predecessor hidden state; omit the repeated scalar target step. |
+| `GLM53F_SPARSE_BATCH_FRONT=1` | Reuse FP8/BF16 projection weights across verifier positions while keeping selection and pool updates causal. |
+| `GLM53F_Q4_BATCH_ROUTED=1` | Group matching expert parts across tokens; reuse Q4/Q5 unpacking and retain Q6/IQ row fallback. Requires shared batching. |
+| `GLM53F_SPARSE_MLA_REG=1` | Keep query absorption and per-shard weighted-value sums in SVE registers, preserving reduction order. |
+| `GLM53F_SPEC_DIRECT_SNAPSHOT=1` | Capture KDA state directly into per-position target snapshots and restore independent layers in parallel. |
+| `GLM53F_KDA_FUSED_OP=1` | Run scalar KDA output projection in its existing team with the eight-row kernel. |
+| `GLM53F_SPARSE_DETAIL=1` | Report projection, indexer, selected-KV packing, MLA, output-projection, and collective time. |
+| `GLM53F_NUMA_INTERLEAVE=4-7` | Launch under `numactl` with interleaved anonymous allocations; inspect the allocation's topology before selecting this mask. |
+
+`GLM53F_SPEC_OPT_SWEEP=1` compares eight cumulative variants from the same
+warmed state: baseline, carry, front, routed, MLA, snapshots, KDA output,
+and sparse output batching. It is mutually exclusive with the existing draft
+sweep and legacy batch comparison. Each output gains its variant suffix.
+Use `GLM53F_SPEC_SELF_REFERENCE=1` for a matching scalar reference, and pass
+the same delivered-token limit to every measurement.
+`GLM53F_SPEC_REPEAT=N` repeats the selected comparison from that same state,
+reversing variant order on alternate repetitions and adding `.rN` to output
+filenames. The scalar reference is generated once outside the timed trials.
+
+Unsloth's [September 4 decode change](https://github.com/ggml-org/llama.cpp/commit/00699716c275498ff84d71e329178fe21cba56a6)
+caches completed pooled indexer keys. This runner already has incremental
+completed-pool updates. Its [GLM-5.3-Flash guide](https://unsloth.ai/docs/jp/moderu/glm-5.3-flash)
+also motivates testing small MTP draft counts; GPU measurements do not predict
+A64FX throughput.
+
+The extended `test_glm53f_kquant.c` checks scalar-versus-multitoken rows and
+shared, reordered, and empty expert routes. `test_glm53f_mla_register.c`
+checks projections, logits, partial sums, and output at five lengths. Both
+pass bit-exact comparisons on A64FX with the fast-math build.
+
+#### Initial continuation results
+
+All 12 routed stages completed at 15,456,534,528 bytes/rank; rank 0's FNV1a
+is `80c171ac9f66d851`, matching the previous working stage. Shared/core and
+MTP stages also completed on all ranks. Sparse batch tests at warm lengths
+2050 and 8190 have zero output/rollback difference. Full-target five-position
+batch/rollback passes, and the MTP cache check at 2051 has bit-exact hidden
+states. Minimum headroom across the full-target test was 12,790,272 KiB.
+
+The first same-state sweep uses 128 delivered tokens and two drafts; these
+are screening results, not sustained-throughput claims. All eight variants
+match all 128 greedy IDs, and that scalar reference also matches the archived
+7,189-token response's prefix exactly.
+
+| Cumulative variant | Delivered tok/s |
+| --- | ---: |
+| Baseline | 20.207 |
+| Carry | 21.250 |
+| + batch front | 23.035 |
+| + routed grouping | 22.918 |
+| + register MLA | 23.621 |
+| + direct snapshots | 24.937 |
+| + KDA output | 24.938 |
+| + sparse output batch | 25.245 |
+
+The last variant is 24.9% faster in this screen, but still below 60 tok/s.
+Its verifier costs 31.742 ms/position: attention 15.075, FFN 12.197,
+mHC 3.977, and head 0.440 ms. Routed grouping and scalar KDA output show no
+isolated benefit here. Logs and identities are under
+`tmp/q4-mtp-51383005/` remotely and `tmp/q4-mtp-51383005-evidence/` locally.
+
+The separate optimized 128-token draft-depth screen matches the archived
+greedy reference at every depth. Delivered rates for depths 1/2/3/4 are
+26.568 / 24.867 / 22.569 / 16.374 tok/s; acceptance fractions are
+0.9844 / 0.7800 / 0.6288 / 0.4716. One draft is best in this screen.
+
+Placement diagnostics on rank 0 found resident pages on compute NUMA nodes
+4/5/6 but none on node 7. Nodes 0-3 are small assistant-core banks; 4-7 are
+the four ~7.2 GiB compute-memory banks. `numactl --interleave=4-7` is supported
+and was tested separately rather than silently changing the baseline.
+
+#### Repeated 1,024-token interleaved trials
+
+With all seven candidate switches enabled and `GLM53F_NUMA_INTERLEAVE=4-7`,
+the following trials reset to the same 8,378-position prompt state and check
+every delivered ID against the archived greedy response. Repetition 2 runs
+depths in reverse order. All twelve trials pass 1,024/1,024 IDs.
+
+| Draft depth | Trial 1 tok/s | Trial 2 tok/s | Trial 3 tok/s | Median tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 29.860 | 29.861 | 29.866 | 29.861 |
+| 2 | 27.295 | 27.286 | 27.288 | 27.288 |
+| 3 | 22.910 | 22.909 | 22.906 | 22.909 |
+| 4 | 17.207 | 17.210 | 17.207 | 17.207 |
+
+One-draft acceptance is 509/514 (99.027%). Its first trial's verifier costs
+32.554 ms/position: attention 15.019, FFN 12.937, mHC 4.270, and head
+0.269 ms. Thus the remaining limit is verifier execution, not acceptance.
+The 60 tok/s target is not met. No GPU-derived speedup is claimed.
+
+Driver SHA256 for these trials:
+`4df0ce5e0a28add1fb9020858fe0053162822d0bfb1fa733f5f532e2ed06a6f0`.
+Prompt SHA256:
+`6e06a30ccda8594dfafdf5ab2e13929b30d6d1baebe16dd07155981e89c23aa6`.
+Logs: `tmp/q4-mtp-51383005/drafts-op-d4-g1024-r3/`.
+
+The historical one-draft baseline (new switches off, default memory policy)
+was then measured with the same prompt and 1,024 delivered tokens, resetting
+between three trials: 22.517 / 22.516 / 22.515 tok/s, all 1,024/1,024 IDs
+exact. Median candidate improvement is **32.62%** (29.861 versus 22.516).
+These are separate process launches because the resident memory placement
+differs; baseline/candidate launches themselves were not interleaved.
+Within each launch, repeated trials reuse the same warmed model and reset
+to the same prompt state. Baseline logs:
+`tmp/q4-mtp-51383005/sustained-baseline-d1-g1024-r3/`.
+
+#### Full continuation to EOS
+
+The selected one-draft interleaved configuration delivers **7,189 tokens at
+29.133 tok/s**, accepting 3,576/3,613 drafts (98.9759%). It ends at token
+154827, passes `REFERENCE checked=7189 delivered=7189`, and its entire ID
+file is byte-identical to the archived greedy response (`cmp` exit 0).
+Minimum `MemAvailable` across ranks is 10,469,952 KiB (9.99 GiB); no memory
+guard trips occur. Decode throughput excludes build, loading, and prompt
+replay. This is a single continuation, not aggregate multi-request throughput.
+
+Full-run verifier cost is 33.591 ms/position: attention 15.718, FFN 12.960,
+mHC 4.587, and head 0.270 ms. At 98.98% one-draft acceptance, improving
+acceptance alone cannot bridge the remaining gap to 60 tok/s; target kernels
+need substantial further work. Keep this as a measured improvement, not a
+60 tok/s claim or a claim about equivalence to the original BF16 checkpoint.
+
+Output: `tmp/q4-mtp-51383005/sustained-op-d1-g7189-r1.ids`.
+Logs: `tmp/q4-mtp-51383005/sustained-op-d1-g7189-r1/`.
+The allocation and HTTP bridge were verified healthy at 15:00 JST; weights
+remain staged and the job is left running for further development.
+
+Reproduce the standalone bit-exact checks inside the allocation:
+
+```sh
+cd a64fx/glm5
+mpifcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -ffast-math \
+  -fno-math-errno -fopenmp test_glm53f_kquant.c -lm -o /local/test_glm53f_kquant
+mpifcc -Nclang -O3 -march=armv8.2-a+sve -ffp-contract=fast -ffast-math \
+  -fno-math-errno -fopenmp test_glm53f_mla_register.c -lm -o /local/test_glm53f_mla_register
+OMP_NUM_THREADS=47 /local/test_glm53f_kquant
+OMP_NUM_THREADS=47 /local/test_glm53f_mla_register
+```
+
+The measured candidate configuration is explicit (defaults remain historical):
+
+```sh
+export GLM53F_SPEC_CARRY=1 GLM53F_SPARSE_BATCH_FRONT=1
+export GLM53F_Q4_BATCH_ROUTED=1 GLM53F_SPARSE_MLA_REG=1
+export GLM53F_SPEC_DIRECT_SNAPSHOT=1 GLM53F_KDA_FUSED_OP=1
+export GLM53F_SPARSE_BATCH_OP=1 GLM53F_NUMA_INTERLEAVE=4-7
+export GLM53F_SPEC_REPEAT=1 GLM53F_SPEC_OPT_SWEEP=0 GLM53F_SPEC_DRAFT_SWEEP=0
+export GLM53F_SPEC_SELF_REFERENCE=0 GLM53F_SPEC_COMPARE_BATCH=0 GLM53F_SPEC_FULL_REPLAY=0
+export GLM53F_SPEC_REFERENCE_IDS=$HOME/work/gemm/q38nf/tmp/glm53f-q4-51370956/mtp-selfcheck8k.ids.greedy
+# Keep these overrides to use the measured executable. A rebuild needs revalidation.
+GLM53F_BUILD=0 GLM53F_SPEC_BINARY=$PWD/glm53f_spec_q4_repeat \
+  bash run_glm53f_q4_mtp_12n.sh \
+  "$HOME/work/gemm/q38nf/tmp/glm53f-codegen-51336165/prompt_ids_header.txt" \
+  "$HOME/work/gemm/glm53f/tmp/continuation.ids" 7189 1 7189
+```
+
+The later approximation experiments do not supersede this exact result.
+They passed the paired Python score-loss gate but failed C++ compilation and
+long scalar/MTP equivalence. Their faster raw timings are not promoted; see
+[GLM53F_APPROX_12N.md](GLM53F_APPROX_12N.md).

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Direct execution inside an existing 12-node A64FX interactive allocation.
 set -euo pipefail
-if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
-    echo "usage: $0 PROMPT_IDS OUTPUT_IDS [cycles=128] [drafts=1]" >&2
+if [ "$#" -lt 2 ]; then
+    echo "usage: $0 PROMPT_IDS OUTPUT_IDS [cycles=128] [drafts=1] [max_tokens=0] [decode options...]" >&2
     exit 2
 fi
 job=${PJM_JOBID:?Run inside the 12-node interactive job}
@@ -29,10 +29,18 @@ mpiexec -np 12 sh -c '
     r=${PMIX_RANK:-${PJM_MPI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}
     for directory do
         manifest=$(printf "%s/rank%02d.manifest" "$directory" "$r")
-        test -s "$manifest" || { echo "missing stage: $manifest" >&2; exit 2; }
+        blob=$(printf "%s/rank%02d.blob" "$directory" "$r")
+        test -s "$manifest" && test -s "$blob" || { echo "missing stage: $manifest / $blob" >&2; exit 2; }
     done
 ' sh "$routed" "$shared" "$mtp_routed" "$mtp_shared"
 export GLM53F_REPACK_DIR=${GLM53F_REPACK_DIR:-/local/glm53f-q4-core-$job}
+mpiexec -np 12 sh -c '
+    r=${PMIX_RANK:-${PJM_MPI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}
+    for suffix in core.blob core.manifest; do
+        file=$(printf "%s/rank%02d.%s" "$1" "$r" "$suffix")
+        test -s "$file" || { echo "missing core stage: $file" >&2; exit 2; }
+    done
+' sh "$GLM53F_REPACK_DIR"
 export GLM53F_REPACK_REQUIRE=0
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-47}
 export OMP_DYNAMIC=false OMP_WAIT_POLICY=active
@@ -44,8 +52,16 @@ export GLM53F_SPARSE_BATCH_OP=${GLM53F_SPARSE_BATCH_OP:-0}
 (cd "$repo_glm5" && mpiexec -np 12 ../utofu-tests/tofu_topo_helper)
 export TOFU_TOPO_PATH=$repo_glm5/tofu_topo.txt
 export GLM53F_SPEC_PROMPT_IDS=$1 GLM53F_SPEC_OUTPUT_IDS=$2
+numa_command=()
+if [ -n "${GLM53F_NUMA_INTERLEAVE:-}" ]; then
+    # Fugaku compute-memory nodes are 4-7 in this allocation; inspect
+    # numactl --hardware before selecting a mask on another environment.
+    numa_command=(numactl "--interleave=$GLM53F_NUMA_INTERLEAVE")
+fi
 mpiexec -np 12 -of-proc "$logdir/decode" \
+    bash "$repo_glm5/glm53f_rank_guard.sh" \
+    "${numa_command[@]}" \
     "${GLM53F_SPEC_BINARY:-$repo_glm5/glm53f_spec_decode_12n}" \
     "$model" "$routed" "$shared" "$mtp_routed" "$mtp_shared" \
-    1 "${3:-128}" "${4:-1}" 0
+    1 "${3:-128}" "${4:-1}" 0 "${5:-0}" "${@:6}"
 grep -E 'GLM53F_SPEC_(PHASE|DECODE|REFERENCE|VARIANT)' "$logdir"/decode.*.0
