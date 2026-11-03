@@ -12,16 +12,28 @@ os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
 
 
 def read_exr(path):
+    import os
+    os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')     # some OpenCV builds disable EXR unless asked
     import cv2
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise IOError(f'cannot read {path}')
+    if img is None:     # OpenCV 5 builds reject Blender's EXRs: fall back to the OpenEXR bindings (BSD-3) when installed
+        try:
+            import OpenEXR
+        except ImportError:
+            raise IOError(f'cannot read {path}') from None
+        ch = OpenEXR.File(str(path)).parts[0].channels
+        if 'RGBA' in ch or 'RGB' in ch:
+            return np.ascontiguousarray(ch['RGBA' if 'RGBA' in ch else 'RGB'].pixels.astype(np.float32))
+        names = [n for n in ('R', 'G', 'B', 'A') if n in ch]
+        return np.ascontiguousarray(np.stack([ch[n].pixels for n in names], -1).astype(np.float32))
     if img.ndim == 3:
         img = img[..., ::-1] if img.shape[2] == 3 else img[..., [2, 1, 0, 3]]      # BGR(A) -> RGB(A)
     return np.ascontiguousarray(img.astype(np.float32))
 
 
 def write_exr(path, rgb):
+    import os
+    os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
     import cv2
     rgb = np.asarray(rgb, np.float32)
     bgr = rgb[..., ::-1] if rgb.shape[-1] == 3 else rgb[..., [2, 1, 0, 3]]

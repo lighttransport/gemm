@@ -10,6 +10,8 @@ import signal
 import subprocess
 import time
 
+import numpy as np
+
 from .. import gpu
 from .offline_assets import prepare
 
@@ -30,12 +32,15 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
            ablate=(), noisy=True, eyes=None, chart=False, displacement_scale=1., micro_scale=1., save_blend=True,
-           lip_coat_scale=.6, lip_coat_roughness=.30, teeth_glow=0., mouth_fill=.02):
+           lip_coat_scale=.6, lip_coat_roughness=.30, teeth_glow=0., mouth_fill=.02, explicit_camera=None):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
     un-denoised beauty (beauty_noisy.exr) from the same render. quality/ablate select the material set
-    ('full' = A/B study candidate B; ablate lists stages removed, e.g. ('2d',))."""
+    ('full' = A/B study candidate B; ablate lists stages removed, e.g. ('2d',)).
+    explicit_camera: {origin (m), rotation rows right/up/back, focal_px, size} renders exactly that pinhole camera (centred
+    principal point) instead of a preset placed from the fitted portrait camera; used by metahuman.compare_render so
+    Cycles and the MetaHuman reference renders share one camera."""
     from .render_cameras import CAMERAS
     if device not in ('hip', 'cuda', 'optix', 'cpu') or preset not in PRESETS:
         raise ValueError('invalid render device or preset')
@@ -45,6 +50,12 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
         raise ValueError('invalid lighting, yaw or pitch')
     if camera not in CAMERAS:
         raise ValueError('unknown camera preset: '+str(camera))
+    if explicit_camera is not None:
+        explicit_camera=dict(origin=[float(v) for v in explicit_camera['origin']],
+                             rotation=np.asarray(explicit_camera['rotation'],float).reshape(3,3).tolist(),
+                             focal_px=float(explicit_camera['focal_px']),size=[int(v) for v in explicit_camera['size']])
+        if explicit_camera['focal_px']<=0 or explicit_camera['size'][0]!=explicit_camera['size'][1]:
+            raise ValueError('explicit camera needs a positive focal length and a square image')
     if not -3<=exposure<=3 or not 0<=sss_weight<=1:
         raise ValueError('exposure must be -3..3 EV and SSS weight 0..1')
     if quality not in QUALITY or any(a not in ABLATIONS for a in ablate):
@@ -89,7 +100,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
                    camera=camera,pitch=pitch,distance_scale=distance_scale,focal_scale=focal_scale,hdri=hdri_record,
                    samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy),
                    chart=bool(chart),displacement_scale=float(displacement_scale),micro_scale=float(micro_scale),save_blend=bool(save_blend),
-                   lip_coat_scale=float(lip_coat_scale), lip_coat_roughness=float(lip_coat_roughness), teeth_glow=float(teeth_glow), mouth_fill=float(mouth_fill))
+                   lip_coat_scale=float(lip_coat_scale), lip_coat_roughness=float(lip_coat_roughness), teeth_glow=float(teeth_glow), mouth_fill=float(mouth_fill), explicit_camera=explicit_camera)
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())

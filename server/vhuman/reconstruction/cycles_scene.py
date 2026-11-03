@@ -557,6 +557,11 @@ def run(request):
         transform[:3,:3]=np.asarray(rows).T;transform[:3,3]=origin;camera_obj.matrix_world=Matrix(transform.tolist())
         camera_record.update(target=render_cameras.CAMERAS[name][4],origin=[float(v) for v in origin],focal_px=float(focal),
                              rotation=np.asarray(rows).tolist(),targets={k:[float(x) for x in v] for k,v in points.items()})
+    explicit=request.get('explicit_camera')
+    if explicit:   # metahuman.compare_render: exact shared pinhole camera, centred principal point
+        camera_data.shift_x=0;camera_data.shift_y=0;camera_data.lens=36*explicit['focal_px']/explicit['size'][1]
+        transform[:3,:3]=np.asarray(explicit['rotation']).T;transform[:3,3]=explicit['origin'];camera_obj.matrix_world=Matrix(transform.tolist())
+        camera_record=dict(preset='explicit',origin=explicit['origin'],rotation=explicit['rotation'],focal_px=explicit['focal_px'],size=explicit['size'])
     camera_data.clip_start=.01;camera_data.clip_end=10
     lighting=request.get('lighting','studio')
     for name,position,power,size in ([] if lighting=='hdri' else [('key',(-.35,.35,.45),35,.35),('fill',(.35,.1,.35),12,.3),('rim',(.2,.3,-.3),20,.25)]):

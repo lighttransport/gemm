@@ -31,6 +31,7 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 | Ear prior | `$P -m server.vhuman.metahuman.ear_prior_fit` (closest-point projection; `EAR_PRIOR_PROJECTION=ray` optional) |
 | Ear fit with the prior | ear workspace env + `EAR_PRIOR=/mnt/nvme02/models/vhuman-mh/ear_prior_v1.npz EAR_PRIOR_MODES=3 EAR_CROSS_PENALTY=0.02`, then `fit_band_joint.py`, `shape_ears.py`, `synth_ear_texture.py` as in `stage3_ears.sh` (outputs via `EAR_FIT_OUT_DIR`, `EAR_FIT`, `EAR_SHAPE_OUT`) |
 | Reference-render cameras | `$P -m server.vhuman.metahuman.render_plan` then `launch render_batch.py <batch.json>` |
+| UE-vs-Cycles comparison | ROCm venv: `-m server.vhuman.metahuman.compare_render --every 10` (pseudo-candidates + Cycles renders with the reference cameras), then `--report` (CPU: `HIP_VISIBLE_DEVICES=`); outputs `/mnt/nvme01/data/vhuman-mh/compare_v1/` |
 | Use the skin prior | `bake_portrait(..., skin_prior=PATH)`; `tmp/vhuman-ab-cycles/scripts/rebake.py ... --skin-prior PATH` |
 | Tests | `$P -m pytest -q server/vhuman/test_metahuman_prior.py` |
 
@@ -119,5 +120,26 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   expression appearance on the B6 geometry. Dense-ear L/R correspondence is not one-to-one (prior fitted per side).
 - Normal-map prior (tangent-frame conversion), 2048 texel map, `skin_templates` cavity from the prior.
 - Eye colour calibration from MetaHuman eye close-ups (render_batch eye cameras, TextureBooth env).
-- UE-vs-Cycles harness: run `render_batch.py` on the 120 render ids; render the same cameras in Cycles from a GNM
-  pseudo-candidate (binding + resampled atlas); calibrate lights with a ColorChecker in both; material sweep.
+- UE-vs-Cycles harness (2026-11-03): reference renders done (120 ids); `compare_render.py` builds GNM pseudo-candidates
+  (bound skin exact, GNM identity fit for eyes/mouth, MH albedo via texel_map_2048, flat normal, template ORM/eyes),
+  translates head + cameras to vhuman's head anchor so the studio rig applies, and renders through
+  `offline_render.render(explicit_camera=...)`. First head: ear view silhouette IoU 0.9998 (cameras and geometry agree);
+  Cycles skin reads glossier (forehead/lip specular) and eyes use template parameters. Open: ColorChecker light
+  calibration in both renderers, MH tangent-normal conversion, MH eye parameters on the Cycles side, material sweep.
+  First run (12 heads = render ids[::10], 10 cameras, ~21 s/view; `compare_v1/summary.json`):
+
+  | camera | head-row IoU | Cycles->UE gain | LPIPS | DISTS | dE |
+  |---|---|---|---|---|---|
+  | front | .80* | .31 | .378 | .288 | 12.8 |
+  | yaw +40 / -40 | .83* | .11 / .37 | .444 / .372 | .332 / .286 | 13.2 / 8.7 |
+  | yaw +90 / -90 | .86* | .07 / .37 | .588 / .542 | .377 / .326 | 10.5 / 15.1 |
+  | ear L / R | 1.00 | .09 / .50 | .250 / .226 | .235 / .203 | 9.3 / 6.2 |
+  | eye L / R | 1.00 | .16 / .35 | .313 / .301 | .226 / .209 | 8.5 / 5.4 |
+  | mouth | 1.00 | .31 | .261 | .202 | 11.9 |
+
+  (*) wide views include UE's torso/tank top, which the head-only pseudo-candidate lacks. Gain is per view, exposure-
+  matched before LPIPS; it is consistent across heads (spread < .05), so the gap is the light rig, not the skin: the
+  vhuman studio key sits on the subject's left (+yaw side, ~5x brighter than the -yaw side relative to UE Studio).
+  Visual: Cycles skin is glossier and smoother (freckles/pores attenuated: flat normal, no MH cavity), eyes are the
+  template (brown iris, wide sclera, upward gaze). Next is the ColorChecker light calibration; skin metrics are not
+  meaningful before it.
