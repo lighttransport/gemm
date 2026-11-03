@@ -72,8 +72,11 @@ def measure(sid, side):
         m = (rr >= a) & (rr < b) & (lum > .005)
         return np.median(img[m], 0).tolist(), int(m.sum())
     inner, ni = ring(.45, .65); outer, no = ring(.65, .9); whole, nw = ring(max(pupil_ratio + .05, .3), .9)
+    # sclera: horizontal sectors 1.15-1.6 R (inside the eye opening at the canthi side), brightest half (vessels excluded)
+    sm = sector & (rr >= 1.15) & (rr < 1.6)
+    sl = lum[sm]; sclera = np.median(img[sm][sl >= np.median(sl)], 0).tolist() if sm.sum() > 20 else None
     return dict(inner_linear=inner, outer_linear=outer, median_linear=whole, pupil_ratio=pupil_ratio, iris_radius_px=r_iris, geometric_radius_px=float(r_geo),
-                center_px=[float(cx), float(cy)], pixels=dict(inner=ni, outer=no, whole=nw))
+                center_px=[float(cx), float(cy)], sclera_linear=sclera, pixels=dict(inner=ni, outer=no, whole=nw, sclera=int(sm.sum())))
 
 
 def nearest_chart(target):

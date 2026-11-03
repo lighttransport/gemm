@@ -188,3 +188,11 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   chart U/V + saturation/tint. 240 eyes (120 heads): reproduction dE mean .52, p95 2.2; measured pupil/iris ratio
   .12-.65 correlates with MH dilation (r .77) and sets vhuman dilation (ratio / P_REF). Other same-name fields are copied
   with range conversion (pattern IRISnnn -> pattern_n, cornea size x .2/.165). Not yet verified in rendered close-ups.
+  `eye_prior_fit` now adds `vhuman_distribution` to eye_prior_v1.json: a 4-component full-covariance GMM (numpy EM) over
+  chart U/V, saturation, tint and dilation of the 240 mapped eyes, and `sample_vhuman(prior, rng)` draws validated
+  vhuman eye parameters from it. MH irises in base colour are darker than vhuman's chart: mapped V averages .07 (primary)
+  and tint ~.8 does the rest, so the chart's dark end is where MetaHuman eyes live. Sclera albedo (measured beside the
+  iris) is only weakly explained by MH skin u/v (r2 .10, rms .069): sclera tint is not a skin-tone function in MH data.
+- B7 (2026-11-04, `tmp/vhuman-ab-cycles/scripts/make_ears08.py`): B6 + normal prior `detail_xy` as skin_normal.png with
+  `skin_normal_map=True` for the real subjects s1/s2; render plan `normal` (B7 on the prior views + eye close-ups, B6 eye
+  close-ups), report `prior_report.py B5 B6 B7`.

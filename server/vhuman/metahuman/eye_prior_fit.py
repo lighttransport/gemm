@@ -132,6 +132,61 @@ def marginals(eyes):
     return stats
 
 
+VH_FEATURES = ('primary_u', 'primary_v', 'secondary_u', 'secondary_v', 'global_saturation', 'tint_r', 'tint_g', 'tint_b', 'dilation')
+
+
+def gmm(x, k=4, iters=200, reg=1e-4, seed=0):
+    """Full-covariance Gaussian mixture by EM (numpy; small data)."""
+    rng = np.random.default_rng(seed); n, d = x.shape
+    mu = x[rng.choice(n, k, replace=False)]; cov = np.repeat(np.cov(x.T)[None] + reg * np.eye(d), k, 0); w = np.full(k, 1 / k)
+    ll_prev = -np.inf
+    for _ in range(iters):
+        logp = np.stack([np.log(w[j]) - .5 * (np.linalg.slogdet(cov[j])[1] + d * np.log(2 * np.pi)
+                         + np.einsum('ni,ij,nj->n', x - mu[j], np.linalg.inv(cov[j]), x - mu[j])) for j in range(k)], 1)
+        top = logp.max(1, keepdims=True); ll = float((top[:, 0] + np.log(np.exp(logp - top).sum(1))).mean())
+        r = np.exp(logp - top); r /= r.sum(1, keepdims=True)
+        nk = r.sum(0) + 1e-9; w = nk / n; mu = (r.T @ x) / nk[:, None]
+        cov = np.stack([((r[:, j, None] * (x - mu[j])).T @ (x - mu[j])) / nk[j] + reg * np.eye(d) for j in range(k)])
+        if ll - ll_prev < 1e-6:
+            break
+        ll_prev = ll
+    return dict(weights=w.tolist(), means=mu.tolist(), covariances=cov.tolist(), mean_log_likelihood=ll)
+
+
+def vhuman_distribution(calibration_path=MODELS_ROOT / 'eye_colour_calibration_v1.json', k=4):
+    """Distribution of the MetaHuman eyes in vhuman parameter space (eye_map rows): GMM over chart U/V, saturation,
+    tint and dilation, plus sclera albedo regressed on the MetaHuman skin tone (u, v) of the same sample."""
+    from .samples import V1
+    cal = json.loads(Path(calibration_path).read_text())
+    rows = cal['rows']
+    x = np.array([[*r['vhuman']['primary'], *r['vhuman']['secondary'], r['vhuman']['global_saturation'], *r['vhuman']['global_tint'],
+                   r['vhuman']['dilation']] for r in rows])
+    out = dict(features=list(VH_FEATURES), n=len(x), mean=x.mean(0).tolist(), std=x.std(0).tolist(), min=x.min(0).tolist(), max=x.max(0).tolist(),
+               gmm=gmm(x, k))
+    sc = [(r, json.loads((V1 / 'samples' / r['id'] / 'params.json').read_text())['skin']) for r in rows if r['measured'].get('sclera_linear')]
+    if sc:
+        a = np.array([[1., s['u'], s['v']] for _, s in sc]); y = np.array([r['measured']['sclera_linear'] for r, _ in sc])
+        coef, *_ = np.linalg.lstsq(a, y, rcond=None); pred = a @ coef
+        out['sclera_vs_skin'] = dict(model='sclera_linear_rgb = c0 + c_u * skin_u + c_v * skin_v (MetaHuman skin u, v)', coef=coef.tolist(),
+                                     rms=float(np.sqrt(((pred - y) ** 2).mean())), y_std=y.std(0).tolist(), n=len(y),
+                                     r2=float(1 - ((pred - y) ** 2).sum() / ((y - y.mean(0)) ** 2).sum()))
+    return out
+
+
+def sample_vhuman(prior, rng, base=None):
+    """Draw vhuman eye parameters from prior['vhuman_distribution'] (eye/params validated; other fields from base/defaults)."""
+    from ..eye import params as P
+    dist = prior['vhuman_distribution']['gmm']
+    j = rng.choice(len(dist['weights']), p=np.asarray(dist['weights']) / np.sum(dist['weights']))
+    v = rng.multivariate_normal(dist['means'][j], dist['covariances'][j])
+    p = P.validate(base) if base else P.defaults()
+    clip = lambda x, lo, hi: float(np.clip(x, lo, hi))
+    p['iris'].update(primary_color_u=clip(v[0], 0, 1), primary_color_v=clip(v[1], 0, 1), secondary_color_u=clip(v[2], 0, 1),
+                     secondary_color_v=clip(v[3], 0, 1), global_saturation=clip(v[4], 0, 3), global_tint=[clip(t, 0, 1) for t in v[5:8]])
+    p['pupil']['dilation'] = clip(v[8], .25, 2.)
+    return P.validate(p)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--out', default=str(MODELS_ROOT / 'eye_prior_v1.json'))
@@ -140,8 +195,14 @@ def main():
     flat = [flatten(p['settings']['eye_left']) for p in presets]
     rec = dict(format='vhuman.metahuman_prior.v1', name='eye_prior_v1', code_sha256=code_sha256(), licence=LICENCE, default_enabled=False,
                derived_from='MetaHuman Creator EyePresets (T3D export) merged over the struct defaults', presets=presets,
-               preset_marginals=marginals(flat), colour_calibration=None,
-               limitations=['12 presets only; colour calibration to vhuman iris controls pending MetaHuman eye close-up renders'])
+               preset_marginals=marginals(flat), colour_calibration=None, vhuman_distribution=None,
+               limitations=['12 presets for the MetaHuman-space marginals'])
+    cal = MODELS_ROOT / 'eye_colour_calibration_v1.json'
+    if cal.is_file():          # eye_map calibrate: MetaHuman eyes measured on the UE close-ups, mapped to vhuman controls
+        from .manifest import sha256
+        rec['colour_calibration'] = dict(path=str(cal), sha256=sha256(cal), summary=json.loads(cal.read_text())['reproduction_delta_e'])
+        rec['vhuman_distribution'] = vhuman_distribution(cal)
+        rec['limitations'].append('vhuman-space distribution from base-colour (albedo) measurements; not yet checked on rendered close-ups')
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(rec, indent=1) + '\n')
     print(f'{len(presets)} presets -> {a.out}')
