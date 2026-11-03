@@ -387,6 +387,24 @@ def surface_triangles(triangles, removed, ear_triangles):
     return np.concatenate((np.asarray(triangles)[keep], ear_triangles)), keep
 
 
+def rendered_surface(geometry, view=0):
+    """Skin surface as rendered for one fitted view: the base bake faces minus the native ear faces, plus the surface-bound refined ear
+    (same atlas UVs). ``geometry`` is the candidate's geometry.npz. Returns vertices, triangles, per-corner UVs; without refined ears it is
+    the base bake mesh. Every view shares the topology, so the vertex arrays can be stacked per view."""
+    g = geometry
+    if 'ear_dense_triangles' not in g.files:
+        return g['captured'][view], g['triangles'], g['triangle_uvs']
+    from scipy.spatial import cKDTree
+    full = g['full_captured'][view]
+    _, m = cKDTree(g['full_neutral']).query(g['neutral'])                       # base vertex -> full vertex (exact)
+    bt = m[g['triangles']]
+    gone = {tuple(t) for t in np.sort(g['full_triangles'][g['ear_removed_triangles']], 1)}
+    keep = np.array([tuple(t) not in gone for t in np.sort(bt, 1)])
+    dense = evaluate(full, g['ear_bind_ids'], g['ear_bind_weights'], g['ear_bind_offsets'])
+    return (np.concatenate((full, dense)), np.concatenate((bt[keep], g['ear_dense_triangles'])),
+            np.concatenate((g['triangle_uvs'][keep], g['ear_dense_triangle_uvs'])))
+
+
 def oriented_area_ratio(reference, current, triangles):
     """Signed area of current relative to reference along reference normals."""
     r = reference[triangles]
@@ -882,3 +900,179 @@ def coarse_lod(topo, triangles, triangle_uvs):
         v = int(v)
         out[idx] = v if v in boundary else lookup[v]
     return out, np.asarray(triangle_uvs)[removed]
+
+
+# ---------------------------------------------------------------- learned ear shape prior (MetaHuman-derived, opt-in)
+def load_ear_prior(path):
+    """Per-side dense-ear shape prior written by server/vhuman/metahuman/ear_prior_fit.py.
+
+    Prior sides are named by the subject ('left' = +x); ear_mesh.SIDES names sides by image position, so callers match
+    sides by vertex set (`prior_side`). Rows of `<side>_mean` follow the ascending vertex indices in `<side>`.
+    Returns {'left'|'right': dict(index, mean (n,3), basis (K,3n), sigma (K,), colour_mean (n,3) or None)}, sha256."""
+    import hashlib
+    z = np.load(path)
+    out = {}
+    for side in ('left', 'right'):
+        out[side] = dict(index=np.asarray(z[side]), mean=z[f'{side}_mean'].astype(float), basis=z[f'{side}_basis'].astype(float),
+                         sigma=z[f'{side}_sigma'].astype(float),
+                         colour_mean=z[f'{side}_colour_mean'].astype(float) if f'{side}_colour_mean' in z.files else None,
+                         hmean=z[f'{side}_hmean'].astype(float) if f'{side}_hmean' in z.files else None,
+                         hbasis=z[f'{side}_hbasis'].astype(float) if f'{side}_hbasis' in z.files else None,
+                         hsigma=z[f'{side}_hsigma'].astype(float) if f'{side}_hsigma' in z.files else None)
+    out['template_points'] = z['template_points'].astype(float) if 'template_points' in z.files else None
+    with open(path, 'rb') as f:
+        out['sha256'] = hashlib.sha256(f.read()).hexdigest()
+    return out
+
+
+def adapt_prior(prior, topo, template, tolerance=1e-6):
+    """Remap a dense-ear prior onto another subject's refined-ear topology.
+
+    The band extent (and so the dense vertex numbering) depends on each subject's head, but every dense vertex is defined by
+    the same subdivision operator rows of native GNM vertices; applied to the fixed GNM template that gives an exact,
+    subject-independent key (verified: all 4,108 ear vertices of s2 match s1 with zero error).
+    Each topology vertex takes the prior row with the nearest template point on the same side. Returns a new prior dict
+    (same keys) indexed by this topology, plus match statistics; vertices farther than `tolerance` are counted as unmatched
+    (they are band/root vertices in practice, where the relief is feathered to zero)."""
+    if prior.get('template_points') is None:
+        raise ValueError('ear prior has no template_points; refit it with server/vhuman/metahuman/ear_prior_fit.py')
+    from scipy.spatial import cKDTree
+    pts = topo['operator'] @ np.asarray(template, float)                  # subdivision of the fixed GNM template: exact per-construction key
+    out = dict(sha256=prior['sha256'], template_points=pts)
+    stats = {}
+    for name, sign in SIDES:
+        k = np.sort(np.asarray(topo['sides'][name]['new']))
+        side = 'left' if pts[k][:, 0].mean() > 0 else 'right'          # prior sides are named by the subject (+x = left)
+        p = prior[side]
+        d, j = cKDTree(prior['template_points'][p['index']]).query(pts[k])
+        def rows(a, cols3=True):
+            if a is None:
+                return None
+            if a.ndim == 1:
+                return a[j]
+            if cols3:                                                  # (K, 3n) basis -> (K, 3 len(k))
+                return a.reshape(len(a), -1, 3)[:, j].reshape(len(a), -1)
+            return a[:, j]
+        out[side] = dict(index=k, mean=p['mean'][j], basis=rows(p['basis']), sigma=p['sigma'], colour_mean=None if p['colour_mean'] is None else p['colour_mean'][j],
+                         hmean=None if p['hmean'] is None else p['hmean'][j], hbasis=None if p['hbasis'] is None else rows(p['hbasis'], False), hsigma=p['hsigma'])
+        stats[name] = dict(prior_side=side, vertices=int(len(k)), unmatched=int((d > tolerance).sum()), max_mm=float(1e3 * d.max()))
+    out['adaptation'] = stats
+    return out
+
+
+def prior_side(prior, indices):
+    """Name of the prior side whose vertex set equals `indices` (a topo['sides'][name]['new'] array)."""
+    s = set(map(int, indices))
+    for side in ('left', 'right'):
+        if set(map(int, prior[side]['index'])) == s:
+            return side
+    raise ValueError('ear prior topology does not match this refined-ear topology')
+
+
+def prior_shape(prior, side, coeffs=None, n_vertices=None):
+    """Shape of one prior side for coefficients (in units of the per-mode sigma, clipped to +-3), as (n_total,3) scattered
+    into the dense-ear vertex order (rows outside the side are zero)."""
+    p = prior[side]
+    shape = p['mean'].reshape(-1).copy()
+    if coeffs is not None and len(coeffs):
+        c = np.clip(np.asarray(coeffs, float), -3, 3) * p['sigma'][:len(coeffs)]
+        shape += c @ p['basis'][:len(c)]
+    out = np.zeros((n_vertices or int(p['index'].max()) + 1, 3))
+    out[p['index']] = shape.reshape(-1, 3)
+    return out
+
+
+def _similarity(source, target, weights):
+    w = weights / weights.sum()
+    ms, mt = (w[:, None] * source).sum(0), (w[:, None] * target).sum(0)
+    xs, xt = source - ms, target - mt
+    u, sv, vt = np.linalg.svd((w[:, None] * xt).T @ xs)
+    d = np.eye(3); d[2, 2] = np.sign(np.linalg.det(u @ vt))
+    r = u @ d @ vt
+    scale = np.trace(np.diag(sv) @ d) / (w * (xs ** 2).sum(1)).sum()
+    return scale, r, mt - scale * r @ ms
+
+
+def apply_prior_shape(topo, positions, band, root_distance_m, prior, coeffs=None, *, root_feather_m=.004, band_weight=4.):
+    """Rest shape of the refined ears from the learned prior (replaces apply_relief's authored relief).
+
+    Per side: prior shape (mean + sum c_k sigma_k basis_k), similarity-aligned to the current dense positions with the
+    band (head-skin) vertices weighted `band_weight` x, so the ear sits where the subject's ear is; ear (non-band) vertices
+    move to the aligned prior, feathered to zero at the old root like the relief; band skin is unchanged.
+    coeffs: {ear_mesh side name: array} (optional, sigma units). Returns (positions, report)."""
+    out = np.asarray(positions, float).copy()
+    band = np.asarray(band, bool)
+    rep = {}
+    for name, _ in SIDES:
+        k = np.asarray(topo['sides'][name]['new'])
+        side = prior_side(prior, k)
+        target = prior_shape(prior, side, None if coeffs is None else coeffs.get(name), len(out))[k]
+        w = np.where(band[k], band_weight, 1.)
+        s, r, t = _similarity(target, out[k], w)
+        aligned = (s * (r @ target.T)).T + t
+        ek = ~band[k]
+        f = smoothstep(np.asarray(root_distance_m)[k][ek] / root_feather_m)[:, None]
+        delta = aligned[ek] - out[k][ek]
+        out[k[ek]] = out[k][ek] + f * delta
+        rep[name] = dict(prior_side=side, scale=float(s), displacement_mm_mean=float(1e3 * np.linalg.norm(f * delta, axis=1).mean()),
+                         displacement_mm_max=float(1e3 * np.linalg.norm(f * delta, axis=1).max()),
+                         band_fit_mm=float(1e3 * np.linalg.norm(aligned[~ek] - out[k][~ek], axis=1).mean()))
+    rep['prior_sha256'] = prior['sha256']
+    return out, rep
+
+
+def prior_colour(prior, n_vertices):
+    """(n_vertices,3) per-dense-vertex log-albedo pattern relative to each ear's median (zeros if the prior has none)."""
+    out = np.zeros((n_vertices, 3))
+    for side in ('left', 'right'):
+        if prior[side]['colour_mean'] is not None:
+            out[prior[side]['index']] = prior[side]['colour_mean']
+    return out
+
+
+def prior_heights(prior, side, coeffs=None):
+    """Relief heights (metres, along the low-pass normal) of one prior side for coefficients in sigma units (clipped +-3)."""
+    p = prior[side]
+    if p['hmean'] is None:
+        raise ValueError('ear prior has no relief-height model; refit with server/vhuman/metahuman/ear_prior_fit.py')
+    h = p['hmean'].copy()
+    if coeffs is not None and len(coeffs):
+        c = np.clip(np.asarray(coeffs, float), -3, 3) * p['hsigma'][:len(coeffs)]
+        h += c @ p['hbasis'][:len(c)]
+    return h
+
+
+def apply_prior_relief(full, triangles, topo, positions, band, root_distance_m, prior, coeffs=None, *, root_feather_m=.004,
+                       gain=1., smooth_iterations=16):
+    """Learned counterpart of apply_relief: displace ear skin by the MetaHuman-derived relief heights.
+
+    Same mechanics as the authored relief (smoothed vertex normals, root feather, band unchanged, scalar smoothing), but
+    the per-vertex height comes from the prior (mean + modes) instead of authored ridges in lateral coordinates, and the
+    back of the ear is included. coeffs: {ear_mesh side name: array in sigma units}. Returns (positions, heights_mm, report)."""
+    from ..rig.common import vertex_normals
+    native = topo['native_count']
+    ext = extended(full, positions)
+    tri, _ = surface_triangles(triangles, topo['removed'], topo['triangles'])
+    normals = vertex_normals(ext, tri)[native:]
+    out = np.asarray(positions, float).copy()
+    heights = np.zeros(len(positions))
+    rep = {}
+    band = np.asarray(band, bool)
+    for name, _ in SIDES:
+        k = np.asarray(topo['sides'][name]['new'])
+        side = prior_side(prior, k)
+        h_full = np.zeros(len(out)); h_full[prior[side]['index']] = prior_heights(prior, side, None if coeffs is None else coeffs.get(name))
+        ek = k[~band[k]]
+        t = topo['triangles']
+        local = t[np.isin(t-native, ek).all(1)]-native
+        remap = -np.ones(len(positions), np.int64); remap[ek] = np.arange(len(ek))
+        lt = remap[local]
+        weight = smoothstep(np.asarray(root_distance_m)[ek]/root_feather_m)
+        delta = smooth_scalar(gain*h_full[ek]*1e3*weight, lt, len(ek), smooth_iterations)          # mm
+        smooth = np.stack([smooth_scalar(normals[ek][:, c], lt, len(ek), 8) for c in range(3)], 1)
+        smooth /= np.linalg.norm(smooth, axis=1, keepdims=True)
+        out[ek] = out[ek]+smooth*delta[:, None]*1e-3
+        heights[ek] = delta
+        rep[name] = dict(prior_side=side, height_mm_abs_mean=float(np.abs(delta).mean()), height_mm_min=float(delta.min()), height_mm_max=float(delta.max()))
+    rep['prior_sha256'] = prior['sha256']
+    return out, heights, rep

@@ -1,225 +1,60 @@
-# Resume vhuman texture and contact quality work
+# Resume prompt: vhuman texture seams, refined-ear bake round
 
-## Current state
+Paste this into a new session. Repo `/mnt/nvme02/work/gemm/pixal3d`, branch `pixal3d`. Workspace `tmp/vhuman-ab-cycles/` (`$W`, git-ignored); `$W/RESUME.md` has the Cycles A/B study decisions, `server/vhuman/QUALITY_ITERATIONS.md` the write-up. Plans and findings of this round: `seamless-uv-texture-plan-2026-11.md` (sections 6-13; read 7-13 first), `ear-seam-delight-mv-texture-2026-11.md` (survey), `keenface-gap-plan-2026-10.md`. Memory notes: `vhuman-cycles-ab-study`, `vhuman-inverse-texture-plan`.
 
-Repository: `/mnt/nvme02/work/gemm/pixal3d`, branch `pixal3d`.
-Latest commits: `176c2d09` (surface-bound refined ears, ear texture helpers,
-Blender/mobile/web runtime support) and `9294f5ac` (iteration record).
-No push was performed. This handoff remains untracked. Do not modify
-`resume-vhuman-rig.md` as part of this work.
+## Rules (CLAUDE.md and the user)
+- NEVER `p4 submit`. Never use /tmp (use repo `tmp/` or the scratchpad). Never `git push` without explicit permission. Commit only when asked; report hashes.
+- Mainline licences: Apache, MIT, BSD or GPL only. Research/NC material is evaluation-only and goes in provenance.
+- Commit trailer: the one in the session's attribution reminder (last used: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`).
+- One heavy GPU job at a time (Blender B render peaks at ~13 GB of the 16 GB card). Render: `VHUMAN_BLENDER_LD_LIBRARY_PATH=/opt/rocm/core-10.1/lib`. rocm venv (`tmp/vhuman-rocm-venv`) needs `LD_LIBRARY_PATH=/opt/rocm/core-10.0/lib`. CPU venv `tmp/vhuman-cpu-venv` for numpy-only bakes and EXR reads (`OPENCV_IO_ENABLE_OPENEXR=1`). Run python with `PYTHONPATH=$PWD TMPDIR=$PWD/tmp`. Kill by explicit PID, never a pkill pattern. `render_matrix.py` skips existing outputs: delete a render dir to force a re-render.
 
-The latest work focused on ear shape and texture synthesis/completion. Continue
-from the refined-ear candidate rather than restarting the reconstruction.
+## State (2026-11-01 evening)
+HEAD `8aaa1855` (mouth_fill). Already committed: bake cleanup opts (`9060db13`: silhouette guard, feather, gain match, front blend, bg-reject), soft lip coat (`b7a360fb`), teeth shade / lip coat scale (`7e1c041e`). Candidates B (A/B study), B2 (clay ear detail), **B3 = `ears03`** (cleaned bake + ears02 ear) are registered in `scripts/write_candidates.py` and rendered.
 
-Canonical workspace: `tmp/vhuman-ear-synth/`. Read `session.json` there and the
-last section of `server/vhuman/QUALITY_ITERATIONS.md` first. The parent
-contact-tone workspace `tmp/vhuman-contact-tone/` remains the baseline for
-matched comparisons.
+### Uncommitted (this round)
+- `server/vhuman/reconstruction/materials.py`: `bake_portrait(min_facing, magnification_cap)` + `magnification_weight()`; opt-in, defaults 0. Not applied to the front-only bake that `protect_front` restores.
+- `server/vhuman/reconstruction/ear_mesh.py`: `rendered_surface(geometry, view)` = base skin faces minus `ear_removed_triangles` plus the surface-bound refined ear (`ear_dense_*`, positions via `evaluate(full_captured[view], ear_bind_*)`); same atlas UVs.
+- `server/vhuman/reconstruction/inverse_texture.py`: experimental inverse texture solver (see Findings). Useful as a scorer: `python -m server.vhuman.reconstruction.inverse_texture <candidate> <out> --iters 0 --no-warp` prints per-view and ear-texel re-projection residuals and LPIPS of a candidate's atlas.
+- Docs: `seamless-uv-texture-plan-2026-11.md`, `ear-seam-delight-mv-texture-2026-11.md`, `keenface-gap-plan-2026-10.md`, `pixal3d-quality-ab-cycles-prompt.md` (untracked), this file.
+- In the git-ignored workspace: `scripts/rebake.py` (`--ear-surface --min-facing --mag-cap --res`), `scripts/make_ears03.py` (env `REBAKE_DIR`, `OUT_NAME`; records `rebake_options` in provenance), `scripts/inverse_preview.py` (unlit albedo previews; `ears` mode = zoomed ear sheets), `inverse_metrics.py`, `smudge_source.py`, `smudge_metric.py`. PyTorch3D 0.7.9 ROCm wheel: `tmp/wheels/` (+ `.source.txt`), installed in the rocm venv.
 
-- Selected reconstruction: `reconstruction_final3/`.
-- Geometry SHA256: `a2f43542f902df874c14ab45ee6052b7c3d56cc30940476ea7094919b020d3ae`.
-- Basecolor SHA256: `0989f254c245ff200285ee55a53397027efa2acf3be38e75caa3b8bed4605540`.
-- Native arrays and both motion tracks are byte-identical to the parent; refined
-  ears live in `ear_*` fields (surface-bound to the hidden native ear cage).
-- Selected native Blender scenes: `final3_scene/head.blend`,
-  `final3_stress_scene/head.blend`; motions `final3_default_motion/`,
-  `final3_stress_motion/` (rebound metadata only).
-- Portable bundles: `final3_default_usd/portable.blend`, `final3_stress_usd/portable.blend`.
-- Mobile package `final3_oral_mobile/` (coarse ear LOD + lip-driven mouth occlusion) and browser `final3_oral_player/`
-  (drag to turn/tilt, pitch slider, mouth-occlusion toggle). Mouth occlusion research/fit: `tmp/vhuman-mouth-occlusion/`,
-  `server/vhuman/MOUTH_RENDERING_RESEARCH.md` (proposal list for teeth/gums/tongue/lips quality).
-- Shape `shape_v3/`, texture `texture_final3/`, generated close-ups
-  `generated_zoom/` (+ `visual_review.json`), projection `gen_projection3.npz`.
-- Rebuild chain: `shape_ears.py` → `build_candidate.py` → `project_generated.py`
-  → `synth_ear_texture.py` → `rebuild.sh <shape> <tag> <texture>` (candidate,
-  motions, scene assets, Blender scenes); then `verify_ear_scene.py`,
-  `audit_ear_motion.py`, USD workers, `skin_ear_assets.py ... coarse` + mobile
-  export/preprocess/browser, `build_review.py`.
-- Comparison gallery: `review/` (three panels, 13 pairs, bundles, recipes).
+### Candidates built this round (all `validate_candidate`-clean, none registered, none rendered)
+| Candidate | Meaning |
+|---|---|
+| `candidates/{s1,s2}/B/reconstruction/ears04` | ears03 with the bake observing the **refined ear**, no fix. s1 good; s2 gets a new orange smudge above the left ear |
+| `candidates/s2/B/reconstruction/ears05` | s2, refined ear **+ `--min-facing .25 --mag-cap 6`** (from `rebake/s2/bg_ear_fix`). Smudge back to B3 level (R-B 58) |
+| `rebake/s1/bg_ear`, `rebake/s2/bg_ear`, `rebake/s2/bg_ear_fix` | bakes behind the above. The 1024 `fast_*` test bakes and older intermediates were deleted in the 2026-11-01 cleanup; regenerate with `--res 1024` (~100 s) |
 
-Review URL: <http://127.0.0.1:45615/vhuman-ear-synth/review/>.
-Browser URL: <http://127.0.0.1:45615/vhuman-ear-synth/final3_oral_player/>.
-If the server is gone, serve the repo's `tmp/` directory on localhost port 45615.
+## Findings that matter
+1. **The base bake saw the coarse ear.** `geometry.npz` `captured`/`triangles` have the coarse GNM ear; renders use the refined ear. Front-photo ear residual .0538 -> .0335 with the refined surface. Control: rebaking with the coarse ear reproduces `rebake/s1/bg` bit-exactly, so only the surface differs.
+2. **Refined-ear bake effect:** changes only a ~60-texel ring around the ear mask (5-7k texels). s1: removes the pink smudge and two dark dots behind the ear. s2: new orange blob above the left ear (see 3).
+3. **s2 smudge cause:** 2693 texels seen only by view_2 (-40 deg generated), 79 pixels magnified ~12 texels/pixel, facing .14, at the helix top where grey hair overlaps the ear (parsed as ear, support 1.0), then lifted by delight (illumination clip .5-2). Fix = `min_facing .25` + `magnification_cap 6` (cap is texels per source pixel at 2048; `rebake.py` rescales it for `--res`). Side effect: ~27.6k texels (2048) elsewhere change, all with confidence < 80/255 (mean 7), i.e. near-unobserved texels now filled by completion. Front-protected texels with front confidence >= .5: 312 of 835k change.
+4. **Inverse texture solver (plan stages 0-4) is a negative result.** Shared albedo pyramid + per-view SH9 + footprint-aware mip sampling fits trained views 10-20% better but held-out views and seam ratio do not improve; per-view warp stays at 0.2-0.7 px; LPIPS crops make held-out LPIPS 33-38% worse; mirror ear priors make held-out ear residual worse (.073 -> .081-.083). Atlas mirrors exactly ((u,v) -> (1-u,v)) but the refined ears are fitted per side. Conclusion: remaining side-view/ear error is input quality and the synthetic ear texture, not lighting or alignment. Do not spend more time on solver variants.
+5. **Only ~17% of ear-mask texels are seen by any of the three views**; the rest is `ear_texture.py` / ears02 synthesis. That is the main remaining lever for ear texture.
+6. Front pixels cover ~1.49 texels at 2048 (head-on), so footprint thresholds must be relative to that.
 
-## What improved and what was verified
+## Next steps (in order)
+1. **s1 full rebake with the fix** and composite `ears05`: `rebake.py candidates/s1/B/reconstruction/ears03 rebake/s1/bg_ear_fix --guard 3 --feather 6 --gain --inner-lip --front-blend --bg-reject --ear-surface --min-facing .25 --mag-cap 6` (CPU, ~14 min), then `REBAKE_DIR=bg_ear_fix OUT_NAME=ears05 tmp/vhuman-cpu-venv/bin/python scripts/make_ears03.py s1`. The 1024 fast check already showed the s1 gain is kept (seam 1.55 coarse / 1.59 refined / 1.50 refined+fix); confirm at 2048 with `inverse_preview.py ears` and `smudge_metric.py`-style checks.
+2. **Register B4 = ears05** in `scripts/write_candidates.py` (like B3 at line ~60: `cands['B4'] = dict(cands['B3'], dir=.../ears05)`, plus `B4-ps` for PixelSmile) and render B3 vs B4: front, yaw_p40, yaw_p90, yaw_m90, ear_left/right, mouth, both subjects (`render_matrix.py --plan b3` pattern, studio, 1024²/128). Sheets like `bench/b3_final_s*.png`. Score ears/face with `stage5_report.score`. Confirm ears stay ahead of A and no new smudges.
+3. If B4 holds: commit (materials.py min_facing/magnification cap; ear_mesh.rendered_surface; inverse_texture.py as experimental/scoring; docs; this file), add a short section to `server/vhuman/QUALITY_ITERATIONS.md` and `$W/RESUME.md` (refined-ear finding, min_facing/magnification cap, negative solver result), update the `vhuman-cycles-ab-study` memory. Consider making `--ear-surface` the default in the real pipeline's bake (`pipeline.py` line ~254 passes the coarse mesh to `bake_portrait`); that changes every candidate, so decide with the user.
+4. s2 leftovers (older than this round, not caused by it): thin orange line behind the right ear (+90 side) and the beige ring under that ear. Trace with `smudge_source.py`-style forward projection first; likely an unobserved-region or ears02 artefact.
+5. Ear texture itself: improve the `ear_texture.py` / ears02 synthesis (83% of ear-mask texels), or fit the refined ear outline (plan stage 3: PyTorch3D soft silhouette, ear vertex offsets) so the front photo explains more of the ear. Both are design work; start from `seamless-uv-texture-plan-2026-11.md` section 9.
+6. Older open items: hair/scalp (crown and back bald; needs generated back/±135 views or the VDA-style orbit spike in `ear-seam-delight-mv-texture-2026-11.md` sections 4-5), s1's mouth barely opens (expression-fit limit), s1 surprise tongue/palate glossy, s2 teeth olive in shadowed fear frame (mouth_fill is only a stand-in for translucency), render time ~2x and 13 GB VRAM for B, delight unification (OpenDelight licence of weights still unchecked).
 
-Refined ears (latest): frontal ear-mask coverage 61.5→89.3% (left) and
-63.7→94.1% (right), ear length about 68 mm with protrusion/flare, authored
-helix/antihelix/crura/fossa/concha/tragus relief, zero ear crossings over 81
-default + 43 stress samples, minimum relative triangle area 0.215. Ear texture
-resamples eroded photographed ear cores (3,988 texels) and synthesizes the rest
-(harmonic tone, pore-scale exemplar detail, two guarded Qwen-Image-Edit-2511
-close-ups for 14,428 texels, capped rim/lobe tint, bounded cavity de-shadowing);
-other texels are byte-identical. Scene 738/396, USD 1,458/972 and 774/516,
-browser 30 FPS with binding p95 3.3e-6 mm all pass. Details and rejected trials
-are in the last QUALITY_ITERATIONS section.
+## Cleanup done (2026-11-01)
+Deleted: per-render scene files and `cache/` folders in `/mnt/nvme01/vhuman-ab-renders` (`head.blend`, `skin_detail.npz`, `scene_assets.npz`, `skin_templates.npz`, `beauty_noisy.exr`, Blender temp cache; 30 GB freed, nvme01 now ~43 GB free); in `$W`: `inverse/`, `smudge_s2/`, `rendertest/`, `candidates_v1/`, `subjects_v1/`, `review.bak/`, `smoke/`, `ears/s1_test`, `calibration/chart_*`, the `fast_*` and intermediate rebake dirs, and 12 benchmark subfolders under `bench/` (4 GB freed on nvme02). Render dirs keep `beauty.png`, `beauty.exr`, `render_result.json`, `display.json`; `redisplay.py` and the reports still work. Re-rendering a camera regenerates the scene files (delete its dir or set `RM_FORCE=1`). Candidates ears03/04/05 still validate. Not deleted (ask first): `tmp/vhuman-independent/heads`, `vhuman-ear-synth`, `vhuman-rig`, the older quality-run dirs, caches and source trees; "probably safe" list of ~4 GB of unreferenced scratch dirs was listed in the chat, not removed.
 
-Earlier (contact-tone) results, still inherited:
+## Key technical facts
+- `bake_portrait` weight per view = valid x depth agreement (2 mm, <=512 px raster) x facing x mask support (x min-facing ramp x magnification weight if enabled). Images are opaque, so the background is never excluded by alpha: hence the silhouette guard and bg-reject.
+- Bake speed: ~14 min at 2048, **~100 s at `--res 1024`** (fast preset for iteration; `make_ears03.py` composite needs 2048, so judge fast bakes directly, e.g. `smudge_metric.py`, `inverse_preview.py ears`).
+- Seam stat = gradient on the front-protection ring / interior; ragged = coverage perimeter / sqrt(area), smooth ~4-6.
+- GNM UV is one island with 76 seam edges; atlas rows = v*res (no flip); the head mesh is mirror symmetric to .25 mm.
+- Index spaces: base skin mesh (11460 vertices) = skin component minus mouth sock, `full_neutral[m]` exact; `ear_removed_triangles` index `full_triangles`; dense ear triangles use full indices (< 17821) or 17821+k.
+- `reference.Camera` -> PyTorch3D `PerspectiveCameras`: `S=diag(-1,1,-1)`, `R=(S R_cam)^T`, `T=-(S R_cam) o`, focal (f,fy), principal (cx,cy), `in_ndc=False`, `image_size=(H,W)`.
+- Studio preset is calibrated (`STUDIO_ENERGY_SCALE`=2^-1.3632, `CALIBRATED_HDRI`); uncalibrated renders clip skin and fake ear-colour wins. `lip_coat_scale` .6 / `lip_coat_roughness` .30 are the defaults; `mouth_fill` .02 W (quality candidates only); `teeth_glow` defaults to 0.
+- Held-out evidence must exclude the held-out view; `inverse_texture` residuals use refit lighting, so they compare textures, not lightings.
 
-Selected tongue-root cleanup: localized native expression basis 353 at -0.5,
-full weight within 1 mm and geodesic feather to 4 mm. Incorporated in rest
-geometry and carried through native joint skinning. Across 43 stress samples,
-strict self-crossing totals decrease 764 → 258, leaving six pairs per sample.
-Maximum shift 0.602 mm; minimum relative oriented tongue area 0.284. Visible
-contacts remain 70 → 70 over 215 views, with no tested view worsening.
-
-Selected neck tone: conservative half-strength bounded log-RGB alignment of
-unobserved upper-neck skin toward photo-supported cheeks. Changes 332,076 texels,
-with zero photographed or ear texel edits; multiplicative gains retain detail.
-Ear texture/fitting and previous scalp cleanup are retained. Broad jaw and scalp
-patches are still visible. This is a color prior, not measured pigmentation.
-
-Offline eyelid experiment: render subdivision level 2 baked into a dense mesh,
-then exterior camera-ray correction with shared orientation-constrained weights.
-Changes 208 vertices by at most 0.194 mm. All 41 saved poses and 40 midpoints pass
-orientation checks, minimum relative area 0.205. Four critical-pose exterior
-crossings decrease 1,556 → 1,173 (24.6%), but internal socket crossings increase
-6,038 → 6,439. Visible contacts remain 464 → 464 over 20 views, with none worse.
-Fresh Blender verification checks all 41 poses and UVs. Do not claim overall
-contact clearance or promote this bake as an accepted native solution.
-
-Both native USD bundles pass export/reimport plus fresh portable import and
-22-file source-evidence verification. Default: 1,458 mesh and 972 shader-animation
-checks; stress: 774 and 516. Twelve relevant host tests pass. Hardware browser
-verification passes on RTX 5060 Ti at the configured desktop 30 FPS cap. Gallery
-checks pass links, images, archives, controls and narrow-screen layout.
-No physical phone/tablet was connected; the user requested a device test page.
-Finite crossing checks do not prove continuous clearance, containment/tangency
-freedom, displaced-surface clearance or refractive visibility.
-
-## Remaining items, in priority order
-
-0. **Ear follow-ups.** Ear backs have only synthesized colour (the 135° generated
-   view was rejected; try shaded conditioning renders or a different view/seed).
-   Reduce the remaining photographed concha/notch shading on the left ear with a
-   proper occlusion estimate instead of the luminance floor. The fold relief is
-   a generic prior and ear width is tied to length; a side photo or a better
-   generated side view could constrain both. Mobile uses a coarse ear LOD; bake a
-   normal map from the dense ear if budget allows. `player.cpp` per-vertex
-   binding changes are uncompiled here (no Filament SDK).
-
-1. **Coupled exterior eyelid and internal socket clearance.** Address both sides
-   of the closed outer/inner lid junction without transferring intersections
-   into the socket. Evaluate actual render subdivision and signed/dynamic
-   displacement, plus optical shells and eyelashes. Preserve source projection,
-   eye shape, blink appearance and face attachments. The dense experiment is a
-   reference and review artifact, not the solution to reuse unchanged.
-2. **Residual oral contacts.** Remove the six tongue self-crossings per audited
-   pose and reduce tongue/floor, cavity and gum contacts through rest and authored
-   speech/open-mouth poses. Preserve the exposed tongue and existing no-worse
-   visibility result; enforce orientation/edge limits and native skinning.
-3. **Broad skin-tone transitions.** Improve the remaining jaw band and scalp/neck
-   patches with geometry-aware fitting/baking or material estimation. Protect
-   photographed skin and ear texels unless a separately evidenced edit is
-   justified. Preserve fine texture, and label unobserved color as a prior.
-   Use matched lighting/camera renders; avoid merely blurring detail away.
-4. **Bring accepted corrections into live deformation/export.** The native
-   browser has the root and neck changes but no dense eyelid correction or
-   collision-accepted speech gate. Once a correction passes the quality gates,
-   implement a compact runtime-compatible field/control, keeping native motion,
-   bindings, source hashes and Blender/USD appearance consistent. Do not export
-   the dense non-native skin through the current mobile exporter as a rigid mesh.
-5. **Broaden contact and visual validation.** Check the full blink and oral tracks,
-   fractional times and side views, with stronger clearance/visibility methods
-   where needed. Preserve all observed regressions in reports. Rebuild the
-   gallery and portable bundles, fresh-import verify, and test the native browser
-   after accepted changes. Test a physical mobile device when one becomes
-   available; desktop results are not mobile measurements.
-6. **Cleanup and reproducible handoff.** Consolidate successful experiment recipes
-   into reusable repo tools where useful, retain evidence/provenance and rejected
-   trials, update canonical session pointers and this file. Commit coherent
-   changes locally and report the hash; do not push without per-action permission.
-
-Known rejected approaches: deeper projective eye-shell refits clear base meshes
-but worsen render-level visible contacts; tiny lid rollbacks and subdivision
-crease variants worsen some views; unconstrained camera-ray correction folds
-facets; global tongue basis 353 changes worsen exposed contacts; stronger neck
-alignment/jaw chroma trials are unselected. Read their audits before repeating.
-
-## Runtime and operating constraints
-
-- RTX 5060 Ti, 16 GB VRAM; GPU use is authorized.
-- Blender: `$HOME/local/blender-5.2.2-linux-x64/blender` (5.2.2 LTS).
-  Use `--python-exit-code 1`, enable Cycles as required after loading a file,
-  and use the CUDA device for rendering. Blender can require elevated execution
-  because restricted execution stalls audio/device initialization.
-- Python: `tmp/vhuman-texture-venv/bin/python`.
-- Never use `/tmp`. Use `/local` if available, otherwise repo `tmp/`;
-  set `TMPDIR="$PWD/tmp"`. `/local` was unavailable during this iteration.
-- Missing weights/data may be transferred with scp/rsync from `b550:/mnt/disk1`
-  or `b550:~/work/gemm/pixal3d/tmp` into `/mnt/nvme02/models`, using
-  `/mnt/nvme01/models` if disk space requires. Check space and existing files
-  before copying; these locations/network operations may require escalation.
-- Pinned GNM: `/mnt/nvme02/models/vhuman-rig-models/gnm-v3/gnm_head.npz`.
-- Browser build uses `EM_CACHE="$PWD/tmp/vhuman-texture-5060ti/emscripten-cache"`
-  and Three.js `tmp/vhuman-texture-5060ti/vendor/package` (0.163.0).
-- Follow repository AGENTS.md. No sub-agents are authorized by this handoff.
-- Preserve the independent implementation provenance: do not distribute/reuse
-  legacy generated eye assets from pre-independence `tmp/vhuman` recovery records
-  as independent outputs. Keep applicable third-party notices.
-
-Useful verification commands (from repo root):
-
-```bash
-TMPDIR="$PWD/tmp" tmp/vhuman-texture-venv/bin/python -m unittest \
-  server.vhuman.test_sequence_clearance \
-  server.vhuman.test_local_skin_color server.vhuman.test_lid_cleanup
-TMPDIR="$PWD/tmp" tmp/vhuman-texture-venv/bin/python \
-  -m server.vhuman.mobile.browser_verify \
-  --player tmp/vhuman-contact-tone/player --out tmp/vhuman-contact-tone/next-browser-check \
-  --hardware --device-test
-```
-
-Use a fresh output directory for exporters/builders and preserve prior receipts.
-Other exact build/verification commands and saved recipes are in the workspace.
-
-## Copy/paste resuming prompt
-
-> Read AGENTS.md, resume-vhuman.md, recent git log,
-> server/vhuman/QUALITY_ITERATIONS.md and tmp/vhuman-contact-tone/session.json.
-> Continue improving the preferred vhuman candidate (tmp/vhuman-ear-synth/session.json) on this RTX 5060 Ti 16 GB.
-> Prioritize coupled eyelid/socket clearance, residual tongue/oral contacts, and
-> broad jaw/scalp/neck tone transitions, and the ear follow-ups. Retain the
-> refined surface-bound ears, tongue-root and neck-tone improvements and source identity.
-> Use Blender at ~/local/blender-5.2.2-linux-x64 for geometry, shading, fitting
-> and baking; write custom Python import/export/connection scripts as useful.
-> Prefer portable USD, with NumPy/custom formats allowed for experiments.
-> GPU access is allowed; fetch missing weights/data from b550:/mnt/disk1 or
-> b550:~/work/gemm/pixal3d/tmp to /mnt/nvme02/models (or /mnt/nvme01/models for
-> capacity) as needed. Do not repeat rejected trials without new evidence.
-> Validate rendered/subdivided geometry and contact visibility, not just base
-> mesh counts. Keep corrections constrained and preserve photographed/ear skin
-> and fine texture. Only promote improvements that pass matched quality gates;
-> contact acceptance remains false until supported. Prepare device testing but
-> do not claim physical mobile validation without a device. Keep experiments,
-> evidence, hashes and export/runtime provenance reviewable. Update the gallery,
-> canonical session and this handoff, run relevant checks, commit coherent work
-> locally and report remaining issues and commit hashes. Never use /tmp or push
-> without explicit per-action permission. Continue autonomously within this
-> scope; no new time-budgeted goal or sub-agent work is requested here.
-
-## Mouth contact + full-geometry mouth lighting (2026-10-09)
-- Lining/teeth gap fixed by the per-pose contact deformer (server/vhuman/reconstruction/{oral_contact,contact_runtime}.py, web/vhuman_mobile_contact.js); median gap 2.86 -> 0.91 mm.
-- v1 occlusion reference was wrong (truncated occluders). New: Cycles GI bakes (tmp/vhuman-mouth-gi/bake_gi.py), fit_gi.py + fit_transfer.py write oral_occlusion.json with indirect affine + learned per-light transfer.
-- Artifacts: tmp/vhuman-ear-synth/{reconstruction_contact,contact_scene,contact_stress_scene,contact_*_usd,contact_mobile,contact_player}.
-- Rebuild order: build_candidate_contact.py -> contact_assets.py -> build_contact_scene.py (Blender) -> bake_gi.py -> fit_transfer.py -> fit_gi.py <mobile_scene> <candidate> -> export/preprocess/browser.
-- Open: iOS/Filament lacks oral shader + contact deformer; no phone test; deep lining 2.3% penetration (hidden).
-
-## Cycles quality A/B study (2026-10-31 / 11-01)
-
-- Workspace `tmp/vhuman-ab-cycles/` (decisions and timeline: `RESUME.md`; research: `research-2026-11-01.md`).
-  Write-up: `server/vhuman/QUALITY_ITERATIONS.md` "Cycles quality A/B study". Review page: serve `tmp/` on localhost and
-  open `vhuman-ab-cycles/review/` (calibrated display); metrics in `metrics/<s>/metrics.json`.
-- Candidates: `candidates/<s>/candidates.json` (A = `A_fit`, B = `B/reconstruction/ears01`, ablations B-2b..B-2f).
-  Renders on nvme01 (`renders` symlink, ~30 GB); `beauty.png` = chart-calibrated display, `beauty_ev-1.50.png` = original.
-- Re-run chain: `scripts/stage2.sh` (fits) -> `stage3_ears.sh` -> `create.py` expressions -> `write_candidates.py` ->
-  `render_matrix.py` -> `calibrate_scene.py` (CPU venv for EXR reads) -> `redisplay.py` -> `stage5_report.py`.
-  Blender HIP needs `VHUMAN_BLENDER_LD_LIBRARY_PATH=/opt/rocm/core-10.1/lib`.
-- Next, in order: (1) PixelSmile phase B: Wan I2V from each keyframe toward neutral, frames reversed, refit motion, re-render
-  expressions; (2) ear close-ups via depth/normal-conditioned generation (edit models copy their input; SDEdit failed);
-  (3) calibrate the studio preset itself (about -2.86 EV or AgX) instead of re-displaying; (4) B's mouth/iris materials
-  lose to A on LPIPS: compare crops and tune.
-- 2026-11-01 next round done: studio preset calibrated in-scene (17ae979a); B2 = clay-conditioned ear detail (`ears02`) +
-  skin micro/displacement 0.25 (a2094a51); PixelSmile phase B motions (A-ps, B2-ps; `expr/<s>_{A,B}_ps`). Renders for this
-  round: plan `next`/`next2` in render_matrix (studio 1024²/128), report `scripts/next_report.py`. Next: hair/scalp from
-  generated back views, silhouette background bleed, feathered view boundaries, colour seams, mouth-interior teeth.
+## Resume checklist
+1. `git status`, `git log -3`; confirm the uncommitted list above.
+2. `ls tmp/vhuman-ab-cycles/candidates/s{1,2}/B/reconstruction` (ears04 both, ears05 s2 only).
+3. Start with step 1 (s1 rebake in the background) while preparing step 2's `write_candidates.py` edit; no GPU use until the rebake finishes if a render is queued.

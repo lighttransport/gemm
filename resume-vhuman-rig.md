@@ -52,6 +52,10 @@ teeth, …) using PyTorch / ML training on this GEMM repo, **then the deformer**
 
 MetaHuman DNA Calibration (proprietary) and Unreal sources/plugins (EULA):
 concepts only — never copy code, DNA files, joint/control lists, masks or numbers.
+Exception since the UE EULA revision `<placeholder>` (2026-11): statistics derived
+from locally generated MetaHuman Creator output (means/PCA/distributions/renders)
+are allowed; artifacts only under /mnt/nvme02/models/vhuman-mh, dataset under
+/mnt/nvme01/data/vhuman-mh, never in git, every artifact carries report.json provenance.
 OpenRigLogic is MIT (concepts used). LightRig/LightUSD are Apache-2.0,
 external clones only. Generated assets stay out of Git.
 

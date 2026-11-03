@@ -606,9 +606,13 @@ restricts it to use in connection with NVIDIA Audio2Face.
 
 - MetaHuman DNA Calibration (proprietary licence restricted to Unreal Engine
   use) and the Unreal Engine source/plugins (EULA) were read for concepts
-  only. No code, DNA files, joint lists, control lists, masks or numeric data
-  from them are used. OpenRigLogic (MIT) informed the evaluation layering;
-  no code is copied.
+  only. No code, DNA files, joint lists, control lists or masks from them are
+  copied. Statistical priors derived from locally generated MetaHuman Creator
+  output (means, PCA bases, parameter distributions) are permitted by the UE
+  EULA revision `<placeholder, see server/vhuman/README.md>` and are stored
+  outside the repository under `/mnt/nvme02/models/vhuman-mh/`, off by
+  default. OpenRigLogic (MIT) informed the evaluation layering; no code is
+  copied.
 - The template topology, canonical layout numbers, tooth/tongue proportions
   and expression fields are original synthetic choices, not measurements of
   any licensed character or scan.

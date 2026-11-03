@@ -117,8 +117,33 @@ def fuse_samples(colors,confidence):
         downweighted_observations=int(((robust<confidence*.8)&(confidence>.1)).sum()))
 
 
+def magnification_weight(pixels, yy, xx, res, cap):
+    """Per-texel weight 1 -> 0 as one source pixel spans more texels: 1 up to ``cap`` texels per pixel, 0 at 2*cap.
+
+    The texel->pixel Jacobian comes from neighbouring texels' projections (forward, else backward difference); its smallest singular
+    value is the pixel spacing along the most stretched direction, so texels per pixel = 1/sigma_min. Unknown (isolated) texels get 1."""
+    P = np.full((res, res, 2), np.nan)
+    P[yy, xx] = pixels
+    def diff(axis):
+        d = np.full_like(P, np.nan)
+        a = np.diff(P, axis=axis)
+        fwd = [slice(None)]*3; bwd = [slice(None)]*3
+        fwd[axis] = slice(0, -1); bwd[axis] = slice(1, None)
+        d[tuple(bwd)] = a
+        d[tuple(fwd)] = np.where(np.isnan(a), d[tuple(fwd)], a)
+        return d
+    dx, dy = diff(1), diff(0)
+    S = (dx**2).sum(-1) + (dy**2).sum(-1)
+    det = dx[..., 0]*dy[..., 1] - dx[..., 1]*dy[..., 0]
+    smin2 = (S - np.sqrt(np.maximum(S**2 - 4*det**2, 0)))/2
+    mag = 1/np.sqrt(np.maximum(smin2, 1e-12))
+    mag = np.where(np.isfinite(mag), mag, 1.)[yy, xx]
+    return np.clip((2*cap - mag)/cap, 0, 1)
+
+
 def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=512, roughness=.55, f0=.028, spatial_materials=False,
-                  protect_front=False, silhouette_guard_px=0., feather_px=0., gain_match=False, front_blend=False, background_reject=False):
+                  protect_front=False, silhouette_guard_px=0., feather_px=0., gain_match=False, front_blend=False, background_reject=False,
+                  min_facing=0., magnification_cap=0., skin_prior=None):
     """Bake the skin basecolor/ORM/specular atlas from the portrait (+ generated) views, fusing per-view delit albedo.
 
     Opt-in multiview cleanup (all off by default; 2026-11-01 Cycles study):
@@ -131,7 +156,10 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
       front_blend: with protect_front, keep front texels exact only where the front's confidence is high and
         cross-fade to the fused colour over front confidence 0.2-0.5, instead of a hard switch (the seam ring).
       background_reject: drop texels whose source pixel matches the view's border colour (backdrop seen past a misfit ear).
-      The guard and feathering also apply to the front-only bake that protect_front restores."""
+      min_facing: ramp a view's weight from 0 at this facing (n.v) to full at min_facing+.2 (grazing pixels mix hair/skin edges);
+      magnification_cap: weight 1 up to this many texels per source pixel, 0 at twice that (a few pixels smeared over many texels).
+      The guard and feathering also apply to the front-only bake that protect_front restores; min_facing and the magnification cap do not
+      (the protected front texels are the photograph itself)."""
     if not .08<=roughness<=1. or not .005<=f0<=.04:
         raise ValueError("roughness must be .08..1; F0 .005...04")
     from scipy.ndimage import distance_transform_edt
@@ -193,6 +221,10 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
                 from scipy.ndimage import binary_dilation as _dil
                 near = _dil(near, iterations=3)
                 conf = conf*~near[np.clip(iy, 0, h-1), np.clip(ix, 0, w-1)]
+        if min_facing > 0:
+            conf = conf*np.clip((agree-min_facing)/.2, 0, 1)
+        if magnification_cap > 0:
+            conf = conf*magnification_weight(pixels, yy, xx, res, magnification_cap)
         if silhouette_guard_px > 0:
             # distance (source px) from the projected texel to the mesh silhouette in this view
             inside = np.isfinite(depth) & (depth > 0)
@@ -223,8 +255,9 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
             g = np.median(albedos[0][both], 0) / np.maximum(np.median(albedos[vi][both], 0), 1e-6)
             g = np.clip(g, .7, 1.4); albedos[vi] = albedos[vi]*g; gains.append(g.tolist())
     fused,weight,fusion=fuse_samples(np.asarray(albedos),np.asarray(confidences))
-    if gains is not None or silhouette_guard_px > 0 or feather_px > 0:
+    if gains is not None or silhouette_guard_px > 0 or feather_px > 0 or min_facing > 0 or magnification_cap > 0:
         fusion = dict(fusion, multiview_cleanup=dict(silhouette_guard_px=float(silhouette_guard_px), feather_px=float(feather_px),
+                                                     min_facing=float(min_facing), magnification_cap=float(magnification_cap),
                                                      gain_match=bool(gain_match), view_gains=gains))
     accum=fused*weight[:,None]
     reflectance = dict(status='artist prior',reason='calibrated multi-light observations absent')
@@ -253,7 +286,15 @@ def bake_portrait(vertices, triangles, triangle_uvs, views, cameras, out, res=51
         raise ValueError('no visible skin texels; check camera and winding')
     color = np.zeros((res,res,3), float)
     from .texture_completion import harmonic
-    completed,completion_confidence,completion_report=harmonic(neutral_points,neutral_normals,
+    if skin_prior is not None:
+        # opt-in learned prior (server/vhuman/reconstruction/skin_prior.py): unobserved texels get the prior's prediction
+        # fitted to the observed ones, plus the harmonically completed residual; observed texels are unchanged.
+        from .skin_prior import SkinPrior, complete_with_prior
+        prior = skin_prior if isinstance(skin_prior, SkinPrior) else SkinPrior(skin_prior)
+        completed,completion_confidence,completion_report=complete_with_prior(prior,res,yy,xx,
+                                  accum/np.maximum(weight[:,None],1e-9),np.clip(weight,0,1),measured,neutral_points,neutral_normals)
+    else:
+        completed,completion_confidence,completion_report=harmonic(neutral_points,neutral_normals,
                                   accum/np.maximum(weight[:,None],1e-9),measured)
     from .texture_completion import feather
     completed,seam_report=feather(neutral_points,neutral_normals,completed,np.clip(weight,0,1))

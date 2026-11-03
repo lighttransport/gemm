@@ -21,6 +21,11 @@ A local eye/head viewer with synthetic procedural textures, analytic refraction,
 portable glTF export, portrait-based eye fitting and optional Qwen/Pixal3D jobs.
 The runtime requires no Unreal Engine installation, source, content or measured
 character data. Engine-specific import/export adapters are not included.
+Optional statistical priors (means, PCA bases, parameter distributions) derived
+from locally generated MetaHuman Creator output can be loaded from
+`/mnt/nvme02/models/vhuman-mh/` when explicitly enabled; they are off by default
+and never part of the repository (see "Provenance and licensing" below and
+`server/vhuman/metahuman/`).
 
 ## Native face computation (CPU port in progress)
 
@@ -1715,9 +1720,18 @@ commercial appearance training requires new, cleared identity assets.
 Repository-authored code is under the root MIT license. NumPy, Pillow and
 Three.js are external dependencies with their own permissive licenses; the
 optional mapbox-earcut bindings declare ISC and earcut has its own notices.
-No GPL code, Unreal source, Unreal assets or measurements extracted from those
-assets are included in this implementation. Standard mathematical operations
-and original procedural algorithms are used instead of engine material graphs.
+No GPL code, Unreal source or Unreal assets are included in this repository.
+Standard mathematical operations and original procedural algorithms are used
+instead of engine material graphs. Under the Unreal Engine EULA revision of
+`<EULA revision date, section — placeholder: fill in from the EULA text before
+enabling any prior by default>` that permits using MetaHuman-generated data for
+AI training, this project derives statistics only (means, PCA bases, parameter
+distributions, rendered references) from MetaHuman Creator characters generated
+locally in UE 5.8 (`server/vhuman/metahuman/`). Raw MetaHuman meshes, textures,
+DNA files and Epic content are never committed; derived artifacts live under
+`/mnt/nvme02/models/vhuman-mh/` with a provenance manifest
+(`vhuman.metahuman_prior.v1`) naming the dataset, UE build and plugin content
+hashes they were derived from, and are off by default.
 Khronos PBR Neutral tone mapping is used for the preview; third-party libraries
 retain their own licenses. The tone-mapping adaptation notice is preserved in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
