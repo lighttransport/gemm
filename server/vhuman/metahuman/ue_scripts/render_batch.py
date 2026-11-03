@@ -58,7 +58,28 @@ def shoot(world, comp, rt, cam, source, show_only, path, name):
     return f'renders/{name}.exr'
 
 
-def render_sample(sid, world, comp, rt, env):
+SETTLE_S = float(os.environ.get('MH_RENDER_SETTLE_S', '8'))      # after compilation finished: streaming / GPU texture synthesis
+SETTLE_TICKS = 30
+FINISH_ALL = ('Editor.AsyncAssetCompilationFinishAll', 'Editor.AsyncTextureCompilationFinishAll',
+              'Editor.AsyncStaticMeshCompilationFinishAll', 'Editor.AsyncSkinnedAssetCompilationFinishAll')
+
+
+def settle(world):
+    """Generator: let the editor tick until shaders/textures are compiled and streamed (the whole batch used to run inside
+    one frame, so every capture showed placeholder materials: checkerboard skin, no eyes)."""
+    for cmd in FINISH_ALL:
+        unreal.SystemLibrary.execute_console_command(world, cmd)
+    t0, n = time.time(), 0
+    while n < SETTLE_TICKS or time.time() - t0 < SETTLE_S:
+        n += 1
+        if n % 10 == 0:
+            for cmd in FINISH_ALL:
+                unreal.SystemLibrary.execute_console_command(world, cmd)
+        yield
+
+
+def render_sample(sid, world, comp, rt, env, rec_out):
+    """Generator (one step per editor tick)."""
     d = os.path.join(V1, 'samples', sid)
     params = json.load(open(os.path.join(d, 'params.json')))
     cams = json.load(open(os.path.join(d, 'cameras.json')))
@@ -66,6 +87,9 @@ def render_sample(sid, world, comp, rt, env):
     sub = mh.subsystem()
     character = mh.create_character('/Game/MHGen/Render', sid)
     files = []
+    # set before the edit session starts: the editing data picks its preview material at try_add_object_to_edit, and a later
+    # property write does not reach the spawned actor (it rendered the 'Topology' region/wire material)
+    character.preview_material_type = unreal.MetaHumanCharacterSkinPreviewMaterial.EDITABLE
     try:
         with mh.Editing(character):
             sub.set_face_model_coefficients(character=character, coefficients=[float(x) for x in params['coefficients']])
@@ -74,40 +98,74 @@ def render_sample(sid, world, comp, rt, env):
             sub.commit_skin_settings(character=character, skin_settings=gb.skin_settings_from_job(params['skin']))
             gb.apply_eyes(character, params['eyes'])
             actor = sub.spawn_meta_human_actor(character=character)
-            comp.show_only_actors = [actor]
+            yield from settle(world)
+            comp.clear_show_only_components(); comp.show_only_actor_components(actor, True)   # list property is template-locked
             for name, cam in cams['cameras'].items():
                 files.append(shoot(world, comp, rt, cam, unreal.SceneCaptureSource.SCS_FINAL_COLOR_HDR, False, out_dir, f'{name}__{env.lower()}'))
                 files.append(shoot(world, comp, rt, cam, unreal.SceneCaptureSource.SCS_BASE_COLOR, True, out_dir, f'{name}__basecolor'))
-            comp.show_only_actors = []
+                yield
+            comp.clear_show_only_components()
             actor.destroy_actor()
     finally:
         mh.delete_asset(character)
-    rec = dict(ok=True, id=sid, env=env, files=files, size=cams['size'], finished=time.time(),
+    rec = dict(ok=True, id=sid, env=env, files=files, size=cams['size'], finished=time.time(), settle_s=SETTLE_S,
                sha256={f: gb.sha256(os.path.join(d, f)) for f in files if os.path.isfile(os.path.join(d, f))})
     mh.write_json(os.path.join(out_dir, 'renders_done.json'), rec)
-    return rec
+    rec_out.append(rec)
 
 
-def main():
-    batch = json.load(open(mh.script_args()[0]))
+def batch_steps(batch, results):
     env = batch.get('env', 'Studio')
     world = load_environment(env)
     size = int(batch.get('size', 1024))
+    unreal.SystemLibrary.execute_console_command(world, 'r.Streaming.FullyLoadUsedTextures 1')
     cap, comp, rt = make_capture_actor(world, size)
-    results = {}
+    yield from settle(world)          # environment level materials
     for sid in batch['ids']:
         done = os.path.join(V1, 'samples', sid, 'renders', 'renders_done.json')
         if os.path.isfile(done) and json.load(open(done)).get('ok'):
             results[sid] = 'skip'; continue
         try:
-            render_sample(sid, world, comp, rt, env); results[sid] = 'ok'
+            yield from render_sample(sid, world, comp, rt, env, [])
+            results[sid] = 'ok'
         except Exception:      # noqa: BLE001
             tb = traceback.format_exc(); mh.log(tb)
             os.makedirs(os.path.dirname(done), exist_ok=True)
             mh.write_json(done, dict(ok=False, id=sid, error=tb)); results[sid] = 'fail'
         mh.log(f'{sid}: {results[sid]}')
     cap.destroy_actor()
-    return dict(results=results)
 
 
-mh.guarded(main, os.path.join(V1, 'logs', f'render-result-{int(time.time())}.json'))
+def run_ticked(batch, result_path):
+    """Drive batch_steps from Slate's post-tick callback so the engine renders/compiles between steps; quit at the end."""
+    results = {}
+    steps = batch_steps(batch, results)
+    state = {}
+
+    def tick(_dt):
+        if state.get('busy') or state.get('done'):
+            return                     # level loads / exports pump Slate ticks re-entrantly
+        state['busy'] = True
+        try:
+            next(steps)
+        except StopIteration:
+            state['done'] = True
+            unreal.unregister_slate_post_tick_callback(state['handle'])
+            unreal.EditorPythonScripting.set_keep_python_script_alive(False)
+            mh.finish(result_path, dict(results=results), ok=True)
+        except Exception:      # noqa: BLE001
+            state['done'] = True
+            unreal.unregister_slate_post_tick_callback(state['handle'])
+            tb = traceback.format_exc(); mh.log(tb)
+            unreal.EditorPythonScripting.set_keep_python_script_alive(False)
+            mh.finish(result_path, dict(results=results, error=tb), ok=False)
+        finally:
+            state['busy'] = False
+
+    # -ExecutePythonScript quits the editor once the script returns unless the script asks to stay alive
+    unreal.EditorPythonScripting.set_keep_python_script_alive(True)
+    state['handle'] = unreal.register_slate_post_tick_callback(tick)
+
+
+if __name__ != 'render_batch':     # executed by -ExecutePythonScript (private scope)
+    run_ticked(json.load(open(mh.script_args()[0])), os.path.join(V1, 'logs', f'render-result-{int(time.time())}.json'))

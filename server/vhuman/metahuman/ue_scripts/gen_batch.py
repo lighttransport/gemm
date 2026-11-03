@@ -229,4 +229,5 @@ def main():
     return dict(results=results)
 
 
-mh.guarded(main, os.path.join(V1, 'logs', f'batch-result-{int(time.time())}.json'))
+if __name__ != 'gen_batch':      # executed by -ExecutePythonScript (private scope, not '__main__'); render_batch imports it
+    mh.guarded(main, os.path.join(V1, 'logs', f'batch-result-{int(time.time())}.json'))
