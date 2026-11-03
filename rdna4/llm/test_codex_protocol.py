@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from codex_server import Backend, Handler, responses_input_messages, runner_command
+from codex_server import Backend, Handler, chat_prompt, responses_input_messages, runner_command
 
 
 class ProtocolTest(unittest.TestCase):
@@ -224,8 +224,10 @@ class ProtocolTest(unittest.TestCase):
              "output": {"value": 21}},
         ])
         self.assertEqual(messages[-1]["role"], "tool")
-        self.assertIn("call_id=call_1", messages[-1]["content"])
         self.assertIn('"value": 21', messages[-1]["content"])
+        # The checkpoint template frames tool results as a user turn.
+        self.assertIn('<|im_start|>user\n<tool_response>\n{"value": 21}\n</tool_response><|im_end|>',
+                      chat_prompt(messages))
 
     def test_responses_function_call_is_preserved(self):
         messages = responses_input_messages([
@@ -235,8 +237,9 @@ class ProtocolTest(unittest.TestCase):
             {"type": "function_call_output", "call_id": "call_1", "output": "hello"},
         ])
         self.assertEqual(messages[1]["role"], "assistant")
-        self.assertIn("<function=echo>", messages[1]["content"])
-        self.assertIn("<parameter=text>\nhello", messages[1]["content"])
+        self.assertEqual(messages[1]["tool_calls"][0]["name"], "echo")
+        self.assertIn("<tool_call>\n<function=echo>\n<parameter=text>\nhello\n</parameter>\n"
+                      "</function>\n</tool_call><|im_end|>", chat_prompt(messages))
         self.assertEqual(messages[2]["role"], "tool")
 
     def test_startup_waits_for_runner_ready(self):
@@ -247,6 +250,132 @@ class ProtocolTest(unittest.TestCase):
         with patch("codex_server.sys.stderr"):
             backend._wait_ready()
         self.assertTrue(backend.ready)
+
+    def test_dead_runner_is_restarted_before_the_next_request(self):
+        answer = base64.b64encode(b"hi").decode()
+
+        class FakeProc:
+            def __init__(self, out, status=None):
+                self.stdin, self.stdout, self.status = io.StringIO(), io.StringIO(out), status
+                self.pid = 0
+            def poll(self):
+                return self.status
+            def wait(self, timeout=None):
+                return self.status
+
+        backend = Backend.__new__(Backend)
+        backend.ready = True
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.proc = FakeProc("", status=-9)
+        backend._spawn_args = (["runner"], {})
+        backend.restart_times = []
+        restarted = threading.Event()
+        backend.on_restart = restarted.set
+        spawned = FakeProc(f"READY max_seq_len=4096\nOK 0 5 1 stop {answer} 1 1\n")
+        with patch("codex_server.subprocess.Popen", return_value=spawned), \
+             patch("codex_server.time.sleep"), patch("codex_server.os.killpg"), \
+             patch("codex_server.sys.stderr"):
+            text = backend.generate("prompt", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)[0]
+        self.assertEqual(text, "hi")
+        self.assertIs(backend.proc, spawned)
+        self.assertTrue(restarted.is_set())
+        # A runner that keeps dying is left down instead of crash-looping.
+        backend.restart_times = [time.monotonic()] * 3
+        backend.proc = FakeProc("", status=-9)
+        with patch("codex_server.os.killpg"), self.assertRaisesRegex(RuntimeError, "runner exited"):
+            backend.generate("prompt", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)
+
+    def test_request_is_retried_when_the_runner_dies_before_output(self):
+        answer = base64.b64encode(b"again").decode()
+
+        class FakeProc:
+            def __init__(self, out, status=None):
+                self.stdin, self.stdout, self.status = io.StringIO(), io.StringIO(out), status
+                self.pid = 0
+            def poll(self):
+                return self.status
+            def wait(self, timeout=None):
+                return self.status
+
+        backend = Backend.__new__(Backend)
+        backend.ready = True
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.proc = FakeProc("", status=None)      # alive, then its pipe closes
+        backend._spawn_args = (["runner"], {})
+        backend.restart_times = []
+        backend.on_restart = None
+
+        def dies():
+            backend.proc.status = -11
+            return ""
+        backend.proc.stdout.readline = dies
+        spawned = FakeProc(f"READY\nOK 0 5 1 stop {answer} 1 1\n")
+        with patch("codex_server.subprocess.Popen", return_value=spawned), \
+             patch("codex_server.time.sleep"), patch("codex_server.os.killpg"), \
+             patch("codex_server.sys.stderr"):
+            text = backend.generate("prompt", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)[0]
+        self.assertEqual(text, "again")
+
+    def test_a_request_that_keeps_crashing_the_runner_is_refused(self):
+        class DyingProc:
+            def __init__(self, *args, **kwargs):
+                self.stdin, self.stdout, self.status, self.pid = io.StringIO(), io.StringIO("READY\n"), None, 0
+            def poll(self):
+                return self.status
+            def wait(self, timeout=None):
+                return self.status
+
+        backend = Backend.__new__(Backend)
+        backend.ready = True
+        backend.lock = threading.Lock()
+        backend.cancel_lock = threading.Lock()
+        backend.proc = DyingProc()
+        backend._spawn_args = (["runner"], {})
+        backend.restart_times = []
+        backend.on_restart = None
+        spawned = []
+
+        def spawn(*args, **kwargs):
+            proc = DyingProc()
+            proc.stdout.readline = lambda p=proc: ("READY\n" if not backend.ready else
+                                                   (setattr(p, "status", -11) or ""))
+            spawned.append(proc)
+            return proc
+        backend.proc.stdout.readline = lambda: (setattr(backend.proc, "status", -11) or "")
+        with patch("codex_server.subprocess.Popen", side_effect=spawn), \
+             patch("codex_server.time.sleep"), patch("codex_server.os.killpg"), \
+             patch("codex_server.sys.stderr"), patch.dict(os.environ, {"QWEN38_MAX_RESTARTS": "9"}):
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    backend.generate("boom", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)
+            before = len(spawned)
+            with self.assertRaisesRegex(RuntimeError, "crashed the runner twice"):
+                backend.generate("boom", 4, 0.0, 1.0, 1, 0.0, 1.0, 0.0)
+            self.assertEqual(len(spawned), before)
+
+    def test_default_reasoning_effort_fills_only_unnamed_efforts(self):
+        handler = Handler.__new__(Handler)
+        handler.thinking = "auto"
+        handler.default_effort = "medium"
+        on = {"chat_template_kwargs": {"enable_thinking": True}}
+        self.assertEqual(handler.thinking_mode(on, "/v1/chat/completions"), (True, "medium"))
+        self.assertEqual(handler.thinking_mode({**on, "reasoning_effort": "high"},
+                                               "/v1/chat/completions"), (True, "high"))
+        self.assertEqual(handler.thinking_mode({}, "/v1/chat/completions"), (False, None))
+        self.assertEqual(handler.thinking_mode(
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+            "/v1/messages"), (True, "high"))
+
+    def test_startup_reads_the_allocated_context(self):
+        backend = Backend.__new__(Backend)
+        backend.ready = False
+        backend.proc = SimpleNamespace(stdout=io.StringIO("READY max_seq_len=190464\n"),
+                                       poll=lambda: None)
+        backend._wait_ready()
+        self.assertTrue(backend.ready)
+        self.assertEqual(backend.max_seq_len, 190464)
 
     def test_startup_reports_runner_failure(self):
         backend = Backend.__new__(Backend)

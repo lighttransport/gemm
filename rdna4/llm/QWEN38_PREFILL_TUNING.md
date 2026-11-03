@@ -1448,7 +1448,11 @@ coding prompt on the scalar approximate route completed with `PASS` and a
 syntax-valid clamp function: `10.90` prefill / `19.87` decode / `11.21`
 end-to-end tok/s at 64 generated tokens (hash
 `325c17a54f291bb4`). The separate batched coding benchmark was traced to a
-gfx1201 hipBLASLt workspace `hipMalloc` crash. Qwen4 batched prefill now
+gfx1201 hipBLASLt workspace `hipMalloc` crash. **(Correction, 2026-09-26: the self-owned
+`gemm_bf16_own[_db]` kernels had swapped K-loop strides from `be2a07f2` until
+`2422e4d8`, so every WMMA-backend result in this section was computed with a
+wrong GEMM. The batched-WMMA quality failures below must be re-measured before
+they are attributed to batched prefill/state propagation.)** Qwen4 batched prefill now
 defaults to the self-owned WMMA GEMM backend; explicit `LLM_GEMM=blaslt`
 remains available only for guarded A/B diagnostics because it can reproduce
 the driver crash. The same 512-token coding benchmark

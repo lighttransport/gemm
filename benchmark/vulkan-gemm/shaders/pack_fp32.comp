@@ -1,0 +1,19 @@
+#version 460
+// Row-major A[M,K] -> packed A[K,M], with coalesced loads and stores.
+layout(local_size_x=32, local_size_y=8) in;
+layout(set=0, binding=0, std430) readonly buffer Input { float input_a[]; };
+layout(set=0, binding=1, std430) writeonly buffer Output { float packed_a[]; };
+layout(push_constant) uniform Params { uint m; uint k; } p;
+shared float tile[32][33];
+void main() {
+    uint x = gl_LocalInvocationID.x, y = gl_LocalInvocationID.y;
+    uint col = gl_WorkGroupID.x*32+x;
+    uint row = gl_WorkGroupID.y*32+y;
+    for (uint i=0; i<32; i+=8)
+        tile[y+i][x] = row+i < p.m && col < p.k ? input_a[(row+i)*p.k+col] : 0;
+    barrier();
+    col = gl_WorkGroupID.y*32+x;
+    row = gl_WorkGroupID.x*32+y;
+    for (uint i=0; i<32; i+=8)
+        if (row+i < p.k && col < p.m) packed_a[(row+i)*p.m+col] = tile[x][y+i];
+}

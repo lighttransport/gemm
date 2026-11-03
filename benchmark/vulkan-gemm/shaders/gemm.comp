@@ -1,0 +1,52 @@
+#version 460
+// TYPE: 0=int8, 1=int16, 2=int32, 3=fp16 storage, 4=fp32, 5=fp64.
+#if TYPE == 0
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#define INPUT int8_t
+#define ACC int
+#elif TYPE == 1
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#define INPUT int16_t
+#define ACC int
+#elif TYPE == 2
+#define INPUT int
+#define ACC int
+#elif TYPE == 3
+// Storage-only extension: no Float16 arithmetic capability is required.
+#extension GL_EXT_shader_16bit_storage : require
+#define INPUT float16_t
+#define ACC float
+#elif TYPE == 4
+#define INPUT float
+#define ACC float
+#elif TYPE == 5
+#define INPUT double
+#define ACC double
+#endif
+
+layout(local_size_x=16, local_size_y=16) in;
+layout(set=0, binding=0, std430) readonly buffer A { INPUT a[]; };
+layout(set=0, binding=1, std430) readonly buffer B { INPUT b[]; };
+layout(set=0, binding=2, std430) writeonly buffer C { ACC c[]; };
+layout(push_constant) uniform Params { uint m; uint n; uint k; } p;
+shared ACC ta[16][16];
+shared ACC tb[16][16];
+
+void main() {
+    uint x = gl_LocalInvocationID.x, y = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.y * 16 + y;
+    uint col = gl_WorkGroupID.x * 16 + x;
+    ACC sum = ACC(0);
+    for (uint tile = 0; tile < p.k; tile += 16) {
+        ta[y][x] = (row < p.m && tile+x < p.k) ? ACC(a[row*p.k+tile+x]) : ACC(0);
+        tb[y][x] = (tile+y < p.k && col < p.n) ? ACC(b[(tile+y)*p.n+col]) : ACC(0);
+        barrier();
+        for (uint i = 0; i < 16; ++i) {
+            sum += ta[y][i] * tb[i][x];
+        }
+        barrier();
+    }
+    if (row < p.m && col < p.n) c[row*p.n+col] = sum;
+}

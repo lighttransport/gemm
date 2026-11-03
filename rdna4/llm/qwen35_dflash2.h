@@ -287,6 +287,10 @@ static void hllm_qwen35_dflash2_capture(hip_llm_runner *r, int layer,
     d->feature_rows = rows;
 }
 
+static void hllm_qwen35_dflash2_set_feature_rows(hip_llm_runner *r, int rows) {
+    if (r && r->qwen35_dflash2) r->qwen35_dflash2->feature_rows = rows;
+}
+
 static int hllm_qwen35_dflash2_capture_rmsnorm(hip_llm_runner *r, int layer,
         void *norm, void *hidden, void *weight, int rows, float eps) {
     hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
@@ -344,7 +348,8 @@ static void hllm_dflash_project(hip_llm_runner *r, void *dst, void *weight,
         hipFunction_t iq4_fn = nc == 5120 ?
             r->fn_qwen35_matvec_iq4xs_5120_multi8 :
             r->fn_qwen35_matvec_iq4xs_multi8;
-        LAUNCH(iq4_fn, (nr+7)/8, 1, 1,
+        int rows_per_block = nc == 5120 ? 32 : 8;   /* 5120 variant: 4 rows/warp */
+        LAUNCH(iq4_fn, (nr+rows_per_block-1)/rows_per_block, 1, 1,
                256, 1, 1, 0, r->stream, ma);
     } else if (q4_q81) {
         if(d->q81_source!=x||d->q81_rows!=rows||d->q81_cols!=nc||
@@ -861,6 +866,36 @@ static void hllm_dflash_conv(hip_llm_runner *r, hllm_qwen35_dflash2 *d,
                   &groups, &side };
     LAUNCH(d->fn_conv,(total+255)/256,1,1,256,1,1,0,r->stream,a);
     d->q81_source=NULL;
+}
+
+int hip_llm_qwen35_dflash2_synced(hip_llm_runner *r, int position) {
+    hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
+    return d && d->kv_end == position;
+}
+
+int hip_llm_qwen35_dflash2_clear_gap(hip_llm_runner *r, int position) {
+    hllm_qwen35_dflash2 *d = r ? r->qwen35_dflash2 : NULL;
+    if (!d || position < d->kv_end) return -1;
+    if (d->inject_pending && hllm_dflash_overlap_wait(r, d)) return -1;
+    /* Positions the target decoded without the draft would otherwise keep
+     * stale ring rows from older positions.  Zero keys score uniformly and
+     * zero values add nothing; only the last window is ever read. */
+    int start = d->kv_end > position - HLLM_DFLASH_WINDOW ?
+                d->kv_end : position - HLLM_DFLASH_WINDOW;
+    size_t row = (size_t)HLLM_DFLASH_KV_HEADS * HLLM_DFLASH_HEAD_DIM * sizeof(float);
+    for (int p = start; p < position; ) {
+        int slot = p % HLLM_DFLASH_WINDOW;
+        int n = HLLM_DFLASH_WINDOW - slot;
+        if (n > position - p) n = position - p;
+        for (int l = 0; l < HLLM_DFLASH_LAYERS; ++l)
+            if (hipMemsetAsync((char *)d->layers[l].key_cache + (size_t)slot * row, 0,
+                               (size_t)n * row, r->stream) != hipSuccess ||
+                hipMemsetAsync((char *)d->layers[l].value_cache + (size_t)slot * row, 0,
+                               (size_t)n * row, r->stream) != hipSuccess) return -1;
+        p += n;
+    }
+    d->kv_end = position;
+    return 0;
 }
 
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,

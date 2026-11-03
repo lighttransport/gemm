@@ -1,0 +1,35 @@
+#version 460
+layout(local_size_x=256) in;
+layout(set=0, binding=0, std430) buffer Data { uint data[]; };
+layout(set=0, binding=1, std430) buffer Result { uint errors; };
+layout(push_constant) uniform Params {
+    uint offset_words;
+    uint count_words;
+    uint chunk;
+    uint complement;
+    uint verify;
+} p;
+
+uint pattern(uint i) {
+    uint v = (i ^ (p.chunk * 0x9e3779b9u)) + 0x7f4a7c15u;
+    v = (v ^ (v >> 16)) * 0x85ebca6bu;
+    v = (v ^ (v >> 13)) * 0xc2b2ae35u;
+    return (v ^ (v >> 16)) ^ p.complement;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    // Stride permits bounded dispatches even with a small workgroup-count limit.
+    uint stride = gl_NumWorkGroups.x * 256;
+    uint failures = 0;
+    for (; i < p.count_words; i += stride) {
+        uint index = p.offset_words + i;
+        uint value = pattern(index);
+        if (p.verify != 0) {
+            if (data[index] != value) ++failures;
+        } else {
+            data[index] = value;
+        }
+    }
+    if (failures != 0) atomicAdd(errors, failures);
+}

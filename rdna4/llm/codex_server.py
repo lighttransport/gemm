@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import socket
@@ -24,7 +25,14 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from qwen_tools import call_events, parse_calls, tool_instructions, tool_registry
+from qwen_chat import (RawTurnCache, StreamSplitter, chat_input_messages, content_text,
+                       encode_raw,
+                       generation_suffix, prefix_boundaries, render_messages,
+                       responses_input_messages, split_generation, system_frame)
+from qwen_tools import call_events, parse_calls, tool_registry
+import anthropic_api
+from live_stream import MessagesLive, ResponsesLive, new_ref
+from prefix_store import PrefixStore
 
 
 WEB_DIR = Path(__file__).with_name("web")
@@ -157,112 +165,17 @@ def _handle_sigterm(signum, frame):
     raise KeyboardInterrupt
 
 
-def content_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        # Responses API messages use input_text/output_text, while Chat
-        # Completions uses text.  Dropping input_text silently turns a real
-        # user request into an empty message and makes the model answer the
-        # surrounding Codex system prompt instead.
-        return "".join(x.get("text", "") for x in content
-                       if isinstance(x, dict) and
-                       x.get("type") in ("text", "input_text", "output_text", None))
-    return ""
+def chat_prompt(messages, registry=None, thinking=False, effort=None):
+    """Render messages with the checkpoint's chat template (see qwen_chat)."""
+    return render_messages(messages, registry, thinking, effort)
 
 
-def responses_input_messages(value):
-    """Normalize Responses input message objects and direct content items."""
-    if isinstance(value, str):
-        return [{"role": "user", "content": value}]
-    if isinstance(value, dict):
-        return [{"role": value.get("role", "user"),
-                 "content": value.get("content", value.get("text", ""))}]
-    if not isinstance(value, list):
-        return []
-    messages = []
-    direct = []
-    for item in value:
-        if isinstance(item, dict) and item.get("role"):
-            messages.append(item)
-        elif isinstance(item, dict) and item.get("type") == "function_call":
-            # Responses represents the assistant's tool invocation as an
-            # output item rather than a role-bearing message. Keep it when a
-            # client sends the full prior turn back for the tool-result turn;
-            # otherwise the tool output has no causal assistant context.
-            name = item.get("name", "")
-            arguments = item.get("arguments", "{}")
-            try:
-                parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
-            except (TypeError, ValueError):
-                parsed = {"input": str(arguments)}
-            if not isinstance(parsed, dict):
-                parsed = {"input": json.dumps(parsed, ensure_ascii=False)}
-            call = ["<tool_call>", f"<function={name}>"]
-            for key, value in parsed.items():
-                rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-                call.extend((f"<parameter={key}>", rendered, "</parameter>"))
-            call.extend(("</function>", "</tool_call>"))
-            messages.append({"role": "assistant", "content": "\n".join(call)})
-        elif isinstance(item, dict) and item.get("type") == "function_call_output":
-            # Responses sends tool results as input items rather than chat
-            # messages. Preserve them as a tool turn; dropping them makes a
-            # follow-up generation repeat the same call without its result.
-            output = item.get("output", "")
-            if not isinstance(output, str):
-                output = json.dumps(output, ensure_ascii=False)
-            call_id = item.get("call_id", "")
-            label = f" call_id={call_id}" if call_id else ""
-            messages.append({"role": "tool",
-                             "content": f"<tool_response{label}>\n{output}\n</tool_response>"})
-        elif isinstance(item, dict) and "content" in item:
-            # Be liberal with message-shaped Responses items that omit role;
-            # treating them as user content is safer than silently dropping
-            # the actual request and answering only the system prompt.
-            messages.append({"role": "user", "content": item["content"]})
-        elif isinstance(item, dict) and item.get("type") in ("input_text", "output_text", "text"):
-            direct.append(item)
-    if direct:
-        messages.append({"role": "user", "content": direct})
-    return messages
+def chat_prefix(messages, registry=None, thinking=False, effort=None):
+    """Return the stable leading system frame for prefix KV reuse."""
+    return system_frame(messages, registry, thinking, effort)
 
 
-def chat_prompt(messages):
-    # Match the checkpoint's non-thinking ChatML template, including the
-    # reasoning frame on historical assistant turns. Omitting it changes the
-    # token prefix and discards reusable conversation KV on every follow-up.
-    out = [chat_prefix(messages)]
-    leading = True
-    for m in messages:
-        role = m.get("role", "user")
-        if leading and role in ("system", "developer"):
-            continue
-        leading = False
-        text = content_text(m.get("content", "")).strip()
-        if role == "assistant":
-            text = "<think>\n\n</think>\n\n" + text
-        out.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    # Qwen3.8 Flash Next thinks by default.  Match llama.cpp's explicit
-    # non-thinking mode by placing an empty reasoning block before the final
-    # answer; otherwise <think> content leaks into the Responses text.
-    out.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-    return "".join(out)
-
-
-def chat_prefix(messages):
-    """Return the stable leading system/developer frames for prefix KV reuse."""
-    out = []
-    for m in messages:
-        if m.get("role") not in ("system", "developer"):
-            break
-        text = content_text(m.get("content", "")).strip()
-        if text:
-            out.append(text)
-    # Qwen3.8's GGUF template merges consecutive system/developer messages.
-    return "<|im_start|>system\n" + "\n".join(out) + "<|im_end|>\n" if out else ""
-
-
-def fit_context(messages, context_tokens, output_tokens):
+def fit_context(messages, context_tokens, output_tokens, render=None):
     """Keep system/developer instructions and the newest complete user turns.
 
     The tokenizer lives in the GPU child, so this uses a conservative 4-byte
@@ -271,8 +184,11 @@ def fit_context(messages, context_tokens, output_tokens):
     assistant, and tool messages are trimmed as turn groups so a tool result is
     not retained without the request and call that produced it.
     """
-    budget = max(128, context_tokens - output_tokens) * 4
-    if len(chat_prompt(messages)) <= budget:
+    render = render or chat_prompt
+    # Source code tokenizes at about 2.7 characters per token with this
+    # vocabulary; 3 keeps the trimmed prompt inside the runner's window.
+    budget = max(128, context_tokens - output_tokens) * 3
+    if len(render(messages)) <= budget:
         return messages
     indexed = list(enumerate(messages))
     pinned = [(i, message) for i, message in indexed
@@ -290,7 +206,7 @@ def fit_context(messages, context_tokens, output_tokens):
     for group in reversed(groups):
         trial_items = sorted(kept + group, key=lambda item: item[0])
         trial = [message for _, message in trial_items]
-        if len(chat_prompt(trial)) > budget and len(kept) > len(pinned):
+        if len(render(trial)) > budget and len(kept) > len(pinned):
             break
         kept.extend(group)
     return [message for _, message in sorted(kept, key=lambda item: item[0])]
@@ -338,6 +254,9 @@ class Backend:
                             stderr=None, text=True, bufsize=1, env=runner_env)
         if os.name == "posix":
             popen_kwargs["start_new_session"] = True
+        self._spawn_args = (cmd, popen_kwargs)
+        self.restart_times = []
+        self.on_restart = None
         self.proc = subprocess.Popen(cmd, **popen_kwargs)
         self.lock = threading.Lock()
         self.request_gate = FairRequestGate()
@@ -347,7 +266,9 @@ class Backend:
         self.request_cancellations = {}
         self.metrics_local = threading.local()
         self.ready = False
-        self.model = args.model.rsplit("/", 1)[-1]
+        self.max_seq_len = None
+        self.model = (getattr(args, "served_model_name", None) or
+                      args.model.rsplit("/", 1)[-1])
         try:
             ready_timeout = float(os.environ.get("QWEN38_READY_TIMEOUT", "300"))
             if not math.isfinite(ready_timeout) or ready_timeout <= 0:
@@ -377,6 +298,46 @@ class Backend:
         gate = getattr(self, "request_gate", None)
         if gate is not None:
             gate.close()
+        self._stop_proc()
+
+    def _restart_locked(self):
+        """Replace a runner that died (GPU fault, OOM kill) before a request.
+
+        Called with self.lock held.  At most QWEN38_MAX_RESTARTS (default 3)
+        restarts within ten minutes: a runner that keeps dying is left down
+        and /health reports it, rather than crash-looping on a bad GPU."""
+        status = self.proc.poll()
+        now = time.monotonic()
+        limit = int(os.environ.get("QWEN38_MAX_RESTARTS", "3"))
+        self.restart_times = [t for t in self.restart_times if now - t < 600.0]
+        if getattr(self, "_spawn_args", None) is None or len(self.restart_times) >= limit:
+            raise RuntimeError("runner exited")
+        self.restart_times.append(now)
+        sys.stderr.write(f"[runner] exited with status {status}; restarting "
+                         f"({len(self.restart_times)}/{limit} in 10 min)\n")
+        self._stop_proc()
+        cmd, popen_kwargs = self._spawn_args
+        # The dead process's VRAM is released asynchronously by the driver;
+        # a load that races it fails, so allow one delayed retry.
+        for attempt in range(2):
+            time.sleep(3.0 if attempt == 0 else 15.0)
+            self.ready = False
+            self.proc = subprocess.Popen(cmd, **popen_kwargs)
+            try:
+                self._wait_ready(float(os.environ.get("QWEN38_READY_TIMEOUT", "300")))
+                break
+            except RuntimeError as exc:
+                sys.stderr.write(f"[runner] restart attempt {attempt + 1} failed: {exc}\n")
+                self._stop_proc()
+        else:
+            raise RuntimeError("runner exited and could not be restarted")
+        sys.stderr.write("[runner] restarted\n")
+        if self.on_restart is not None:
+            # Runs before the request that triggered the restart continues;
+            # hooks start their own threads for slow work (prefix warm-up).
+            self.on_restart()
+
+    def _stop_proc(self):
         if self.proc.poll() is None:
             if os.name == "posix" and hasattr(self.proc, "pid"):
                 try:
@@ -396,6 +357,12 @@ class Backend:
             else:
                 self.proc.kill()
             self.proc.wait()
+        for pipe in (getattr(self.proc, "stdin", None), getattr(self.proc, "stdout", None)):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except (OSError, ValueError):
+                pass
 
     def _wait_ready(self, timeout=None):
         """Wait until the resident runner has loaded the model."""
@@ -423,7 +390,13 @@ class Backend:
                 raise RuntimeError(
                     "runner exited before READY" +
                     (f" (status {status})" if status is not None else ""))
-            if raw.rstrip("\r\n") == "READY":
+            line = raw.rstrip("\r\n")
+            if line == "READY" or line.startswith("READY "):
+                # "READY max_seq_len=N" reports the context the runner
+                # allocated, which free VRAM may have clamped.
+                match = re.search(r"max_seq_len=(\d+)", line)
+                if match:
+                    self.max_seq_len = int(match.group(1))
                 self.ready = True
             else:
                 sys.stderr.write("[runner diagnostic] " + raw)
@@ -483,13 +456,49 @@ class Backend:
             self.metrics_local = threading.local()
         self.metrics_local.value = value
 
+    def _transact(self, line, on_token):
+        """Send one request line and read until its OK/ERR result."""
+        # HIP libraries may print diagnostics on stdout. Consume those
+        # within the transaction: returning early leaves its OK queued
+        # and makes the next HTTP request receive the previous answer.
+        self.proc.stdin.write(line)
+        self.proc.stdin.flush()
+        while True:
+            raw = self.proc.stdout.readline()
+            if not raw:
+                raise RuntimeError("runner closed its response pipe")
+            result = raw.rstrip("\r\n")
+            if result.startswith("TOK "):
+                if on_token is not None:
+                    try:
+                        on_token(base64.b64decode(result[4:]).decode("utf-8", "replace"))
+                    except (ValueError, UnicodeError):
+                        sys.stderr.write("[runner diagnostic] malformed token frame\n")
+                continue
+            if result.startswith(("OK ", "ERR ")):
+                return result
+            sys.stderr.write("[runner diagnostic] " + result + "\n")
+
+    def _reap_if_dead(self):
+        """True when the runner process has exited (waits briefly for it)."""
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return False
+        except (AttributeError, TypeError):
+            return self.proc.poll() is not None
+        return True
+
     def generate(self, prompt, max_tokens, temperature, top_p, top_k, presence, repetition, min_p,
                  prefix="", cancellation=None, on_token=None, seed=None,
                  frequency=0.0, penalty_last_n=64, cache_key="shared",
                  request_id=None, request_registered=False):
         request_start = time.monotonic()
         cancellation = cancellation if cancellation is not None else threading.Event()
-        prefix_payload = base64.b64encode(prefix.encode("utf-8")).decode("ascii") if prefix else "-"
+        # One stable prefix, or several (each gets a shared runner snapshot).
+        prefixes = [p for p in ([prefix] if isinstance(prefix, str) else prefix or []) if p]
+        prefix_payload = ",".join(base64.b64encode(p.encode("utf-8")).decode("ascii")
+                                  for p in prefixes) or "-"
         payload = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
         cache_identity = hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()
         seed_field = "-" if seed is None else str(seed)
@@ -515,45 +524,56 @@ class Backend:
             if ticket is None:
                 return "", 0, 0, 0, "cancelled"
             with self.lock:
-                if self.proc.poll() is not None:
-                    raise RuntimeError("runner exited")
-                # The constructor normally consumes READY; retain this check for
-                # tests and callers that construct Backend without __init__.
-                self._wait_ready()
-                with self.cancel_lock:
+                streamed = False
+
+                def forward_token(piece):
+                    nonlocal streamed
+                    streamed = True
+                    on_token(piece)
+
+                line_hash = hashlib.sha256(line.encode("utf-8")).hexdigest()
+                crashed = getattr(self, "crash_requests", None)
+                if crashed is None:
+                    crashed = self.crash_requests = {}
+                if crashed.get(line_hash, 0) >= 2:
+                    # Agents resend a failed request verbatim; one that has
+                    # killed the runner twice would otherwise use up the
+                    # restart budget and take the server down for everyone.
+                    raise RuntimeError("this request crashed the runner twice; not retrying")
+                for attempt in range(2):
                     if cancellation.is_set():
                         return "", 0, 0, 0, "cancelled"
-                    self.active_cancel = cancellation
-                    self.active_request_id = request_id
-                # Preserve the final empty field: an immediate EOS is a valid
-                # completion and the runner's OK line intentionally ends with an
-                # empty base64 payload in that case.
-                # HIP libraries may print diagnostics on stdout. Consume those
-                # within the transaction: returning early leaves its OK queued
-                # and makes the next HTTP request receive the previous answer.
-                try:
-                    self.proc.stdin.write(line)
-                    self.proc.stdin.flush()
-                    while True:
-                        raw = self.proc.stdout.readline()
-                        if not raw:
-                            raise RuntimeError("runner closed its response pipe")
-                        result = raw.rstrip("\r\n")
-                        if result.startswith("TOK "):
-                            if on_token is not None:
-                                try:
-                                    on_token(base64.b64decode(result[4:]).decode("utf-8", "replace"))
-                                except (ValueError, UnicodeError):
-                                    sys.stderr.write("[runner diagnostic] malformed token frame\n")
-                            continue
-                        if result.startswith(("OK ", "ERR ")):
-                            break
-                        sys.stderr.write("[runner diagnostic] " + result + "\n")
-                finally:
-                    # Clear ownership before another request can take self.lock.
+                    if self.proc.poll() is not None:
+                        self._restart_locked()
+                    # The constructor normally consumes READY; retain this check for
+                    # tests and callers that construct Backend without __init__.
+                    self._wait_ready()
                     with self.cancel_lock:
-                        self.active_cancel = None
-                        self.active_request_id = None
+                        if cancellation.is_set():
+                            return "", 0, 0, 0, "cancelled"
+                        self.active_cancel = cancellation
+                        self.active_request_id = request_id
+                    try:
+                        result = self._transact(line, forward_token if on_token else None)
+                        break
+                    except (OSError, RuntimeError) as exc:
+                        # The runner died under this request.  Before any
+                        # token reached the client the request can simply
+                        # run again on a restarted runner; afterwards the
+                        # client has partial output and gets the error.
+                        died = self._reap_if_dead()
+                        if died:
+                            crashed[line_hash] = crashed.get(line_hash, 0) + 1
+                            if len(crashed) > 64:
+                                crashed.pop(next(iter(crashed)))
+                        if attempt or streamed or not died:
+                            raise
+                        sys.stderr.write(f"[runner] died during a request ({exc}); retrying\n")
+                    finally:
+                        # Clear ownership before another request can take self.lock.
+                        with self.cancel_lock:
+                            self.active_cancel = None
+                            self.active_request_id = None
         finally:
             self.request_gate.release(ticket)
             if not request_registered:
@@ -587,12 +607,124 @@ class Backend:
         return text, int(cached), int(prompt_tokens), int(completion_tokens), finish
 
 
+def responses_output(response_id, reasoning, raw_turn, text, calls):
+    """Responses output items for one assistant turn.
+
+    The leading reasoning item carries the raw generated turn as opaque
+    encrypted_content.  Clients that keep reasoning items (Codex requests
+    reasoning.encrypted_content with store=false) send it back, so the next
+    prompt reproduces this turn byte for byte and the runner extends its live
+    KV/recurrent state instead of re-prefilling or restoring a snapshot.
+    """
+    items = [{"type": "reasoning", "id": "rs_" + uuid.uuid4().hex,
+              "summary": ([{"type": "summary_text", "text": reasoning}]
+                          if reasoning else []),
+              "encrypted_content": encode_raw(raw_turn)}]
+    if text or not calls:
+        items.append({"type": "message", "id": response_id + "-item",
+                      "role": "assistant", "status": "completed",
+                      "content": [{"type": "output_text", "text": text,
+                                   "annotations": []}]})
+    items.extend(calls)
+    return items
+
+
+def stream_error_event(api_path, message, overflow=False):
+    """SSE bytes that report a failure after the stream has started.
+
+    A context overflow uses the codes agents act on (Codex compacts on
+    context_length_exceeded, Claude Code on "prompt is too long")."""
+    if api_path == "/v1/messages":
+        payload = {"type": "error", "error": {
+            "type": "invalid_request_error" if overflow else "api_error", "message": message}}
+        return ("event: error\ndata: " + json.dumps(payload) + "\n\n").encode()
+    if api_path == "/v1/responses":
+        payload = {"type": "response.failed", "response": {
+            "status": "failed", "error": {
+                "code": "context_length_exceeded" if overflow else "server_error",
+                "message": message}}}
+        return ("event: response.failed\ndata: " + json.dumps(payload) + "\n\n").encode()
+    payload = {"error": {"message": message,
+                         "type": "invalid_request_error" if overflow else "server_error",
+                         **({"code": "context_length_exceeded"} if overflow else {})}}
+    return ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode()
+
+
 class Handler(BaseHTTPRequestHandler):
     backend = None
     model = "local"
     max_tokens = 256
     context = 4096
     coding = False
+    thinking = "auto"
+    raw_turns = RawTurnCache()
+    prefix_store = None
+
+    def count_tokens(self):
+        """Estimate /v1/messages/count_tokens from the rendered prompt."""
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            if n <= 0 or n > MAX_REQUEST_BYTES:
+                raise ValueError("invalid request body size")
+            req = json.loads(self.rfile.read(n))
+            if not isinstance(req, dict):
+                raise ValueError("request body must be a JSON object")
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self.close_connection = True
+            self.send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(exc)}})
+            return
+        try:
+            thinking, effort = self.thinking_mode(req, "/v1/messages")
+            registry = tool_registry(anthropic_api.tool_definitions(req.get("tools")))
+            prompt = chat_prompt(anthropic_api.request_messages(req), registry, thinking, effort)
+        except Exception as exc:  # malformed shapes: report, keep serving
+            self.send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": str(exc)}})
+            return
+        # About 3.5 bytes per token for this tokenizer on code and English.
+        self.send_json(200, {"input_tokens": max(1, round(len(prompt.encode("utf-8")) / 3.5))})
+
+    def thinking_mode(self, req, api_path):
+        """(thinking, effort), with --default-reasoning-effort filling in an
+        effort the client did not name.  The template otherwise renders its
+        xhigh instruction: pi's llama.cpp provider sends none and thought
+        ~7x longer per turn than Codex at medium on the same task."""
+        thinking, effort = self._thinking_mode(req, api_path)
+        default = getattr(self, "default_effort", None)
+        if thinking and effort is None and default:
+            effort = default
+        return thinking, effort
+
+    def _thinking_mode(self, req, api_path):
+        """Return (thinking, effort) for a request.
+
+        auto: Responses requests think when they ask for a reasoning effort
+        (Codex always sends one); Chat Completions think only when asked via
+        reasoning_effort or chat_template_kwargs.enable_thinking.
+        """
+        if api_path == "/v1/messages":
+            requested, effort = anthropic_api.thinking_request(req)
+            if self.thinking == "off":
+                return False, effort
+            if self.thinking == "on":
+                return True, effort or "medium"
+            return requested, effort
+        effort = None
+        reasoning = req.get("reasoning")
+        if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
+            effort = reasoning["effort"]
+        elif isinstance(req.get("reasoning_effort"), str):
+            effort = req["reasoning_effort"]
+        kwargs = req.get("chat_template_kwargs")
+        explicit = kwargs.get("enable_thinking") if isinstance(kwargs, dict) else None
+        if self.thinking == "off":
+            return False, effort
+        if self.thinking == "on":
+            return explicit is not False and effort not in ("none",), effort
+        if isinstance(explicit, bool):
+            return explicit, effort
+        return effort is not None and effort not in ("none", "minimal"), effort
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] " + (fmt % args) + "\n")
@@ -627,6 +759,14 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return False
 
+    def do_HEAD(self):
+        # Connectivity probes (Claude Code sends HEAD /api/hello).
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        known = ("/", "/api/hello", "/health", "/v1/health", "/models", "/v1/models", "/v1")
+        self.send_response(200 if path in known else 404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         self._request_id = None
         path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -645,7 +785,20 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path in ("/v1/models", "/models"):
             now = int(time.time())
-            self.send_json(200, {"object": "list", "data": [{"id": self.model, "object": "model", "created": now, "owned_by": "local"}]})
+            # llama.cpp router shape (status/meta) so router clients such as
+            # pi's llama.cpp extension accept this single resident model.
+            self.send_json(200, {"object": "list", "data": [{
+                "id": self.model, "object": "model", "created": now, "owned_by": "local",
+                "status": {"value": "loaded"}, "source": "resident",
+                "meta": {"n_ctx": self.context, "n_ctx_train": self.context},
+                "architecture": {"input_modalities": ["text"]}}]})
+        elif path in ("/props", "/v1/props"):
+            template = Path(__file__).with_name("qwen38_chat_template.jinja")
+            self.send_json(200, {
+                "models_autoload": False,
+                "chat_template": template.read_text() if template.exists() else "",
+                "default_generation_settings": {"n_ctx": self.context},
+                "model_path": self.model})
         else:
             self.log_message("404 GET %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
@@ -678,7 +831,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path.rstrip("/") or "/"
         if path.startswith("/v1/"):
             api_path = path
-        elif path in ("/chat/completions", "/completions", "/responses"):
+        elif path in ("/chat/completions", "/completions", "/responses", "/messages",
+                      "/messages/count_tokens"):
             api_path = "/v1" + path
         else:
             api_path = path
@@ -712,7 +866,26 @@ class Handler(BaseHTTPRequestHandler):
                 "request_id": request_id,
             })
             return
-        if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
+        if api_path == "/v1/messages/count_tokens":
+            self.count_tokens()
+            return
+        if path in ("/models/load", "/models/unload"):
+            # One resident model: loading is a no-op and it stays loaded.
+            try:
+                n = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                n = -1
+            if n < 0 or n > 65536:
+                self.close_connection = True
+                self.send_json(400, {"error": {"message": "invalid request body",
+                                                "type": "invalid_request_error"}})
+                return
+            if n:
+                self.rfile.read(n)
+            self.send_json(200, {"success": True})
+            return
+        if api_path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses",
+                            "/v1/messages"):
             self.log_message("404 POST %s", self.path)
             self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
             return
@@ -759,6 +932,11 @@ class Handler(BaseHTTPRequestHandler):
                 cache_key = metadata["session_id"]
             elif self.headers.get("X-Prompt-Cache-Key") is not None:
                 cache_key = self.headers.get("X-Prompt-Cache-Key")
+            elif self.headers.get("X-Claude-Code-Session-Id") is not None:
+                cache_key = self.headers.get("X-Claude-Code-Session-Id")
+            elif isinstance(metadata.get("user_id"), str) and metadata["user_id"]:
+                # Claude Code embeds its session id in metadata.user_id.
+                cache_key = metadata["user_id"][:512]
             else:
                 cache_key = "shared"
             if not isinstance(cache_key, str) or not cache_key or len(cache_key) > 512:
@@ -769,6 +947,8 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = req.get("prompt", "")
                 if isinstance(prompt, list): prompt = "".join(map(str, prompt))
                 messages = [{"role": "user", "content": prompt}]
+            elif api_path == "/v1/messages":
+                messages = anthropic_api.request_messages(req)
             elif api_path == "/v1/responses":
                 messages = []
                 if req.get("instructions"): messages.append({"role": "system", "content": req["instructions"]})
@@ -776,15 +956,18 @@ class Handler(BaseHTTPRequestHandler):
                 messages.extend(responses_input_messages(inp))
             else:
                 messages = req.get("messages", [])
+                if isinstance(messages, list) and all(isinstance(m, dict) for m in messages):
+                    messages = chat_input_messages(messages)
             if (not isinstance(messages, list) or
                     any(not isinstance(message, dict) for message in messages)):
                 self.send_json(400, {"error": {
                     "message": "messages must be an array of objects",
                     "type": "invalid_request_error"}})
                 return
-            registry = tool_registry(req.get("tools", []))
-            if registry:
-                messages.insert(0, {"role": "system", "content": tool_instructions(registry)})
+            registry = tool_registry(
+                anthropic_api.tool_definitions(req.get("tools"))
+                if api_path == "/v1/messages" else req.get("tools", []))
+            thinking, effort = self.thinking_mode(req, api_path)
             try:
                 requested_limit = int(req.get("max_tokens", req.get("max_output_tokens", self.max_tokens)))
             except (TypeError, ValueError):
@@ -794,17 +977,34 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": {"message": "max_tokens must be non-negative", "type": "invalid_request_error"}})
                 return
             limit = min(requested_limit, self.max_tokens)
-            messages = fit_context(messages, self.context, limit)
-            prompt = chat_prompt(messages)
-            prefix = chat_prefix(messages)
+            self.raw_turns.resolve(messages, cache_key)
+            messages = fit_context(
+                messages, self.context, limit,
+                lambda m: chat_prompt(m, registry, thinking, effort))
+            prompt = chat_prompt(messages, registry, thinking, effort)
+            prefix = prefix_boundaries(messages, registry, thinking, effort)
+            trace_dir = os.environ.get("QWEN38_TRACE_DIR")
+            if trace_dir:
+                # Diagnostic only: raw request plus the exact rendered prompt,
+                # for diffing successive agent turns' prefixes.  A trace that
+                # cannot be written must never fail the request itself.
+                stamp = f"{time.time():.6f}-{uuid.uuid4().hex[:8]}"
+                try:
+                    os.makedirs(trace_dir, mode=0o700, exist_ok=True)
+                    fd = os.open(os.path.join(trace_dir, f"{stamp}.json"),
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump({"path": api_path, "cache_key": cache_key, "request": req,
+                                   "prompt": prompt, "prefix": prefix}, f, ensure_ascii=False)
+                except OSError as exc:
+                    self.log_message("trace not written: %s", exc)
             # The C child reads one complete request into a fixed 4 MiB line.
             # Check the actual UTF-8/base64 expansion before streaming headers;
             # an oversized partial line would otherwise desynchronize every
             # later request on the resident runner.
             prompt_bytes = len(prompt.encode("utf-8"))
-            prefix_bytes = len(prefix.encode("utf-8"))
-            encoded_bytes = (4 * ((prompt_bytes + 2) // 3) +
-                             (4 * ((prefix_bytes + 2) // 3) if prefix else 1) +
+            prefix_bytes = sum(4 * ((len(p.encode("utf-8")) + 2) // 3) + 1 for p in prefix)
+            encoded_bytes = (4 * ((prompt_bytes + 2) // 3) + max(prefix_bytes, 1) +
                              2048)
             if encoded_bytes >= MAX_RUNNER_LINE_BYTES:
                 self.send_json(400, {"error": {
@@ -818,8 +1018,22 @@ class Handler(BaseHTTPRequestHandler):
             # MoE decode remains both useful and coherent.
             # The child receives these values through the request protocol;
             # its standalone benchmark sampling defaults do not apply here.
-            default_temp, default_top_p, default_top_k, default_presence = (
-                (0.7, 0.80, 20, 1.5) if self.coding else (0.2, 0.95, 20, 0.0))
+            # Qwen's published profiles: thinking (coding) 0.6/0.95/20, and
+            # non-thinking 0.7/0.8/20 with presence 1.5.  Agent (Responses)
+            # traffic without explicit controls takes them; a near-greedy
+            # default makes tool-using agents repeat one failing call.
+            if thinking:
+                defaults = (0.6, 0.95, 20, 0.0)
+            elif self.coding or api_path in ("/v1/responses", "/v1/messages"):
+                defaults = (0.7, 0.80, 20, 1.5)
+            else:
+                defaults = (0.2, 0.95, 20, 0.0)
+            default_temp, default_top_p, default_top_k, default_presence = defaults
+            if api_path == "/v1/messages" and os.environ.get("QWEN38_HONOR_CLIENT_SAMPLING", "0") == "0":
+                # Anthropic clients send temperature 1 (required there with
+                # extended thinking); Qwen's profiles are the useful values.
+                req = {k: v for k, v in req.items()
+                       if k not in ("temperature", "top_p", "top_k")}
             try:
                 temp = float(req.get("temperature", default_temp))
                 top_p = float(req.get("top_p", default_top_p))
@@ -849,7 +1063,8 @@ class Handler(BaseHTTPRequestHandler):
             stream_keepalive_stop = threading.Event()
             stream_keepalive = None
             stream_write_lock = threading.Lock()
-            stream_response_id = "resp-" + uuid.uuid4().hex if req.get("stream") else None
+            stream_response_id = (("chatcmpl-" if api_path == "/v1/chat/completions" else "resp-")
+                                  + uuid.uuid4().hex) if req.get("stream") else None
             stream_created = int(time.time())
             if not self.backend.register_request(request_id, cancelled):
                 self.send_json(409, {"error": {
@@ -857,6 +1072,21 @@ class Handler(BaseHTTPRequestHandler):
                     "type": "invalid_request_error"}})
                 return
             watcher = None
+            live = None
+            live_ref = None
+            sequence = [2]
+
+            def sse(event, payload):
+                with stream_write_lock:
+                    self.wfile.write(("event: " + event + "\ndata: " +
+                                      json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.flush()
+
+            def sse_responses(obj):
+                obj = {**obj, "sequence_number": sequence[0]}
+                sequence[0] += 1
+                sse(obj["type"], obj)
+
             try:
                 if req.get("stream"):
                     # Send headers only after reserving the ID. A duplicate
@@ -872,18 +1102,37 @@ class Handler(BaseHTTPRequestHandler):
                     stream_base = {"id": stream_response_id, "object": "response",
                                    "created_at": stream_created, "status": "in_progress",
                                    "model": self.model, "output": []}
-                    for sequence_number, event in enumerate(("response.created", "response.in_progress")):
-                        payload = {"type": event, "response": stream_base,
-                                   "sequence_number": sequence_number}
+                    if api_path == "/v1/messages":
+                        stream_response_id = "msg_" + uuid.uuid4().hex[:24]
+                        event, payload = anthropic_api.stream_start(
+                            stream_response_id, self.model, 0, 0)
                         self.wfile.write(("event: " + event + "\ndata: " +
-                                         json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                                          json.dumps(payload) + "\n\n").encode())
+                    elif api_path == "/v1/responses":
+                        # Chat Completions streams carry only chunks: the
+                        # OpenAI SDKs hand `response.*` events to chat
+                        # clients as chunks without `choices`.
+                        for sequence_number, event in enumerate(("response.created", "response.in_progress")):
+                            payload = {"type": event, "response": stream_base,
+                                       "sequence_number": sequence_number}
+                            self.wfile.write(("event: " + event + "\ndata: " +
+                                             json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
                     self.wfile.flush()
+                    # Reasoning and answer text stream while the model runs.
+                    if api_path == "/v1/messages":
+                        live_ref = new_ref()
+                        live = MessagesLive(sse, live_ref)
+                    elif api_path == "/v1/responses":
+                        live_ref = new_ref()
+                        live = ResponsesLive(sse_responses, stream_response_id, live_ref)
+                    keepalive_bytes = (b'event: ping\ndata: {"type": "ping"}\n\n'
+                                       if api_path == "/v1/messages" else b": keep-alive\n\n")
 
                     def keepalive():
                         while not stream_keepalive_stop.wait(5.0):
                             try:
                                 with stream_write_lock:
-                                    self.wfile.write(b": keep-alive\n\n")
+                                    self.wfile.write(keepalive_bytes)
                                     self.wfile.flush()
                             except (BrokenPipeError, ConnectionResetError, OSError):
                                 cancelled.set()
@@ -893,16 +1142,40 @@ class Handler(BaseHTTPRequestHandler):
                     stream_keepalive = threading.Thread(target=keepalive, daemon=True)
                     stream_keepalive.start()
 
+                splitter = StreamSplitter(thinking)
+                role_sent = [False]
+
                 def stream_token(token):
-                    if not req.get("stream") or api_path != "/v1/chat/completions":
+                    if not req.get("stream"):
                         return
-                    obj = {"id": stream_response_id, "object": "chat.completion.chunk",
-                           "created": stream_created, "model": self.model,
-                           "choices": [{"index": 0, "delta": {"content": token},
-                                        "finish_reason": None}]}
+                    if live is not None:
+                        parts = splitter.feed(token)
+                        if parts:
+                            try:
+                                live.feed(parts)
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                cancelled.set()
+                                self.backend.cancel(cancelled)
+                        return
+                    if api_path != "/v1/chat/completions":
+                        return
+                    parts = splitter.feed(token)
+                    if not parts:
+                        return
                     try:
                         with stream_write_lock:
-                            self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                            for kind, piece in parts:
+                                field = "reasoning_content" if kind == "reasoning" else "content"
+                                delta = {field: piece}
+                                if not role_sent[0]:
+                                    delta = {"role": "assistant", **delta}
+                                    role_sent[0] = True
+                                obj = {"id": stream_response_id, "object": "chat.completion.chunk",
+                                       "created": stream_created, "model": self.model,
+                                       "choices": [{"index": 0, "delta": delta,
+                                                    "finish_reason": None}]}
+                                self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) +
+                                                  "\n\n").encode())
                             self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         cancelled.set()
@@ -928,12 +1201,43 @@ class Handler(BaseHTTPRequestHandler):
                 self.log_message("request cancelled: %s", self.path)
                 self.close_connection = True
                 return
-            tool_text, calls = parse_calls(text, registry)
-            if calls:
-                text = tool_text
-            ident = "chatcmpl-" + uuid.uuid4().hex
+            if self.prefix_store is not None:
+                self.prefix_store.record(prefix)
+            # The exact bytes of this assistant turn after "<|im_start|>assistant\n".
+            raw_turn = generation_suffix(thinking) + text
+            reasoning_text, answer = split_generation(text, thinking)
+            tool_text, calls = parse_calls(answer, registry)
+            text = tool_text if calls else answer
+            sys.stderr.write(f"[turn] {api_path} finish={finish} completion={ctok} "
+                             f"reasoning_chars={len(reasoning_text)} answer_chars={len(answer)} "
+                             f"calls={len(calls)}\n")
+            if not calls and "<tool_call>" in answer:
+                # The client receives this as plain text; make it visible.
+                sys.stderr.write("[tool-call] unparsed: " +
+                                 answer[answer.find("<tool_call>"):][:400].replace("\n", "\\n") + "\n")
+            if api_path == "/v1/messages":
+                content = anthropic_api.response_content(reasoning_text, raw_turn, text, calls)
+                self.raw_turns.remember(raw_turn, text, calls, scope=cache_key, ids=
+                                        [b["id"] for b in content if b["type"] == "tool_use"])
+                reason = anthropic_api.stop_reason(calls, finish)
+                use = anthropic_api.usage(ptok, cached, ctok)
+                if req.get("stream"):
+                    self.close_connection = True
+                    self.raw_turns.remember_ref(live_ref, raw_turn)
+                    live.finish(text, [b for b in content if b["type"] == "tool_use"],
+                                reason, use)
+                else:
+                    self.send_json(200, anthropic_api.message_object(
+                        "msg_" + uuid.uuid4().hex[:24], self.model, content, reason, use))
+                return
+            if api_path != "/v1/messages":
+                self.raw_turns.remember(raw_turn, text, calls, scope=cache_key, ids=
+                                        [c.get("call_id") for c in calls])
+            ident = (stream_response_id if req.get("stream") and api_path == "/v1/chat/completions"
+                     else "chatcmpl-" + uuid.uuid4().hex)
             created = int(time.time())
-            usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok, "cached_tokens": cached}
+            usage = {"prompt_tokens": ptok, "completion_tokens": ctok, "total_tokens": ptok + ctok,
+                     "cached_tokens": cached, "prompt_tokens_details": {"cached_tokens": cached}}
             performance = getattr(self.backend, "last_metrics", {})
             if req.get("stream"):
                 # The stream headers and keepalive comments were sent before
@@ -943,50 +1247,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 if api_path == "/v1/responses":
                     response_id = stream_response_id
-                    if calls:
-                        response_base = {"id": response_id, "object": "response",
-                                         "created_at": created, "status": "in_progress",
-                                         "model": self.model, "output": []}
-                        events = list(call_events(response_id, calls))[2:]
-                        response_done = {**response_base, "status": "completed",
-                                         "output": calls,
-                                         "usage": {"input_tokens": ptok,
-                                                   "output_tokens": ctok,
-                                                   "total_tokens": ptok + ctok,
-                                                   "input_tokens_details": {"cached_tokens": cached}}}
-                        events.append({"type": "response.completed", "response": response_done})
-                        for sequence_number, obj in enumerate(events, 2):
-                            event = obj["type"]
-                            obj = {**obj, "sequence_number": sequence_number}
-                            self.wfile.write(("event: " + event + "\ndata: " +
-                                              json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
-                        self.wfile.flush()
-                        return
-                    item_id = response_id + "-item"
-                    part = {"type": "output_text", "text": text, "annotations": []}
-                    item = {"type": "message", "id": item_id, "role": "assistant", "status": "completed", "content": [part]}
-                    response_base = {"id": response_id, "object": "response", "created_at": created,
-                                     "status": "in_progress", "model": self.model, "output": []}
-                    created_obj = {"type": "response.created", "response": response_base}
-                    in_progress_obj = {"type": "response.in_progress", "response": response_base}
-                    added_obj = {"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": item_id, "role": "assistant", "status": "in_progress", "content": []}}
-                    part_added_obj = {"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}
-                    delta_obj = {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": text}
-                    text_done_obj = {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": text}
-                    part_done_obj = {"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": part}
-                    item_done_obj = {"type": "response.output_item.done", "output_index": 0, "item": item}
-                    response_done = {**response_base, "status": "completed", "output": [item], "usage": {"input_tokens": ptok, "output_tokens": ctok, "total_tokens": ptok + ctok, "input_tokens_details": {"cached_tokens": cached}}}
-                    done_obj = {"type": "response.completed", "response": response_done}
-                    events = (("response.output_item.added", added_obj), ("response.content_part.added", part_added_obj),
-                              ("response.output_text.delta", delta_obj), ("response.output_text.done", text_done_obj),
-                              ("response.content_part.done", part_done_obj), ("response.output_item.done", item_done_obj),
-                              ("response.completed", done_obj))
-                    for sequence_number, (event, obj) in enumerate(events, 2):
-                        # Responses stream consumers use this to order and
-                        # validate events.  In particular, Codex silently
-                        # discards otherwise well-formed events without it.
-                        obj = {**obj, "sequence_number": sequence_number}
-                        self.wfile.write(("event: " + event + "\ndata: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                    self.raw_turns.remember_ref(live_ref, raw_turn)
+                    output = live.finish(text, calls)
+                    response_done = {"id": response_id, "object": "response",
+                                     "created_at": created, "status": "completed",
+                                     "model": self.model, "output": output,
+                                     "usage": {"input_tokens": ptok, "output_tokens": ctok,
+                                               "total_tokens": ptok + ctok,
+                                               "input_tokens_details": {"cached_tokens": cached}}}
+                    # Codex discards Responses events without sequence_number.
+                    sse_responses({"type": "response.completed", "response": response_done})
                 else:
                     if calls:
                         delta = {"role": "assistant", "tool_calls": [
@@ -1003,32 +1273,41 @@ class Handler(BaseHTTPRequestHandler):
                     elif text and api_path != "/v1/chat/completions":
                         obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                         self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
-                    obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}], "performance": performance}
-                    self.wfile.write(("data: " + json.dumps(obj) + "\n\ndata: [DONE]\n\n").encode())
+                    elif text.startswith(splitter.content) and len(text) > len(splitter.content):
+                        # Held-back answer text that turned out not to be a call.
+                        obj = {"id": ident, "object": "chat.completion.chunk", "created": created,
+                               "model": self.model, "choices": [{"index": 0, "delta": {
+                                   "content": text[len(splitter.content):]}, "finish_reason": None}]}
+                        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+                    obj = {"id": ident, "object": "chat.completion.chunk", "created": created, "model": self.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if calls else finish}], "performance": performance}
+                    self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+                    options = req.get("stream_options")
+                    if isinstance(options, dict) and options.get("include_usage"):
+                        obj = {"id": ident, "object": "chat.completion.chunk", "created": created,
+                               "model": self.model, "choices": [],
+                               "usage": {"prompt_tokens": ptok, "completion_tokens": ctok,
+                                         "total_tokens": ptok + ctok,
+                                         "prompt_tokens_details": {"cached_tokens": cached}}}
+                        self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
             if api_path == "/v1/responses":
                 response_id = "resp-" + uuid.uuid4().hex
-                if calls:
-                    self.send_json(200, {"id": response_id, "object": "response",
-                                         "created_at": created, "model": self.model,
-                                         "output": calls, "status": "completed",
-                                         "usage": {"input_tokens": ptok,
-                                                   "output_tokens": ctok,
-                                                   "total_tokens": ptok + ctok,
-                                                   "input_tokens_details": {"cached_tokens": cached}}})
-                    return
-                item = {"type": "message", "id": response_id + "-item", "role": "assistant",
-                        "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}
-                self.send_json(200, {"id": response_id, "object": "response", "created_at": created,
-                                     "model": self.model, "output": [item], "output_text": text,
-                                     "status": "completed", "usage": {"input_tokens": ptok,
-                                     "output_tokens": ctok, "total_tokens": ptok + ctok,
-                                     "input_tokens_details": {"cached_tokens": cached}}})
+                output = responses_output(response_id, reasoning_text, raw_turn, text, calls)
+                self.send_json(200, {"id": response_id, "object": "response",
+                                     "created_at": created, "model": self.model,
+                                     "output": output, "output_text": "" if calls else text,
+                                     "status": "completed",
+                                     "usage": {"input_tokens": ptok, "output_tokens": ctok,
+                                               "total_tokens": ptok + ctok,
+                                               "input_tokens_details": {"cached_tokens": cached}}})
             elif api_path == "/v1/completions":
                 self.send_json(200, {"id": ident, "object": "text_completion", "created": created, "model": self.model, "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
             else:
                 message = {"role": "assistant", "content": text}
+                if reasoning_text:
+                    message["reasoning_content"] = reasoning_text
                 if calls:
                     message["content"] = None
                     message["tool_calls"] = [{"id": item["call_id"], "type": item["type"],
@@ -1042,13 +1321,31 @@ class Handler(BaseHTTPRequestHandler):
             # socket left to report an error on.
             return
         except Exception as exc:
-            self.log_message("500 POST %s: %s", self.path, exc)
+            self.log_message("error POST %s: %s", self.path, exc)
+            overflow = "exceeds context capacity" in str(exc)
+            message = (f"prompt is too long: it exceeds the {self.context}-token context window"
+                       if overflow else str(exc))
             if response_started:
-                # HTTP status and SSE headers are already committed. Appending
-                # a JSON error response would corrupt the event stream.
+                # Headers are committed: report the failure in the stream's own
+                # protocol so agents surface it instead of retrying a silently
+                # truncated response.
                 self.close_connection = True
+                try:
+                    self.wfile.write(stream_error_event(api_path, message, overflow))
+                    self.wfile.flush()
+                except OSError:
+                    pass
                 return
-            self.send_json(500, {"error": {"message": str(exc), "type": "server_error"}})
+            # Agents compact their history on these context-overflow errors.
+            if api_path == "/v1/messages":
+                self.send_json(400 if overflow else 500, {"type": "error", "error": {
+                    "type": "invalid_request_error" if overflow else "api_error",
+                    "message": message}})
+            else:
+                self.send_json(400 if overflow else 500, {"error": {
+                    "message": message,
+                    "type": "invalid_request_error" if overflow else "server_error",
+                    "code": "context_length_exceeded" if overflow else None}})
 
 
 def main():
@@ -1061,6 +1358,21 @@ def main():
     ap.add_argument("--max-output", type=int, default=256)
     ap.add_argument("--moe-cache-mb", type=int, default=0)
     ap.add_argument("--coding", action="store_true")
+    ap.add_argument("--prefix-store", default="",
+                    help="JSON file remembering agents' system prefixes across restarts "
+                         "(contains system prompts; written 0600); empty disables")
+    ap.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "xhigh"),
+                    default=None,
+                    help="reasoning effort for thinking requests that name none "
+                         "(default: the chat template's xhigh)")
+    ap.add_argument("--prefix-warmup", type=int, default=4,
+                    help="stored prefixes to re-prefill at startup (0 disables)")
+    ap.add_argument("--served-model-name", default=None,
+                    help="model id reported by /v1/models and responses "
+                         "(default: the GGUF file name)")
+    ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
+                    help="Qwen3.8 reasoning mode: auto follows the request's reasoning "
+                         "effort (Responses) or enable_thinking (Chat Completions)")
     ap.add_argument("--qwen4-coding-profile", action="store_true")
     ap.add_argument("--qwen4-mtp", help="NextN sidecar; accelerate greedy requests only")
     ap.add_argument("--qwen4-exact", action="store_true", help="exact Qwen4 routing/QSA baseline")
@@ -1105,8 +1417,15 @@ def main():
     Handler.backend = Backend(args)
     Handler.model = Handler.backend.model
     Handler.max_tokens = args.max_output
-    Handler.context = args.context
+    # Advertise and budget against the window the runner really allocated.
+    Handler.context = min(args.context, getattr(Handler.backend, "max_seq_len", None) or
+                          args.context)
+    if Handler.context < args.context:
+        print(f"context clamped by the runner: {args.context} -> {Handler.context} tokens",
+              flush=True)
     Handler.coding = args.coding
+    Handler.default_effort = args.default_reasoning_effort
+    Handler.thinking = args.thinking
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
     except Exception:
@@ -1116,6 +1435,37 @@ def main():
         raise
     signal.signal(signal.SIGTERM, _handle_sigterm)
     print(f"OpenAI-compatible API: http://{args.host}:{args.port}/v1", flush=True)
+    def update_context():
+        # A runner restarted while the old one's VRAM was still being
+        # released may have clamped to a smaller context.
+        allocated = getattr(Handler.backend, "max_seq_len", None) or args.context
+        if min(args.context, allocated) != Handler.context:
+            sys.stderr.write(f"[runner] context now {min(args.context, allocated)} tokens "
+                             f"(was {Handler.context})\n")
+            Handler.context = min(args.context, allocated)
+
+    Handler.backend.on_restart = update_context
+    if args.prefix_store:
+        Handler.prefix_store = PrefixStore(args.prefix_store)
+
+        def warmup():
+            # Queued like ordinary requests: an agent request that arrives
+            # meanwhile waits only for the item in progress.
+            for boundaries in Handler.prefix_store.warmup_list()[:max(0, args.prefix_warmup)]:
+                start = time.monotonic()
+                try:
+                    _, cached, tokens, _, _ = Handler.backend.generate(
+                        boundaries[-1], 0, 0.0, 0.95, 20, 0.0, 1.0, 0.0,
+                        prefix=boundaries, cache_key="prefix-warmup")
+                    sys.stderr.write(f"[warmup] prefix {tokens} tokens "
+                                     f"({tokens - cached} prefilled) in "
+                                     f"{time.monotonic() - start:.1f}s\n")
+                except Exception as exc:  # warm-up is best effort
+                    sys.stderr.write(f"[warmup] failed: {exc}\n")
+        # A restarted runner has lost its shared prefixes as well.
+        Handler.backend.on_restart = lambda: (
+            update_context(), threading.Thread(target=warmup, daemon=True).start())
+        threading.Thread(target=warmup, daemon=True).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:

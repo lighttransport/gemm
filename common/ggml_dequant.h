@@ -39,6 +39,12 @@ typedef struct {
     uint8_t  qs[16];  /* bits / quants */
 } block_q1_0;
 
+/* Q2_0 block: 64 values, 18 bytes. Code 0..3 represents -1..2. */
+typedef struct {
+    uint16_t d;
+    uint8_t qs[16];
+} block_q2_0;
+
 /* MXFP4 block: 32 elements, 17 bytes */
 typedef struct {
     uint8_t e;        /* E8M0 scale */
@@ -232,6 +238,7 @@ void dequantize_row_q2_K(const void *src, float *dst, int n);
 void dequantize_row_q3_K(const void *src, float *dst, int n);
 void dequantize_row_q8_0(const void *src, float *dst, int n);
 void dequantize_row_q1_0(const void *src, float *dst, int n);
+void dequantize_row_q2_0(const void *src, float *dst, int n);
 void dequantize_row_mxfp4(const void *src, float *dst, int n);
 void dequantize_row_nvfp4(const void *src, float *dst, int n);
 void dequantize_row_q4_K(const void *src, float *dst, int n);
@@ -265,6 +272,7 @@ static inline size_t dequant_row_size(uint32_t type, int n) {
         case GGML_TYPE_Q3_K:    bs = 256; ts = 110; break;
         case GGML_TYPE_Q8_0:    bs = 32;  ts = 34;  break;
         case GGML_TYPE_Q1_0:    bs = 128; ts = 18;  break;
+        case GGML_TYPE_Q2_0:    bs = 64;  ts = 18;  break;
         case GGML_TYPE_MXFP4:   bs = 32;  ts = 17;  break;
         case GGML_TYPE_NVFP4:   bs = 64;  ts = 36;  break;
         case GGML_TYPE_Q4_K:    bs = 256; ts = 144; break;
@@ -4554,6 +4562,15 @@ void dequantize_row_tq1_0(const void *restrict vx, float *restrict y, int k) {
     }
 }
 
+void dequantize_row_q2_0(const void *src, float *dst, int n) {
+    const block_q2_0 *blocks = (const block_q2_0 *)src;
+    for (int b = 0; b < n / 64; ++b) {
+        float scale = ggml_fp16_to_fp32(blocks[b].d);
+        for (int j = 0; j < 64; ++j)
+            dst[b * 64 + j] = (float)(((blocks[b].qs[j / 4] >> (2 * (j % 4))) & 3) - 1) * scale;
+    }
+}
+
 void dequantize_row_tq2_0(const void *restrict vx, float *restrict y, int k) {
     const block_tq2_0 *restrict x = (const block_tq2_0 *)vx;
     const int nb = k / 256;
@@ -4583,6 +4600,9 @@ int dequant_row(uint32_t type, const void *src, float *dst, int n) {
             return 0;
         case GGML_TYPE_Q1_0:
             dequantize_row_q1_0(src, dst, n);
+            return 0;
+        case GGML_TYPE_Q2_0:
+            dequantize_row_q2_0(src, dst, n);
             return 0;
         case GGML_TYPE_MXFP4:
             dequantize_row_mxfp4(src, dst, n);

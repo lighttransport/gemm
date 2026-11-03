@@ -85,6 +85,7 @@ typedef struct {
     int qwen35_native_q8_prefill;
     int qwen35_native_q2k; /* precise Q2_K x Q8_1 decode on gfx1201 */
     int qwen35_native_mmvq; /* also IQ2_XXS/XS/S, IQ3_XXS/S with precise Q8_1 staging */
+    int qwen4_ple_ssd; /* bounded GGUF row reads from SSD */
 } hip_llm_load_options;
 
 typedef struct {
@@ -181,6 +182,15 @@ float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
 int hip_llm_qwen35_mtp_verify_argmax(hip_llm_runner *r, const int32_t *tokens,
                                     int rows, int position, int32_t *argmax);
 int hip_llm_qwen35_mtp_commit(hip_llm_runner *r, int processed);
+/* Allocate the verification workspace for `rows` rows now (about 1.2 GiB
+ * for eight rows of the 27B model) instead of on the first verify.  Returns
+ * nonzero when it does not fit; the caller should then decode without the
+ * draft model. */
+int hip_llm_qwen35_mtp_verify_reserve(hip_llm_runner *r, int rows);
+/* Allocate the worst-case Q8 prefill attention scratch now (about 200 MiB
+ * for 512-row batches) so a server's first long prompt cannot fail on it
+ * after the KV cache and optional workspaces have taken the VRAM. */
+int hip_llm_reserve_prefill_scratch(hip_llm_runner *r);
 /* Discard only the dense draft transaction/history. Target prompt state and
  * logits remain live. Call at every independent serving request boundary. */
 void hip_llm_qwen35_mtp_reset(hip_llm_runner *r);
@@ -189,6 +199,12 @@ void hip_llm_qwen35_mtp_reset(hip_llm_runner *r);
  * only verified target tokens are committed to the caller. */
 int hip_llm_qwen35_dflash2_load(hip_llm_runner *r, const char *path,
                                char *error, size_t error_cap);
+/* True when the draft's context ends at `position`, so a proposal there is
+ * valid.  Plain target decoding does not extend it; the next prefill does. */
+int hip_llm_qwen35_dflash2_synced(hip_llm_runner *r, int position);
+/* After the target decoded [draft end, position) alone, blank those rows
+ * of the draft's context window and mark it current at `position`. */
+int hip_llm_qwen35_dflash2_clear_gap(hip_llm_runner *r, int position);
 int hip_llm_qwen35_dflash2_propose(hip_llm_runner *r, int32_t anchor,
                                   int position, int count, int32_t *drafts);
 int hip_llm_qwen35_dflash2_commit(hip_llm_runner *r, int position,
@@ -318,6 +334,10 @@ void hip_llm_set_qwen35_snapshot_max_tokens(hip_llm_runner *r, int tokens);
  * included when available so a cache hit can resume without prompt replay.
  * The opaque snapshot is owned by the caller and may be reused across turns. */
 hip_llm_state_snapshot *hip_llm_snapshot_state(hip_llm_runner *r);
+/* Recurrent, logits and draft state without the attention KV rows.  Valid
+ * to restore only while the KV rows up to its position are still in VRAM
+ * (for example to roll back a cancelled decode to its prompt boundary). */
+hip_llm_state_snapshot *hip_llm_snapshot_state_resident(hip_llm_runner *r);
 /* Snapshot only the attention KV slots in [start_pos, start_pos+n_positions).
  * This bounded transaction is intended for speculative draft verification. */
 hip_llm_state_snapshot *hip_llm_snapshot_state_window(hip_llm_runner *r,

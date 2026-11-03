@@ -11,3 +11,4 @@ tmp/
 # rocprof outputs
 rocp_*.csv
 rocp_*.json
+qwen35_matvec_multi.inc

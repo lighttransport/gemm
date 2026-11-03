@@ -184,6 +184,28 @@ def direct_stdio_cases(backend, label="DFlash2"):
         results = list(pool.map(run_case, cases))
     for result, expected in results:
         require(result[3] > 0 and expected in result[0], result)
+
+    # A prefill whose last batch has one row must not leave the verifier's
+    # graph-replayed feature row count stale (commit of an accepted window
+    # used to be rejected with "features=1").  Probe the appended size, then
+    # decode a predictable, draft-friendly answer from that exact state.
+    count_prompt = None
+    for words in range(10, 200):
+        messages = [{"role": "user", "content":
+                     "Here are some numbers: " +
+                     " ".join(str(i) for i in range(1, words)) +
+                     ". Now count from 1 to 30, separated by commas. "
+                     "Output only the numbers."}]
+        probe = backend.generate(chat_prompt(messages), 0, 0, 0.95, 20, 0, 1, 0,
+                                 seed=42, cache_key="one-row-probe")
+        if (probe[2] - probe[1]) % 128 == 1:
+            count_prompt = chat_prompt(messages)
+            break
+    require(count_prompt is not None, "no one-row prefill length found")
+    counted = backend.generate(count_prompt, 48, 0, 0.95, 20, 0, 1, 0,
+                               seed=42, cache_key="one-row-count")
+    require(counted[-1] in ("stop", "length") and "1,2,3,4,5" in
+            counted[0].replace(" ", ""), counted)
     print(f"{label} stdio window/cache/sampling/cancel/concurrency: PASS")
 
 

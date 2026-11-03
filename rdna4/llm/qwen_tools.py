@@ -52,14 +52,26 @@ def tool_instructions(registry):
               "For a custom tool, put its raw text in the input parameter.")
 
 
-def render_call(name, arguments):
-    if isinstance(arguments, str):
-        arguments = json.loads(arguments)
-    return ("<tool_call>\n<function=" + name + ">\n" + "".join(
-        "<parameter=" + key + ">\n"
-        + (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
-        + "\n</parameter>\n" for key, value in arguments.items())
-        + "</function>\n</tool_call>")
+_INVALID = object()
+
+
+def _parameter_value(schema, value):
+    """Decode one <parameter> body according to its property schema.
+
+    The template writes strings raw and everything else as JSON.  A string
+    alternative (``["string", "null"]``) keeps the raw text, and a property
+    without a ``type`` (``enum``/``anyOf``/free-form) falls back to it when
+    the body is not JSON, instead of turning the whole call into text.
+    """
+    kind = schema.get("type") if isinstance(schema, dict) else None
+    if kind == "string":
+        return value
+    if isinstance(kind, list) and "string" in kind:
+        return None if value.strip() == "null" and "null" in kind else value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value if kind is None else _INVALID
 
 
 def parse_calls(text, registry):
@@ -95,7 +107,10 @@ def parse_calls(text, registry):
         parameters = list(re.finditer(parameter_pattern, body, re.S))
         if re.sub(parameter_pattern, "", body, flags=re.S).strip():
             return text, []
-        properties = spec["parameters"].get("properties", {})
+        properties = spec["parameters"].get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        required = spec["parameters"].get("required")
+        required = required if isinstance(required, list) else []
         custom_input = None
         for parameter in parameters:
             key, value = parameter.groups()
@@ -113,16 +128,14 @@ def parse_calls(text, registry):
                 continue
             if key in arguments or key not in properties:
                 return text, []
-            if properties[key].get("type") != "string":
-                try:
-                    value = json.loads(value)
-                except ValueError:
-                    return text, []
+            value = _parameter_value(properties[key], value)
+            if value is _INVALID:
+                return text, []
             arguments[key] = value
         if spec["type"] == "custom" and custom_input is None:
             return text, []
         if spec["type"] != "custom" and any(
-                key not in arguments for key in spec["parameters"].get("required", [])):
+                key not in arguments for key in required):
             return text, []
         item = {"id": "fc_" + uuid.uuid4().hex, "call_id": "call_" + uuid.uuid4().hex,
                 "name": spec["name"], "status": "completed"}

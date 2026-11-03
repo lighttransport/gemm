@@ -7,8 +7,11 @@
 //
 #pragma once
 
-#include <cstdint>
-#include <cstddef>
+#include <stdint.h>
+#include <stddef.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,6 +64,9 @@ typedef uint32_t VkSampleMask;
 #define VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME "VK_KHR_shader_float16_int8"
 #define VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME "VK_KHR_cooperative_matrix"
 #define VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME "VK_KHR_shader_bfloat16"
+#define VK_EXT_MEMORY_BUDGET_EXTENSION_NAME "VK_EXT_memory_budget"
+#define VK_AMD_SHADER_INFO_EXTENSION_NAME "VK_AMD_shader_info"
+#define VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME "VK_AMD_memory_overallocation_behavior"
 
 //------------------------------------------------------------------------------
 // Handle types
@@ -184,6 +190,12 @@ typedef enum VkStructureType {
     VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO = 48,
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES = 51,
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 = 1000059006,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES = 1000168000,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES = 1000413001,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT = 1000237000,
+    VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD = 1000189000,
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES = 1000083000,
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR = 1000141000,
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR = 1000506000,
@@ -767,6 +779,103 @@ typedef struct VkMemoryAllocateInfo {
     uint32_t memoryTypeIndex;
 } VkMemoryAllocateInfo;
 
+typedef struct VkPhysicalDeviceProperties2 {
+    VkStructureType sType;
+    void* pNext;
+    VkPhysicalDeviceProperties properties;
+} VkPhysicalDeviceProperties2;
+
+typedef struct VkPhysicalDeviceMaintenance3Properties {
+    VkStructureType sType;
+    void* pNext;
+    uint32_t maxPerSetDescriptors;
+    VkDeviceSize maxMemoryAllocationSize;
+} VkPhysicalDeviceMaintenance3Properties;
+
+typedef struct VkPhysicalDeviceMaintenance4Properties {
+    VkStructureType sType;
+    void* pNext;
+    VkDeviceSize maxBufferSize;
+} VkPhysicalDeviceMaintenance4Properties;
+
+typedef struct VkPhysicalDeviceMemoryProperties2 {
+    VkStructureType sType;
+    void* pNext;
+    VkPhysicalDeviceMemoryProperties memoryProperties;
+} VkPhysicalDeviceMemoryProperties2;
+
+typedef struct VkPhysicalDeviceMemoryBudgetPropertiesEXT {
+    VkStructureType sType;
+    void* pNext;
+    VkDeviceSize heapBudget[VK_MAX_MEMORY_HEAPS];
+    VkDeviceSize heapUsage[VK_MAX_MEMORY_HEAPS];
+} VkPhysicalDeviceMemoryBudgetPropertiesEXT;
+
+typedef enum VkMemoryOverallocationBehaviorAMD {
+    VK_MEMORY_OVERALLOCATION_BEHAVIOR_DEFAULT_AMD = 0,
+    VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD = 1,
+    VK_MEMORY_OVERALLOCATION_BEHAVIOR_DISALLOWED_AMD = 2,
+    VK_MEMORY_OVERALLOCATION_BEHAVIOR_MAX_ENUM_AMD = 0x7FFFFFFF
+} VkMemoryOverallocationBehaviorAMD;
+
+typedef struct VkDeviceMemoryOverallocationCreateInfoAMD {
+    VkStructureType sType;
+    const void* pNext;
+    VkMemoryOverallocationBehaviorAMD overallocationBehavior;
+} VkDeviceMemoryOverallocationCreateInfoAMD;
+
+typedef struct VkMappedMemoryRange {
+    VkStructureType sType;
+    const void* pNext;
+    VkDeviceMemory memory;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+} VkMappedMemoryRange;
+
+typedef enum VkQueryType {
+    VK_QUERY_TYPE_OCCLUSION = 0,
+    VK_QUERY_TYPE_PIPELINE_STATISTICS = 1,
+    VK_QUERY_TYPE_TIMESTAMP = 2,
+    VK_QUERY_TYPE_MAX_ENUM = 0x7FFFFFFF
+} VkQueryType;
+
+typedef struct VkQueryPoolCreateInfo {
+    VkStructureType sType;
+    const void* pNext;
+    VkFlags flags;
+    VkQueryType queryType;
+    uint32_t queryCount;
+    VkFlags pipelineStatistics;
+} VkQueryPoolCreateInfo;
+
+typedef enum VkShaderInfoTypeAMD {
+    VK_SHADER_INFO_TYPE_STATISTICS_AMD = 0,
+    VK_SHADER_INFO_TYPE_BINARY_AMD = 1,
+    VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD = 2,
+    VK_SHADER_INFO_TYPE_MAX_ENUM_AMD = 0x7FFFFFFF
+} VkShaderInfoTypeAMD;
+
+typedef struct VkShaderResourceUsageAMD {
+    uint32_t numUsedVgprs;
+    uint32_t numUsedSgprs;
+    uint32_t ldsSizePerLocalWorkGroup;
+    size_t ldsUsageSizeInBytes;
+    size_t scratchMemUsageInBytes;
+} VkShaderResourceUsageAMD;
+
+typedef struct VkShaderStatisticsInfoAMD {
+    VkShaderStageFlags shaderStageMask;
+    VkShaderResourceUsageAMD resourceUsage;
+    uint32_t numPhysicalVgprs;
+    uint32_t numPhysicalSgprs;
+    uint32_t numAvailableVgprs;
+    uint32_t numAvailableSgprs;
+    uint32_t computeWorkGroupSize[3];
+} VkShaderStatisticsInfoAMD;
+
+#define VK_QUERY_RESULT_64_BIT 0x00000001
+#define VK_QUERY_RESULT_WAIT_BIT 0x00000002
+
 typedef struct VkMemoryRequirements {
     VkDeviceSize size;
     VkDeviceSize alignment;
@@ -965,9 +1074,18 @@ typedef struct VkMemoryBarrier {
 // Access flags
 #define VK_ACCESS_SHADER_READ_BIT  0x00000020
 #define VK_ACCESS_SHADER_WRITE_BIT 0x00000040
+#define VK_ACCESS_TRANSFER_READ_BIT 0x00000800
+#define VK_ACCESS_TRANSFER_WRITE_BIT 0x00001000
+#define VK_ACCESS_HOST_READ_BIT 0x00002000
+#define VK_ACCESS_HOST_WRITE_BIT 0x00004000
 
 // Pipeline stage flags
 #define VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT 0x00000800
+#define VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT 0x00000001
+#define VK_PIPELINE_STAGE_TRANSFER_BIT 0x00001000
+#define VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT 0x00002000
+#define VK_PIPELINE_STAGE_HOST_BIT 0x00004000
+#define VK_PIPELINE_STAGE_ALL_COMMANDS_BIT 0x00010000
 
 typedef struct VkSubmitInfo {
     VkStructureType sType;
@@ -1006,6 +1124,8 @@ typedef void (VKAPI_PTR *PFN_vkDestroyInstance)(VkInstance, const VkAllocationCa
 typedef VkResult (VKAPI_PTR *PFN_vkEnumeratePhysicalDevices)(VkInstance, uint32_t*, VkPhysicalDevice*);
 typedef VkResult (VKAPI_PTR *PFN_vkEnumerateDeviceExtensionProperties)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*);
 typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceProperties)(VkPhysicalDevice, VkPhysicalDeviceProperties*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceProperties2)(VkPhysicalDevice, VkPhysicalDeviceProperties2*);
+typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceMemoryProperties2)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2*);
 typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceFeatures)(VkPhysicalDevice, VkPhysicalDeviceFeatures*);
 typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceFeatures2)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*);
 typedef void (VKAPI_PTR *PFN_vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*);
@@ -1040,6 +1160,17 @@ typedef VkResult (VKAPI_PTR *PFN_vkAllocateMemory)(VkDevice, const VkMemoryAlloc
 typedef void (VKAPI_PTR *PFN_vkFreeMemory)(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*);
 typedef VkResult (VKAPI_PTR *PFN_vkMapMemory)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void**);
 typedef void (VKAPI_PTR *PFN_vkUnmapMemory)(VkDevice, VkDeviceMemory);
+typedef VkResult (VKAPI_PTR *PFN_vkFlushMappedMemoryRanges)(VkDevice, uint32_t, const VkMappedMemoryRange*);
+typedef VkResult (VKAPI_PTR *PFN_vkInvalidateMappedMemoryRanges)(VkDevice, uint32_t, const VkMappedMemoryRange*);
+
+typedef VkResult (VKAPI_PTR *PFN_vkCreateQueryPool)(VkDevice, const VkQueryPoolCreateInfo*, const VkAllocationCallbacks*, VkQueryPool*);
+typedef void (VKAPI_PTR *PFN_vkDestroyQueryPool)(VkDevice, VkQueryPool, const VkAllocationCallbacks*);
+typedef void (VKAPI_PTR *PFN_vkCmdResetQueryPool)(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t);
+typedef void (VKAPI_PTR *PFN_vkCmdWriteTimestamp)(VkCommandBuffer, VkFlags, VkQueryPool, uint32_t);
+typedef VkResult (VKAPI_PTR *PFN_vkGetQueryPoolResults)(VkDevice, VkQueryPool, uint32_t, uint32_t, size_t, void*, VkDeviceSize, VkFlags);
+typedef VkResult (VKAPI_PTR *PFN_vkResetCommandPool)(VkDevice, VkCommandPool, VkCommandPoolResetFlags);
+typedef VkResult (VKAPI_PTR *PFN_vkGetShaderInfoAMD)(VkDevice, VkPipeline, VkShaderStageFlagBits,
+                                                VkShaderInfoTypeAMD, size_t*, void*);
 
 // Buffer functions
 typedef VkResult (VKAPI_PTR *PFN_vkCreateBuffer)(VkDevice, const VkBufferCreateInfo*, const VkAllocationCallbacks*, VkBuffer*);
@@ -1114,6 +1245,18 @@ const char* vkewResultToString(VkResult result);
 //------------------------------------------------------------------------------
 // Vulkan function declarations (extern)
 //------------------------------------------------------------------------------
+
+extern PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
+extern PFN_vkGetPhysicalDeviceMemoryProperties2 vkGetPhysicalDeviceMemoryProperties2;
+extern PFN_vkFlushMappedMemoryRanges vkFlushMappedMemoryRanges;
+extern PFN_vkInvalidateMappedMemoryRanges vkInvalidateMappedMemoryRanges;
+extern PFN_vkCreateQueryPool vkCreateQueryPool;
+extern PFN_vkDestroyQueryPool vkDestroyQueryPool;
+extern PFN_vkCmdResetQueryPool vkCmdResetQueryPool;
+extern PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp;
+extern PFN_vkGetQueryPoolResults vkGetQueryPoolResults;
+extern PFN_vkResetCommandPool vkResetCommandPool;
+extern PFN_vkGetShaderInfoAMD vkGetShaderInfoAMD;
 
 // Global/Loader functions
 extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;

@@ -53,6 +53,8 @@ typedef struct hllm_qwen35_mtp {
     void *verify_x, *verify_logits, *verify_positions, *verify_argmax;
     void *verify_norm, *verify_gate, *verify_up;
     void *verify_q, *verify_scales;
+    /* verify_q holds Q8_1 of vq_src while hllm_launch_seq == vq_seq. */
+    void *vq_src; int vq_nc, vq_rows; unsigned long long vq_seq;
     void *verify_ssm_qkv, *verify_ssm_z, *verify_ssm_alpha, *verify_ssm_beta, *verify_ssm_out;
     void *verify_attn_parts, *verify_attn_meta;
     void *verify_conv[128], *verify_rec[128];
@@ -361,6 +363,15 @@ static hipFunction_t hllm_dense_mtp_iq_fixed8(hip_llm_runner *r, int type) {
     }
 }
 
+/* Weight rows per warp of the fixed8 kernels (qwen35_matvec_iq.hip). */
+static int hllm_dense_mtp_iq_fixed8_rows(int type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS: return 4;
+        case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_S: return 2;
+        default: return 1;
+    }
+}
+
 static void hllm_dense_mtp_res_rmsnorm_batch(hip_llm_runner *r, void *x,
         void *res, void *normalized, void *weight, int width, int rows) {
     float eps = r->rms_norm_eps;
@@ -409,7 +420,8 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                    (nr+rows_per_block-1)/rows_per_block, rows, 1,
                    threads, 1, 1, 0, r->stream, a);
         } else {
-            LAUNCH(iq1_fn, (nr+7)/8, 1, 1, 256, 1, 1, 0, r->stream, a);
+            /* reuse8 kernels own four rows per warp */
+            LAUNCH(iq1_fn, (nr+31)/32, 1, 1, 256, 1, 1, 0, r->stream, a);
         }
         r->q8x2_reuse_valid = r->batch_q8_valid = 0;
         return;
@@ -433,9 +445,18 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
          * projections.  Always restage it: pointer identity does not imply
          * that an earlier graph node's contents survive later scratch writes. */
         int total = rows*nc;
-        void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
-        LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
-               r->stream, qa);
+        /* ...but a projection issued immediately after another one of the
+         * same source (SSM qkv+z, attention q/k/v, FFN gate+up) may reuse
+         * it: nothing else was launched in between. */
+        const char *vq_env = getenv("LLM_QWEN35_VERIFY_Q81_REUSE");
+        int vq_reuse = (!vq_env || atoi(vq_env) != 0) &&
+            m->vq_src == x && m->vq_nc == nc && m->vq_rows == rows &&
+            m->vq_seq == hllm_launch_seq;
+        if (!vq_reuse) {
+            void *qa[] = { &m->verify_q, &m->verify_scales, &x, &total };
+            LAUNCH(r->fn_qwen35_quantize_q81, total/32, 1, 1, 32, 1, 1, 0,
+                   r->stream, qa);
+        }
         void *a[] = { &dst, &w, &m->verify_q, &m->verify_scales, &nr, &nc };
         if (type == GGML_TYPE_Q2_K) {
             if (rows == HLLM_DENSE_MTP_REUSE_ROWS) {
@@ -468,11 +489,13 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
             hipFunction_t iq4_fn = nc == 5120 ?
                 r->fn_qwen35_matvec_iq4xs_5120_multi8 :
                 r->fn_qwen35_matvec_iq4xs_multi8;
-            LAUNCH(iq4_fn, (nr+7)/8, 1, 1,
+            int rows_per_block = nc == 5120 ? 32 : 8;   /* 5120 variant: 4 rows/warp */
+            LAUNCH(iq4_fn, (nr+rows_per_block-1)/rows_per_block, 1, 1,
                    256, 1, 1, 0, r->stream, ma);
         } else if (rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
                    type != GGML_TYPE_IQ4_XS &&
-                   !(type == GGML_TYPE_IQ2_S && nc > 6144)) {
+                   !(type == GGML_TYPE_IQ2_S && nc > 6144 &&
+                     rows != HLLM_DENSE_MTP_REUSE_ROWS)) {
             int kind = hllm_dense_mtp_iq_kind(type);
             if (rows <= HLLM_DENSE_MTP_SMALL_REUSE_ROWS) {
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
@@ -480,15 +503,21 @@ static void hllm_dense_mtp_projection(hip_llm_runner *r, void *dst, void *w,
                 LAUNCH(r->fn_qwen35_matvec_iq_multi4, (nr+3)/4, 1, 1,
                        128, 1, 1, 0, r->stream, ma);
             } else {
-                hipFunction_t multi = rows == HLLM_DENSE_MTP_REUSE_ROWS ?
+                int fixed = rows == HLLM_DENSE_MTP_REUSE_ROWS;
+                hipFunction_t multi = fixed ?
                     hllm_dense_mtp_iq_fixed8(r, type) :
                     hllm_dense_mtp_iq_multi8(r, type);
                 void *ma[] = { &dst, &w, &m->verify_q, &m->verify_scales,
                                &nr, &nc, &rows };
-                LAUNCH(multi, (nr+7)/8, 1, 1, 256, 1, 1, 0,
+                int rows_per_block = 8 * (fixed ? hllm_dense_mtp_iq_fixed8_rows(type) : 1);
+                LAUNCH(multi, (nr+rows_per_block-1)/rows_per_block, 1, 1, 256, 1, 1, 0,
                        r->stream, ma);
             }
         } else LAUNCH(fn, (nr+7)/8, rows, 1, 256, 1, 1, 0, r->stream, a);
+        m->vq_src = x; m->vq_nc = nc; m->vq_rows = rows;
+        m->vq_seq = hllm_launch_seq;
+        r->q8x2_reuse_valid = r->iq1_q8_valid = r->batch_q8_valid = 0;
+        return;
     } else {
         for (int i = 0; i < rows; ++i)
             launch_matvec_ffn_auto(r, (float *)dst+(size_t)i*nr, w,
@@ -669,6 +698,77 @@ static void hllm_dense_mtp_attention(hip_llm_runner *r, hip_layer *cl,
         r->d_attn_proj_batch, m->verify_norm, cl->ffn_norm_w, ne, rows);
 }
 
+/* Allocate the fixed-width verification workspace (per-row recurrent state
+ * checkpoints for every SSM layer, logits and scratch).  It is about 1.2 GiB
+ * for eight rows of the 27B model, so a server calls this before accepting
+ * requests: allocating it lazily on the first verify fails when the KV cache
+ * has already taken the remaining VRAM. */
+static int hllm_qwen35_mtp_verify_alloc(hip_llm_runner *r, hllm_qwen35_mtp *m,
+                                        int capacity) {
+    size_t conv = (size_t)(r->ssm_conv_kernel-1)*r->ssm_qkv_dim*sizeof(float);
+    size_t rec = (size_t)r->ssm_dt_rank*r->ssm_d_state*r->ssm_d_state*sizeof(float);
+    /* Fixed capacity keeps captured graph pointers stable.  A loaded
+     * draft backend uses one fixed verification width for its lifetime. */
+    m->verify_capacity = -1;
+#define VERIFY_ALLOC_FAIL() do { \
+        hipStreamSynchronize(r->stream); \
+        hllm_qwen35_mtp_verify_workspace_free(m); \
+        return -1; \
+    } while (0)
+    if (hipMalloc(&m->verify_x, (size_t)capacity*r->n_embd*sizeof(float)) ||
+        hipMalloc(&m->verify_norm, (size_t)capacity*r->n_embd*sizeof(float)) ||
+        hipMalloc(&m->verify_gate, (size_t)capacity*r->n_ff*sizeof(float)) ||
+        hipMalloc(&m->verify_up, (size_t)capacity*r->n_ff*sizeof(float)) ||
+        hipMalloc(&m->verify_q, (size_t)capacity*r->n_ff) ||
+        hipMalloc(&m->verify_scales, (size_t)capacity*r->n_ff/32*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_qkv, (size_t)capacity*r->ssm_qkv_dim*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_z, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_out, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_alpha, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
+        hipMalloc(&m->verify_ssm_beta, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
+        hipMalloc(&m->verify_attn_parts, (size_t)capacity*r->n_heads*
+            r->q8_attention_max_splits*r->head_dim*sizeof(float)) ||
+        hipMalloc(&m->verify_attn_meta, (size_t)capacity*r->n_heads*
+            r->q8_attention_max_splits*2*sizeof(float)) ||
+        hipMalloc(&m->verify_logits, (size_t)capacity*r->n_vocab*sizeof(float)) ||
+        hipMalloc(&m->verify_positions, (size_t)capacity*sizeof(int)) ||
+        hipMalloc(&m->verify_argmax, (size_t)capacity*sizeof(int32_t)))
+        VERIFY_ALLOC_FAIL();
+    m->host_logits = malloc((size_t)capacity*r->n_vocab*sizeof(float));
+    if (!m->host_logits) VERIFY_ALLOC_FAIL();
+    void *conv_dst[128], *conv_src[128], *rec_dst[128], *rec_src[128];
+    int ssm_layers = 0;
+    for (int l = 0; l < r->n_layers; ++l) if (r->layers[l].is_ssm) {
+        if (hipMalloc(&m->verify_conv[l], (size_t)capacity*conv) ||
+            hipMalloc(&m->verify_rec[l], (size_t)capacity*rec))
+            VERIFY_ALLOC_FAIL();
+        conv_dst[ssm_layers] = r->layers[l].d_conv_state;
+        conv_src[ssm_layers] = m->verify_conv[l];
+        rec_dst[ssm_layers] = r->layers[l].d_recurrent_state;
+        rec_src[ssm_layers] = m->verify_rec[l];
+        ++ssm_layers;
+    }
+    size_t ptr_bytes = (size_t)ssm_layers*sizeof(void *);
+    if (hipMalloc(&m->verify_conv_dst_ptrs, ptr_bytes) ||
+        hipMalloc(&m->verify_conv_src_ptrs, ptr_bytes) ||
+        hipMalloc(&m->verify_rec_dst_ptrs, ptr_bytes) ||
+        hipMalloc(&m->verify_rec_src_ptrs, ptr_bytes) ||
+        hipMemcpyAsync(m->verify_conv_dst_ptrs, conv_dst, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream) ||
+        hipMemcpyAsync(m->verify_conv_src_ptrs, conv_src, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream) ||
+        hipMemcpyAsync(m->verify_rec_dst_ptrs, rec_dst, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream) ||
+        hipMemcpyAsync(m->verify_rec_src_ptrs, rec_src, ptr_bytes,
+                       hipMemcpyHostToDevice, r->stream))
+        VERIFY_ALLOC_FAIL();
+    m->verify_ssm_layers = ssm_layers;
+    m->verify_capacity = capacity;
+#undef VERIFY_ALLOC_FAIL
+    hllm_vram_sample(r);
+    return 0;
+}
+
 /* Capture a layer-major window with the target's exact arithmetic contract.
  * Grouped kernels share weights without changing each row's accumulation
  * order. Recurrent state is checkpointed after every row, and positions stay
@@ -685,68 +785,8 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
     for (int i = 0; i < rows; ++i) if (tokens[i] < 0 || tokens[i] >= r->n_vocab) return NULL;
     size_t conv = (size_t)(r->ssm_conv_kernel-1)*r->ssm_qkv_dim*sizeof(float);
     size_t rec = (size_t)r->ssm_dt_rank*r->ssm_d_state*r->ssm_d_state*sizeof(float);
-    if (!m->verify_capacity) {
-        /* Fixed capacity keeps captured graph pointers stable.  A loaded
-         * draft backend uses one fixed verification width for its lifetime. */
-        int capacity = rows;
-        m->verify_capacity = -1;
-#define VERIFY_ALLOC_FAIL() do { \
-            hipStreamSynchronize(r->stream); \
-            hllm_qwen35_mtp_verify_workspace_free(m); \
-            return NULL; \
-        } while (0)
-        if (hipMalloc(&m->verify_x, (size_t)capacity*r->n_embd*sizeof(float)) ||
-            hipMalloc(&m->verify_norm, (size_t)capacity*r->n_embd*sizeof(float)) ||
-            hipMalloc(&m->verify_gate, (size_t)capacity*r->n_ff*sizeof(float)) ||
-            hipMalloc(&m->verify_up, (size_t)capacity*r->n_ff*sizeof(float)) ||
-            hipMalloc(&m->verify_q, (size_t)capacity*r->n_ff) ||
-            hipMalloc(&m->verify_scales, (size_t)capacity*r->n_ff/32*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_qkv, (size_t)capacity*r->ssm_qkv_dim*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_z, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_out, (size_t)capacity*r->ssm_d_inner*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_alpha, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
-            hipMalloc(&m->verify_ssm_beta, (size_t)capacity*r->ssm_dt_rank*sizeof(float)) ||
-            hipMalloc(&m->verify_attn_parts, (size_t)capacity*r->n_heads*
-                r->q8_attention_max_splits*r->head_dim*sizeof(float)) ||
-            hipMalloc(&m->verify_attn_meta, (size_t)capacity*r->n_heads*
-                r->q8_attention_max_splits*2*sizeof(float)) ||
-            hipMalloc(&m->verify_logits, (size_t)capacity*r->n_vocab*sizeof(float)) ||
-            hipMalloc(&m->verify_positions, (size_t)capacity*sizeof(int)) ||
-            hipMalloc(&m->verify_argmax, (size_t)capacity*sizeof(int32_t)))
-            VERIFY_ALLOC_FAIL();
-        m->host_logits = malloc((size_t)capacity*r->n_vocab*sizeof(float));
-        if (!m->host_logits) VERIFY_ALLOC_FAIL();
-        void *conv_dst[128], *conv_src[128], *rec_dst[128], *rec_src[128];
-        int ssm_layers = 0;
-        for (int l = 0; l < r->n_layers; ++l) if (r->layers[l].is_ssm) {
-            if (hipMalloc(&m->verify_conv[l], (size_t)capacity*conv) ||
-                hipMalloc(&m->verify_rec[l], (size_t)capacity*rec))
-                VERIFY_ALLOC_FAIL();
-            conv_dst[ssm_layers] = r->layers[l].d_conv_state;
-            conv_src[ssm_layers] = m->verify_conv[l];
-            rec_dst[ssm_layers] = r->layers[l].d_recurrent_state;
-            rec_src[ssm_layers] = m->verify_rec[l];
-            ++ssm_layers;
-        }
-        size_t ptr_bytes = (size_t)ssm_layers*sizeof(void *);
-        if (hipMalloc(&m->verify_conv_dst_ptrs, ptr_bytes) ||
-            hipMalloc(&m->verify_conv_src_ptrs, ptr_bytes) ||
-            hipMalloc(&m->verify_rec_dst_ptrs, ptr_bytes) ||
-            hipMalloc(&m->verify_rec_src_ptrs, ptr_bytes) ||
-            hipMemcpyAsync(m->verify_conv_dst_ptrs, conv_dst, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream) ||
-            hipMemcpyAsync(m->verify_conv_src_ptrs, conv_src, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream) ||
-            hipMemcpyAsync(m->verify_rec_dst_ptrs, rec_dst, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream) ||
-            hipMemcpyAsync(m->verify_rec_src_ptrs, rec_src, ptr_bytes,
-                           hipMemcpyHostToDevice, r->stream))
-            VERIFY_ALLOC_FAIL();
-        m->verify_ssm_layers = ssm_layers;
-        m->verify_capacity = capacity;
-#undef VERIFY_ALLOC_FAIL
-        hllm_vram_sample(r);
-    }
+    if (!m->verify_capacity &&
+        hllm_qwen35_mtp_verify_alloc(r, m, rows)) return NULL;
     if (rows > m->verify_capacity) return NULL;
     int reuse_attention = rows > 1 && rows <= HLLM_DENSE_MTP_REUSE_ROWS &&
                           r->fn_q8_attention_decode_reuse8;
@@ -848,6 +888,11 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
     if (hipMemcpyAsync(m->verify_positions, positions, (size_t)rows*sizeof(int),
                        hipMemcpyHostToDevice, r->stream) ||
         hipGraphLaunch(*selected_execution, r->stream)) return NULL;
+    /* The graph replays the DFlash2 feature capture kernels, but their
+     * host-side row count was only recorded while capturing.  A one-row
+     * prefill batch in between would otherwise leave it at 1 and reject
+     * the commit of a multi-row accepted window. */
+    hllm_qwen35_dflash2_set_feature_rows(r, rows);
     if (argmax) {
         void *a[] = { &m->verify_logits, &r->n_vocab, &rows, &m->verify_argmax };
         LAUNCH(r->fn_qwen4_argmax_batch, rows, 1, 1, 256, 1, 1, 0, r->stream, a);
@@ -865,6 +910,13 @@ static float *hllm_qwen35_mtp_verify_impl(hip_llm_runner *r,
 float *hip_llm_qwen35_mtp_verify(hip_llm_runner *r, const int32_t *tokens,
                                 int rows, int position) {
     return hllm_qwen35_mtp_verify_impl(r, tokens, rows, position, NULL);
+}
+
+int hip_llm_qwen35_mtp_verify_reserve(hip_llm_runner *r, int rows) {
+    hllm_qwen35_mtp *m = r ? r->qwen35_mtp : NULL;
+    if (!m || rows < 1 || rows > HLLM_DENSE_MTP_MAX_ROWS) return -1;
+    if (m->verify_capacity) return m->verify_capacity >= rows ? 0 : -1;
+    return hllm_qwen35_mtp_verify_alloc(r, m, rows);
 }
 
 int hip_llm_qwen35_mtp_verify_argmax(hip_llm_runner *r, const int32_t *tokens,
