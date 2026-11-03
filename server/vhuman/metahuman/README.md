@@ -33,6 +33,9 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 | Reference-render cameras | `$P -m server.vhuman.metahuman.render_plan` then `launch render_batch.py <batch.json>` |
 | UE-vs-Cycles comparison | ROCm venv: `-m server.vhuman.metahuman.compare_render --every 10` (pseudo-candidates + Cycles renders with the reference cameras), then `--report` (CPU: `HIP_VISIBLE_DEVICES=`); outputs `/mnt/nvme01/data/vhuman-mh/compare_v1/` |
 | Light calibration | `-m server.vhuman.metahuman.light_calibration all` (ColorChecker probes: Cycles CPU + one UE session, then the fit), `batch` writes `render_batches/vhstudio.json`; `launch render_batch.py <vhstudio.json>` renders `<cam>__vhstudio.exr`; `compare_render --report --ue-env vhstudio`; outputs `/mnt/nvme01/data/vhuman-mh/light_calib_v1/` |
+| MH normal conversion | `-m server.vhuman.metahuman.normal_map <id> [--out PNG]`, `--check <id> [--converted PNG]` (convention tests); `compare_render --update-normal` writes it into the pseudo-candidates, `--variant normal` renders/reports with it (`offline_render(skin_normal_map=True)`) |
+| Normal prior | `-m server.vhuman.metahuman.normal_prior_fit [--res 1024 --k 40 --workers 8]` -> `normal_prior_v1.npz` (+ report); `normal_prior_fit.write_png(prior, 'detail_xy', png)` encodes a Blender skin_normal.png |
+| Eye mapping | `-m server.vhuman.metahuman.eye_map calibrate` (UE eye close-ups -> `eye_colour_calibration_v1.json`), `eye_map params <id>`; `compare_render --variant normal_eyes` renders with `head/fit_mh_eyes.json` |
 | Use the skin prior | `bake_portrait(..., skin_prior=PATH)`; `tmp/vhuman-ab-cycles/scripts/rebake.py ... --skin-prior PATH` |
 | Tests | `$P -m pytest -q server/vhuman/test_metahuman_prior.py` |
 
@@ -119,8 +122,8 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 ## Open
 - B6 follow-ups: regenerate s1's 90-degree ear views (other seeds) so the projection guard passes; refit the
   expression appearance on the B6 geometry. Dense-ear L/R correspondence is not one-to-one (prior fitted per side).
-- Normal-map prior (tangent-frame conversion), 2048 texel map, `skin_templates` cavity from the prior.
-- Eye colour calibration from MetaHuman eye close-ups (render_batch eye cameras, TextureBooth env).
+- Normal-map prior (PCA of converted normals; conversion exists, see normal_map.py), `skin_templates` cavity from the prior.
+- Eye mapping: render the normal_eyes variant and compare eye close-ups (colour is calibrated on albedo, not yet on renders).
 - UE-vs-Cycles harness (2026-11-03): reference renders done (120 ids); `compare_render.py` builds GNM pseudo-candidates
   (bound skin exact, GNM identity fit for eyes/mouth, MH albedo via texel_map_2048, flat normal, template ORM/eyes),
   translates head + cameras to vhuman's head anchor so the studio rig applies, and renders through
@@ -167,3 +170,21 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   material: Cycles skin has a stronger, broader forehead/cheek specular, less pore/freckle relief (flat normal, no MH
   cavity) and slightly pinker lips; the eyes are the template. Next: MH tangent-normal conversion, MH eye parameters on
   the Cycles side, then the material sweep against the VHStudio references.
+- MH tangent-normal conversion (2026-11-04, `normal_map.py`): MetaHuman normals are red = +u, green = +row (UE/DirectX),
+  measured, not assumed: red and green divergences correlate with the cavity detail with the same sign (r -.42..-.50 on
+  three heads) and the height integrated under that reading is negatively skewed (pores/creases are pits). Per GNM
+  texel the MH normal is expanded in the MH smooth tangent frame (MikkTSpace-like: T from UV per vertex+UV corner,
+  B = sign N x T) at the texel map's MH triangle/barycentrics on that identity's MH head and re-expressed in the GNM frame
+  of its bound skin, written with Blender's convention (green = +V up). The converted map passes the same tests read
+  that way (r -.34/-.36, skew -1.4). Cycles: `skin_normal_map=True` feeds the candidate's skin_normal.png into the full
+  skin graph, whiteout-blended with the tiled pores (graph unchanged when off).
+- Normal prior (2026-11-04, `normal_prior_fit.py`, `normal_prior_v1.npz`): 450 training heads converted on their own MH
+  head / bound GNM skin at 1024; mean, std, PCA K=40 (58% variance) on tangent xy, mean split into a 12 px low-frequency
+  part (mostly MH-vs-GNM mesh shading) and the detail part (pores, creases: what transfers to non-MetaHuman heads).
+  Held-out rms xy error: flat .117, prior mean .060, detail-only .070, low-frequency-only .104.
+- Eye mapping (2026-11-04, `eye_map.py`): vhuman's iris chart is its own palette, so MH U/V are calibrated through
+  measured colour: UE base-colour eye close-ups -> pupil (black, < .004), iris edge (largest radial luminance step in the
+  horizontal sectors; the GNM limbus estimate is ~30% too small for MH irises), inner/outer ring colours -> nearest
+  chart U/V + saturation/tint. 240 eyes (120 heads): reproduction dE mean .52, p95 2.2; measured pupil/iris ratio
+  .12-.65 correlates with MH dilation (r .77) and sets vhuman dilation (ratio / P_REF). Other same-name fields are copied
+  with range conversion (pattern IRISnnn -> pattern_n, cornea size x .2/.165). Not yet verified in rendered close-ups.

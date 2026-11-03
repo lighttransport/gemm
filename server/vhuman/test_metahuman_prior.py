@@ -86,3 +86,23 @@ def test_artifact_path_rejects_repo_outputs():
     with pytest.raises(ValueError):
         artifact_path(Path(__file__).parent / 'metahuman' / 'weights.npz')
     assert artifact_path('/mnt/nvme02/models/vhuman-mh/x.npz')
+
+
+def test_tangent_frames_flat_patch_and_green_flip():
+    """On a flat grid with uv = (x, row = y) the smooth frame is T = +x, B(row) = +y; a tangent normal expanded in one
+    frame and re-expressed in the same frame is unchanged."""
+    from server.vhuman.metahuman.normal_map import corner_frames, texel_frames
+    xs, ys = np.meshgrid(np.linspace(0, 1, 5), np.linspace(0, 1, 5))
+    v = np.stack([xs.ravel(), ys.ravel(), np.zeros(25)], 1)
+    q = np.arange(25).reshape(5, 5)
+    tris = np.concatenate([np.stack([q[:-1, :-1].ravel(), q[:-1, 1:].ravel(), q[1:, 1:].ravel()], 1),
+                           np.stack([q[:-1, :-1].ravel(), q[1:, 1:].ravel(), q[1:, :-1].ravel()], 1)])
+    uv = v[:, :2][tris]
+    fr = corner_frames(v, tris, uv)
+    tf = texel_frames(fr, np.array([3, 20]), np.array([[.2, .3, .5], [1 / 3, 1 / 3, 1 / 3]]))
+    np.testing.assert_allclose(np.abs(tf[:, 0]), [[1, 0, 0]] * 2, atol=1e-9)
+    np.testing.assert_allclose(tf[:, 0], [[1, 0, 0]] * 2, atol=1e-9)
+    np.testing.assert_allclose(tf[:, 1], [[0, 1, 0]] * 2, atol=1e-9)
+    n = np.array([[.3, -.2, .93], [-.1, .4, .91]]); n /= np.linalg.norm(n, axis=1, keepdims=True)
+    world = np.einsum('nk,nkj->nj', n, tf); local = np.einsum('nkj,nj->nk', tf, world)
+    np.testing.assert_allclose(local, n, atol=1e-9)

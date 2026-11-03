@@ -114,7 +114,7 @@ def build_candidate(sid, *, force=False):
     if img.size != res:
         img = img.resize(res, Image.LANCZOS)
     img.save(out / 'skin_basecolor.png')
-    Image.new('RGB', res, (128, 128, 255)).save(out / 'skin_normal.png')
+    write_normal(out, d, s, skin, tm, res)
     # portrait = UE front render (display transform) so parsing/accessory/hair stages see this identity, bald
     front = read_exr(d / 'renders' / 'front__studio.exr')[..., :3]
     gain = .8 / max(float(np.percentile(front, 99)), 1e-6)
@@ -134,7 +134,7 @@ def build_candidate(sid, *, force=False):
     manifest['geometry']['metahuman_pseudo_candidate'] = dict(
         sample=sid, template=str(TEMPLATE), translation_m=shift.tolist(), gnm_identity_fit_rms_mm=fit['fit_rms_mm'],
         texel_map=tm_path.name if tm_path.is_file() else 'texel_map_1024.npz', texel_valid_fraction=float(ok.mean()),
-        limitations=['skin normal map flat (MH tangent normals not converted)', 'ORM/specular and eye parameters from the template candidate',
+        limitations=['skin normal = MH tangent normals converted to GNM tangent space (used only with skin_normal_map=True)', 'ORM/specular and eye parameters from the template candidate',
                      'eyes/mouth/teeth from the GNM identity fit, not the MH meshes', 'portrait is the UE front render'])
     completion = json.loads((out / 'generated_skin.json').read_text())
     completion['basecolor_sha256'] = _sha(out / 'skin_basecolor.png'); completion['source_geometry_sha256'] = manifest['geometry_sha256']
@@ -146,36 +146,75 @@ def build_candidate(sid, *, force=False):
     return out
 
 
-def render_sample(sid, cameras=CAMERAS):
+def write_normal(out, d, s, skin, tm, res):
+    """skin_normal.png = the sample's MH tangent normals in GNM tangent space (normal_map.convert); flat where unmapped."""
+    from .normal_map import convert, encode
+    n, ok = convert(np.asarray(Image.open(d / 'tex' / 'normal.png')), to_vhuman(s['face']['head'][0]).astype(np.float64), skin, tm)
+    img = Image.fromarray(encode(n))
+    if img.size != res:
+        img = img.resize(res, Image.LANCZOS)
+    img.save(out / 'skin_normal.png')
+    return float(ok.mean())
+
+
+def update_normal(sid):
+    """Add the converted normal to an existing pseudo-candidate (built before normal_map existed)."""
+    out = COMPARE_ROOT / sid / 'head' / 'reconstruction' / 'mh'
+    m = json.loads((out / 'manifest.json').read_text())['geometry']['metahuman_pseudo_candidate']
+    d = V1 / 'samples' / sid; s = load_sample(d)
+    skin = evaluate(load_binding(), to_vhuman(s['face']['head'][0]))
+    tm = dict(np.load(OUT_DIR / m['texel_map']))
+    return write_normal(out, d, s, skin, tm, Image.open(out / 'skin_basecolor.png').size)
+
+
+VARIANTS = {'': {}, 'normal': dict(skin_normal_map=True), 'normal_eyes': dict(skin_normal_map=True)}   # dir suffix -> render options
+MH_EYES = ('normal_eyes',)        # variants that render with the MetaHuman-calibrated eye parameters (eye_map)
+
+
+def write_eye_fit(sid):
+    """head/fit_mh_eyes.json: the template fit with eye_params mapped from this sample's MetaHuman eyes (eye_map)."""
+    from .eye_map import params_for
+    head = COMPARE_ROOT / sid / 'head'
+    fit = json.loads((head / 'fit.json').read_text())
+    p, rec = params_for(sid, 'left')
+    fit['eye_params'] = p
+    fit['eye_params_source'] = dict(method='metahuman.eye_map', sample=sid, side='left', reproduction_delta_e=rec['reproduction_delta_e'])
+    (head / 'fit_mh_eyes.json').write_text(json.dumps(fit, indent=1) + '\n')
+    return head / 'fit_mh_eyes.json'
+
+
+def render_sample(sid, cameras=CAMERAS, variant=''):
     from ..reconstruction.offline_render import render
     cand = build_candidate(sid)
     shift = np.asarray(json.loads((cand / 'manifest.json').read_text())['geometry']['metahuman_pseudo_candidate']['translation_m'])
     cams = json.loads((V1 / 'samples' / sid / 'cameras.json').read_text())['cameras']
     done = []
     for name in cameras:
-        out = COMPARE_ROOT / sid / 'cycles' / name
+        out = COMPARE_ROOT / sid / ('cycles' + (f'_{variant}' if variant else '')) / name
         if (out / 'render_result.json').is_file():
             done.append(name); continue
         if out.exists():
             shutil.rmtree(out)
         v = cams[name]['vhuman']
         explicit = dict(origin=(np.asarray(v['origin']) + shift).tolist(), rotation=v['rotation'], focal_px=v['focal_px'], size=v['size'])
-        opts = dict(RENDER); preset = opts.pop('preset'); samples = opts.pop('samples')
+        opts = dict(RENDER, **VARIANTS[variant]); preset = opts.pop('preset'); samples = opts.pop('samples')
+        if variant in MH_EYES:
+            opts['head_fit'] = write_eye_fit(sid)
         render(cand, out, device='hip', preset=preset, samples=samples, resolution=int(v['size'][0]), explicit_camera=explicit,
                hard_limit_mib=14336, **opts)
         done.append(name)
     return done
 
 
-def report(ids, cameras=CAMERAS, env='studio'):
+def report(ids, cameras=CAMERAS, env='studio', variant=''):
     from ..face_parsing import FaceParser
     from ..reconstruction import ab_metrics as am
     parser = FaceParser(); rows = {}
-    suffix = '' if env == 'studio' else f'_{env}'
+    suffix = ('' if env == 'studio' else f'_{env}') + (f'_{variant}' if variant else '')
     for sid in ids:
         rec = {}
         for name in cameras:
-            c = COMPARE_ROOT / sid / 'cycles' / name / 'beauty.exr'
+            c = COMPARE_ROOT / sid / ('cycles' + (f'_{variant}' if variant else '')) / name / 'beauty.exr'
             ue = V1 / 'samples' / sid / 'renders' / f'{name}__{env}.exr'
             ub = V1 / 'samples' / sid / 'renders' / f'{name}__basecolor.exr'
             if not (c.is_file() and ue.is_file()):
@@ -205,7 +244,7 @@ def report(ids, cameras=CAMERAS, env='studio'):
         if vals:
             summary[name] = {k: float(np.nanmean([v[k] for v in vals if isinstance(v.get(k), (int, float))] or [np.nan]))
                              for k in ('silhouette_iou_head_rows', 'cycles_to_ue_gain', 'lpips', 'dists', 'delta_e')} | dict(n=len(vals))
-    (COMPARE_ROOT / f'summary{suffix}.json').write_text(json.dumps(dict(ids=list(rows), env=env, cameras=summary), indent=1) + '\n')
+    (COMPARE_ROOT / f'summary{suffix}.json').write_text(json.dumps(dict(ids=list(rows), env=env, variant=variant, cameras=summary), indent=1) + '\n')
     return summary
 
 
@@ -214,17 +253,23 @@ def main():
     ap.add_argument('--ids', default=''); ap.add_argument('--every', type=int, default=10)
     ap.add_argument('--cameras', default=','.join(CAMERAS)); ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--report', action='store_true')
+    ap.add_argument('--variant', default='', choices=list(VARIANTS), help='Cycles render variant (normal: converted MH skin normal on)')
+    ap.add_argument('--update-normal', action='store_true', help='write the converted MH normal into existing pseudo-candidates')
     ap.add_argument('--ue-env', default='studio', help="UE reference lighting: studio (MetaHuman Studio) or vhstudio (calibrated vhuman rig)")
     a = ap.parse_args()
     render_ids = sorted(json.loads((V1 / 'sampling.json').read_text())['render_ids'])
     ids = a.ids.split(',') if a.ids else render_ids[::a.every]
     cams = tuple(a.cameras.split(','))
     if a.report:
-        print(json.dumps(report(ids, cams, a.ue_env), indent=1)); return
+        print(json.dumps(report(ids, cams, a.ue_env, a.variant), indent=1)); return
+    if a.update_normal:
+        for sid in ids:
+            print(sid, 'normal valid', update_normal(sid), flush=True)
+        return
     for sid in ids:
         if a.build_only:
             print(sid, build_candidate(sid, force=True), flush=True); continue
-        print(sid, render_sample(sid, cams), flush=True)
+        print(sid, render_sample(sid, cams, a.variant), flush=True)
 
 
 if __name__ == '__main__':

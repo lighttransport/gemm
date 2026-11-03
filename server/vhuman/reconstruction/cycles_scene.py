@@ -155,7 +155,31 @@ def full_skin_graph(skin,node,bound,out,request):
     uvn=nodes.new('ShaderNodeUVMap');uvn.uv_map='UVMap';mapping=nodes.new('ShaderNodeMapping');mapping.inputs['Scale'].default_value=(12,12,1)
     links.new(uvn.outputs['UV'],mapping.inputs['Vector']);links.new(mapping.outputs['Vector'],micro_img.inputs['Vector'])
     nm=nodes.new('ShaderNodeNormalMap');nm.space='TANGENT';nm.uv_map='UVMap'
-    links.new(micro_img.outputs['Color'],nm.inputs['Color']);links.new(math('MULTIPLY',micro,.6*float(request.get('micro_scale',1.))),nm.inputs['Strength'])
+    skin_normal=out/'skin_normal_map.png'
+    if request.get('skin_normal_map') and skin_normal.is_file():
+        # per-texel skin normal (e.g. metahuman.normal_map: converted MetaHuman detail, Blender/OpenGL tangent convention)
+        # combined with the tiled pores by a whiteout blend in tangent space: n = norm(a.xy + k b.xy, a.z b.z), with the
+        # pore strength k = micro mask x .6 x micro_scale and the map strength s (xy scale) from skin_normal_strength
+        def vec(op,a,b=None,*,scale=None):
+            v=nodes.new('ShaderNodeVectorMath');v.operation=op;links.new(a,v.inputs[0])
+            if b is not None:
+                links.new(b,v.inputs[1]) if not isinstance(b,tuple) else v.inputs[1].__setattr__('default_value',b)
+            if scale is not None:links.new(scale,v.inputs['Scale']) if not isinstance(scale,(int,float)) else v.inputs['Scale'].__setattr__('default_value',scale)
+            return v.outputs[0] if op!='DOT_PRODUCT' else v.outputs['Value']
+        detail_img=image_node(nodes,skin_normal,linear=True)
+        a=vec('MULTIPLY_ADD',detail_img.outputs['Color'],(2,2,2));a.node.inputs[2].default_value=(-1,-1,-1)
+        b=vec('MULTIPLY_ADD',micro_img.outputs['Color'],(2,2,2));b.node.inputs[2].default_value=(-1,-1,-1)
+        sa,sb=nodes.new('ShaderNodeSeparateXYZ'),nodes.new('ShaderNodeSeparateXYZ');links.new(a,sa.inputs[0]);links.new(b,sb.inputs[0])
+        k=math('MULTIPLY',micro,.6*float(request.get('micro_scale',1.)));strength=float(request.get('skin_normal_strength',1.))
+        c=nodes.new('ShaderNodeCombineXYZ')
+        links.new(math('ADD',math('MULTIPLY',sa.outputs['X'],strength),math('MULTIPLY',sb.outputs['X'],k)),c.inputs['X'])
+        links.new(math('ADD',math('MULTIPLY',sa.outputs['Y'],strength),math('MULTIPLY',sb.outputs['Y'],k)),c.inputs['Y'])
+        links.new(math('MULTIPLY',sa.outputs['Z'],sb.outputs['Z']),c.inputs['Z'])
+        n=vec('NORMALIZE',c.outputs[0]);col=vec('MULTIPLY_ADD',n,(.5,.5,.5));col.node.inputs[2].default_value=(.5,.5,.5)
+        links.new(col,nm.inputs['Color']);nm.inputs['Strength'].default_value=1.
+        skin['skin_normal_map']=json.dumps(dict(path=str(skin_normal),strength=strength,blend='whiteout with tiled pores'))
+    else:
+        links.new(micro_img.outputs['Color'],nm.inputs['Color']);links.new(math('MULTIPLY',micro,.6*float(request.get('micro_scale',1.))),nm.inputs['Strength'])
     links.new(nm.outputs['Normal'],node.inputs['Normal'])
     # dynamic facial colour (hemoglobin prior): compressed regions flush, stretched regions blanch.
     # hb = sum_r gain_r * mask_r * wrinkle_r  (wrinkle_r = regional compression in -1..1 driven by motion)

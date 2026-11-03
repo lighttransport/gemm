@@ -32,7 +32,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            include_hair=True,fit_eyes=False, camera='portrait', pitch=0., distance_scale=None, focal_scale=None,
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
            ablate=(), noisy=True, eyes=None, chart=False, displacement_scale=1., micro_scale=1., save_blend=True,
-           lip_coat_scale=.6, lip_coat_roughness=.30, teeth_glow=0., mouth_fill=.02, explicit_camera=None):
+           lip_coat_scale=.6, lip_coat_roughness=.30, teeth_glow=0., mouth_fill=.02, explicit_camera=None,
+           skin_normal_map=False, skin_normal_strength=1.):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
@@ -100,7 +101,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
                    camera=camera,pitch=pitch,distance_scale=distance_scale,focal_scale=focal_scale,hdri=hdri_record,
                    samples=samples or spp,resolution=resolution or res_px,quality=quality,ablate=list(ablate),noisy=bool(noisy),
                    chart=bool(chart),displacement_scale=float(displacement_scale),micro_scale=float(micro_scale),save_blend=bool(save_blend),
-                   lip_coat_scale=float(lip_coat_scale), lip_coat_roughness=float(lip_coat_roughness), teeth_glow=float(teeth_glow), mouth_fill=float(mouth_fill), explicit_camera=explicit_camera)
+                   lip_coat_scale=float(lip_coat_scale), lip_coat_roughness=float(lip_coat_roughness), teeth_glow=float(teeth_glow), mouth_fill=float(mouth_fill), explicit_camera=explicit_camera,
+                   skin_normal_map=bool(skin_normal_map), skin_normal_strength=float(skin_normal_strength))
     if motion:
         motion=Path(motion).resolve()
         track=json.loads((motion/'motion.json').read_text())
@@ -114,6 +116,12 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
         if not 1<=frame<=track['frames']:raise ValueError('render frame outside motion range')
         request.update(motion=str(motion),frame=frame)
     # A measured tooth shade travels with the candidate (cycles_scene.full_mouth_materials reads out/teeth.json).
+    # skin_normal_map: the candidate's per-texel skin_normal.png (Blender tangent convention) enters the 'full' skin graph,
+    # whiteout-blended with the tiled pores (cycles_scene.full_skin_graph); off by default, the graph is unchanged then.
+    if skin_normal_map:
+        if not (Path(candidate)/'skin_normal.png').is_file():raise ValueError('skin_normal_map requested but the candidate has no skin_normal.png')
+        from .observations import sha256
+        shutil.copyfile(Path(candidate)/'skin_normal.png',out/'skin_normal_map.png');request['skin_normal_sha256']=sha256(out/'skin_normal_map.png')
     if (Path(candidate)/'teeth.json').is_file():
         shutil.copyfile(Path(candidate)/'teeth.json',out/'teeth.json');request['teeth']=str((Path(candidate)/'teeth.json').resolve())
     (out/'request.json').write_text(json.dumps(request, indent=2))
