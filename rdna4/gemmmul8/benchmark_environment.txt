@@ -1,0 +1,32 @@
+2026-11-03 01:26:16 UTC
+HIP version: 7.16.26385-0000000
+AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm/core-10.1/lib/llvm/bin
+Configuration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg
+AMDSMI Tool: 27.1.0+7da43026 | AMDSMI Library version: 27.1.0 | ROCm version: 10.1.0 | amdgpu version: 7.1.9.31600000 | ionic version: N/A
+        MARKET_NAME: AMD Radeon RX 9070 XT
+        NUM_COMPUTE_UNITS: 64
+        TARGET_GRAPHICS_VERSION: gfx1201
+        TYPE: GDDR6
+        VENDOR: SAMSUNG
+        SIZE: 16304 MB
+        BIT_WIDTH: 256
+Repository base revision: 7b8b87ad04a4306a6a0f0d4cd905ae80afd4d974
+
+Benchmark binary SHA-256 (device 0):
+1503698b56355be23d7254f43e80fbbaa612e9612755d5a8a396aa59c250fc48  rdna4/gemmmul8/bench_ozaki
+4e81bbe83424dbec5d73aa0414e196126557c942f83c516660a41b6479291cab  rdna4/gemmmul8/libozaki2.so
+2538a2db90567fc86d3c9319e69170aba616448a7c9b4013fd2be02f2549d615  rdna4/gemmmul8/vendor/GEMMul8/lib/libgemmul8.so
+Telemetry during 8192 INT8: 2026-11-03 01:29:33 UTC
+GPU: 0
+        GFX_ACTIVITY: 42 %
+    POWER:
+        SOCKET_POWER: 91 W
+        THROTTLE_STATUS: THROTTLED
+        POWER_MANAGEMENT: ENABLED
+        UBB_POWER: N/A
+    TEMPERATURE:
+        EDGE: 52 °C
+        HOTSPOT: 83 °C

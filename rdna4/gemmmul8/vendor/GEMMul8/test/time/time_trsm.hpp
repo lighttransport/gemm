@@ -1,0 +1,20 @@
+#pragma once
+#include "../common/common.hpp"
+
+namespace bench::time::trsm {
+
+template <typename T>
+void check_time(
+    std::string &deviceName,
+    std::string &dateTime,
+    size_t memory_limit,
+    cublasSideMode_t side,
+    cublasFillMode_t uplo,
+    cublasOperation_t trans,
+    cublasDiagType_t diag,
+    const bool run_Ozaki2_I8,
+    const bool run_Ozaki2_F8,
+    const bool run_cuBLAS_FP64_emu,
+    const bool is_square = false);
+
+} // namespace bench::time::trsm

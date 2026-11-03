@@ -1,0 +1,13 @@
+bench_wmma
+test_modular
+
+/vendor/GEMMul8/build/
+/vendor/GEMMul8/lib/
+/vendor/GEMMul8/compile_info
+bench_ozaki
+test_api
+tune_ozaki
+__pycache__/
+test_crt
+test_encoding
+bench_modular

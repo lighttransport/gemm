@@ -1,0 +1,496 @@
+#pragma once
+#include "../common/common.hpp"
+#include "mod_launch_i8.hpp"
+#include "mod_launch_f8.hpp"
+#include "../common/make_fp_mant_exp.hpp"
+
+namespace gemmul8::mod {
+
+template <Backend BACKEND, unsigned NUM_MODULI, bool COMPLEX = false>
+__device__ __forceinline__ common::fp64_mant_exp scaled_mant_exp(double v) {
+    auto d = common::make_fp64_mant_exp<common::fp64_mant_exp>(v);
+    if constexpr (BACKEND == Backend::INT8 && common::table::log2P<BACKEND, NUM_MODULI, COMPLEX> < 94.0f) d.exp.is_hi = false;
+    return d;
+}
+
+template <Backend BACKEND, unsigned NUM_MODULI>
+__device__ __forceinline__ common::fp64_mant_exp2 scaled_mant_exp(cuDoubleComplex v) {
+    return {scaled_mant_exp<BACKEND, NUM_MODULI, true>(v.x),
+            scaled_mant_exp<BACKEND, NUM_MODULI, true>(v.y)};
+}
+
+//------------------------------
+// Interface
+//------------------------------
+#define GEMMUL8_FOR_EACH_IDX_20(M) \
+    M(0U)                          \
+    M(1U)                          \
+    M(2U)                          \
+    M(3U)                          \
+    M(4U)                          \
+    M(5U)                          \
+    M(6U)                          \
+    M(7U)                          \
+    M(8U)                          \
+    M(9U)                          \
+    M(10U)                         \
+    M(11U)                         \
+    M(12U)                         \
+    M(13U)                         \
+    M(14U)                         \
+    M(15U)                         \
+    M(16U)                         \
+    M(17U)                         \
+    M(18U)                         \
+    M(19U)
+
+#define GEMMUL8_INT8_RUN_SCALAR_STEP(I) \
+    if constexpr (NUM_MODULI > (I)) {   \
+        mod_launch<(I), V>(out, v);     \
+        out += inc;                     \
+    }
+
+#define GEMMUL8_INT8_RUN_VEC4_STEP(I)            \
+    if constexpr (NUM_MODULI > (I)) {            \
+        mod_launch<(I), V>(out, v0, v1, v2, v3); \
+        out += inc;                              \
+    }
+
+#define GEMMUL8_INT8_RUN_CPLX_SCALAR_STEP(I) \
+    if constexpr (NUM_MODULI > (I)) {        \
+        mod_launch<(I), V>(out0, out1, v);   \
+        out0 += inc;                         \
+        out1 += inc;                         \
+    }
+
+#define GEMMUL8_INT8_RUN_CPLX_VEC4_STEP(I)              \
+    if constexpr (NUM_MODULI > (I)) {                   \
+        mod_launch<(I), V>(out0, out1, v0, v1, v2, v3); \
+        out0 += inc;                                    \
+        out1 += inc;                                    \
+    }
+
+#define GEMMUL8_FP8_RUN_SCALAR_STEP(I)                                                                   \
+    if constexpr (NUM_MODULI > (I)) {                                                                    \
+        constexpr unsigned modulus_id = common::table::active_index<Backend::FP8, NUM_MODULI, I, false>; \
+        mod_launch<modulus_id, V>(out, inc, v);                                                          \
+        out += common::fp8_plan::scheme<int32_t(modulus_id - 20U)>.products * inc;                       \
+    }
+
+#define GEMMUL8_FP8_RUN_VEC4_STEP(I)                                                                     \
+    if constexpr (NUM_MODULI > (I)) {                                                                    \
+        constexpr unsigned modulus_id = common::table::active_index<Backend::FP8, NUM_MODULI, I, false>; \
+        mod_launch<modulus_id, V>(out, inc, v0, v1, v2, v3);                                             \
+        out += common::fp8_plan::scheme<int32_t(modulus_id - 20U)>.products * inc;                       \
+    }
+
+#define GEMMUL8_FP8_RUN_CPLX_SCALAR_STEP(I)                                                             \
+    if constexpr (NUM_MODULI > (I)) {                                                                   \
+        constexpr unsigned modulus_id = common::table::active_index<Backend::FP8, NUM_MODULI, I, true>; \
+        if constexpr (common::fp8_plan::mixed_complex_v<NUM_MODULI>) {                                  \
+            constexpr auto s = common::fp8_plan::scheme<int32_t(modulus_id - 20U)>;                     \
+            mod_launch<modulus_id, V>(out0, out0 + s.products * inc, inc, v);                           \
+            out0 += s.products * common::fp8_plan::complex_parts_v<s.p> * inc;                          \
+        } else {                                                                                        \
+            mod_launch<modulus_id, V>(out0, out1, inc, v);                                              \
+        }                                                                                               \
+        const size_t step = common::fp8_plan::scheme<int32_t(modulus_id - 20U)>.products * inc;         \
+        if constexpr (!common::fp8_plan::mixed_complex_v<NUM_MODULI>) out0 += step;                     \
+        out1 += step;                                                                                   \
+    }
+
+#define GEMMUL8_FP8_RUN_CPLX_VEC4_STEP(I)                                                               \
+    if constexpr (NUM_MODULI > (I)) {                                                                   \
+        constexpr unsigned modulus_id = common::table::active_index<Backend::FP8, NUM_MODULI, I, true>; \
+        if constexpr (common::fp8_plan::mixed_complex_v<NUM_MODULI>) {                                  \
+            constexpr auto s = common::fp8_plan::scheme<int32_t(modulus_id - 20U)>;                     \
+            mod_launch<modulus_id, V>(out0, out0 + s.products * inc, inc, v0, v1, v2, v3);              \
+            out0 += s.products * common::fp8_plan::complex_parts_v<s.p> * inc;                          \
+        } else {                                                                                        \
+            mod_launch<modulus_id, V>(out0, out1, inc, v0, v1, v2, v3);                                 \
+        }                                                                                               \
+        const size_t step = common::fp8_plan::scheme<int32_t(modulus_id - 20U)>.products * inc;         \
+        if constexpr (!common::fp8_plan::mixed_complex_v<NUM_MODULI>) out0 += step;                     \
+        out1 += step;                                                                                   \
+    }
+
+// interface for general NUM_MODULI
+template <unsigned NUM_MODULI, typename V> struct ModUnroll {
+
+    //=====
+    // INT8
+    //=====
+    __device__ __forceinline__ static void run(
+        int8_t *__restrict__ out,
+        size_t inc,
+        V v //
+    ) {
+        if constexpr (common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_INT8_RUN_SCALAR_STEP);
+    }
+
+    __device__ __forceinline__ static void run(
+        char4 *__restrict__ out,
+        size_t inc,
+        V v0, V v1, V v2, V v3 //
+    ) {
+        if constexpr (common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_INT8_RUN_VEC4_STEP);
+    }
+
+    __device__ __forceinline__ static void run(
+        int8_t *__restrict__ out0,
+        int8_t *__restrict__ out1,
+        size_t inc,
+        V v //
+    ) {
+        if constexpr (!common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_INT8_RUN_CPLX_SCALAR_STEP);
+    }
+
+    __device__ __forceinline__ static void run(
+        char4 *__restrict__ out0,
+        char4 *__restrict__ out1,
+        size_t inc,
+        V v0, V v1, V v2, V v3 //
+    ) {
+        if constexpr (!common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_INT8_RUN_CPLX_VEC4_STEP);
+    }
+
+    //=====
+    // FP8
+    //=====
+    __device__ __forceinline__ static void run(
+        __nv_fp8_e4m3 *__restrict__ out,
+        size_t inc,
+        V v //
+    ) {
+        if constexpr (common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_FP8_RUN_SCALAR_STEP);
+    }
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8x4_e4m3 *__restrict__ out,
+        size_t inc,
+        V v0, V v1, V v2, V v3 //
+    ) {
+        if constexpr (common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_FP8_RUN_VEC4_STEP);
+    }
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8_e4m3 *__restrict__ out0,
+        __nv_fp8_e4m3 *__restrict__ out1,
+        size_t inc,
+        V v //
+    ) {
+        if constexpr (!common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_FP8_RUN_CPLX_SCALAR_STEP);
+    }
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8x4_e4m3 *__restrict__ out0,
+        __nv_fp8x4_e4m3 *__restrict__ out1,
+        size_t inc,
+        V v0, V v1, V v2, V v3 //
+    ) {
+        if constexpr (!common::isComplex<V>) return;
+        GEMMUL8_FOR_EACH_IDX_20(GEMMUL8_FP8_RUN_CPLX_VEC4_STEP);
+    }
+};
+
+#undef GEMMUL8_FOR_EACH_IDX_20
+#undef GEMMUL8_INT8_RUN_SCALAR_STEP
+#undef GEMMUL8_INT8_RUN_VEC4_STEP
+#undef GEMMUL8_INT8_RUN_CPLX_SCALAR_STEP
+#undef GEMMUL8_INT8_RUN_CPLX_VEC4_STEP
+#undef GEMMUL8_FP8_RUN_SCALAR_STEP
+#undef GEMMUL8_FP8_RUN_VEC4_STEP
+#undef GEMMUL8_FP8_RUN_CPLX_SCALAR_STEP
+#undef GEMMUL8_FP8_RUN_CPLX_VEC4_STEP
+
+// interface for NUM_MODULI > common::threshold::M & V = float
+template <unsigned NUM_MODULI> struct ModUnroll<NUM_MODULI, float> {
+
+    //=====
+    // INT8
+    //=====
+    __device__ __forceinline__ static void run(
+        int8_t *__restrict__ out,
+        size_t inc,
+        float v //
+    ) {
+        common::fp32_mant_exp d = common::make_fp32_mant_exp(v);
+        ModUnroll<NUM_MODULI, common::fp32_mant_exp>::run(out, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        char4 *__restrict__ out,
+        size_t inc,
+        float v0, float v1, float v2, float v3 //
+    ) {
+        common::fp32_mant_exp d0 = common::make_fp32_mant_exp(v0);
+        common::fp32_mant_exp d1 = common::make_fp32_mant_exp(v1);
+        common::fp32_mant_exp d2 = common::make_fp32_mant_exp(v2);
+        common::fp32_mant_exp d3 = common::make_fp32_mant_exp(v3);
+        ModUnroll<NUM_MODULI, common::fp32_mant_exp>::run(out, inc, d0, d1, d2, d3);
+    }
+
+    //=====
+    // FP8
+    //=====
+    using FP8Mant = std::conditional_t<
+        (common::table::log2P<Backend::FP8, NUM_MODULI, false> >= 94.0f),
+        common::fp64_mant_exp, common::fp32_mant_exp>;
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8_e4m3 *__restrict__ out,
+        size_t inc,
+        float v //
+    ) {
+        FP8Mant d = common::make_fp32_mant_exp_as<FP8Mant>(v);
+        ModUnroll<NUM_MODULI, FP8Mant>::run(out, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8x4_e4m3 *__restrict__ out,
+        size_t inc,
+        float v0, float v1, float v2, float v3 //
+    ) {
+        FP8Mant d0 = common::make_fp32_mant_exp_as<FP8Mant>(v0);
+        FP8Mant d1 = common::make_fp32_mant_exp_as<FP8Mant>(v1);
+        FP8Mant d2 = common::make_fp32_mant_exp_as<FP8Mant>(v2);
+        FP8Mant d3 = common::make_fp32_mant_exp_as<FP8Mant>(v3);
+        ModUnroll<NUM_MODULI, FP8Mant>::run(out, inc, d0, d1, d2, d3);
+    }
+};
+
+// interface for NUM_MODULI > common::threshold::M & V = double
+template <unsigned NUM_MODULI> struct ModUnroll<NUM_MODULI, double> {
+
+    //=====
+    // INT8
+    //=====
+    __device__ __forceinline__ static void run(
+        int8_t *__restrict__ out,
+        size_t inc,
+        double v //
+    ) {
+        using VT = common::fp64_mant_exp;
+
+        VT d = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v);
+        ModUnroll<NUM_MODULI, VT>::run(out, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        char4 *__restrict__ out,
+        size_t inc,
+        double v0, double v1, double v2, double v3 //
+    ) {
+        using VT = common::fp64_mant_exp;
+
+        VT d0 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v0);
+        VT d1 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v1);
+        VT d2 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v2);
+        VT d3 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v3);
+        ModUnroll<NUM_MODULI, VT>::run(out, inc, d0, d1, d2, d3);
+    }
+
+    //=====
+    // FP8
+    //=====
+    __device__ __forceinline__ static void run(
+        __nv_fp8_e4m3 *__restrict__ out,
+        size_t inc,
+        double v //
+    ) {
+        using VT = common::fp64_mant_exp;
+
+        VT d = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v);
+        ModUnroll<NUM_MODULI, VT>::run(out, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8x4_e4m3 *__restrict__ out,
+        size_t inc,
+        double v0, double v1, double v2, double v3 //
+    ) {
+        using VT = common::fp64_mant_exp;
+
+        VT d0 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v0);
+        VT d1 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v1);
+        VT d2 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v2);
+        VT d3 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v3);
+        ModUnroll<NUM_MODULI, VT>::run(out, inc, d0, d1, d2, d3);
+    }
+};
+
+// interface for NUM_MODULI > common::threshold::M & V = cuFloatComplex
+template <unsigned NUM_MODULI> struct ModUnroll<NUM_MODULI, cuFloatComplex> {
+
+    //=====
+    // INT8
+    //=====
+    __device__ __forceinline__ static void run(
+        int8_t *__restrict__ out0,
+        int8_t *__restrict__ out1,
+        size_t inc,
+        cuFloatComplex v //
+    ) {
+        common::fp32_mant_exp2 d = common::make_fp32_mant_exp2(v);
+        ModUnroll<NUM_MODULI, common::fp32_mant_exp2>::run(out0, out1, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        char4 *__restrict__ out0,
+        char4 *__restrict__ out1,
+        size_t inc,
+        cuFloatComplex v0,
+        cuFloatComplex v1,
+        cuFloatComplex v2,
+        cuFloatComplex v3 //
+    ) {
+        common::fp32_mant_exp2 d0 = common::make_fp32_mant_exp2(v0);
+        common::fp32_mant_exp2 d1 = common::make_fp32_mant_exp2(v1);
+        common::fp32_mant_exp2 d2 = common::make_fp32_mant_exp2(v2);
+        common::fp32_mant_exp2 d3 = common::make_fp32_mant_exp2(v3);
+        ModUnroll<NUM_MODULI, common::fp32_mant_exp2>::run(out0, out1, inc, d0, d1, d2, d3);
+    }
+
+    //=====
+    // FP8
+    //=====
+    using FP8Mant = std::conditional_t<
+        (common::table::log2P<Backend::FP8, NUM_MODULI, true> >= 94.0f),
+        common::fp64_mant_exp2, common::fp32_mant_exp2>;
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8_e4m3 *__restrict__ out0,
+        __nv_fp8_e4m3 *__restrict__ out1,
+        size_t inc,
+        cuFloatComplex v //
+    ) {
+        FP8Mant d = common::make_fp32_mant_exp2_as<FP8Mant>(v);
+        ModUnroll<NUM_MODULI, FP8Mant>::run(out0, out1, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8x4_e4m3 *__restrict__ out0,
+        __nv_fp8x4_e4m3 *__restrict__ out1,
+        size_t inc,
+        cuFloatComplex v0,
+        cuFloatComplex v1,
+        cuFloatComplex v2,
+        cuFloatComplex v3 //
+    ) {
+        FP8Mant d0 = common::make_fp32_mant_exp2_as<FP8Mant>(v0);
+        FP8Mant d1 = common::make_fp32_mant_exp2_as<FP8Mant>(v1);
+        FP8Mant d2 = common::make_fp32_mant_exp2_as<FP8Mant>(v2);
+        FP8Mant d3 = common::make_fp32_mant_exp2_as<FP8Mant>(v3);
+        ModUnroll<NUM_MODULI, FP8Mant>::run(out0, out1, inc, d0, d1, d2, d3);
+    }
+};
+
+// interface for NUM_MODULI > common::threshold::M & V = cuDoubleComplex
+template <unsigned NUM_MODULI> struct ModUnroll<NUM_MODULI, cuDoubleComplex> {
+
+    //=====
+    // INT8
+    //=====
+    __device__ __forceinline__ static void run(
+        int8_t *__restrict__ out0,
+        int8_t *__restrict__ out1,
+        size_t inc,
+        cuDoubleComplex v //
+    ) {
+        using VT = common::fp64_mant_exp2;
+
+        VT d = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v);
+        ModUnroll<NUM_MODULI, VT>::run(out0, out1, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        char4 *__restrict__ out0,
+        char4 *__restrict__ out1,
+        size_t inc,
+        cuDoubleComplex v0,
+        cuDoubleComplex v1,
+        cuDoubleComplex v2,
+        cuDoubleComplex v3 //
+    ) {
+        using VT = common::fp64_mant_exp2;
+
+        VT d0 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v0);
+        VT d1 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v1);
+        VT d2 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v2);
+        VT d3 = scaled_mant_exp<Backend::INT8, NUM_MODULI>(v3);
+        ModUnroll<NUM_MODULI, VT>::run(out0, out1, inc, d0, d1, d2, d3);
+    }
+
+    //=====
+    // FP8
+    //=====
+    __device__ __forceinline__ static void run(
+        __nv_fp8_e4m3 *__restrict__ out0,
+        __nv_fp8_e4m3 *__restrict__ out1,
+        size_t inc, cuDoubleComplex v //
+    ) {
+        using VT = common::fp64_mant_exp2;
+
+        VT d = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v);
+        ModUnroll<NUM_MODULI, VT>::run(out0, out1, inc, d);
+    }
+
+    __device__ __forceinline__ static void run(
+        __nv_fp8x4_e4m3 *__restrict__ out0,
+        __nv_fp8x4_e4m3 *__restrict__ out1,
+        size_t inc,
+        cuDoubleComplex v0,
+        cuDoubleComplex v1,
+        cuDoubleComplex v2,
+        cuDoubleComplex v3 //
+    ) {
+        using VT = common::fp64_mant_exp2;
+
+        VT d0 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v0);
+        VT d1 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v1);
+        VT d2 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v2);
+        VT d3 = scaled_mant_exp<Backend::FP8, NUM_MODULI>(v3);
+        ModUnroll<NUM_MODULI, VT>::run(out0, out1, inc, d0, d1, d2, d3);
+    }
+};
+
+template <Backend BACKEND, unsigned NUM_MODULI, typename Out>
+struct ModUnrollFillZero {
+
+    __device__ __forceinline__ static void run(
+        Out *__restrict__ out,
+        size_t inc //
+    ) {
+        constexpr unsigned num_mat = common::table::num_mat_v<BACKEND, NUM_MODULI>;
+        const Out zero             = common::Tconst<Out>::zero();
+
+#pragma unroll
+        for (unsigned i = 0; i < num_mat; ++i) {
+            out[i * inc] = zero;
+        }
+    }
+
+    __device__ __forceinline__ static void run(
+        Out *__restrict__ out0,
+        Out *__restrict__ out1,
+        size_t inc //
+    ) {
+        constexpr unsigned num_mat = common::table::num_mat_v<BACKEND, NUM_MODULI, true>;
+        const Out zero             = common::Tconst<Out>::zero();
+
+#pragma unroll
+        for (unsigned i = 0; i < num_mat; ++i) {
+            out0[i * inc] = zero;
+            out1[i * inc] = zero;
+        }
+    }
+};
+
+} // namespace gemmul8::mod

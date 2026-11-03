@@ -1,0 +1,982 @@
+#pragma once
+#include <cstdint>
+
+namespace gemmul8::common::fp8_plan {
+
+struct info {
+    int32_t p;
+    unsigned products;
+    int32_t w; // 0: CRT; positive: AWE; negative: congruence encoding
+    int32_t q[3];
+    int32_t coefficient[3];
+    unsigned max_abs;
+    int32_t root_minus_one;
+};
+
+constexpr unsigned modulus_index(unsigned p) { return 20U + p; }
+
+constexpr info get(int32_t p) {
+    switch (p) {
+    case 13325:
+        return {
+            13325,
+            3U,
+            0,
+            {   25,    41,   13},
+            {-1599, -4550, 6150},
+            24U,
+            993
+        };
+    case 1617:
+        return {
+            1617,
+            2U,
+            0,
+            { 49, 33, 1},
+            {-33, 49, 0},
+            32U,
+            0
+        };
+    case 33:
+        return {
+            33,
+            1U,
+            0,
+            {33, 1, 1},
+            { 1, 0, 0},
+            16U,
+            0
+        };
+    case 53280:
+        return {
+            53280,
+            3U,
+            0,
+            {    45,    37,   32},
+            {-18944, 17280, 1665},
+            28U,
+            0
+        };
+    case 51168:
+        return {
+            51168,
+            3U,
+            0,
+            {   41,     39,    32},
+            {19968, -18368, -1599},
+            24U,
+            0
+        };
+    case 22496:
+        return {
+            22496,
+            3U,
+            0,
+            {  37,    19,   32},
+            {4256, -3552, -703},
+            20U,
+            0
+        };
+    case 391:
+        return {
+            391,
+            2U,
+            0,
+            { 23, 17, 1},
+            {-17, 69, 0},
+            11U,
+            0
+        };
+    case 943:
+        return {
+            943,
+            2U,
+            0,
+            { 41, 23, 1},
+            {-23, 41, 0},
+            24U,
+            0
+        };
+    case 527:
+        return {
+            527,
+            2U,
+            0,
+            { 31,  17, 1},
+            {-17, -93, 0},
+            15U,
+            0
+        };
+    case 1591:
+        return {
+            1591,
+            2U,
+            0,
+            { 43,  37, 1},
+            {-37, -86, 0},
+            26U,
+            0
+        };
+    case 59163:
+        return {
+            59163,
+            3U,
+            0,
+            {   41,     39,    37},
+            {-7215, -15170, 22386},
+            24U,
+            0
+        };
+    case 2303:
+        return {
+            2303,
+            2U,
+            0,
+            { 49, 47, 1},
+            {-47, 49, 0},
+            32U,
+            0
+        };
+    case 1376:
+        return {
+            1376,
+            2U,
+            0,
+            {  43,  32, 1},
+            {-128, 129, 0},
+            26U,
+            0
+        };
+    case 899:
+        return {
+            899,
+            2U,
+            0,
+            { 31, 29, 1},
+            {-29, 62, 0},
+            15U,
+            0
+        };
+    case 575:
+        return {
+            575,
+            2U,
+            0,
+            { 25, 23, 1},
+            {-46, 25, 0},
+            12U,
+            0
+        };
+    case 1283:
+        return {
+            1283,
+            3U,
+            201,
+            {1283, 1283, 1283},
+            {  64,  -34,  -13},
+            32U,
+            0
+        };
+    case 1279:
+        return {
+            1279,
+            3U,
+            599,
+            {1279, 1279, 1279},
+            {  32,   17,   15},
+            32U,
+            0
+        };
+    case 1249:
+        return {
+            1249,
+            3U,
+            293,
+            {1249, 1249, 1249},
+            {  17,   15,  -47},
+            30U,
+            585
+        };
+    case 323:
+        return {
+            323,
+            2U,
+            0,
+            {19, 17, 1},
+            {17, 19, 0},
+            9U,
+            0
+        };
+    case 1223:
+        return {
+            1223,
+            3U,
+            286,
+            {1223, 1223, 1223},
+            {  47,   11,  -30},
+            32U,
+            0
+        };
+    case 1201:
+        return {
+            1201,
+            3U,
+            128,
+            {1201, 1201, 1201},
+            {  47,  -11,  -19},
+            32U,
+            49
+        };
+    case 1193:
+        return {
+            1193,
+            3U,
+            186,
+            {1193, 1193, 1193},
+            {  45,  -19,  -13},
+            30U,
+            186
+        };
+    case 1181:
+        return {
+            1181,
+            3U,
+            185,
+            {1181, 1181, 1181},
+            {  51,   13,   45},
+            30U,
+            243
+        };
+    case 1177:
+        return {
+            1177,
+            3U,
+            313,
+            {1177, 1177, 1177},
+            { -15,  -13,   49},
+            32U,
+            0
+        };
+    case 1171:
+        return {
+            1171,
+            3U,
+            137,
+            {1171, 1171, 1171},
+            { -60,   23,   26},
+            32U,
+            0
+        };
+    case 1163:
+        return {
+            1163,
+            3U,
+            104,
+            {1163, 1163, 1163},
+            {  34,  -47,   56},
+            30U,
+            0
+        };
+    case 1153:
+        return {
+            1153,
+            3U,
+            140,
+            {1153, 1153, 1153},
+            {  25,  -41,    8},
+            32U,
+            140
+        };
+    case 1151:
+        return {
+            1151,
+            3U,
+            205,
+            {1151, 1151, 1151},
+            {  28,   15,   17},
+            28U,
+            0
+        };
+    case 1129:
+        return {
+            1129,
+            3U,
+            176,
+            {1129, 1129, 1129},
+            { -45,   17,   13},
+            28U,
+            168
+        };
+    case 1123:
+        return {
+            1123,
+            3U,
+            55,
+            {1123, 1123, 1123},
+            {  21,  -32,   41},
+            30U,
+            0
+        };
+    case 65231:
+        return {
+            65231,
+            3U,
+            0,
+            {   43,   41,    37},
+            {27306, 7955, 29971},
+            26U,
+            0
+        };
+    case 992:
+        return {
+            992,
+            2U,
+            0,
+            { 32, 31, 1},
+            {-31, 32, 0},
+            16U,
+            0
+        };
+    case 783:
+        return {
+            783,
+            2U,
+            0,
+            { 29,  27, 1},
+            {-54, -29, 0},
+            14U,
+            0
+        };
+    case 4199:
+        return {
+            4199,
+            3U,
+            0,
+            {  19,  17,   13},
+            {1768, 494, 1938},
+            9U,
+            0
+        };
+    case 11:
+        return {
+            11,
+            1U,
+            0,
+            {11, 1, 1},
+            { 1, 0, 0},
+            5U,
+            0
+        };
+    case 18241:
+        return {
+            18241,
+            3U,
+            0,
+            {   37,    29,    17},
+            {-1479, -8177, -8584},
+            20U,
+            191
+        };
+    case 1025:
+        return {
+            1025,
+            2U,
+            0,
+            { 41,  25, 1},
+            {-25, -41, 0},
+            24U,
+            32
+        };
+    case 1313:
+        return {
+            1313,
+            3U,
+            349,
+            {1313, 1313, 1313},
+            {  49,  -32,   15},
+            32U,
+            515
+        };
+    case 1517:
+        return {
+            1517,
+            2U,
+            0,
+            { 41, 37, 1},
+            {-37, 41, 0},
+            24U,
+            401
+        };
+    case 725:
+        return {
+            725,
+            2U,
+            0,
+            {25,  29, 1},
+            {29, -25, 0},
+            14U,
+            157
+        };
+    case 1117:
+        return {
+            1117,
+            3U,
+            472,
+            {1117, 1117, 1117},
+            { -26,  -15,   64},
+            28U,
+            214
+        };
+    case 1109:
+        return {
+            1109,
+            3U,
+            406,
+            {1109, 1109, 1109},
+            { -30,  -19,  -11},
+            32U,
+            354
+        };
+    case 1097:
+        return {
+            1097,
+            3U,
+            189,
+            {1097, 1097, 1097},
+            {  35,  -33,   29},
+            32U,
+            341
+        };
+    case 1093:
+        return {
+            1093,
+            3U,
+            282,
+            {1093, 1093, 1093},
+            { -31,   -2,   35},
+            32U,
+            530
+        };
+    case 1069:
+        return {
+            1069,
+            3U,
+            87,
+            {1069, 1069, 1069},
+            { -12,  -25,   37},
+            28U,
+            249
+        };
+    case 6409:
+        return {
+            6409,
+            3U,
+            0,
+            {   29,   17,   13},
+            {-1768, 2262, -493},
+            14U,
+            684
+        };
+    case 25:
+        return {
+            25,
+            1U,
+            0,
+            {25, 1, 1},
+            { 1, 0, 0},
+            12U,
+            7
+        };
+    case 1061:
+        return {
+            1061,
+            3U,
+            50,
+            {1061, 1061, 1061},
+            { -64,   17,   22},
+            26U,
+            103
+        };
+    case 1049:
+        return {
+            1049,
+            3U,
+            142,
+            {1049, 1049, 1049},
+            {  22,   23,   82},
+            28U,
+            426
+        };
+    case 1033:
+        return {
+            1033,
+            3U,
+            178,
+            {1033, 1033, 1033},
+            {  29,    3,  -35},
+            30U,
+            355
+        };
+    case 1021:
+        return {
+            1021,
+            3U,
+            50,
+            {1021, 1021, 1021},
+            {  41,   -8,  -21},
+            28U,
+            374
+        };
+    case 1013:
+        return {
+            1013,
+            3U,
+            71,
+            {1013, 1013, 1013},
+            {  29,  -33,   14},
+            28U,
+            45
+        };
+    case 1009:
+        return {
+            1009,
+            3U,
+            82,
+            {1009, 1009, 1009},
+            {  37,   -7,  -25},
+            28U,
+            469
+        };
+    case 1763:
+        return {
+            1763,
+            2U,
+            0,
+            {43,  41, 1},
+            {41, -43, 0},
+            26U,
+            0
+        };
+    case 1184:
+        return {
+            1184,
+            2U,
+            0,
+            {  32,  37, 1},
+            {-111, -64, 0},
+            20U,
+            0
+        };
+    case 7429:
+        return {
+            7429,
+            3U,
+            0,
+            {  19,    17,  23},
+            {2737, -3059, 323},
+            11U,
+            0
+        };
+    case 2021:
+        return {
+            2021,
+            2U,
+            0,
+            { 47, 43, 1},
+            {-43, 47, 0},
+            30U,
+            0
+        };
+    case 49:
+        return {
+            49,
+            1U,
+            0,
+            {49, 1, 1},
+            { 1, 0, 0},
+            32U,
+            0
+        };
+    case 343:
+        return {
+            343,
+            2U,
+            -7,
+            {49, 343, 1},
+            { 7,  -6, 0},
+            32U,
+            0
+        };
+    case 19305:
+        return {
+            19305,
+            3U,
+            -45,
+            { 135,    33,   39},
+            {8866, -9360, 6930},
+            28U,
+            0
+        };
+    case 11583:
+        return {
+            11583,
+            3U,
+            -27,
+            {   81,   33,    39},
+            {-5291, -351, -2079},
+            22U,
+            0
+        };
+    default: return {};
+    }
+}
+
+template <int32_t P> inline constexpr info scheme = get(P);
+
+__host__ __device__ constexpr int32_t crt_unscale(int32_t p, unsigned j) {
+    switch (p) {
+    case 1617: return j == 0 ? 12 : 8;
+    case 391: return j == 0 ? 2 : 1;
+    case 943: return j == 0 ? 4 : 3;
+    case 527: return j == 0 ? 12 : 6;
+    case 1591: return j == 0 ? 6 : 15;
+    case 1763: return j == 0 ? 8 : 15;
+    case 1184: return j == 0 ? 7 : 10;
+    case 2021: return j == 0 ? 23 : 21;
+    case 2303: return j == 0 ? 5 : 27;
+    case 899: return j == 0 ? 4 : 15;
+    case 575: return j == 0 ? 13 : 14;
+    case 323: return j == 0 ? 16 : 3;
+    case 783: return j == 0 ? 15 : 11;
+    case 1025: return j == 0 ? 31 : 17;
+    case 1517: return j == 0 ? 21 : 19;
+    case 725: return j == 0 ? 13 : 15;
+    default: return 1;
+    }
+}
+
+__host__ __device__ constexpr bool crt_scaled(int32_t p) {
+    return crt_unscale(p, 0) != 1 || crt_unscale(p, 1) != 1;
+}
+
+inline constexpr int32_t real_prefix[]       = {59163, 2303, 1376, 899, 575, 1283, 1279, 1249, 323, 1223, 1201, 1193, 1181, 1177, 1171, 1163, 1153, 1151, 1129, 1123};
+inline constexpr int32_t real_20[]           = {65231, 2303, 992, 783, 575, 4199, 1283, 1279, 1249, 1223, 1201, 1193, 1181, 1171, 1163, 1153, 1151, 1129, 1123, 11};
+inline constexpr int32_t complex_small[]     = {18241, 1025, 1313, 1249, 1201, 1193};
+inline constexpr int32_t complex_medium[]    = {1517, 725, 1313, 1249, 1201, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093, 1069};
+inline constexpr int32_t complex_large[]     = {6409, 1517, 25, 1249, 1201, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093, 1069, 1061, 1049, 1033, 1021, 1013, 1009};
+inline constexpr int32_t real_congruence6[]  = {19305, 22496, 2303, 1763, 391, 899};
+inline constexpr int32_t real_congruence7[]  = {1283, 391, 899, 19305, 22496, 2303, 1763};
+inline constexpr int32_t real_congruence8[]  = {2303, 1763, 899, 1283, 1279, 391, 19305, 22496};
+inline constexpr int32_t real_congruence9[]  = {22496, 1283, 343, 11583, 1279, 2021, 943, 527, 725};
+inline constexpr int32_t real_congruence10[] = {1283, 1279, 1249, 527, 725, 343, 11583, 22496, 2021, 943};
+inline constexpr int32_t real_congruence11[] = {2021, 943, 527, 1279, 1249, 1223, 22496, 1283, 725, 343, 11583};
+inline constexpr int32_t real_congruence12[] = {1249, 1223, 1201, 1283, 22496, 343, 1279, 11583, 2021, 943, 527, 725};
+inline constexpr int32_t real_congruence13[] = {1283, 1279, 1249, 1223, 1201, 1193, 527, 725, 343, 11583, 22496, 2021, 943};
+inline constexpr int32_t real_congruence14[] = {1201, 1193, 1181, 2021, 943, 527, 1279, 1249, 1223, 22496, 1283, 725, 343, 11583};
+inline constexpr int32_t real_congruence15[] = {1249, 1223, 1201, 1283, 22496, 343, 1193, 1181, 1171, 1279, 11583, 2021, 943, 527, 725};
+inline constexpr int32_t real_congruence16[] = {1283, 1279, 1249, 1223, 1201, 1193, 1181, 1171, 1163, 527, 725, 343, 11583, 22496, 2021, 943};
+inline constexpr int32_t real_congruence17[] = {1171, 1163, 1153, 1201, 1193, 1181, 2021, 943, 527, 1279, 1249, 1223, 22496, 1283, 725, 343, 11583};
+inline constexpr int32_t real_congruence18[] = {1249, 1223, 1201, 1193, 1181, 1171, 1163, 1153, 1151, 1283, 22496, 343, 1279, 11583, 2021, 943, 527, 725};
+inline constexpr int32_t real_congruence19[] = {1283, 1279, 1249, 1223, 1201, 1193, 1181, 1171, 1163, 1153, 1151, 1129, 527, 725, 343, 11583, 22496, 2021, 943};
+inline constexpr int32_t real_congruence20[] = {11583, 22496, 49, 1279, 1249, 1223, 1201, 1193, 1181, 1171, 1163, 1153, 1151, 1129, 1123, 1283, 527, 725, 2021, 943};
+
+constexpr int32_t modulus(unsigned n, unsigned i, bool complex) {
+    if (!complex) {
+        if (n == 2) {
+            constexpr int32_t small[] = {65231, 2303};
+            return small[i];
+        }
+        if (n == 3 || n == 4) {
+            constexpr int32_t p[] = {53280, 2303, 1763, 899};
+            return p[i];
+        }
+        if (n == 5) {
+            constexpr int32_t p[] = {51168, 2303, 1591, 899, 575};
+            return p[i];
+        }
+        switch (n) {
+        case 6U: return real_congruence6[i];
+        case 7U: return real_congruence7[i];
+        case 8U: return real_congruence8[i];
+        case 9U: return real_congruence9[i];
+        case 10U: return real_congruence10[i];
+        case 11U: return real_congruence11[i];
+        case 12U: return real_congruence12[i];
+        case 13U: return real_congruence13[i];
+        case 14U: return real_congruence14[i];
+        case 15U: return real_congruence15[i];
+        case 16U: return real_congruence16[i];
+        case 17U: return real_congruence17[i];
+        case 18U: return real_congruence18[i];
+        case 19U: return real_congruence19[i];
+        case 20U: return real_congruence20[i];
+        default: return real_prefix[i];
+        }
+    }
+    switch (n) {
+    case 3U: {
+        constexpr int32_t p[] = {49, 13325, 18241};
+        return p[i];
+    }
+    case 4U: {
+        constexpr int32_t p[] = {49, 2021, 13325, 18241};
+        return p[i];
+    }
+    case 7U: {
+        constexpr int32_t p[] = {49, 2021, 18241, 1025, 1313, 1249, 1201};
+        return p[i];
+    }
+    case 8U: {
+        constexpr int32_t p[] = {49, 2021, 18241, 1025, 1313, 1249, 1201, 1193};
+        return p[i];
+    }
+    case 9U: {
+        constexpr int32_t p[] = {49, 2021, 18241, 1025, 1313, 1249, 1201, 1193, 1181};
+        return p[i];
+    }
+    case 10U: {
+        constexpr int32_t p[] = {49, 2021, 18241, 1025, 1313, 1249, 1201, 1193, 1181, 1153};
+        return p[i];
+    }
+    case 11U: {
+        constexpr int32_t p[] = {49, 2021, 18241, 1025, 1313, 1249, 1201, 1193, 1181, 1153, 1129};
+        return p[i];
+    }
+    case 12U: {
+        constexpr int32_t p[] = {49, 2021, 18241, 1025, 1313, 1249, 1201, 1193, 1181, 1153, 1129, 1117};
+        return p[i];
+    }
+    case 13U: {
+        constexpr int32_t p[] = {49, 2021, 18241, 1025, 1313, 1249, 1201, 1193, 1181, 1153, 1129, 1117, 1109};
+        return p[i];
+    }
+    case 14U: {
+        constexpr int32_t p[] = {33, 49, 2021, 18241, 13325, 1249, 1201, 1193, 1181, 1153, 1129, 1117, 1109, 1097};
+        return p[i];
+    }
+    case 15U: {
+        constexpr int32_t p[] = {1617, 2021, 1249, 6409, 25, 1201, 1517, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093};
+        return p[i];
+    }
+    case 16U: {
+        constexpr int32_t p[] = {1617, 2021, 1249, 6409, 25, 1201, 1517, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093, 1069};
+        return p[i];
+    }
+    case 17U: {
+        constexpr int32_t p[] = {1617, 2021, 1249, 6409, 25, 1201, 1517, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093, 1069, 1061};
+        return p[i];
+    }
+    case 18U: {
+        constexpr int32_t p[] = {1617, 2021, 1249, 6409, 25, 1201, 1517, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093, 1069, 1061, 1049};
+        return p[i];
+    }
+    case 19U: {
+        constexpr int32_t p[] = {1617, 2021, 1249, 6409, 25, 1201, 1517, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093, 1069, 1061, 1049, 1033};
+        return p[i];
+    }
+    case 20U: {
+        constexpr int32_t p[] = {1617, 2021, 1249, 6409, 25, 1201, 1517, 1193, 1181, 1153, 1129, 1117, 1109, 1097, 1093, 1069, 1061, 1049, 1033, 1021};
+        return p[i];
+    }
+    }
+    return n <= 6U    ? complex_small[i]
+           : n <= 14U ? complex_medium[i]
+                      : complex_large[i];
+}
+
+constexpr unsigned index(unsigned n, unsigned i, bool complex) {
+    return modulus_index(unsigned(modulus(n, i, complex)));
+}
+
+constexpr unsigned complex_parts(int32_t p, bool herk = false) {
+    return get(p).root_minus_one == 0 ? 3U : (herk ? 1U : 2U);
+}
+
+template <int32_t P, bool Herk = false>
+inline constexpr unsigned complex_parts_v = complex_parts(P, Herk);
+
+constexpr bool mixed_complex(unsigned n) {
+    for (unsigned i = 0; i < n; ++i)
+        if (complex_parts(modulus(n, i, true)) == 3U) return true;
+    return false;
+}
+
+template <unsigned N>
+inline constexpr bool mixed_complex_v = mixed_complex(N);
+
+constexpr unsigned planes(unsigned n, unsigned first, unsigned count, bool complex) {
+    unsigned sum = 0;
+    for (unsigned i = first; i < first + count; ++i) {
+        const int32_t p = modulus(n, i, complex);
+        sum += get(p).products * (complex ? complex_parts(p) : 1U);
+    }
+    return sum;
+}
+
+template <unsigned N, bool Complex>
+inline constexpr unsigned plane_count = Complex ? (planes(N, 0U, N, true) + 1U) / 2U : planes(N, 0U, N, false);
+
+constexpr unsigned plane_max_abs(info s, unsigned j) {
+    if (s.w == 0 || s.p == 19305 || s.p == 11583) {
+        const int32_t q = s.w < 0 && j == 0 ? -s.w : s.q[j];
+        return unsigned(q > 33 ? q - 17 : q / 2);
+    }
+    switch (s.p) {
+    case 1279: return j < 2 ? 30U : 32U;
+    case 1223:
+    case 1201: return j == 1 ? 30U : 32U;
+    case 1181: return j < 2 ? 28U : 30U;
+    case 1177: return j == 2 ? 28U : 32U;
+    case 1151:
+    case 1117: return j == 1 ? 28U : 26U;
+    case 1109: return j < 2 ? 26U : 32U;
+    case 1049: return j < 2 ? 26U : 28U;
+    default: return s.max_abs;
+    }
+}
+
+constexpr unsigned plane_max_abs(int32_t p, unsigned j) { return plane_max_abs(get(p), j); }
+
+constexpr unsigned plane_k_block(int32_t p, unsigned j, bool first, unsigned alignment = 256U) {
+    const auto s          = get(p);
+    const unsigned m      = plane_max_abs(s, j);
+    const unsigned budget = (1U << 24) - (first ? 0U : unsigned(s.q[j] / 2) + 1U);
+    return (budget / (m * m) / alignment) * alignment;
+}
+
+struct k_accumulation {
+    uint64_t used[3]{};
+    unsigned product_bound[3]{}, remainder_bound[3]{};
+    unsigned products = 0;
+
+    constexpr k_accumulation() = default;
+    constexpr k_accumulation(int32_t p, unsigned first_k) {
+        const auto s = get(p);
+        products     = s.products;
+        for (unsigned j = 0; j < products; ++j) {
+            const unsigned m   = plane_max_abs(s, j);
+            product_bound[j]   = m * m;
+            remainder_bound[j] = unsigned(s.q[j] / 2) + 1U;
+            used[j]            = uint64_t(first_k) * product_bound[j];
+        }
+    }
+
+    constexpr unsigned advance(unsigned k) {
+        unsigned mask = 0;
+        for (unsigned j = 0; j < products; ++j) {
+            const uint64_t term = uint64_t(k) * product_bound[j];
+            if (used[j] + term > (1U << 24)) {
+                mask |= 1U << j;
+                used[j] = remainder_bound[j];
+            }
+            used[j] += term;
+        }
+        return mask;
+    }
+};
+
+constexpr unsigned k_block(int32_t p, bool first, unsigned alignment = 256U) {
+    const auto s    = get(p);
+    unsigned result = plane_k_block(p, 0U, first, alignment);
+    for (unsigned j = 1; j < s.products; ++j) {
+        const unsigned limit = plane_k_block(p, j, first, alignment);
+        if (limit < result) result = limit;
+    }
+    return result;
+}
+
+} // namespace gemmul8::common::fp8_plan
+
+#define GEMMUL8_FP8_FOR_EACH_MODULUS(M) \
+    M(13325)                            \
+    M(1617)                             \
+    M(33)                               \
+    M(53280)                            \
+    M(51168)                            \
+    M(22496)                            \
+    M(391)                              \
+    M(943)                              \
+    M(527)                              \
+    M(1591)                             \
+    M(59163)                            \
+    M(2303)                             \
+    M(1376)                             \
+    M(899)                              \
+    M(575)                              \
+    M(1283)                             \
+    M(1279)                             \
+    M(1249)                             \
+    M(323)                              \
+    M(1223)                             \
+    M(1201)                             \
+    M(1193)                             \
+    M(1181)                             \
+    M(1177)                             \
+    M(1171)                             \
+    M(1163)                             \
+    M(1153)                             \
+    M(1151)                             \
+    M(1129)                             \
+    M(1123)                             \
+    M(65231)                            \
+    M(992)                              \
+    M(783)                              \
+    M(4199)                             \
+    M(11)                               \
+    M(18241)                            \
+    M(1025)                             \
+    M(1313)                             \
+    M(1517)                             \
+    M(725)                              \
+    M(1117)                             \
+    M(1109)                             \
+    M(1097)                             \
+    M(1093)                             \
+    M(1069)                             \
+    M(6409)                             \
+    M(25)                               \
+    M(1061)                             \
+    M(1049)                             \
+    M(1033)                             \
+    M(1021)                             \
+    M(1013)                             \
+    M(1009)                             \
+    M(1763)                             \
+    M(1184)                             \
+    M(7429)                             \
+    M(2021)                             \
+    M(49)                               \
+    M(343)                              \
+    M(19305)                            \
+    M(11583)
+
+#define GEMMUL8_FP8_FOR_EACH_COMPLEX_MODULUS(M) \
+    M(13325)                                    \
+    M(1617)                                     \
+    M(33)                                       \
+    M(2021)                                     \
+    M(49)                                       \
+    M(1249)                                     \
+    M(1201)                                     \
+    M(1193)                                     \
+    M(1181)                                     \
+    M(1153)                                     \
+    M(1129)                                     \
+    M(18241)                                    \
+    M(1025)                                     \
+    M(1313)                                     \
+    M(1517)                                     \
+    M(725)                                      \
+    M(1117)                                     \
+    M(1109)                                     \
+    M(1097)                                     \
+    M(1093)                                     \
+    M(1069)                                     \
+    M(6409)                                     \
+    M(25)                                       \
+    M(1061)                                     \
+    M(1049)                                     \
+    M(1033)                                     \
+    M(1021)                                     \
+    M(1013)                                     \
+    M(1009)
