@@ -167,7 +167,8 @@ def update_normal(sid):
     return write_normal(out, d, s, skin, tm, Image.open(out / 'skin_basecolor.png').size)
 
 
-VARIANTS = {'': {}, 'normal': dict(skin_normal_map=True), 'normal_eyes': dict(skin_normal_map=True)}   # dir suffix -> render options
+VARIANTS = {'': {}, 'normal': dict(skin_normal_map=True), 'normal_eyes': dict(skin_normal_map=True),   # dir suffix -> render options
+            'mat_r125_c0': dict(skin_normal_map=True, material_overrides=dict(roughness_scale=1.25, skin_coat=0.))}
 MH_EYES = ('normal_eyes',)        # variants that render with the MetaHuman-calibrated eye parameters (eye_map)
 
 
@@ -211,7 +212,7 @@ def sweep(env='vhstudio', score=False):
             for sid in SWEEP_IDS:
                 print(v, sid, render_sample(sid, SWEEP_CAMERAS, v), flush=True)
         return None
-    rows = {v: report(SWEEP_IDS, SWEEP_CAMERAS, env, v) for v in ['normal'] + variants}
+    rows = {v: report(SWEEP_IDS, SWEEP_CAMERAS, env, v, write_summary=False) for v in ['normal'] + variants}
     def mean(summary, key):
         vals = [c[key] for c in summary.values() if isinstance(c.get(key), (int, float))]
         return float(np.mean(vals)) if vals else None
@@ -221,6 +222,42 @@ def sweep(env='vhstudio', score=False):
     out = dict(env=env, ids=list(SWEEP_IDS), cameras=list(SWEEP_CAMERAS), sweep={k: list(v) for k, v in SWEEP.items()},
                table=table, ranked_by_lpips=ranked, per_camera=rows)
     (COMPARE_ROOT / f'sweep_{env}.json').write_text(json.dumps(out, indent=1) + '\n')
+    return out
+
+
+# Confirmation of the sweep's candidates (2026-11-04) on all comparison heads and the skin-heavy views.
+CONFIRM = ('sw_roughness_scale_1.25', 'sw_skin_coat_0', 'mat_r125_c0')
+CONFIRM_CAMERAS = ('front', 'yaw_p40', 'yaw_m40', 'yaw_p90', 'yaw_m90', 'mouth')
+
+
+def confirm(ids, env='vhstudio', score=False):
+    """score=False: render CONFIRM x ids x CONFIRM_CAMERAS (GPU). score=True: per-view paired deltas vs 'normal'
+    (LPIPS / DISTS / dE), means, and how many views each variant improves -> compare_v1/confirm_<env>.json."""
+    if not score:
+        for v in CONFIRM:
+            for sid in ids:
+                print(v, sid, render_sample(sid, CONFIRM_CAMERAS, v), flush=True)
+        return None
+    rows = {v: report(ids, CONFIRM_CAMERAS, env, v, write_summary=False) for v in ('normal',) + CONFIRM}
+    suffix = f'_{env}' if env != 'studio' else ''
+    per = {v: {sid: json.loads((COMPARE_ROOT / sid / f'compare{suffix}_{v}.json').read_text()) for sid in ids} for v in ('normal',) + CONFIRM}
+    out = dict(env=env, ids=list(ids), cameras=list(CONFIRM_CAMERAS), variants={}, per_camera=rows)
+    for v in CONFIRM:
+        d = {k: [] for k in ('lpips', 'dists', 'delta_e')}
+        by_id = {}
+        for sid in ids:
+            for cam in CONFIRM_CAMERAS:
+                a, b = per['normal'][sid].get(cam), per[v][sid].get(cam)
+                if not a or not b or a.get('lpips') is None or b.get('lpips') is None:
+                    continue
+                for k in d:
+                    d[k].append(b[k] - a[k])
+                by_id.setdefault(sid, []).append(b['lpips'] - a['lpips'])
+        out['variants'][v] = dict(
+            n=len(d['lpips']), **{f'mean_d{k}': float(np.mean(x)) for k, x in d.items()},
+            **{f'improved_{k}': int(np.sum(np.asarray(x) < 0)) for k, x in d.items()},
+            heads_improved_lpips=int(sum(np.mean(x) < 0 for x in by_id.values())), per_head_dlpips={k: float(np.mean(x)) for k, x in by_id.items()})
+    (COMPARE_ROOT / f'confirm_{env}.json').write_text(json.dumps(out, indent=1) + '\n')
     return out
 
 
@@ -259,7 +296,9 @@ def render_sample(sid, cameras=CAMERAS, variant=''):
     return done
 
 
-def report(ids, cameras=CAMERAS, env='studio', variant=''):
+def report(ids, cameras=CAMERAS, env='studio', variant='', write_summary=True):
+    """Score Cycles vs UE per view. Per-head compare<suffix>.json is merged (cameras not scored here are kept), so
+    subset runs (sweep, confirm: write_summary=False) never drop results; summary<suffix>.json only from full runs."""
     from ..face_parsing import FaceParser
     from ..reconstruction import ab_metrics as am
     parser = FaceParser(); rows = {}
@@ -290,14 +329,18 @@ def report(ids, cameras=CAMERAS, env='studio', variant=''):
                              lpips=r.get('lpips'), dists=r.get('dists'), delta_e=(r.get('delta_e') or {}).get('mean'), status=r['status'])
             Image.fromarray(np.concatenate([a, b], 1)).save(COMPARE_ROOT / sid / f'{name}_ue{suffix}_cycles.png')
         rows[sid] = rec
-        (COMPARE_ROOT / sid / f'compare{suffix}.json').write_text(json.dumps(rec, indent=1) + '\n')
+        path = COMPARE_ROOT / sid / f'compare{suffix}.json'
+        merged = json.loads(path.read_text()) if path.is_file() else {}
+        merged.update(rec)
+        path.write_text(json.dumps(merged, indent=1) + '\n')
     summary = {}
     for name in cameras:
         vals = [rows[s][name] for s in rows if name in rows[s]]
         if vals:
             summary[name] = {k: float(np.nanmean([v[k] for v in vals if isinstance(v.get(k), (int, float))] or [np.nan]))
                              for k in ('silhouette_iou_head_rows', 'cycles_to_ue_gain', 'lpips', 'dists', 'delta_e')} | dict(n=len(vals))
-    (COMPARE_ROOT / f'summary{suffix}.json').write_text(json.dumps(dict(ids=list(rows), env=env, variant=variant, cameras=summary), indent=1) + '\n')
+    if write_summary:
+        (COMPARE_ROOT / f'summary{suffix}.json').write_text(json.dumps(dict(ids=list(rows), env=env, variant=variant, cameras=summary), indent=1) + '\n')
     return summary
 
 
@@ -307,6 +350,7 @@ def main():
     ap.add_argument('--cameras', default=','.join(CAMERAS)); ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--report', action='store_true')
     ap.add_argument('--variant', default='', help='Cycles render variant: ' + ', '.join(VARIANTS) + ', or sw_<param>_<value> (sweep)')
+    ap.add_argument('--confirm', action='store_true', help='render (or with --report: score) the CONFIRM variants on the selected ids x CONFIRM_CAMERAS')
     ap.add_argument('--sweep', action='store_true', help='material sweep renders (SWEEP x SWEEP_IDS x SWEEP_CAMERAS); with --report: score and rank them')
     ap.add_argument('--update-normal', action='store_true', help='write the converted MH normal into existing pseudo-candidates')
     ap.add_argument('--ue-env', default='studio', help="UE reference lighting: studio (MetaHuman Studio) or vhstudio (calibrated vhuman rig)")
@@ -318,6 +362,11 @@ def main():
         out = sweep(a.ue_env, score=a.report)
         for v in (out or {}).get('ranked_by_lpips', []):
             print(v, json.dumps(out['table'][v]))
+        return
+    if a.confirm:
+        out = confirm(ids, a.ue_env, score=a.report)
+        for v, r in (out or {}).get('variants', {}).items():
+            print(v, json.dumps({k: x for k, x in r.items() if k != 'per_head_dlpips'}))
         return
     if a.report:
         print(json.dumps(report(ids, cams, a.ue_env, a.variant), indent=1)); return
