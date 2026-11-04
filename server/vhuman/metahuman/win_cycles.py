@@ -133,7 +133,7 @@ def stage(ids, variants, cameras, profile, root):
         shutil.copytree(cand, root / sid / 'cand')
         shift = np.asarray(json.loads((cand / 'manifest.json').read_text())['geometry']['metahuman_pseudo_candidate']['translation_m'])
         bases = {}
-        for key in sorted({cr.MH_EYES.get(v, 0) for v, _ in todo}):     # 0 = template eyes; n = eye_map version n
+        for key in sorted({cr.eye_version(v) for v, _ in todo}):     # 0 = template eyes; n = eye_map version n
             base = root / sid / ('base' if not key else f'base_eyes{key}')
             if not (base / 'request.json').is_file():
                 if base.exists():
@@ -147,7 +147,7 @@ def stage(ids, variants, cameras, profile, root):
             bases[key] = (base.name, json.loads((base / 'request.json').read_text()))
         cams = json.loads((V1 / 'samples' / sid / 'cameras.json').read_text())['cameras']
         for v, c in todo:
-            base_name, base_req = bases[cr.MH_EYES.get(v, 0)]
+            base_name, base_req = bases[cr.eye_version(v)]
             req = view_request(base_req, cams[c]['vhuman'], shift, c, cr.variant_options(v), prof, cr.RENDER['micro_scale'])
             jobs.append(dict(sid=sid, variant=v, camera=c, base=f'{sid}/{base_name}', candidate=f'{sid}/cand',
                              out=f'{sid}/{variant_dir(v, profile)}/{c}', request=req))

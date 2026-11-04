@@ -35,7 +35,7 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 | Light calibration | `-m server.vhuman.metahuman.light_calibration all` (ColorChecker probes: Cycles CPU + one UE session, then the fit), `batch` writes `render_batches/vhstudio.json`; `launch render_batch.py <vhstudio.json>` renders `<cam>__vhstudio.exr`; `compare_render --report --ue-env vhstudio`; outputs `/mnt/nvme01/data/vhuman-mh/light_calib_v1/` |
 | MH normal conversion | `-m server.vhuman.metahuman.normal_map <id> [--out PNG]`, `--check <id> [--converted PNG]` (convention tests); `compare_render --update-normal` writes it into the pseudo-candidates, `--variant normal` renders/reports with it (`offline_render(skin_normal_map=True)`) |
 | Normal prior | `-m server.vhuman.metahuman.normal_prior_fit [--res 1024 --k 40 --workers 8]` -> `normal_prior_v1.npz` (+ report); `normal_prior_fit.write_png(prior, 'detail_xy', png)` encodes a Blender skin_normal.png |
-| Eye mapping | `-m server.vhuman.metahuman.eye_map calibrate` (UE eye close-ups -> `eye_colour_calibration_v1.json`), `eye_map params <id>`; `compare_render --variant normal_eyes` renders with `head/fit_mh_eyes.json` |
+| Eye mapping | `-m server.vhuman.metahuman.eye_map calibrate` (UE eye close-ups -> `eye_colour_calibration_v1.json`), `eye_map params <id> [--version 1\|2]` (default 2 = sclera tint from the measured MH sclera); `compare_render --variant normal_eyes` / `normal_eyes2` renders with `head/fit_mh_eyes.json` (v1) / `fit_mh_eyes_v2.json`; `--eyes` / `--ears` score the eye and ear sets |
 | Windows UE worker | `-m server.vhuman.metahuman.winjob sync` / `render <ids> --env Studio\|VHStudio` / `compare <ids>` (`VHUMAN_WIN_HOST`, DX12 SM5 on RX 570; setup `../vhuman-win10.md`; pushes params/cameras, runs render_batch.py detached via WMI, pulls into `DATASET_ROOT/win_v1`); roots overridable via `VHUMAN_UE_ROOT` / `VHUMAN_MH_PROJECT` / `VHUMAN_MH_DATA` / `VHUMAN_MH_MODELS` / `VHUMAN_UE_RHI` |
 | Windows Cycles (CPU) | `-m server.vhuman.metahuman.win_cycles render <tag> [--ids] [--variants] [--cameras] [--profile fast]` / `pull <tag>`, then `compare_render --confirm --report --profile fast` (Linux stages heads with `offline_render.render(stage_only=True)`, the worker renders 512 px / 32 spp in ~15 s/view into `<variant>__fast` dirs; `../vhuman-win10.md` §10) |
 | Material sweep | `compare_render --sweep` (renders SWEEP x SWEEP_IDS x SWEEP_CAMERAS on the GPU), then `--sweep --report --ue-env vhstudio` (CPU) -> `compare_v1/sweep_vhstudio.json` ranked by skin LPIPS |
@@ -194,7 +194,8 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 
   MH normals win every face view on every head (+40: 12/12, +90: 11/12) and lose both ears on 9/12 heads: pore
   sparkle much stronger than UE plus streaks in the concha (the GNM ear is coarser than the MH ear, so the MH ear
-  normals do not line up with its folds) -> ears should use flat/attenuated normals. MH eyes (`normal_eyes`): iris
+  normals do not line up with its folds) -> ears should use flat/attenuated normals (not confirmed: the 12-head ear
+  run below finds the MH ear normals closer to UE than a faded ear). MH eyes (`normal_eyes`): iris
   colour family now follows MH (blue/grey/green instead of the template brown), pupil size varies; mapped irises are
   less saturated than UE (green-hazel reads grey), the Cycles sclera is whiter, and UE's red freckles are missing on the
   Cycles side; metric gain small (eye LPIPS -.002/-.003).
@@ -243,3 +244,31 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   consistent gain (-.0013, 5 of 6 views); SSS weight/scale are flat (+-.001); normal strength 1.0 is optimal (0.5 and
   1.5 both worse); micro-pores 0 is neutral (DISTS -.003), 0.5 worse. Candidate change: coat 0.10 -> 0 and roughness
   x1.25, to confirm on more heads and on the s1/s2 photo metrics before changing defaults.
+- Fast confirm (2026-11-04, Windows Cycles CPU 512 px / 32 spp, `win_cycles`; 12 heads x 6 cameras = 72 views vs
+  `normal`, `compare_v1/confirm_vhstudio__fast.json`; fast vs full probe on mh_000000 front: LPIPS .0936 vs .0937):
+  roughness x1.25 LPIPS -.0043 (58/72 views, 10/12 heads), DISTS -.0046, dE -.74, mouth gains most (-.011), front least
+  (-.0007), mh_000145 worse (+.0093); coat 0 -.0015 (63/72 views, 12/12 heads); both together -.0044 (54/72, 9/12).
+  Roughness stays identity-dependent; defaults unchanged.
+- Ear normal fade (2026-11-04, `normal_ear_scale` via the `ears` template mask; 12 heads x ear_left/right, +-90, front,
+  `compare_v1/ears_vhstudio__fast.json`; deltas vs `normal`, ear-region metrics on 46 views):
+
+  | variant | ear LPIPS | ear DISTS | ear dE | view LPIPS | heads better |
+  |---|---|---|---|---|---|
+  | ear normal 0 | +.0156 | +.0123 | +1.90 | +.0037 | 0/12 |
+  | ear normal .5 | +.0016 | +.0029 | +.56 | +.0000 | 9/12 |
+  | no normal map | +.0145 | +.0183 | +1.71 | +.0062 | 4/12 |
+
+  The MH ear normals carry relief UE also shows; fading them is worse on every ear camera. Default stays 1.
+- Eye mapping v2 (2026-11-04, `eye_map.VERSION = 2`): sclera tint = MH sclera albedo measured on a band beside the iris
+  (median linear .39/.27/.25) / vhuman SCLERA_ALBEDO (.74/.70/.66); v1 used the MH tint setting and rendered the sclera
+  ~2.6x brighter than UE. 12 heads x eye_left/right, front, +-40 (`compare_v1/eyes_vhstudio__fast.json`, vs `normal`
+  = template eyes; eye-region metrics on 35 views):
+
+  | variant | view LPIPS | eye LPIPS | eye DISTS | eye dE | heads better |
+  |---|---|---|---|---|---|
+  | v1 `normal_eyes` | -.0017 | -.0027 | -.0080 | -2.9 | 10/12 |
+  | v2 `normal_eyes2` | -.0052 | -.0076 | -.0135 | -7.5 | 12/12 |
+
+  Eye dE front / eye_left / eye_right: template 28.7 / 32.6 / 28.2, v1 25.8 / 29.6 / 25.5, v2 19.0 / 25.5 / 22.6
+  (eye_right eye LPIPS +.009 with v2). Remaining gap: the iris keeps MH chroma in the mapping but renders grey under the
+  Cycles cornea reflection, and the GNM eye sits offset from the MH eye.

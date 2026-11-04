@@ -495,10 +495,13 @@ def run(request):
     full=request.get('quality','baseline')=='full';ablate=set(request.get('ablate',[]))
     skin_full=full and '2c' not in ablate and (out/'skin_templates.npz').is_file()
     if skin_full:full_skin_graph(skin,node,bound,out,request)
+    # eye material overrides (metahuman.compare_render EYE_SWEEP): sclera/iris/cornea roughness, cornea IOR, cornea
+    # Specular IOR Level; absent = the authored values.
+    eye_mo=dict(request.get('material_overrides') or {})
     for name,color,roughness in [('teeth',(.65,.6,.5),.25),('gums',(.35,.08,.07),.35),
         ('tongue',(.4,.09,.08),.4),('cavity',(.33,.09,.09),.45),('sclera',(.7,.65,.6),.25),
         ('iris',(.12,.065,.035),.55),('frame',(.12,.045,.025),.25),('pupil',(.001,.001,.001),1),('lash',(.025,.018,.012),.45)]:
-        materials[name],principled=material(name,color,roughness)
+        materials[name],principled=material(name,color,float(eye_mo.get(f'{name}_roughness',roughness)) if name in ('sclera','iris') else roughness)
         if name in ('gums','tongue'):
             principled.inputs['Subsurface Weight'].default_value=.1
             principled.inputs['Subsurface Radius'].default_value=(.0008,.0004,.0002)
@@ -507,7 +510,9 @@ def run(request):
             texture=image_node(materials[name].node_tree.nodes,out/('sclera.png' if name=='sclera' else 'iris.png'))
             materials[name].node_tree.links.new(texture.outputs['Color'],principled.inputs['Base Color'])
     if full and '2e' not in ablate:full_mouth_materials(materials,out,request)
-    materials['cornea'],_=material('cornea',(1,1,1),.025,1,config['optical_eyes']['ior'])
+    materials['cornea'],cornea=material('cornea',(1,1,1),float(eye_mo.get('cornea_roughness',.025)),1,
+                                        float(eye_mo.get('cornea_ior',config['optical_eyes']['ior'])))
+    if 'cornea_specular' in eye_mo:cornea.inputs['Specular IOR Level'].default_value=float(eye_mo['cornea_specular'])
     materials['glass'],_=material('glass',(1,1,1),.025,1,1.5)
     materials['tear'],_=material('tear_film',(1,1,1),.02,1,1.336)
     materials['hat'],principled=material('hat',(.015,.018,.025),.7)

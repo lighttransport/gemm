@@ -185,9 +185,28 @@ SWEEP_IDS = ('mh_000000', 'mh_000145', 'mh_000300')      # three skin tones / ag
 SWEEP_CAMERAS = ('front', 'yaw_p40')
 RENDER_ARGS = ('skin_normal_strength', 'micro_scale')
 
+# Eye optics sweep: 'normal_eyes2' (eye_map v2) + one Cycles eye-material setting (cycles_scene material_overrides; the
+# authored values are cornea roughness .025, IOR 1.376, Specular IOR Level .5, sclera roughness .25, iris .55).
+EYE_SWEEP = {'cornea_roughness': (0., .08, .15), 'cornea_ior': (1.3, 1.336, 1.42), 'cornea_specular': (0., .25, 1.),
+             'sclera_roughness': (.15, .4, .6), 'iris_roughness': (.3, .8)}
+EYE_SWEEP_IDS = ('mh_000000', 'mh_000145', 'mh_000300', 'mh_000358')
+EYE_SWEEP_CAMERAS = ('eye_left', 'eye_right', 'front')
+
 
 def sweep_variant(param, value):
     return f'sw_{param}_{value:g}'
+
+
+def eye_variant(param, value):
+    return f'ew_{param}_{value:g}'
+
+
+EYE_SWEEP_VARIANTS = tuple(eye_variant(p, v) for p, values in EYE_SWEEP.items() for v in values)
+
+
+def eye_version(variant):
+    """eye_map version a variant renders with (0 = template eyes)."""
+    return 2 if variant.startswith('ew_') else MH_EYES.get(variant, 0)
 
 
 def variant_options(variant):
@@ -204,6 +223,10 @@ def variant_options(variant):
                 else:
                     opts['material_overrides'] = {param: value}
                 return opts
+    if variant.startswith('ew_'):
+        for param in EYE_SWEEP:
+            if variant.startswith(f'ew_{param}_'):
+                return dict(VARIANTS['normal_eyes2'], material_overrides={param: float(variant[len(f'ew_{param}_'):])})
     raise ValueError(f'unknown variant {variant!r}')
 
 
@@ -234,10 +257,12 @@ CONFIRM = ('sw_roughness_scale_1.25', 'sw_skin_coat_0', 'mat_r125_c0')
 CONFIRM_CAMERAS = ('front', 'yaw_p40', 'yaw_m40', 'yaw_p90', 'yaw_m90', 'mouth')
 # Ear experiment (2026-11-04): the MH normal regressed ear views on 9/12 heads; fade it on the GNM ears.
 EYE_SET = dict(variants=('normal_eyes', 'normal_eyes2'), cameras=('eye_left', 'eye_right', 'front', 'yaw_p40', 'yaw_m40'))
+EYE_SWEEP_SET = dict(variants=EYE_SWEEP_VARIANTS, cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
 EAR_SET = dict(variants=('', 'normal_ear0', 'normal_ear50'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))
 
 
-def confirm(ids, env='vhstudio', score=False, profile='full', variants=CONFIRM, cameras=CONFIRM_CAMERAS, name='confirm'):
+def confirm(ids, env='vhstudio', score=False, profile='full', variants=CONFIRM, cameras=CONFIRM_CAMERAS, name='confirm',
+            baseline='normal'):
     """score=False: render CONFIRM x ids x CONFIRM_CAMERAS (GPU). score=True: per-view paired deltas vs 'normal'
     (LPIPS / DISTS / dE), means, and how many views each variant improves -> compare_v1/confirm_<env>.json.
     profile 'fast': score the Windows CPU renders (win_cycles, 512 px / 32 spp, 'normal' included) against each other
@@ -249,21 +274,21 @@ def confirm(ids, env='vhstudio', score=False, profile='full', variants=CONFIRM, 
             for sid in ids:
                 print(v, sid, render_sample(sid, cameras, v), flush=True)
         return None
-    variants = tuple(v for v in variants if v != 'normal')
-    rows = {v: report(ids, cameras, env, v, write_summary=False, profile=profile) for v in ('normal',) + variants}
+    variants = tuple(v for v in variants if v != baseline)
+    rows = {v: report(ids, cameras, env, v, write_summary=False, profile=profile) for v in (baseline,) + variants}
     suffix = f'_{env}' if env != 'studio' else ''
     psuf = '' if profile == 'full' else f'__{profile}'
     def load(sid, v):
         path = COMPARE_ROOT / sid / f"compare{suffix}{'_' + v if v else ''}{psuf}.json"
         return json.loads(path.read_text()) if path.is_file() else {}
-    per = {v: {sid: load(sid, v) for sid in ids} for v in ('normal',) + variants}
-    out = dict(env=env, profile=profile, ids=list(ids), cameras=list(cameras), baseline='normal', variants={}, per_camera=rows)
+    per = {v: {sid: load(sid, v) for sid in ids} for v in (baseline,) + variants}
+    out = dict(env=env, profile=profile, ids=list(ids), cameras=list(cameras), baseline=baseline, variants={}, per_camera=rows)
     for v in variants:
         d = {k: [] for k in ('lpips', 'dists', 'delta_e') + REGION_KEYS}
         by_id = {}
         for sid in ids:
             for cam in cameras:
-                a, b = per['normal'][sid].get(cam), per[v][sid].get(cam)
+                a, b = per[baseline][sid].get(cam), per[v][sid].get(cam)
                 if not a or not b or a.get('lpips') is None or b.get('lpips') is None:
                     continue
                 for k in d:
@@ -278,9 +303,11 @@ def confirm(ids, env='vhstudio', score=False, profile='full', variants=CONFIRM, 
     return out
 
 
-def write_eye_fit(sid, version=1):
-    """head/fit_mh_eyes[_v<n>].json: the template fit with eye_params mapped from this sample's MetaHuman eyes (eye_map)."""
-    from .eye_map import params_for
+def write_eye_fit(sid, version=None):
+    """head/fit_mh_eyes[_v<n>].json: the template fit with eye_params mapped from this sample's MetaHuman eyes (eye_map;
+    version None = eye_map.VERSION)."""
+    from .eye_map import VERSION, params_for
+    version = VERSION if version is None else version
     head = COMPARE_ROOT / sid / 'head'
     fit = json.loads((head / 'fit.json').read_text())
     p, rec = params_for(sid, 'left', version)
@@ -307,8 +334,8 @@ def render_sample(sid, cameras=CAMERAS, variant=''):
         v = cams[name]['vhuman']
         explicit = dict(origin=(np.asarray(v['origin']) + shift).tolist(), rotation=v['rotation'], focal_px=v['focal_px'], size=v['size'])
         opts = dict(RENDER, **variant_options(variant)); preset = opts.pop('preset'); samples = opts.pop('samples')
-        if variant in MH_EYES:
-            opts['head_fit'] = write_eye_fit(sid, MH_EYES[variant])
+        if eye_version(variant):
+            opts['head_fit'] = write_eye_fit(sid, eye_version(variant))
         render(cand, out, device='hip', preset=preset, samples=samples, resolution=int(v['size'][0]), explicit_camera=explicit,
                hard_limit_mib=14336, **opts)
         done.append(name)
@@ -399,6 +426,7 @@ def main():
     ap.add_argument('--update-normal', action='store_true', help='write the converted MH normal into existing pseudo-candidates')
     ap.add_argument('--ears', action='store_true', help='score the EAR_SET experiment (normal_ear* vs normal; renders via win_cycles)')
     ap.add_argument('--eyes', action='store_true', help='score the EYE_SET experiment (MH eye mapping v1/v2 vs normal)')
+    ap.add_argument('--eye-sweep', action='store_true', help='score the EYE_SWEEP experiment (ew_* eye optics vs normal_eyes2)')
     ap.add_argument('--profile', default='full', choices=('full', 'fast'), help="with --confirm --report: 'fast' scores win_cycles' 512 px / 32 spp renders")
     ap.add_argument('--ue-env', default='studio', help="UE reference lighting: studio (MetaHuman Studio) or vhstudio (calibrated vhuman rig)")
     a = ap.parse_args()
@@ -410,8 +438,10 @@ def main():
         for v in (out or {}).get('ranked_by_lpips', []):
             print(v, json.dumps(out['table'][v]))
         return
-    if a.ears or a.eyes:
-        out = confirm(ids, a.ue_env, score=True, profile=a.profile, name='ears' if a.ears else 'eyes', **(EAR_SET if a.ears else EYE_SET))
+    if a.ears or a.eyes or a.eye_sweep:
+        name, exp = (('ears', EAR_SET) if a.ears else ('eyes', EYE_SET) if a.eyes else ('eye_sweep', EYE_SWEEP_SET))
+        out = confirm(a.ids.split(',') if a.eye_sweep and a.ids else EYE_SWEEP_IDS if a.eye_sweep else ids,
+                      a.ue_env, score=True, profile=a.profile, name=name, **exp)
         for v, r in out['variants'].items():
             print(v, json.dumps({k: x for k, x in r.items() if k != 'per_head_dlpips'}))
         return

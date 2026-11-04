@@ -182,3 +182,13 @@ def test_box_down_matches_block_mean():
     assert box_down(x, 4) is x
     with pytest.raises(ValueError):
         box_down(np.zeros((6, 6, 3)), 4)
+
+
+def test_eye_sweep_variants():
+    from server.vhuman.metahuman import compare_render as cr, eye_map
+    assert eye_map.VERSION == 2
+    assert len(cr.EYE_SWEEP_VARIANTS) == sum(len(v) for v in cr.EYE_SWEEP.values())
+    assert cr.variant_options('ew_cornea_ior_1.336') == dict(skin_normal_map=True, material_overrides={'cornea_ior': 1.336})
+    assert [cr.eye_version(v) for v in ('normal', 'normal_eyes', 'normal_eyes2', 'ew_sclera_roughness_0.4')] == [0, 1, 2, 2]
+    for v in cr.EYE_SWEEP_VARIANTS:
+        assert cr.variant_options(v)['material_overrides']

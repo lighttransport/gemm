@@ -29,6 +29,7 @@ from ..eye.chart import chart_color
 LIMBUS_RADIUS_M = .006          # eye/params optics.limbus_radius default (GNM)
 MH_CORNEA_DEFAULT = .165
 PUPIL_LUM = .004
+VERSION = 2                     # default mapping: v2 sclera tint from the MetaHuman sclera (fast confirm: eye dE -7.5, 12/12 heads); v1 kept
 P_REF = P.P_REF                 # pupil radius / iris radius at dilation 1
 U_GRID, V_GRID = np.meshgrid(np.linspace(0, 1, 101), np.linspace(0, 1, 101))
 CHART = chart_color(U_GRID, V_GRID)
@@ -117,7 +118,7 @@ def mh_eye(settings, side):
                             vascularity_coverage=f['sclera_vascularity_coverage']))
 
 
-def to_vhuman(mh, measured, version=1):
+def to_vhuman(mh, measured, version=VERSION):
     """mh: params.json eyes.settings.eye_<side>; measured: measure(). Returns validated vhuman eye params + the record.
     version 2: sclera tint = the measured MetaHuman sclera albedo / vhuman's SCLERA_ALBEDO (custom tint), instead of the
     MetaHuman tint setting (measured on a horizontal band beside the iris, measure()['sclera_band_linear']). MetaHuman
@@ -166,24 +167,24 @@ def to_vhuman(mh, measured, version=1):
     return p, rec
 
 
-def params_for(sid, side='left', version=1):
+def params_for(sid, side='left', version=VERSION):
     settings = json.loads((V1 / 'samples' / sid / 'params.json').read_text())['eyes']['settings']
     return to_vhuman(mh_eye(settings, side), measure(sid, side), version)
 
 
-def calibrate():
+def calibrate(version=VERSION):
     ids = sorted(json.loads((V1 / 'sampling.json').read_text())['render_ids'])
     rows, failed = [], []
     for sid in ids:
         try:
             for side in ('left', 'right'):
-                _, rec = params_for(sid, side); rows.append(dict(id=sid, side=side, **rec))
+                _, rec = params_for(sid, side, version); rows.append(dict(id=sid, side=side, **rec))
         except Exception as e:      # noqa: BLE001
             failed.append(dict(id=sid, error=str(e)))
     de = np.array([r['reproduction_delta_e'] for r in rows])
     out = MODELS_ROOT / 'eye_colour_calibration_v1.json'
     rep = dict(format='vhuman.metahuman_eye_colour.v1', code_sha256=code_sha256(), licence=LICENCE, default_enabled=False,
-               method=__doc__.split('\n\n')[1], n=len(rows), failed=failed,
+               method=__doc__.split('\n\n')[1], n=len(rows), failed=failed, mapping_version=version,
                reproduction_delta_e=dict(mean=float(de.mean()), p95=float(np.percentile(de, 95)), max=float(de.max())) if len(de) else None,
                rows=rows)
     out.write_text(json.dumps(rep, indent=1) + '\n')
@@ -193,11 +194,12 @@ def calibrate():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('step', choices=('calibrate', 'params')); ap.add_argument('sid', nargs='?')
+    ap.add_argument('--version', type=int, default=VERSION, help='eye mapping version (1: MetaHuman sclera tint setting, 2: measured sclera)')
     a = ap.parse_args()
     if a.step == 'params':
-        p, rec = params_for(a.sid)
+        p, rec = params_for(a.sid, version=a.version)
         print(json.dumps(dict(params=p, record=rec), indent=1, default=float)); return
-    out, rep = calibrate()
+    out, rep = calibrate(a.version)
     print(out, json.dumps({k: rep[k] for k in ('n', 'reproduction_delta_e')}), 'failed', len(rep['failed']))
 
 
