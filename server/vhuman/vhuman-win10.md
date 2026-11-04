@@ -287,3 +287,13 @@ VHStudio env (calibrated vhuman rig as RectLights), mh_000000, 10 cameras: 59 s 
 (materials already compiled by the Studio runs). Windows vs Linux: wide views rel 1.1-1.8 %, LPIPS .0001-.0003,
 dE .42-.45; close-ups (ears/eyes/mouth) rel 2.2-3.7 %, LPIPS .0010-.0013, dE .40-.50. The difference image is fine
 noise plus a faint line along the shoulder shadow edge. Within the thresholds, so Windows can render VHStudio references.
+
+Multi-head timing (Studio env, 11 heads mh_000010..mh_000435, 20 shots each, one editor session): 201 s in total =
+~60 s editor start + **14.1 s per head** (14.0-14.4, steady), so ~1,000 heads/4 h of reference renders once started.
+Linux ran the same batches at ~15-20 s per head, so the worker is at least as fast for UE renders, and it runs in parallel
+with Linux Cycles jobs. The launch exited 0 this time (no shutdown crash). Windows vs Linux over all 110 views: LPIPS
+median .0004, max .0052; dE median .42, max .54; none over the thresholds. The largest linear difference (6%,
+mh_000300 front) is the backdrop only: on the front view (the first capture after each head loads) the grey backdrop
+differs by +11% / -10% on 2 of 11 heads while the head pixels match (foreground ratio 1.000). It looks like the
+backdrop not having settled for the first shot; it does not affect skin-crop scores. If backdrop pixels ever matter,
+add a discarded pre-roll capture per head.
