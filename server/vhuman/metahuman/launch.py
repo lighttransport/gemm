@@ -1,4 +1,4 @@
-"""Host-side launcher for Unreal Editor python scripts (headless, Vulkan, offscreen).
+"""Host-side launcher for Unreal Editor python scripts (headless, offscreen; Vulkan on Linux, DX12 on Windows).
 
 usage: python -m server.vhuman.metahuman.launch <script.py> [args...] [--timeout S] [--no-lock] [--result PATH]
 Runs UnrealEditor-Cmd with -ExecutePythonScript under the repository GPU lock, captures the log, and returns 0 only if the
@@ -13,18 +13,29 @@ import sys
 import time
 from pathlib import Path
 
-from . import DATASET_ROOT, PROJECT, UE_EDITOR_CMD, UE_SCRIPTS
+from . import DATASET_ROOT, PROJECT, UE_EDITOR_CMD, UE_RHI, UE_SCRIPTS, WINDOWS
 
-BASE_ARGS = ['-vulkan', '-RenderOffScreen', '-unattended', '-nosplash', '-NoSound', '-ResX=1024', '-ResY=1024',
+BASE_ARGS = ['-RenderOffScreen', '-unattended', '-nosplash', '-NoSound', '-ResX=1024', '-ResY=1024',
              '-NoMetaHumanAccountPortalLoginFallback', '-log', '-stdout', '-FullStdOutLogOutput', '-NoLoadStartupPackages']
 
 
-def command(script, args, log_path):
+def command(script, args, log_path, windows=WINDOWS, rhi=UE_RHI):
+    """argv list on Linux; one command-line string on Windows, where UE wants -ExecutePythonScript="<script> <args>" quoted
+    as a whole (subprocess.list2cmdline would quote the entire -flag=value token instead)."""
     script = Path(script)
     if not script.is_absolute():
         script = UE_SCRIPTS / script
+    if windows:
+        def q(a):
+            a = str(a).replace('\\', '/')
+            if '"' in a or ' ' in a:      # UE splits the quoted value on spaces; keep worker paths space-free
+                raise ValueError(f'space or double quote in UE script argument: {a!r}')
+            return a
+        py = ' '.join([script.as_posix()] + [q(a) for a in args])
+        parts = [f'"{UE_EDITOR_CMD}"', f'"{PROJECT}"', f'-ExecutePythonScript="{py}"', f"-{rhi}", *BASE_ARGS, f'-abslog="{log_path}"']
+        return ' '.join(parts)
     py = ' '.join([str(script)] + [shlex.quote(a) for a in args])
-    return [str(UE_EDITOR_CMD), str(PROJECT), f'-ExecutePythonScript={py}', *BASE_ARGS, f'-abslog={log_path}']
+    return [str(UE_EDITOR_CMD), str(PROJECT), f'-ExecutePythonScript={py}', f"-{rhi}", *BASE_ARGS, f'-abslog={log_path}']
 
 
 def run(script, args=(), *, timeout=3600., use_lock=True, result=None, env_extra=None, min_free_mib=6144):
@@ -34,15 +45,16 @@ def run(script, args=(), *, timeout=3600., use_lock=True, result=None, env_extra
     log_path = logs / f'{Path(script).stem}-{stamp}.log'
     env = dict(os.environ, VHUMAN_MH_OUT=str(DATASET_ROOT))
     # the root filesystem (home) filled up on 2026-11-03: keep every UE cache on nvme01 (Zen DataPath is set in DefaultEngine.ini)
-    env['UE-LocalDataCachePath'] = str(PROJECT.parent.parent / 'DDC')
-    env['XDG_CONFIG_HOME'] = str(PROJECT.parent.parent / 'xdg-config')     # UE Linux puts ~/.config/Epic (Zen, crash reports, user settings) here
-    env.setdefault('DISPLAY', ':0')
+    if not WINDOWS:
+        env['UE-LocalDataCachePath'] = str(PROJECT.parent.parent / 'DDC')
+        env['XDG_CONFIG_HOME'] = str(PROJECT.parent.parent / 'xdg-config')     # UE Linux puts ~/.config/Epic (Zen, crash reports, user settings) here
+        env.setdefault('DISPLAY', ':0')
     if env_extra:
         env.update(env_extra)
     cmd = command(script, list(args), log_path)
     if result:
         Path(result).unlink(missing_ok=True)
-    print('launch:', ' '.join(shlex.quote(c) for c in cmd), flush=True)
+    print('launch:', cmd if isinstance(cmd, str) else ' '.join(shlex.quote(c) for c in cmd), flush=True)
     t0 = time.time()
 
     def _no_core():
@@ -52,7 +64,8 @@ def run(script, args=(), *, timeout=3600., use_lock=True, result=None, env_extra
 
     def _run():
         try:
-            proc = subprocess.run(cmd, env=env, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=_no_core)
+            proc = subprocess.run(cmd, env=env, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  preexec_fn=None if WINDOWS else _no_core)
             return proc.returncode
         except subprocess.TimeoutExpired:
             return -9

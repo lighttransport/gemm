@@ -106,3 +106,27 @@ def test_tangent_frames_flat_patch_and_green_flip():
     n = np.array([[.3, -.2, .93], [-.1, .4, .91]]); n /= np.linalg.norm(n, axis=1, keepdims=True)
     world = np.einsum('nk,nkj->nj', n, tf); local = np.einsum('nkj,nj->nk', tf, world)
     np.testing.assert_allclose(local, n, atol=1e-9)
+
+
+def test_windows_launch_command_and_job_script():
+    import pytest
+    from server.vhuman.metahuman import launch, winjob
+    cmd = launch.command('D:/w/ue_scripts/render_batch.py', ['D:\\data\\vhuman-mh\\v1\\render_batches\\t.json'], 'D:/w/log.txt', windows=True, rhi='dx12')
+    assert isinstance(cmd, str)
+    assert '-ExecutePythonScript="' in cmd and 'render_batch.py D:/data/vhuman-mh/v1/render_batches/t.json" -dx12' in cmd
+    assert ' -dx12 -RenderOffScreen ' in cmd and '-vulkan' not in cmd and '-abslog="D:/w/log.txt"' in cmd
+    with pytest.raises(ValueError):
+        launch.command('D:/w/a.py', ['D:/has space/x.json'], 'D:/w/log.txt', windows=True)
+    argv = launch.command('/x/a.py', ['b c'], '/x/log', windows=False, rhi='vulkan')
+    assert isinstance(argv, list) and argv[2] == "-ExecutePythonScript=/x/a.py 'b c'" and '-vulkan' in argv
+    ps = winjob.job_script('t1', ['render_batch.py', 'D:/data/b.json'], 600)
+    assert "$env:VHUMAN_UE_RHI = 'dx12'" in ps and '-m server.vhuman.metahuman.launch render_batch.py D:/data/b.json --timeout 600' in ps
+    assert ps.rstrip().splitlines()[-1].endswith("\\logs\\t1.exit'")
+
+
+def test_gpu_file_lock_roundtrip(tmp_path):
+    from server.vhuman import gpu
+    with gpu.file_lock(tmp_path / 'x.lock', 1.):
+        pass
+    with gpu.file_lock(tmp_path / 'x.lock', 1.):
+        pass

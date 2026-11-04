@@ -94,13 +94,35 @@ def median_lab(rgb, mask):
     return np.median(srgb_to_lab(np.asarray(rgb)[mask]), 0).tolist()
 
 
-def compare_region(reference, render, parser, names, *, size=256, margin=.25):
+def drop_specks(mask, frac=.05):
+    """Keep connected components with at least frac of the largest component's pixels."""
+    from scipy import ndimage
+    lab, n = ndimage.label(mask)
+    if n <= 1:
+        return mask
+    sizes = np.bincount(lab.ravel())[1:]
+    return np.isin(lab, 1 + np.flatnonzero(sizes >= frac * sizes.max()))
+
+
+def compare_region(reference, render, parser, names, *, size=256, margin=.25, aligned=False):
     """Crop both images around the same parsing label set, resize to size^2 and score.
 
-    Crops are aligned by their own label boxes (renders and generated references do not share a calibrated
-    camera); the metrics therefore measure appearance, not registration."""
+    Default: crops are aligned by their own label boxes (renders and generated references do not share a calibrated
+    camera); the metrics therefore measure appearance, not registration. aligned=True (same calibrated camera, e.g.
+    the UE-vs-Cycles harness): parser specks are dropped and one box (around the labels both images agree on, else
+    the reference's) crops both images, so a stray label in one image cannot change its crop."""
     ma = label_mask(parser, reference, names); mb = label_mask(parser, render, names)
-    ca, cma, boxa = bbox_crop(reference, ma, margin=margin); cb, cmb, boxb = bbox_crop(render, mb, margin=margin)
+    if aligned:
+        ma, mb = drop_specks(ma), drop_specks(mb)
+        both = ma & mb
+        _, _, box = bbox_crop(reference, both if both.sum() >= 50 else ma, margin=margin)
+        if box is None:
+            return dict(status='region not found', reference_pixels=int(ma.sum()), render_pixels=int(mb.sum()))
+        x0, y0, x1, y1 = box
+        ca, cma, boxa = np.asarray(reference)[y0:y1, x0:x1], ma[y0:y1, x0:x1], box
+        cb, cmb, boxb = np.asarray(render)[y0:y1, x0:x1], mb[y0:y1, x0:x1], box
+    else:
+        ca, cma, boxa = bbox_crop(reference, ma, margin=margin); cb, cmb, boxb = bbox_crop(render, mb, margin=margin)
     if ca is None or cb is None:
         return dict(status='region not found', reference_pixels=int(ma.sum()), render_pixels=int(mb.sum()))
     ra = np.asarray(Image.fromarray(ca).resize((size, size), Image.BICUBIC))

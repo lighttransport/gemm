@@ -8,8 +8,12 @@ failure. Same lock file as server/pixal3d/app.py (cancellable_file_lock).
 """
 from __future__ import annotations
 
-import fcntl
 import contextvars
+try:
+    import fcntl
+except ImportError:        # Windows worker (metahuman/winjob.py): byte-range lock instead of flock
+    fcntl = None
+    import msvcrt
 import json
 import subprocess
 import threading
@@ -111,16 +115,22 @@ def file_lock(path: Path, timeout: float, cancel: threading.Event | None = None)
             if cancel is not None and cancel.is_set():
                 raise Cancelled("cancelled while waiting for the GPU")
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 break
-            except BlockingIOError:
+            except (BlockingIOError if fcntl is not None else OSError):
                 if time.monotonic() >= deadline:
                     raise GpuBusy(f"the GPU device stayed locked for {timeout:g}s") from None
                 time.sleep(0.1)
         yield
     finally:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:
+                handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         finally:
             handle.close()
 

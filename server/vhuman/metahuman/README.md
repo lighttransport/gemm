@@ -36,6 +36,8 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 | MH normal conversion | `-m server.vhuman.metahuman.normal_map <id> [--out PNG]`, `--check <id> [--converted PNG]` (convention tests); `compare_render --update-normal` writes it into the pseudo-candidates, `--variant normal` renders/reports with it (`offline_render(skin_normal_map=True)`) |
 | Normal prior | `-m server.vhuman.metahuman.normal_prior_fit [--res 1024 --k 40 --workers 8]` -> `normal_prior_v1.npz` (+ report); `normal_prior_fit.write_png(prior, 'detail_xy', png)` encodes a Blender skin_normal.png |
 | Eye mapping | `-m server.vhuman.metahuman.eye_map calibrate` (UE eye close-ups -> `eye_colour_calibration_v1.json`), `eye_map params <id>`; `compare_render --variant normal_eyes` renders with `head/fit_mh_eyes.json` |
+| Windows UE worker | `-m server.vhuman.metahuman.winjob sync` / `render <ids> --env Studio\|VHStudio` / `compare <ids>` (`VHUMAN_WIN_HOST`, DX12 SM5 on RX 570; setup `../vhuman-win10.md`; pushes params/cameras, runs render_batch.py detached via WMI, pulls into `DATASET_ROOT/win_v1`); roots overridable via `VHUMAN_UE_ROOT` / `VHUMAN_MH_PROJECT` / `VHUMAN_MH_DATA` / `VHUMAN_MH_MODELS` / `VHUMAN_UE_RHI` |
+| Material sweep | `compare_render --sweep` (renders SWEEP x SWEEP_IDS x SWEEP_CAMERAS on the GPU), then `--sweep --report --ue-env vhstudio` (CPU) -> `compare_v1/sweep_vhstudio.json` ranked by skin LPIPS |
 | Use the skin prior | `bake_portrait(..., skin_prior=PATH)`; `tmp/vhuman-ab-cycles/scripts/rebake.py ... --skin-prior PATH` |
 | Tests | `$P -m pytest -q server/vhuman/test_metahuman_prior.py` |
 
@@ -178,6 +180,29 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   of its bound skin, written with Blender's convention (green = +V up). The converted map passes the same tests read
   that way (r -.34/-.36, skew -1.4). Cycles: `skin_normal_map=True` feeds the candidate's skin_normal.png into the full
   skin graph, whiteout-blended with the tiled pores (graph unchanged when off).
+  Result (12 heads vs VHStudio, aligned scoring, see below; LPIPS flat -> MH normal -> + MH eyes):
+
+  | camera | LPIPS | dE | DISTS |
+  |---|---|---|---|
+  | front | .136 -> .128 -> .127 | 5.36 -> 5.24 | .184 -> .178 |
+  | yaw +40 / -40 | .093/.110 -> .082/.099 -> .082/.098 | 4.95/5.12 -> 4.81/4.94 | .172/.173 -> .157/.153 |
+  | yaw +90 / -90 | .084/.112 -> .075/.100 | 5.70/5.92 -> 5.71/5.82 | .167/.182 -> .155/.173 |
+  | ear L / R | .184/.229 -> .194/.257 | 5.31/5.38 -> 5.57/5.93 | .176/.203 -> .185/.200 |
+  | eye L / R | .282/.285 -> .269/.246 -> .267/.243 | 4.49/4.87 -> 4.41/4.63 | .207/.205 -> .199/.191 |
+  | mouth | .254 -> .228 | 5.58 -> 5.38 | .199 -> .191 |
+
+  MH normals win every face view on every head (+40: 12/12, +90: 11/12) and lose both ears on 9/12 heads: pore
+  sparkle much stronger than UE plus streaks in the concha (the GNM ear is coarser than the MH ear, so the MH ear
+  normals do not line up with its folds) -> ears should use flat/attenuated normals. MH eyes (`normal_eyes`): iris
+  colour family now follows MH (blue/grey/green instead of the template brown), pupil size varies; mapped irises are
+  less saturated than UE (green-hazel reads grey), the Cycles sclera is whiter, and UE's red freckles are missing on the
+  Cycles side; metric gain small (eye LPIPS -.002/-.003).
+  Scoring fix (2026-11-04): `compare_region` cropped each image around its own parser labels, so a stray 'skin' speck
+  in the Cycles render grew its crop to the full frame (LPIPS jumped .07 <-> .36 between near-identical renders).
+  `compare_render` now uses `compare_region(..., aligned=True)` (specks < 5% of the largest component dropped, one box
+  for both images; same camera). All three summaries were rescored; the VHStudio table above used the old scoring
+  (its wide views were inflated: aligned flat front/+40/-40/+90/-90 = .136/.093/.110/.084/.112; pre-fix summaries in
+  `tmp/vhuman-ab-cycles/metrics/pre_aligned/`).
 - Normal prior (2026-11-04, `normal_prior_fit.py`, `normal_prior_v1.npz`): 450 training heads converted on their own MH
   head / bound GNM skin at 1024; mean, std, PCA K=40 (58% variance) on tangent xy, mean split into a 12 px low-frequency
   part (mostly MH-vs-GNM mesh shading) and the detail part (pores, creases: what transfers to non-MetaHuman heads).
@@ -196,3 +221,14 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 - B7 (2026-11-04, `tmp/vhuman-ab-cycles/scripts/make_ears08.py`): B6 + normal prior `detail_xy` as skin_normal.png with
   `skin_normal_map=True` for the real subjects s1/s2; render plan `normal` (B7 on the prior views + eye close-ups, B6 eye
   close-ups), report `prior_report.py B5 B6 B7`.
+  Result (2026-11-04, LPIPS B6 -> B7): s1 face .427 -> .424, +40/-40 .506/.493 -> .502/.491, held-out ears +90/-90
+  .551/.571 -> .553/.537; s2 face .499 -> .498, +40/-40 .537/.509 -> .533/.509, ears .591/.546 -> .558/.543. B7 wins or
+  ties 7 of 8 rows (s1 +90 ear +.002) and fixes most of B6's s1 -90 ear regression; held-out ear DISTS improves 3 of 4.
+  Visually close to B6 at sheet scale (slightly more pore/crease texture). Unlike the MetaHuman pseudo-candidates, the
+  real subjects use the dense refined ears and only the transferable detail part, so the ears do not regress here.
+  VRAM peak 8.2 GB on eye close-ups (7.1 GB wide views).
+- Material sweep harness (2026-11-04): `offline_render(material_overrides=...)` scales the full skin graph's roughness and
+  specular, sets the skin coat weight (.10) and the SSS weight/scale (.6/.5); empty = the authored graph (no extra nodes).
+  `compare_render` variants `sw_<param>_<value>` = 'normal' + one setting; SWEEP: roughness x .8/1.25/1.5, specular
+  x .5/.75/1.25, skin coat 0/.05/.2, SSS weight .3/.45/.8, SSS scale .25/.75/1, normal strength .5/1.5, micro .0/.5 on
+  mh_000000/145/300 x front/yaw_p40 (114 renders).

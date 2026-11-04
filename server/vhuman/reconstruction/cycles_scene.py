@@ -138,17 +138,25 @@ def full_skin_graph(skin,node,bound,out,request):
         return m.outputs[0]
     # roughness = template*(1+.6 cavity), lips wetter: -0.12*lips
     r=math('MULTIPLY',rough,math('MULTIPLY_ADD',cavity,.6,value=1) if False else math('ADD',math('MULTIPLY',cavity,.6),1))
-    r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True);links.new(r,node.inputs['Roughness'])
+    # material_overrides (metahuman.compare_render --sweep; empty = the authored graph, no extra nodes):
+    # roughness_scale, specular_scale, skin_coat (the .10 skin coat weight), subsurface_weight, subsurface_scale
+    mo=dict(request.get('material_overrides') or {})
+    r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True)
+    if mo.get('roughness_scale',1.)!=1.:r=math('MULTIPLY',r,float(mo['roughness_scale']),clamp=True)
+    links.new(r,node.inputs['Roughness'])
     # specular level = template*(1-.7 cavity)
-    sp=math('MULTIPLY',spec,math('SUBTRACT',1.,math('MULTIPLY',cavity,.7)),clamp=True);links.new(sp,node.inputs['Specular IOR Level'])
+    sp=math('MULTIPLY',spec,math('SUBTRACT',1.,math('MULTIPLY',cavity,.7)),clamp=True)
+    if mo.get('specular_scale',1.)!=1.:sp=math('MULTIPLY',sp,float(mo['specular_scale']),clamp=True)
+    links.new(sp,node.inputs['Specular IOR Level'])
     # second (sharper) lobe kept small so skin reads oily, not wet: coat .10(1-cavity)+.35 lips,
     # roughness .30 -> .12 on lips (the moist lip band)
-    coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),.10),math('MULTIPLY',lips,.35*float(request.get('lip_coat_scale',1.))),clamp=True);links.new(coat,node.inputs['Coat Weight'])
+    coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),float(mo.get('skin_coat',.10))),math('MULTIPLY',lips,.35*float(request.get('lip_coat_scale',1.))),clamp=True);links.new(coat,node.inputs['Coat Weight'])
     cr=math('SUBTRACT',.30,math('MULTIPLY',lips,.30-float(request.get('lip_coat_roughness',.12))),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
     node.inputs['Coat IOR'].default_value=1.4
     # random-walk skin subsurface (radii in metres, literature-scale skin profile)
     node.subsurface_method='RANDOM_WALK_SKIN'
-    node.inputs['Subsurface Weight'].default_value=.6;node.inputs['Subsurface Scale'].default_value=.5
+    node.inputs['Subsurface Weight'].default_value=float(mo.get('subsurface_weight',.6));node.inputs['Subsurface Scale'].default_value=float(mo.get('subsurface_scale',.5))
+    if mo:skin['material_overrides']=json.dumps(mo)
     node.inputs['Subsurface Radius'].default_value=(.00367,.00137,.00068);node.inputs['Subsurface IOR'].default_value=1.4
     # tiled micro normal (pores), strength scaled by the region mask
     micro_img=image_node(nodes,out/'skin_micro_normal.png',linear=True)

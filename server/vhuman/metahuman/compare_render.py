@@ -171,6 +171,59 @@ VARIANTS = {'': {}, 'normal': dict(skin_normal_map=True), 'normal_eyes': dict(sk
 MH_EYES = ('normal_eyes',)        # variants that render with the MetaHuman-calibrated eye parameters (eye_map)
 
 
+# Material sweep (plan 7b), one parameter at a time around the 'normal' variant, scored against the VHStudio references.
+# material_overrides keys go to cycles_scene.full_skin_graph; skin_normal_strength / micro_scale are render arguments.
+SWEEP = {'roughness_scale': (.8, 1.25, 1.5), 'specular_scale': (.5, .75, 1.25), 'skin_coat': (0., .05, .2),
+         'subsurface_weight': (.3, .45, .8), 'subsurface_scale': (.25, .75, 1.), 'skin_normal_strength': (.5, 1.5),
+         'micro_scale': (0., .5)}
+SWEEP_IDS = ('mh_000000', 'mh_000145', 'mh_000300')      # three skin tones / ages among the comparison ids
+SWEEP_CAMERAS = ('front', 'yaw_p40')
+RENDER_ARGS = ('skin_normal_strength', 'micro_scale')
+
+
+def sweep_variant(param, value):
+    return f'sw_{param}_{value:g}'
+
+
+def variant_options(variant):
+    """Render options of a variant name: VARIANTS entries, or sw_<param>_<value> = 'normal' + one sweep setting."""
+    if variant in VARIANTS:
+        return dict(VARIANTS[variant])
+    if variant.startswith('sw_'):
+        for param in SWEEP:
+            if variant.startswith(f'sw_{param}_'):
+                value = float(variant[len(f'sw_{param}_'):])
+                opts = dict(VARIANTS['normal'])
+                if param in RENDER_ARGS:
+                    opts[param] = value
+                else:
+                    opts['material_overrides'] = {param: value}
+                return opts
+    raise ValueError(f'unknown variant {variant!r}')
+
+
+def sweep(env='vhstudio', score=False):
+    """score=False: render every sweep setting (GPU; finished views are skipped). score=True: score each setting and the
+    'normal' baseline against the UE references (run CPU-only, HIP_VISIBLE_DEVICES=) and rank by skin LPIPS."""
+    variants = [sweep_variant(p, v) for p, values in SWEEP.items() for v in values]
+    if not score:
+        for v in variants:
+            for sid in SWEEP_IDS:
+                print(v, sid, render_sample(sid, SWEEP_CAMERAS, v), flush=True)
+        return None
+    rows = {v: report(SWEEP_IDS, SWEEP_CAMERAS, env, v) for v in ['normal'] + variants}
+    def mean(summary, key):
+        vals = [c[key] for c in summary.values() if isinstance(c.get(key), (int, float))]
+        return float(np.mean(vals)) if vals else None
+    table = {v: dict(lpips=mean(r, 'lpips'), dists=mean(r, 'dists'), delta_e=mean(r, 'delta_e'), gain=mean(r, 'cycles_to_ue_gain'))
+             for v, r in rows.items()}
+    ranked = sorted(table, key=lambda v: table[v]['lpips'] if table[v]['lpips'] is not None else 9)
+    out = dict(env=env, ids=list(SWEEP_IDS), cameras=list(SWEEP_CAMERAS), sweep={k: list(v) for k, v in SWEEP.items()},
+               table=table, ranked_by_lpips=ranked, per_camera=rows)
+    (COMPARE_ROOT / f'sweep_{env}.json').write_text(json.dumps(out, indent=1) + '\n')
+    return out
+
+
 def write_eye_fit(sid):
     """head/fit_mh_eyes.json: the template fit with eye_params mapped from this sample's MetaHuman eyes (eye_map)."""
     from .eye_map import params_for
@@ -197,7 +250,7 @@ def render_sample(sid, cameras=CAMERAS, variant=''):
             shutil.rmtree(out)
         v = cams[name]['vhuman']
         explicit = dict(origin=(np.asarray(v['origin']) + shift).tolist(), rotation=v['rotation'], focal_px=v['focal_px'], size=v['size'])
-        opts = dict(RENDER, **VARIANTS[variant]); preset = opts.pop('preset'); samples = opts.pop('samples')
+        opts = dict(RENDER, **variant_options(variant)); preset = opts.pop('preset'); samples = opts.pop('samples')
         if variant in MH_EYES:
             opts['head_fit'] = write_eye_fit(sid)
         render(cand, out, device='hip', preset=preset, samples=samples, resolution=int(v['size'][0]), explicit_camera=explicit,
@@ -231,7 +284,7 @@ def report(ids, cameras=CAMERAS, env='studio', variant=''):
             disp = lambda x: np.uint8(np.clip(np.where(x <= .0031308, 12.92 * x, 1.055 * np.clip(x, 0, None) ** (1 / 2.4) - .055), 0, 1) * 255 + .5)
             k = .6 / max(float(np.percentile(u[um], 95)), 1e-6) if um.any() else 1.
             a, b = disp(u * k), disp(cy[..., :3] * gain * k)
-            r = am.compare_region(a, b, parser, ['skin', 'nose'])
+            r = am.compare_region(a, b, parser, ['skin', 'nose'], aligned=True)
             r.pop('crops', None)
             rec[name] = dict(silhouette_iou_head_rows=float(inter / max(union, 1)), cycles_to_ue_gain=gain,
                              lpips=r.get('lpips'), dists=r.get('dists'), delta_e=(r.get('delta_e') or {}).get('mean'), status=r['status'])
@@ -253,13 +306,19 @@ def main():
     ap.add_argument('--ids', default=''); ap.add_argument('--every', type=int, default=10)
     ap.add_argument('--cameras', default=','.join(CAMERAS)); ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--report', action='store_true')
-    ap.add_argument('--variant', default='', choices=list(VARIANTS), help='Cycles render variant (normal: converted MH skin normal on)')
+    ap.add_argument('--variant', default='', help='Cycles render variant: ' + ', '.join(VARIANTS) + ', or sw_<param>_<value> (sweep)')
+    ap.add_argument('--sweep', action='store_true', help='material sweep renders (SWEEP x SWEEP_IDS x SWEEP_CAMERAS); with --report: score and rank them')
     ap.add_argument('--update-normal', action='store_true', help='write the converted MH normal into existing pseudo-candidates')
     ap.add_argument('--ue-env', default='studio', help="UE reference lighting: studio (MetaHuman Studio) or vhstudio (calibrated vhuman rig)")
     a = ap.parse_args()
     render_ids = sorted(json.loads((V1 / 'sampling.json').read_text())['render_ids'])
     ids = a.ids.split(',') if a.ids else render_ids[::a.every]
     cams = tuple(a.cameras.split(','))
+    if a.sweep:
+        out = sweep(a.ue_env, score=a.report)
+        for v in (out or {}).get('ranked_by_lpips', []):
+            print(v, json.dumps(out['table'][v]))
+        return
     if a.report:
         print(json.dumps(report(ids, cams, a.ue_env, a.variant), indent=1)); return
     if a.update_normal:
