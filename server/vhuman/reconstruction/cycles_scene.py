@@ -139,7 +139,7 @@ def full_skin_graph(skin,node,bound,out,request):
     # roughness = template*(1+.6 cavity), lips wetter: -0.12*lips
     r=math('MULTIPLY',rough,math('MULTIPLY_ADD',cavity,.6,value=1) if False else math('ADD',math('MULTIPLY',cavity,.6),1))
     # material_overrides (metahuman.compare_render --sweep; empty = the authored graph, no extra nodes):
-    # roughness_scale, specular_scale, skin_coat (the .10 skin coat weight), subsurface_weight, subsurface_scale,
+    # roughness_scale, specular_scale, skin_coat (the .10 skin coat weight), subsurface_weight, subsurface_scale, subsurface_radius,
     # normal_ear_scale (per-texel skin normal strength on the ears; skin_normal_map only)
     mo=dict(request.get('material_overrides') or {})
     r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True)
@@ -158,7 +158,9 @@ def full_skin_graph(skin,node,bound,out,request):
     node.subsurface_method='RANDOM_WALK_SKIN'
     node.inputs['Subsurface Weight'].default_value=float(mo.get('subsurface_weight',.6));node.inputs['Subsurface Scale'].default_value=float(mo.get('subsurface_scale',.5))
     if mo:skin['material_overrides']=json.dumps(mo)
-    node.inputs['Subsurface Radius'].default_value=(.00367,.00137,.00068);node.inputs['Subsurface IOR'].default_value=1.4
+    # subsurface_radius override: per-channel mean free path in mm (e.g. UE SSP_skin_unified 1.05/.41/.26)
+    node.inputs['Subsurface Radius'].default_value=tuple(float(x)*1e-3 for x in mo['subsurface_radius']) if 'subsurface_radius' in mo else (.00367,.00137,.00068)
+    node.inputs['Subsurface IOR'].default_value=1.4
     # tiled micro normal (pores), strength scaled by the region mask
     micro_img=image_node(nodes,out/'skin_micro_normal.png',linear=True)
     uvn=nodes.new('ShaderNodeUVMap');uvn.uv_map='UVMap';mapping=nodes.new('ShaderNodeMapping');mapping.inputs['Scale'].default_value=(12,12,1)

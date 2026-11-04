@@ -173,6 +173,17 @@ VARIANTS = {'': {}, 'normal': dict(skin_normal_map=True), 'normal_eyes': dict(sk
             'normal_ear0': dict(skin_normal_map=True, material_overrides=dict(normal_ear_scale=0.)),
             'normal_ear50': dict(skin_normal_map=True, material_overrides=dict(normal_ear_scale=.5)),
             'normal_eyes2': dict(skin_normal_map=True)}
+# UE MetaHuman skin shading (ue_scripts/dump_skin_material.py -> v1/presets/skin_material.json): SSP_skin_unified mean
+# free path colour x distance = 1.05/.41/.26 mm, material Opacity (Scatter Distance Base .5 x Global .5) scales it; dual
+# specular lobes .8r/1.1r mixed .5, no coat; region roughness ~.55-.65 x1.0 (~1.25x vhuman's template); Specular ~.75 ->
+# F0 ~.06 (vhuman .028 at level .5). Variants on 'normal' (Subsurface Weight 1 = all diffuse through the random walk).
+UE_MFP_MM = (1.05, .41, .26)
+UE_SSS = {f'ue_sss{int(k * 100)}': dict(subsurface_weight=1., subsurface_radius=list(UE_MFP_MM), subsurface_scale=k) for k in (.25, .5, 1.)}
+UE_MATCH = dict(roughness_scale=1.25, skin_coat=0.)
+VARIANTS.update({k: dict(skin_normal_map=True, material_overrides=v) for k, v in UE_SSS.items()})
+VARIANTS.update(ue_spec=dict(skin_normal_map=True, material_overrides=dict(specular_scale=1.8)),
+                ue_match=dict(skin_normal_map=True, material_overrides=dict(UE_MATCH, **UE_SSS['ue_sss50'])),
+                ue_match_spec=dict(skin_normal_map=True, material_overrides=dict(UE_MATCH, specular_scale=1.8, **UE_SSS['ue_sss50'])))
 MH_EYES = {'normal_eyes': 1, 'normal_eyes2': 2}   # variants rendered with MetaHuman-mapped eye parameters -> eye_map version
 
 
@@ -258,6 +269,7 @@ CONFIRM_CAMERAS = ('front', 'yaw_p40', 'yaw_m40', 'yaw_p90', 'yaw_m90', 'mouth')
 # Ear experiment (2026-11-04): the MH normal regressed ear views on 9/12 heads; fade it on the GNM ears.
 EYE_SET = dict(variants=('normal_eyes', 'normal_eyes2'), cameras=('eye_left', 'eye_right', 'front', 'yaw_p40', 'yaw_m40'))
 EYE_SWEEP_SET = dict(variants=EYE_SWEEP_VARIANTS, cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
+UE_SET = dict(variants=('ue_sss25', 'ue_sss50', 'ue_sss100', 'ue_spec', 'ue_match', 'ue_match_spec'), cameras=('front', 'yaw_p40', 'yaw_m40'))
 EAR_SET = dict(variants=('', 'normal_ear0', 'normal_ear50'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))
 
 
@@ -426,6 +438,7 @@ def main():
     ap.add_argument('--update-normal', action='store_true', help='write the converted MH normal into existing pseudo-candidates')
     ap.add_argument('--ears', action='store_true', help='score the EAR_SET experiment (normal_ear* vs normal; renders via win_cycles)')
     ap.add_argument('--eyes', action='store_true', help='score the EYE_SET experiment (MH eye mapping v1/v2 vs normal)')
+    ap.add_argument('--ue-match', action='store_true', help='score the UE_SET experiment (UE-derived SSS/specular vs normal)')
     ap.add_argument('--eye-sweep', action='store_true', help='score the EYE_SWEEP experiment (ew_* eye optics vs normal_eyes2)')
     ap.add_argument('--profile', default='full', choices=('full', 'fast'), help="with --confirm --report: 'fast' scores win_cycles' 512 px / 32 spp renders")
     ap.add_argument('--ue-env', default='studio', help="UE reference lighting: studio (MetaHuman Studio) or vhstudio (calibrated vhuman rig)")
@@ -438,8 +451,9 @@ def main():
         for v in (out or {}).get('ranked_by_lpips', []):
             print(v, json.dumps(out['table'][v]))
         return
-    if a.ears or a.eyes or a.eye_sweep:
-        name, exp = (('ears', EAR_SET) if a.ears else ('eyes', EYE_SET) if a.eyes else ('eye_sweep', EYE_SWEEP_SET))
+    if a.ears or a.eyes or a.eye_sweep or a.ue_match:
+        name, exp = (('ears', EAR_SET) if a.ears else ('eyes', EYE_SET) if a.eyes else ('ue_match', UE_SET) if a.ue_match
+                     else ('eye_sweep', EYE_SWEEP_SET))
         out = confirm(a.ids.split(',') if a.eye_sweep and a.ids else EYE_SWEEP_IDS if a.eye_sweep else ids,
                       a.ue_env, score=True, profile=a.profile, name=name, **exp)
         for v, r in out['variants'].items():
