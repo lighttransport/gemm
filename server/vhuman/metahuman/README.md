@@ -272,3 +272,20 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   Eye dE front / eye_left / eye_right: template 28.7 / 32.6 / 28.2, v1 25.8 / 29.6 / 25.5, v2 19.0 / 25.5 / 22.6
   (eye_right eye LPIPS +.009 with v2). Remaining gap: the iris keeps MH chroma in the mapping but renders grey under the
   Cycles cornea reflection, and the GNM eye sits offset from the MH eye.
+- Eye optics sweep (2026-11-04, `compare_render.EYE_SWEEP`, `--eye-sweep`; Cycles eye material overrides on top of
+  `normal_eyes2`; 4 heads x eye_left/right, front, fast profile, `compare_v1/eye_sweep_vhstudio__fast.json`; eye-region
+  deltas on 11 views):
+
+  | setting (authored) | eye LPIPS | eye DISTS | eye dE | views better |
+  |---|---|---|---|---|
+  | cornea roughness .08 (.025) | -.0015 | -.0014 | -.22 | 7/11 |
+  | cornea roughness 0 / .15 | +.0001 / +.0086 | -.0001 / -.0021 | -.05 / -.65 | 6 / 4 |
+  | cornea IOR 1.30 / 1.336 / 1.42 (1.376) | +.0004 / +.0004 / +.0006 | ~0 | -.27 / +.01 / +.66 | 3-5 |
+  | iris roughness .3 / .8 (.55) | +.0017 / +.0037 | -.0036 / +.0011 | -.82 / +.92 | 2 / 2 |
+  | sclera roughness .15 / .4 / .6 (.25) | +.0087 / +.0044 / +.0050 | ~0 | +.04 / -.16 / -.22 | 2-5 |
+  | cornea Specular IOR Level 0 / .25 / 1 (.5) | 0 | 0 | 0 | - |
+
+  All effects are at the 32 spp noise level; defaults unchanged. The Specular IOR Level rows are exactly zero because
+  Cycles ignores it on a fully transmissive (glass) Principled BSDF, so the cornea-reflection test did not run; lowering
+  the IOR to 1.30 (less reflection) does not help either. Untested: an IOR ~1.0 (invisible) cornea; more likely causes
+  of the grey iris are the iris texture brightness and the GNM-vs-MH eye placement.
