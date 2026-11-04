@@ -282,3 +282,8 @@ mh_000000, Studio env, 10 cameras × (lit + base colour) = 20 EXRs:
 
 Next: VHStudio env for the same head (needs `--env VHStudio`; the lights are pushed inside the batch file), then a
 multi-head batch timing with the Linux GPU busy.
+
+VHStudio env (calibrated vhuman rig as RectLights), mh_000000, 10 cameras: 59 s on Windows; no warm-up was needed
+(materials already compiled by the Studio runs). Windows vs Linux: wide views rel 1.1-1.8 %, LPIPS .0001-.0003,
+dE .42-.45; close-ups (ears/eyes/mouth) rel 2.2-3.7 %, LPIPS .0010-.0013, dE .40-.50. The difference image is fine
+noise plus a faint line along the shoulder shadow edge. Within the thresholds, so Windows can render VHStudio references.
