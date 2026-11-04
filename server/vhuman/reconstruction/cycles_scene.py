@@ -139,7 +139,8 @@ def full_skin_graph(skin,node,bound,out,request):
     # roughness = template*(1+.6 cavity), lips wetter: -0.12*lips
     r=math('MULTIPLY',rough,math('MULTIPLY_ADD',cavity,.6,value=1) if False else math('ADD',math('MULTIPLY',cavity,.6),1))
     # material_overrides (metahuman.compare_render --sweep; empty = the authored graph, no extra nodes):
-    # roughness_scale, specular_scale, skin_coat (the .10 skin coat weight), subsurface_weight, subsurface_scale
+    # roughness_scale, specular_scale, skin_coat (the .10 skin coat weight), subsurface_weight, subsurface_scale,
+    # normal_ear_scale (per-texel skin normal strength on the ears; skin_normal_map only)
     mo=dict(request.get('material_overrides') or {})
     r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True)
     if mo.get('roughness_scale',1.)!=1.:r=math('MULTIPLY',r,float(mo['roughness_scale']),clamp=True)
@@ -179,9 +180,15 @@ def full_skin_graph(skin,node,bound,out,request):
         b=vec('MULTIPLY_ADD',micro_img.outputs['Color'],(2,2,2));b.node.inputs[2].default_value=(-1,-1,-1)
         sa,sb=nodes.new('ShaderNodeSeparateXYZ'),nodes.new('ShaderNodeSeparateXYZ');links.new(a,sa.inputs[0]);links.new(b,sb.inputs[0])
         k=math('MULTIPLY',micro,.6*float(request.get('micro_scale',1.)));strength=float(request.get('skin_normal_strength',1.))
+        st=strength
+        if mo.get('normal_ear_scale',1.)!=1.:
+            # fade the per-texel map on the ears: s * (1 - (1 - ear_scale) * ear_weight), ear weight from skin_templates
+            if 'ears' not in maps.files:raise RuntimeError('normal_ear_scale needs skin_templates with an ears map; rebuild them')
+            ear=float_image(nodes,'template_ears',maps['ears']);esep=nodes.new('ShaderNodeSeparateColor');links.new(ear.outputs['Color'],esep.inputs['Color'])
+            st=math('MULTIPLY',math('SUBTRACT',1.,math('MULTIPLY',esep.outputs['Red'],1.-float(mo['normal_ear_scale']))),strength)
         c=nodes.new('ShaderNodeCombineXYZ')
-        links.new(math('ADD',math('MULTIPLY',sa.outputs['X'],strength),math('MULTIPLY',sb.outputs['X'],k)),c.inputs['X'])
-        links.new(math('ADD',math('MULTIPLY',sa.outputs['Y'],strength),math('MULTIPLY',sb.outputs['Y'],k)),c.inputs['Y'])
+        links.new(math('ADD',math('MULTIPLY',sa.outputs['X'],st),math('MULTIPLY',sb.outputs['X'],k)),c.inputs['X'])
+        links.new(math('ADD',math('MULTIPLY',sa.outputs['Y'],st),math('MULTIPLY',sb.outputs['Y'],k)),c.inputs['Y'])
         links.new(math('MULTIPLY',sa.outputs['Z'],sb.outputs['Z']),c.inputs['Z'])
         n=vec('NORMALIZE',c.outputs[0]);col=vec('MULTIPLY_ADD',n,(.5,.5,.5));col.node.inputs[2].default_value=(.5,.5,.5)
         links.new(col,nm.inputs['Color']);nm.inputs['Strength'].default_value=1.

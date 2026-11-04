@@ -75,8 +75,12 @@ def measure(sid, side):
     # sclera: horizontal sectors 1.15-1.6 R (inside the eye opening at the canthi side), brightest half (vessels excluded)
     sm = sector & (rr >= 1.15) & (rr < 1.6)
     sl = lum[sm]; sclera = np.median(img[sm][sl >= np.median(sl)], 0).tolist() if sm.sum() > 20 else None
+    # tighter sclera (eye_map v2): a horizontal band |dy| < .3 R at 1.1-1.45 R, brightest quarter; the sector above reaches
+    # the lids on narrow eyes (dark skin then pulls it down: mh_000300 .10/.04/.03 vs .32/.10/.09 here)
+    band = (np.abs(yy - cy) < .3 * r_iris) & (np.abs(xx - cx) > 1.1 * r_iris) & (np.abs(xx - cx) < 1.45 * r_iris)
+    sclera_band = np.median(img[band & (lum >= np.percentile(lum[band], 75))], 0).tolist() if band.sum() > 40 else None
     return dict(inner_linear=inner, outer_linear=outer, median_linear=whole, pupil_ratio=pupil_ratio, iris_radius_px=r_iris, geometric_radius_px=float(r_geo),
-                center_px=[float(cx), float(cy)], sclera_linear=sclera, pixels=dict(inner=ni, outer=no, whole=nw, sclera=int(sm.sum())))
+                center_px=[float(cx), float(cy)], sclera_linear=sclera, sclera_band_linear=sclera_band, pixels=dict(inner=ni, outer=no, whole=nw, sclera=int(sm.sum())))
 
 
 def nearest_chart(target):
@@ -113,8 +117,12 @@ def mh_eye(settings, side):
                             vascularity_coverage=f['sclera_vascularity_coverage']))
 
 
-def to_vhuman(mh, measured):
-    """mh: params.json eyes.settings.eye_<side>; measured: measure(). Returns validated vhuman eye params + the record."""
+def to_vhuman(mh, measured, version=1):
+    """mh: params.json eyes.settings.eye_<side>; measured: measure(). Returns validated vhuman eye params + the record.
+    version 2: sclera tint = the measured MetaHuman sclera albedo / vhuman's SCLERA_ALBEDO (custom tint), instead of the
+    MetaHuman tint setting (measured on a horizontal band beside the iris, measure()['sclera_band_linear']). MetaHuman
+    scleras are darker and pinker in base colour (median linear .39/.27/.25 on the 12 comparison heads vs vhuman
+    .74/.70/.66); with v1 the Cycles sclera rendered ~2.6x brighter than UE's (lit eye close-ups, 12 heads)."""
     from ..head import iris_match
     p = P.defaults()
     iris, pupil, cornea, sclera = mh['iris'], mh['pupil'], mh['cornea'], mh['sclera']
@@ -141,6 +149,10 @@ def to_vhuman(mh, measured):
                        transmission_color=col('sclera', 'transmission_color', sclera),
                        vascularity_intensity=float(np.clip(sclera['vascularity_intensity'], 0, 1)),
                        vascularity_coverage=float(np.clip(sclera['vascularity_coverage'], 0, .7)))
+    if version >= 2 and measured.get('sclera_band_linear'):
+        from ..eye.sclera import SCLERA_ALBEDO
+        p['sclera'].update(use_custom_tint=True,
+                           tint=np.clip(np.asarray(measured['sclera_band_linear']) / SCLERA_ALBEDO, .05, 1.).tolist())
     p = P.validate(p)
     reproduced = iris_match.controlled_color(blend, p['iris'])
     de = float(np.linalg.norm(_srgb_lab(reproduced) - _srgb_lab(measured['median_linear'])))
@@ -148,13 +160,15 @@ def to_vhuman(mh, measured):
                        secondary_v=iris['secondary_color_v'], color_blend=iris['color_blend'], pattern=mh['pattern_number'],
                        dilation=pupil['dilation'], cornea_size=cornea['size']),
                measured=measured, vhuman=dict(primary=[pu, pv], secondary=[su, sv], global_saturation=p['iris']['global_saturation'],
-                                              global_tint=p['iris']['global_tint'], dilation=p['pupil']['dilation']), reproduction_delta_e=de)
+                                              global_tint=p['iris']['global_tint'], dilation=p['pupil']['dilation'],
+                                              sclera_tint=p['sclera']['tint'], sclera_custom_tint=p['sclera']['use_custom_tint']),
+               reproduction_delta_e=de, version=version)
     return p, rec
 
 
-def params_for(sid, side='left'):
+def params_for(sid, side='left', version=1):
     settings = json.loads((V1 / 'samples' / sid / 'params.json').read_text())['eyes']['settings']
-    return to_vhuman(mh_eye(settings, side), measure(sid, side))
+    return to_vhuman(mh_eye(settings, side), measure(sid, side), version)
 
 
 def calibrate():

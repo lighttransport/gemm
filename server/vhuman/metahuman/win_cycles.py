@@ -73,6 +73,47 @@ def run(root, blender):
 
 
 # ----------------------------------------------------------------------------------------------- Linux side
+def view_request(base_req, cam, shift, camera, opts, prof, micro_scale):
+    """One view's request: the head's staged request with the profile's size/samples, the dataset camera scaled to
+    that size (focal_px x res / size; origin shifted like compare_render.render_sample), CPU, and the variant's options."""
+    k = prof['resolution'] / cam['size'][0]
+    req = dict(base_req, device='cpu', samples=prof['samples'], resolution=prof['resolution'], noisy=False, save_blend=True,
+               camera=camera, explicit_camera=dict(origin=[float(a) + float(b) for a, b in zip(cam['origin'], shift)],
+                                                   rotation=cam['rotation'], focal_px=float(cam['focal_px']) * k,
+                                                   size=[prof['resolution']] * 2),
+               skin_normal_map=bool(opts.get('skin_normal_map', False)),
+               skin_normal_strength=float(opts.get('skin_normal_strength', 1.)),
+               micro_scale=float(opts.get('micro_scale', micro_scale)),
+               material_overrides=dict(opts.get('material_overrides') or {}))
+    if not req['skin_normal_map']:
+        req.pop('skin_normal_sha256', None)
+    return req
+
+
+def extract_views(tar_path, dest_root):
+    """Unpack pulled '<id>/<variant dir>/<camera>/<file>' members (Windows '.\\' prefixes and backslashes accepted) into
+    dest_root; views that already have a render_result.json are left alone; each view's result is written last."""
+    import tarfile
+    got = 0
+    with tarfile.open(tar_path) as t:
+        views = {}
+        for m in t.getmembers():
+            parts = Path(m.name.replace('\\', '/')).parts
+            parts = parts[1:] if parts and parts[0] == '.' else parts
+            if m.isfile() and len(parts) == 4 and '..' not in parts:
+                views.setdefault(Path(*parts[:3]), []).append((parts[3], m))
+        for view, members in views.items():
+            dest = Path(dest_root) / view
+            if (dest / 'render_result.json').is_file():
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            for name, m in sorted(members, key=lambda x: x[0] == 'render_result.json'):
+                with t.extractfile(m) as src, open(dest / name, 'wb') as f:
+                    shutil.copyfileobj(src, f)
+            got += 1
+    return got
+
+
 def stage(ids, variants, cameras, profile, root):
     """Stage inputs under root/<id>/{cand,base} and the job list; returns the number of jobs (finished views skipped)."""
     import numpy as np
@@ -90,34 +131,26 @@ def stage(ids, variants, cameras, profile, root):
         if (root / sid / 'cand').exists():
             shutil.rmtree(root / sid / 'cand')
         shutil.copytree(cand, root / sid / 'cand')
-        base = root / sid / 'base'
-        if not (base / 'request.json').is_file():
-            if base.exists():
-                shutil.rmtree(base)
-            opts = dict(cr.RENDER, **cr.variant_options('normal')); opts.pop('preset'); opts.pop('samples')
-            opts.pop('material_overrides', None)
-            render(cand, base, device='cpu', preset='final', stage_only=True, **opts)
-        shutil.rmtree(base / 'cache', ignore_errors=True)
-        base_req = json.loads((base / 'request.json').read_text())
         shift = np.asarray(json.loads((cand / 'manifest.json').read_text())['geometry']['metahuman_pseudo_candidate']['translation_m'])
+        bases = {}
+        for key in sorted({cr.MH_EYES.get(v, 0) for v, _ in todo}):     # 0 = template eyes; n = eye_map version n
+            base = root / sid / ('base' if not key else f'base_eyes{key}')
+            if not (base / 'request.json').is_file():
+                if base.exists():
+                    shutil.rmtree(base)
+                opts = dict(cr.RENDER, **cr.variant_options('normal')); opts.pop('preset'); opts.pop('samples')
+                opts.pop('material_overrides', None)
+                if key:
+                    opts['head_fit'] = cr.write_eye_fit(sid, key)
+                render(cand, base, device='cpu', preset='final', stage_only=True, **opts)
+            shutil.rmtree(base / 'cache', ignore_errors=True)
+            bases[key] = (base.name, json.loads((base / 'request.json').read_text()))
         cams = json.loads((V1 / 'samples' / sid / 'cameras.json').read_text())['cameras']
         for v, c in todo:
-            cam = cams[c]['vhuman']; k = prof['resolution'] / cam['size'][0]
-            opts = cr.variant_options(v)
-            if v in cr.MH_EYES:
-                raise ValueError('MH-eye variants need a per-view head_fit prepare; render them on Linux')
-            req = dict(base_req, device='cpu', samples=prof['samples'], resolution=prof['resolution'], noisy=False, save_blend=True,
-                       camera=c, explicit_camera=dict(origin=(np.asarray(cam['origin']) + shift).tolist(), rotation=cam['rotation'],
-                                                      focal_px=float(cam['focal_px']) * k, size=[prof['resolution']] * 2),
-                       skin_normal_map=bool(opts.get('skin_normal_map', False)),
-                       skin_normal_strength=float(opts.get('skin_normal_strength', 1.)),
-                       micro_scale=float(opts.get('micro_scale', cr.RENDER['micro_scale'])),
-                       material_overrides=dict(opts.get('material_overrides') or {}))
-            if not req['skin_normal_map']:
-                req.pop('skin_normal_sha256', None)
-            jobs.append(dict(sid=sid, variant=v, camera=c, base=f'{sid}/base', candidate=f'{sid}/cand',
+            base_name, base_req = bases[cr.MH_EYES.get(v, 0)]
+            req = view_request(base_req, cams[c]['vhuman'], shift, c, cr.variant_options(v), prof, cr.RENDER['micro_scale'])
+            jobs.append(dict(sid=sid, variant=v, camera=c, base=f'{sid}/{base_name}', candidate=f'{sid}/cand',
                              out=f'{sid}/{variant_dir(v, profile)}/{c}', request=req))
-    # job order: camera-major within a head so a partial run still yields paired views across variants
     (root / 'jobs.json').write_text(json.dumps(dict(repo=WIN_REPO, profile=profile, jobs=jobs), indent=1))
     return len(jobs)
 
@@ -147,7 +180,6 @@ def render_remote(ids, variants, cameras, profile, tag=None, timeout=8 * 3600, s
 
 def pull(tag):
     """Fetch finished views of a staged job into COMPARE_ROOT/<id>/<variant dir>/<camera> (never overwrites)."""
-    import tarfile
     from . import winjob as wj
     from .compare_render import COMPARE_ROOT
     remote = f'{wj.WIN_DATA}/cycles/{tag}'
@@ -155,23 +187,7 @@ def pull(tag):
            f"if ($f) {{ tar -cf '{wj.win(wj.WIN_ROOT)}\\{tag}_out.tar' --exclude '*.npz' @($f) progress.log }}")
     local = wj.LOCAL_TMP / f'{tag}_out.tar'
     wj.scp_from(f'{wj.WIN_ROOT}/{tag}_out.tar', local)
-    got = 0
-    with tarfile.open(local) as t:
-        views = {}
-        for m in t.getmembers():
-            parts = Path(m.name.replace('\\', '/')).parts
-            parts = parts[1:] if parts and parts[0] == '.' else parts
-            if m.isfile() and len(parts) == 4:
-                views.setdefault(Path(*parts[:3]), []).append((parts[3], m))
-        for view, members in views.items():
-            dest = COMPARE_ROOT / view
-            if (dest / 'render_result.json').is_file():
-                continue
-            dest.mkdir(parents=True, exist_ok=True)
-            for name, m in sorted(members, key=lambda x: x[0] == 'render_result.json'):   # result last = view complete
-                with t.extractfile(m) as src, open(dest / name, 'wb') as f:
-                    shutil.copyfileobj(src, f)
-            got += 1
+    got = extract_views(local, COMPARE_ROOT)
     print(f'{tag}: pulled {got} views', flush=True)
     return got
 

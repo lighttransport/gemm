@@ -99,9 +99,12 @@ def build(candidate, out, *, res=2048, oiliness=1., age=1., seed=7):
     sigma = max(res / 1024, .5)
     maps = dict(roughness=gaussian_filter(splat(rough, DEFAULT[0]), sigma), specular=gaussian_filter(splat(spec, DEFAULT[1]), sigma),
                 micro_strength=gaussian_filter(splat(micro, DEFAULT[2]), sigma), lips=gaussian_filter(splat(lips), sigma * 2),
-                cavity=gaussian_filter(splat(cav), sigma * 3))
+                cavity=gaussian_filter(splat(cav), sigma * 3),
+                # soft ear weight (1 on the GNM ears group): lets cycles_scene fade the per-texel skin normal on the ears
+                # (material_overrides normal_ear_scale); not read by the authored graph
+                ears=np.clip(gaussian_filter(splat(model.group('ears')[exterior].astype(np.float32)), sigma * 4) * 1.5, 0, 1))
     for k in maps:
-        maps[k][tid < 0] = {'roughness': DEFAULT[0], 'specular': DEFAULT[1], 'micro_strength': 0, 'lips': 0, 'cavity': 0}[k]
+        maps[k][tid < 0] = {'roughness': DEFAULT[0], 'specular': DEFAULT[1], 'micro_strength': 0, 'lips': 0, 'cavity': 0, 'ears': 0}[k]
     out.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out / 'skin_templates.npz', **{k: v.astype(np.float32) for k, v in maps.items()})
     Image.fromarray(micro_normal(seed=seed)).save(out / 'skin_micro_normal.png')

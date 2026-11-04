@@ -297,3 +297,33 @@ mh_000300 front) is the backdrop only: on the front view (the first capture afte
 differs by +11% / -10% on 2 of 11 heads while the head pixels match (foreground ratio 1.000). It looks like the
 backdrop not having settled for the first shot; it does not affect skin-crop scores. If backdrop pixels ever matter,
 add a discarded pre-roll capture per head.
+
+## 10. Cycles CPU renders (win_cycles, 2026-11-04)
+
+Blender on the worker renders on the CPU only (Polaris has no HIP), so it is used for small, fast renders that pair with
+each other, not for the full 1024 px / 128 spp comparison set.
+
+```
+python -m server.vhuman.metahuman.win_cycles render <tag> [--ids ...] [--variants normal,...] [--cameras ...] [--profile fast]
+python -m server.vhuman.metahuman.winjob status <tag>      # progress: D:/data/vhuman-mh/cycles/<tag>/progress.log
+python -m server.vhuman.metahuman.win_cycles pull <tag>    # finished views -> compare_v1/<id>/<variant>__fast/<camera>
+python -m server.vhuman.metahuman.compare_render --confirm --report --profile fast --ue-env vhstudio
+```
+
+- **Linux stages, Windows renders.** `stage` runs `offline_render.render(..., stage_only=True)` once per head
+  (prepare + skin templates + wrinkle channels: ~40 s CPU, ~28 MB) and writes one request per variant x camera
+  (`view_request`: profile size/samples, camera focal scaled to that size, device cpu, variant options) into
+  `tmp/win/<tag>/jobs.json`. Finished views (local `render_result.json`) are not staged again.
+- On Windows, `win_cycles.py run` (stdlib only, under Blender's own Python
+  `D:\local\blender-5.2.3-windows-x64\5.2\python\bin\python.exe`) copies the head's base into each view directory, points
+  `scene.json` at the shipped candidate, runs `cycles_scene.py` then `cycles_validate.py`, and deletes the blend and the
+  large npz files. Started detached through `winjob.start(command=...)`; rerunning skips done views.
+- `pull` fetches only views with a `render_result.json`, never overwrites local finished views, and writes each result
+  file last.
+- **Profile `fast`** = 512 px, 32 spp, OIDN denoised: **~15 s per view** on the i9-9900K (14-20 s; mouth views are the
+  slowest). Outputs use separate `<variant>__fast` directories; scoring box-downsamples the 1024 px UE references, and a
+  fast variant is only ever paired with the fast `normal` baseline.
+- Check against full quality (mh_000000 front, normal): fast LPIPS .0936 / DISTS .162 / dE 4.55 vs full (1024 px,
+  128 spp, Linux HIP) .0937 / .167 / 4.50. Good enough to rank material variants.
+- MH-eye variants (`compare_render.MH_EYES`: `normal_eyes` = eye_map v1, `normal_eyes2` = v2) get their own staged base
+  per head (`base_eyes<n>`, prepared with that head fit); other variants share `base`.

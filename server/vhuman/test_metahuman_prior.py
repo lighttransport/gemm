@@ -130,3 +130,55 @@ def test_gpu_file_lock_roundtrip(tmp_path):
         pass
     with gpu.file_lock(tmp_path / 'x.lock', 1.):
         pass
+
+
+def test_win_cycles_view_request_and_dirs():
+    from server.vhuman.metahuman import win_cycles as wc
+    assert wc.variant_dir('normal') == 'cycles_normal' and wc.variant_dir('', 'fast') == 'cycles__fast'
+    assert wc.variant_dir('sw_skin_coat_0', 'fast') == 'cycles_sw_skin_coat_0__fast'
+    base = dict(device='hip', samples=128, resolution=1024, noisy=True, save_blend=False, skin_normal_map=True,
+                skin_normal_sha256='abc', micro_scale=.25, material_overrides={}, out='/linux/out')
+    cam = dict(origin=[0., .1, 1.], rotation=[[1, 0, 0], [0, 1, 0], [0, 0, 1]], focal_px=2000., size=[1024, 1024])
+    req = wc.view_request(base, cam, [0., -.07, 0.], 'front', dict(skin_normal_map=True, material_overrides=dict(roughness_scale=1.25)),
+                          wc.PROFILES['fast'], .25)
+    assert req['device'] == 'cpu' and req['samples'] == 32 and req['resolution'] == 512 and not req['noisy'] and req['save_blend']
+    ec = req['explicit_camera']
+    assert ec['size'] == [512, 512] and ec['focal_px'] == 1000. and np.allclose(ec['origin'], [0., .03, 1.])
+    assert req['material_overrides'] == dict(roughness_scale=1.25) and req['skin_normal_sha256'] == 'abc'
+    assert base['samples'] == 128 and base['material_overrides'] == {}            # base request untouched
+    plain = wc.view_request(base, cam, [0, 0, 0], 'yaw_p40', dict(micro_scale=0.), wc.PROFILES['full'], .25)
+    assert not plain['skin_normal_map'] and 'skin_normal_sha256' not in plain and plain['micro_scale'] == 0.
+    assert plain['explicit_camera']['focal_px'] == 2000. and plain['resolution'] == 1024
+
+
+def test_win_cycles_extract_views(tmp_path):
+    import io
+    import tarfile
+    from server.vhuman.metahuman import win_cycles as wc
+    tar = tmp_path / 'out.tar'
+    def add(t, name, data):
+        info = tarfile.TarInfo(name); info.size = len(data); t.addfile(info, io.BytesIO(data))
+    with tarfile.open(tar, 'w') as t:
+        add(t, '.\\mh_1\\cycles_normal__fast\\front\\beauty.exr', b'new')
+        add(t, '.\\mh_1\\cycles_normal__fast\\front\\render_result.json', b'{}')
+        add(t, 'mh_1/cycles_normal__fast/mouth/beauty.exr', b'new')
+        add(t, 'mh_1/cycles_normal__fast/mouth/render_result.json', b'{}')
+        add(t, 'progress.log', b'done')
+        add(t, 'mh_1/../../escape/x/y', b'bad')
+    done = tmp_path / 'dest' / 'mh_1' / 'cycles_normal__fast' / 'mouth'
+    done.mkdir(parents=True); (done / 'beauty.exr').write_bytes(b'old'); (done / 'render_result.json').write_text('{}')
+    assert wc.extract_views(tar, tmp_path / 'dest') == 1
+    front = tmp_path / 'dest' / 'mh_1' / 'cycles_normal__fast' / 'front'
+    assert (front / 'beauty.exr').read_bytes() == b'new' and (front / 'render_result.json').is_file()
+    assert (done / 'beauty.exr').read_bytes() == b'old'                          # finished views are never overwritten
+    assert not (tmp_path / 'escape').exists() and not (tmp_path / 'dest' / 'progress.log').exists()
+
+
+def test_box_down_matches_block_mean():
+    from server.vhuman.metahuman.compare_render import box_down
+    x = np.arange(4 * 4 * 3, dtype=np.float32).reshape(4, 4, 3)
+    y = box_down(x, 2)
+    assert y.shape == (2, 2, 3) and np.allclose(y[0, 0], x[:2, :2].mean((0, 1))) and np.allclose(y[1, 1], x[2:, 2:].mean((0, 1)))
+    assert box_down(x, 4) is x
+    with pytest.raises(ValueError):
+        box_down(np.zeros((6, 6, 3)), 4)

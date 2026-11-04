@@ -168,8 +168,12 @@ def update_normal(sid):
 
 
 VARIANTS = {'': {}, 'normal': dict(skin_normal_map=True), 'normal_eyes': dict(skin_normal_map=True),   # dir suffix -> render options
-            'mat_r125_c0': dict(skin_normal_map=True, material_overrides=dict(roughness_scale=1.25, skin_coat=0.))}
-MH_EYES = ('normal_eyes',)        # variants that render with the MetaHuman-calibrated eye parameters (eye_map)
+            'mat_r125_c0': dict(skin_normal_map=True, material_overrides=dict(roughness_scale=1.25, skin_coat=0.)),
+            # per-texel MH normal faded on the (coarser) GNM ears: strength x (1 - (1 - s) ear weight)
+            'normal_ear0': dict(skin_normal_map=True, material_overrides=dict(normal_ear_scale=0.)),
+            'normal_ear50': dict(skin_normal_map=True, material_overrides=dict(normal_ear_scale=.5)),
+            'normal_eyes2': dict(skin_normal_map=True)}
+MH_EYES = {'normal_eyes': 1, 'normal_eyes2': 2}   # variants rendered with MetaHuman-mapped eye parameters -> eye_map version
 
 
 # Material sweep (plan 7b), one parameter at a time around the 'normal' variant, scored against the VHStudio references.
@@ -228,55 +232,64 @@ def sweep(env='vhstudio', score=False):
 # Confirmation of the sweep's candidates (2026-11-04) on all comparison heads and the skin-heavy views.
 CONFIRM = ('sw_roughness_scale_1.25', 'sw_skin_coat_0', 'mat_r125_c0')
 CONFIRM_CAMERAS = ('front', 'yaw_p40', 'yaw_m40', 'yaw_p90', 'yaw_m90', 'mouth')
+# Ear experiment (2026-11-04): the MH normal regressed ear views on 9/12 heads; fade it on the GNM ears.
+EYE_SET = dict(variants=('normal_eyes', 'normal_eyes2'), cameras=('eye_left', 'eye_right', 'front', 'yaw_p40', 'yaw_m40'))
+EAR_SET = dict(variants=('', 'normal_ear0', 'normal_ear50'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))
 
 
-def confirm(ids, env='vhstudio', score=False, profile='full'):
+def confirm(ids, env='vhstudio', score=False, profile='full', variants=CONFIRM, cameras=CONFIRM_CAMERAS, name='confirm'):
     """score=False: render CONFIRM x ids x CONFIRM_CAMERAS (GPU). score=True: per-view paired deltas vs 'normal'
     (LPIPS / DISTS / dE), means, and how many views each variant improves -> compare_v1/confirm_<env>.json.
     profile 'fast': score the Windows CPU renders (win_cycles, 512 px / 32 spp, 'normal' included) against each other
-    -> confirm_<env>__fast.json; a fast variant is only ever paired with the fast baseline."""
+    -> confirm_<env>__fast.json; a fast variant is only ever paired with the fast baseline.
+    variants/cameras/name: other experiments with the same pairing (EAR_SET -> ears_<env>...json); ear_* metrics
+    (parser ear labels only) are compared too when present."""
     if not score:
-        for v in CONFIRM:
+        for v in variants:
             for sid in ids:
-                print(v, sid, render_sample(sid, CONFIRM_CAMERAS, v), flush=True)
+                print(v, sid, render_sample(sid, cameras, v), flush=True)
         return None
-    rows = {v: report(ids, CONFIRM_CAMERAS, env, v, write_summary=False, profile=profile) for v in ('normal',) + CONFIRM}
+    variants = tuple(v for v in variants if v != 'normal')
+    rows = {v: report(ids, cameras, env, v, write_summary=False, profile=profile) for v in ('normal',) + variants}
     suffix = f'_{env}' if env != 'studio' else ''
     psuf = '' if profile == 'full' else f'__{profile}'
     def load(sid, v):
-        path = COMPARE_ROOT / sid / f'compare{suffix}_{v}{psuf}.json'
+        path = COMPARE_ROOT / sid / f"compare{suffix}{'_' + v if v else ''}{psuf}.json"
         return json.loads(path.read_text()) if path.is_file() else {}
-    per = {v: {sid: load(sid, v) for sid in ids} for v in ('normal',) + CONFIRM}
-    out = dict(env=env, profile=profile, ids=list(ids), cameras=list(CONFIRM_CAMERAS), variants={}, per_camera=rows)
-    for v in CONFIRM:
-        d = {k: [] for k in ('lpips', 'dists', 'delta_e')}
+    per = {v: {sid: load(sid, v) for sid in ids} for v in ('normal',) + variants}
+    out = dict(env=env, profile=profile, ids=list(ids), cameras=list(cameras), baseline='normal', variants={}, per_camera=rows)
+    for v in variants:
+        d = {k: [] for k in ('lpips', 'dists', 'delta_e') + REGION_KEYS}
         by_id = {}
         for sid in ids:
-            for cam in CONFIRM_CAMERAS:
+            for cam in cameras:
                 a, b = per['normal'][sid].get(cam), per[v][sid].get(cam)
                 if not a or not b or a.get('lpips') is None or b.get('lpips') is None:
                     continue
                 for k in d:
-                    d[k].append(b[k] - a[k])
+                    if isinstance(a.get(k), (int, float)) and isinstance(b.get(k), (int, float)):
+                        d[k].append(b[k] - a[k])
                 by_id.setdefault(sid, []).append(b['lpips'] - a['lpips'])
         out['variants'][v] = dict(
-            n=len(d['lpips']), **{f'mean_d{k}': float(np.mean(x)) for k, x in d.items()},
-            **{f'improved_{k}': int(np.sum(np.asarray(x) < 0)) for k, x in d.items()},
+            n=len(d['lpips']), **{f'n_{r}': len(d[f'{r}_lpips']) for r in REGION_METRICS if d[f'{r}_lpips']}, **{f'mean_d{k}': float(np.mean(x)) for k, x in d.items() if x},
+            **{f'improved_{k}': int(np.sum(np.asarray(x) < 0)) for k, x in d.items() if x},
             heads_improved_lpips=int(sum(np.mean(x) < 0 for x in by_id.values())), per_head_dlpips={k: float(np.mean(x)) for k, x in by_id.items()})
-    (COMPARE_ROOT / f'confirm_{env}{psuf}.json').write_text(json.dumps(out, indent=1) + '\n')
+    (COMPARE_ROOT / f'{name}_{env}{psuf}.json').write_text(json.dumps(out, indent=1) + '\n')
     return out
 
 
-def write_eye_fit(sid):
-    """head/fit_mh_eyes.json: the template fit with eye_params mapped from this sample's MetaHuman eyes (eye_map)."""
+def write_eye_fit(sid, version=1):
+    """head/fit_mh_eyes[_v<n>].json: the template fit with eye_params mapped from this sample's MetaHuman eyes (eye_map)."""
     from .eye_map import params_for
     head = COMPARE_ROOT / sid / 'head'
     fit = json.loads((head / 'fit.json').read_text())
-    p, rec = params_for(sid, 'left')
+    p, rec = params_for(sid, 'left', version)
     fit['eye_params'] = p
-    fit['eye_params_source'] = dict(method='metahuman.eye_map', sample=sid, side='left', reproduction_delta_e=rec['reproduction_delta_e'])
-    (head / 'fit_mh_eyes.json').write_text(json.dumps(fit, indent=1) + '\n')
-    return head / 'fit_mh_eyes.json'
+    fit['eye_params_source'] = dict(method='metahuman.eye_map', version=version, sample=sid, side='left',
+                                    reproduction_delta_e=rec['reproduction_delta_e'])
+    path = head / ('fit_mh_eyes.json' if version == 1 else f'fit_mh_eyes_v{version}.json')
+    path.write_text(json.dumps(fit, indent=1) + '\n')
+    return path
 
 
 def render_sample(sid, cameras=CAMERAS, variant=''):
@@ -295,11 +308,26 @@ def render_sample(sid, cameras=CAMERAS, variant=''):
         explicit = dict(origin=(np.asarray(v['origin']) + shift).tolist(), rotation=v['rotation'], focal_px=v['focal_px'], size=v['size'])
         opts = dict(RENDER, **variant_options(variant)); preset = opts.pop('preset'); samples = opts.pop('samples')
         if variant in MH_EYES:
-            opts['head_fit'] = write_eye_fit(sid)
+            opts['head_fit'] = write_eye_fit(sid, MH_EYES[variant])
         render(cand, out, device='hip', preset=preset, samples=samples, resolution=int(v['size'][0]), explicit_camera=explicit,
                hard_limit_mib=14336, **opts)
         done.append(name)
     return done
+
+
+REGION_METRICS = {'ear': (('ear_', 'yaw_p90', 'yaw_m90'), ('left_ear', 'right_ear')),
+                  'eyes': (('eye_', 'front'), ('left_eye', 'right_eye'))}
+REGION_KEYS = tuple(f'{r}_{m}' for r in REGION_METRICS for m in ('lpips', 'dists', 'delta_e'))
+
+
+def box_down(x, size):
+    """Box-downsample an HxWxC image to size x size (integer factor); unchanged when it already has that size."""
+    if x.shape[:2] == (size, size):
+        return x
+    f = x.shape[0] // size
+    if f < 1 or x.shape[0] != f * size or x.shape[1] != f * size:
+        raise ValueError(f'{x.shape[:2]} is not an integer multiple of {size}')
+    return x.reshape(size, f, size, f, -1).mean((1, 3))
 
 
 def report(ids, cameras=CAMERAS, env='studio', variant='', write_summary=True, profile='full'):
@@ -320,10 +348,7 @@ def report(ids, cameras=CAMERAS, env='studio', variant='', write_summary=True, p
             if not (c.is_file() and ue.is_file()):
                 continue
             cy = read_exr(c); u = read_exr(ue)[..., :3]; ubc = read_exr(ub)[..., :3]
-            f = u.shape[0] // cy.shape[0]
-            if f > 1:      # fast profile: box-downsample the references to the Cycles size
-                box = lambda x: x.reshape(x.shape[0] // f, f, x.shape[1] // f, f, -1).mean((1, 3))
-                u, ubc = box(u), box(ubc)
+            u, ubc = box_down(u, cy.shape[0]), box_down(ubc, cy.shape[0])
             um = ubc.max(-1) > 1e-4
             cm = cy[..., 3] > .5 if cy.shape[-1] == 4 else cy[..., :3].max(-1) > 1e-4
             rows_c = np.flatnonzero(cm.any(1))
@@ -340,6 +365,11 @@ def report(ids, cameras=CAMERAS, env='studio', variant='', write_summary=True, p
             r.pop('crops', None)
             rec[name] = dict(silhouette_iou_head_rows=float(inter / max(union, 1)), cycles_to_ue_gain=gain,
                              lpips=r.get('lpips'), dists=r.get('dists'), delta_e=(r.get('delta_e') or {}).get('mean'), status=r['status'])
+            for key, (prefixes, labels) in REGION_METRICS.items():      # region-only scores (parser labels) on its views
+                if name.startswith(prefixes):
+                    e = am.compare_region(a, b, parser, list(labels), aligned=True)
+                    rec[name].update({f'{key}_lpips': e.get('lpips'), f'{key}_dists': e.get('dists'),
+                                      f'{key}_delta_e': (e.get('delta_e') or {}).get('mean'), f'{key}_status': e['status']})
             Image.fromarray(np.concatenate([a, b], 1)).save(COMPARE_ROOT / sid / f'{name}_ue{suffix}_cycles.png')
         rows[sid] = rec
         path = COMPARE_ROOT / sid / f'compare{suffix}.json'
@@ -351,7 +381,8 @@ def report(ids, cameras=CAMERAS, env='studio', variant='', write_summary=True, p
         vals = [rows[s][name] for s in rows if name in rows[s]]
         if vals:
             summary[name] = {k: float(np.nanmean([v[k] for v in vals if isinstance(v.get(k), (int, float))] or [np.nan]))
-                             for k in ('silhouette_iou_head_rows', 'cycles_to_ue_gain', 'lpips', 'dists', 'delta_e')} | dict(n=len(vals))
+                             for k in ('silhouette_iou_head_rows', 'cycles_to_ue_gain', 'lpips', 'dists', 'delta_e') + REGION_KEYS
+                             if any(isinstance(v.get(k), (int, float)) for v in vals)} | dict(n=len(vals))
     if write_summary:
         (COMPARE_ROOT / f'summary{suffix}.json').write_text(json.dumps(dict(ids=list(rows), env=env, variant=variant, cameras=summary), indent=1) + '\n')
     return summary
@@ -366,6 +397,8 @@ def main():
     ap.add_argument('--confirm', action='store_true', help='render (or with --report: score) the CONFIRM variants on the selected ids x CONFIRM_CAMERAS')
     ap.add_argument('--sweep', action='store_true', help='material sweep renders (SWEEP x SWEEP_IDS x SWEEP_CAMERAS); with --report: score and rank them')
     ap.add_argument('--update-normal', action='store_true', help='write the converted MH normal into existing pseudo-candidates')
+    ap.add_argument('--ears', action='store_true', help='score the EAR_SET experiment (normal_ear* vs normal; renders via win_cycles)')
+    ap.add_argument('--eyes', action='store_true', help='score the EYE_SET experiment (MH eye mapping v1/v2 vs normal)')
     ap.add_argument('--profile', default='full', choices=('full', 'fast'), help="with --confirm --report: 'fast' scores win_cycles' 512 px / 32 spp renders")
     ap.add_argument('--ue-env', default='studio', help="UE reference lighting: studio (MetaHuman Studio) or vhstudio (calibrated vhuman rig)")
     a = ap.parse_args()
@@ -376,6 +409,11 @@ def main():
         out = sweep(a.ue_env, score=a.report)
         for v in (out or {}).get('ranked_by_lpips', []):
             print(v, json.dumps(out['table'][v]))
+        return
+    if a.ears or a.eyes:
+        out = confirm(ids, a.ue_env, score=True, profile=a.profile, name='ears' if a.ears else 'eyes', **(EAR_SET if a.ears else EYE_SET))
+        for v, r in out['variants'].items():
+            print(v, json.dumps({k: x for k, x in r.items() if k != 'per_head_dlpips'}))
         return
     if a.confirm:
         out = confirm(ids, a.ue_env, score=a.report, profile=a.profile)
