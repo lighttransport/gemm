@@ -300,5 +300,16 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   | ue_match_spec (ue_match + specular x1.8) | -.0012 | -.0025 | -.96 | 24 | 8 |
 
   SSS radius/amount is neutral at 512 px although Cycles' mfp is 2-7x UE's; UE's higher F0 alone hurts (UE's lobe mix /
-  cavity attenuation is not reproduced). ue_match dE ~5.0 -> 4.4 on every camera. Defaults unchanged pending the
-  6-camera confirm.
+  cavity attenuation is not reproduced). ue_match dE ~5.0 -> 4.4 on every camera.
+
+  6-camera confirm (`compare_render.UE_CONFIRM_SET`, `win_cycles --score ue_confirm`; 12 heads x 6 cameras = 72 views vs
+  `normal`, `compare_v1/ue_confirm_vhstudio__fast.json`):
+
+  | variant | dLPIPS | dDISTS | ddE | views better | heads better | mouth dLPIPS |
+  |---|---|---|---|---|---|---|
+  | mat_r125_c0 (roughness x1.25, coat 0) | -.0044 | -.0039 | -.67 | 54 | 9 | -.0123 |
+  | ue_match (+ ue_sss50) | -.0018 | -.0006 | -.67 | 50 | 8 | +.0006 |
+  | ue_match_spec (+ specular x1.8) | +.0021 | +.0005 | -.94 | 40 | 4 | +.0209 |
+
+  UE's SSS gives nothing on the wide views and removes the mouth gain; UE's F0 clearly hurts the mouth. The best setting
+  stays roughness x1.25 + coat 0 with the current SSS/specular (mh_000145 worse with all three, +.011-.015).

@@ -68,7 +68,7 @@ untested gaps are the SSS radius / weight and the specular level.
 ## 5. Experiment (`compare_render.UE_SET`, `--ue-match`; 12 heads x front/+-40, fast profile, vs `normal`)
 
 `ue_sss25|50|100` = weight 1 with the UE mfp x .25/.5/1; `ue_spec` = specular x1.8 (F0 ~.05); `ue_match` = roughness
-x1.25 + coat 0 + ue_sss50; `ue_match_spec` = ue_match + specular x1.8. Results: metahuman README "UE-matched skin" (SSS neutral, F0 alone worse, roughness x1.25 + coat 0 carries the gain).
+x1.25 + coat 0 + ue_sss50; `ue_match_spec` = ue_match + specular x1.8. Results: metahuman README "UE-matched skin" (SSS neutral, F0 alone worse, roughness x1.25 + coat 0 carries the gain; the 6-camera confirm prefers roughness x1.25 + coat 0 without the UE SSS: LPIPS -.0044 vs -.0018).
 
 ## References
 - H. W. Jensen, S. Marschner, M. Levoy, P. Hanrahan, "A Practical Model for Subsurface Light Transport", SIGGRAPH 2001.

@@ -162,13 +162,13 @@ def stage(ids, variants, cameras, profile, root):
     return len(jobs)
 
 
-SCORE_SETS = ('confirm', 'ears', 'eyes', 'eye_sweep', 'ue_match')
+SCORE_SETS = ('confirm', 'ears', 'eyes', 'eye_sweep', 'ue_match', 'ue_confirm')
 
 
 def score_set(name, ids, profile, env='vhstudio'):
     """Run the compare_render scoring of a named experiment (CPU: set HIP_VISIBLE_DEVICES= CUDA_VISIBLE_DEVICES=)."""
     from . import compare_render as cr
-    exp = dict(confirm={}, ears=cr.EAR_SET, eyes=cr.EYE_SET, eye_sweep=cr.EYE_SWEEP_SET, ue_match=cr.UE_SET)[name]
+    exp = dict(confirm={}, ears=cr.EAR_SET, eyes=cr.EYE_SET, eye_sweep=cr.EYE_SWEEP_SET, ue_match=cr.UE_SET, ue_confirm=cr.UE_CONFIRM_SET)[name]
     out = cr.confirm(ids, env, score=True, profile=profile, name=name, **exp)
     for v, r in out['variants'].items():
         print(v, json.dumps({k: x for k, x in r.items() if k != 'per_head_dlpips'}), flush=True)
