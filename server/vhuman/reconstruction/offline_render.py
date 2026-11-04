@@ -33,7 +33,7 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
            hdri=None, hdri_strength=1., hdri_rotation=0., samples=None, resolution=None, quality='baseline',
            ablate=(), noisy=True, eyes=None, chart=False, displacement_scale=1., micro_scale=1., save_blend=True,
            lip_coat_scale=.6, lip_coat_roughness=.30, teeth_glow=0., mouth_fill=.02, explicit_camera=None,
-           skin_normal_map=False, skin_normal_strength=1., material_overrides=None):
+           skin_normal_map=False, skin_normal_strength=1., material_overrides=None, stage_only=False):
     """camera: a render_cameras.CAMERAS preset; yaw/pitch/distance_scale/focal_scale override its values.
     lighting 'hdri' lights the scene with `hdri` (default DEFAULT_HDRI; its sha256 is recorded).
     preset hero = 2048^2 / 1024 spp; samples/resolution override any preset. noisy=True also writes the
@@ -41,7 +41,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     ('full' = A/B study candidate B; ablate lists stages removed, e.g. ('2d',)).
     explicit_camera: {origin (m), rotation rows right/up/back, focal_px, size} renders exactly that pinhole camera (centred
     principal point) instead of a preset placed from the fitted portrait camera; used by metahuman.compare_render so
-    Cycles and the MetaHuman reference renders share one camera."""
+    Cycles and the MetaHuman reference renders share one camera.
+    stage_only: stop after the prepared inputs and request.json are written (no Blender run, no GPU); used to stage
+    renders for another machine (metahuman.win_cycles), where cycles_scene.py + cycles_validate.py run on them."""
     from .render_cameras import CAMERAS
     if device not in ('hip', 'cuda', 'optix', 'cpu') or preset not in PRESETS:
         raise ValueError('invalid render device or preset')
@@ -126,6 +128,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     if (Path(candidate)/'teeth.json').is_file():
         shutil.copyfile(Path(candidate)/'teeth.json',out/'teeth.json');request['teeth']=str((Path(candidate)/'teeth.json').resolve())
     (out/'request.json').write_text(json.dumps(request, indent=2))
+    if stage_only:
+        return dict(staged=True, out=str(out), request=request)
     started = time.monotonic()
     peak = 0
     usage_paths = sorted(Path('/sys/class/drm').glob('card[0-9]*/device/mem_info_vram_used'))

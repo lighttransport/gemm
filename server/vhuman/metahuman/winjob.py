@@ -66,15 +66,16 @@ def env_block():
     ])
 
 
-def job_script(tag, module_args, timeout):
-    """PowerShell job: env, launch.py (blocking inside the detached process), exit code + finish time to <tag>.exit."""
+def job_script(tag, module_args, timeout, command=None):
+    """PowerShell job: env, launch.py (blocking inside the detached process), exit code + finish time to <tag>.exit.
+    command: run this PowerShell command line instead of launch.py (e.g. win_cycles.py under Blender's Python)."""
     logs = f'{win(WIN_ROOT)}\\logs'
-    args = ' '.join(module_args)
+    run = command or f"& '{win(WIN_PY)}' -m server.vhuman.metahuman.launch {' '.join(module_args)} --timeout {int(timeout)}"
     return '\n'.join([
         env_block(),
         f"Set-Location '{win(WIN_REPO)}'",
         f"\"pid $PID started $(Get-Date -Format s)\" | Set-Content '{logs}\\{tag}.pid'",
-        f"& '{win(WIN_PY)}' -m server.vhuman.metahuman.launch {args} --timeout {int(timeout)} *> '{logs}\\{tag}.out'",
+        f"{run} *> '{logs}\\{tag}.out'",
         f"\"exit $LASTEXITCODE finished $(Get-Date -Format s)\" | Set-Content '{logs}\\{tag}.exit'",
     ]) + '\n'
 
@@ -123,10 +124,10 @@ def push(ids, env, tag):
     return f'{WIN_DATA}/v1/render_batches/{tag}.json'
 
 
-def start(tag, module_args, timeout):
+def start(tag, module_args, timeout, command=None):
     LOCAL_TMP.mkdir(parents=True, exist_ok=True)
     ps1 = LOCAL_TMP / f'{tag}.ps1'
-    ps1.write_text(job_script(tag, module_args, timeout))
+    ps1.write_text(job_script(tag, module_args, timeout, command))
     scp_to(ps1, f'{WIN_ROOT}/{tag}.ps1')
     logs = f'{win(WIN_ROOT)}\\logs'
     cmd = f'powershell -NoProfile -ExecutionPolicy Bypass -File {win(WIN_ROOT)}\\{tag}.ps1'
