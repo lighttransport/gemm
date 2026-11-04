@@ -327,3 +327,11 @@ python -m server.vhuman.metahuman.compare_render --confirm --report --profile fa
   128 spp, Linux HIP) .0937 / .167 / 4.50. Good enough to rank material variants.
 - MH-eye variants (`compare_render.MH_EYES`: `normal_eyes` = eye_map v1, `normal_eyes2` = v2) get their own staged base
   per head (`base_eyes<n>`, prepared with that head fit); other variants share `base`.
+
+Disconnectable runs (2026-11-04): the worker job is a detached WMI process that reads only its staged copy, so the
+Linux host may reboot mid-run. `win_cycles render <tag> ... --score confirm|ears|eyes|eye_sweep|ue_match` writes
+`tmp/win/<tag>.finish.json`; later `win_cycles status <tag>` (views done/total, progress, exit file), `finish <tag>`
+(wait for the exit file, pull, score; re-runnable, pulled views are skipped) and `resume <tag>` (restart an interrupted
+worker run on the existing stage; finished views are skipped, refuses while no exit file exists unless `--force`).
+Check free space on the COMPARE_ROOT disk before a pull (a full disk aborts the extraction; partially extracted views
+have no render_result.json and are re-extracted by the next pull).

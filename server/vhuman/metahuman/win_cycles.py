@@ -3,6 +3,7 @@
 Linux:   python -m server.vhuman.metahuman.win_cycles stage  [--ids ...] [--variants ...] [--cameras ...] [--profile fast]
          python -m server.vhuman.metahuman.win_cycles render [same options]   (stage + push + run detached + wait + pull)
          python -m server.vhuman.metahuman.win_cycles pull <tag>
+         python -m server.vhuman.metahuman.win_cycles status|resume|finish <tag>   (disconnectable: see below)
 Windows: <blender python> win_cycles.py run <stage root>   (stdlib only; started by `render` through winjob)
 
 stage: offline_render.render(..., stage_only=True) once per head (prepare + skin templates + wrinkle channels are
@@ -10,6 +11,12 @@ camera- and material-independent), plus one request per variant x camera with th
 explicit camera scaled to that resolution and device 'cpu'. Outputs land in COMPARE_ROOT/<id>/<variant dir>/<camera>
 like Linux renders; profile 'fast' (512 px, 32 spp, denoised) uses separate '__fast' directories so they are only
 ever paired with each other (compare_render.report(profile=...)).
+
+Disconnectable: the worker job is a detached WMI process and only reads its staged copy, so the Linux host may log out
+or reboot while it runs. `render --score <set>` records the ids/profile/score set in tmp/win/<tag>.finish.json;
+`finish <tag>` later waits for the exit file (immediately if done), pulls and scores; `status <tag>` prints the
+progress; `resume <tag>` restarts an interrupted worker run on the existing stage (finished views are skipped).
+Never `sync` (it replaces D:/work/gemm-vhuman/server) while a worker render is running.
 """
 import json
 import os
@@ -155,11 +162,64 @@ def stage(ids, variants, cameras, profile, root):
     return len(jobs)
 
 
-def render_remote(ids, variants, cameras, profile, tag=None, timeout=8 * 3600, sync=True):
+SCORE_SETS = ('confirm', 'ears', 'eyes', 'eye_sweep', 'ue_match')
+
+
+def score_set(name, ids, profile, env='vhstudio'):
+    """Run the compare_render scoring of a named experiment (CPU: set HIP_VISIBLE_DEVICES= CUDA_VISIBLE_DEVICES=)."""
+    from . import compare_render as cr
+    exp = dict(confirm={}, ears=cr.EAR_SET, eyes=cr.EYE_SET, eye_sweep=cr.EYE_SWEEP_SET, ue_match=cr.UE_SET)[name]
+    out = cr.confirm(ids, env, score=True, profile=profile, name=name, **exp)
+    for v, r in out['variants'].items():
+        print(v, json.dumps({k: x for k, x in r.items() if k != 'per_head_dlpips'}), flush=True)
+    return out
+
+
+def finish_record(tag):
+    from . import winjob as wj
+    return wj.LOCAL_TMP / f'{tag}.finish.json'
+
+
+def status(tag):
+    from . import winjob as wj
+    remote = wj.win(f'{wj.WIN_DATA}/cycles/{tag}')
+    out = wj.ssh(f"$j = (Get-Content '{remote}\\jobs.json' -Raw | ConvertFrom-Json).jobs.Count; "
+                 f"$d = (Get-ChildItem '{remote}' -Recurse -Filter render_result.json -ErrorAction SilentlyContinue | Measure-Object).Count; "
+                 f"\"views $d/$j\"; Get-Content '{remote}\\progress.log' -Tail 2 -ErrorAction SilentlyContinue", check=False)
+    return out + '\n' + (wj.status(tag) or 'no exit file (running or never started)')
+
+
+def resume(tag, timeout=8 * 3600, force=False):
+    """Restart the worker run of an already staged tag (after a worker reboot / kill); finished views are skipped."""
+    from . import winjob as wj
+    if not force and not wj.status(tag).startswith('exit'):
+        raise RuntimeError(f'{tag}: no exit file, the worker run may still be going (status {tag}); use --force')
+    remote = f'{wj.WIN_DATA}/cycles'
+    script = f'{wj.WIN_REPO}/server/vhuman/metahuman/win_cycles.py'
+    return wj.start(tag, None, timeout, command=f"& '{wj.win(WIN_BLENDER_PY)}' '{wj.win(script)}' run '{wj.win(remote)}/{tag}'")
+
+
+def finish(tag, score=None, wait=True, timeout=8 * 3600):
+    """Wait for the worker (if wait), pull and score with the set recorded by `render --score` (or the given one)."""
+    from . import winjob as wj
+    rec = json.loads(finish_record(tag).read_text()) if finish_record(tag).is_file() else {}
+    if wait:
+        print(tag, 'exit', wj.wait(tag, timeout), flush=True)
+    pull(tag)
+    name = score or rec.get('score')
+    if name:
+        return score_set(name, rec['ids'], rec.get('profile', 'fast'), rec.get('env', 'vhstudio'))
+    return None
+
+
+def render_remote(ids, variants, cameras, profile, tag=None, timeout=8 * 3600, sync=True, score=None):
     import tarfile
     from . import winjob as wj
     tag = tag or f"cycles_{profile}_{time.strftime('%Y%m%d-%H%M%S')}"
     root = wj.LOCAL_TMP / tag
+    wj.LOCAL_TMP.mkdir(parents=True, exist_ok=True)
+    finish_record(tag).write_text(json.dumps(dict(tag=tag, ids=list(ids), variants=list(variants), cameras=list(cameras),
+                                                  profile=profile, score=score, env='vhstudio'), indent=1) + '\n')
     n = stage(ids, variants, cameras, profile, root)
     print(f'{tag}: {n} views staged', flush=True)
     if not n:
@@ -202,21 +262,30 @@ def main():
     import argparse
     from . import compare_render as cr
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('cmd', choices=('stage', 'render', 'pull'))
+    ap.add_argument('cmd', choices=('stage', 'render', 'pull', 'status', 'resume', 'finish'))
     ap.add_argument('tag', nargs='?', default='')
     ap.add_argument('--ids', default=''); ap.add_argument('--variants', default=','.join(('normal',) + cr.CONFIRM))
     ap.add_argument('--cameras', default=','.join(cr.CONFIRM_CAMERAS)); ap.add_argument('--profile', default='fast', choices=PROFILES)
     ap.add_argument('--timeout', type=float, default=8 * 3600); ap.add_argument('--no-sync', action='store_true')
+    ap.add_argument('--score', choices=SCORE_SETS, help='render: scoring set recorded for `finish`; finish: override it')
+    ap.add_argument('--no-wait', action='store_true', help='finish: pull/score what is done now')
+    ap.add_argument('--force', action='store_true', help='resume: restart even without an exit file')
     a = ap.parse_args()
     if a.cmd == 'pull':
         pull(a.tag); return
+    if a.cmd == 'status':
+        print(status(a.tag)); return
+    if a.cmd == 'resume':
+        resume(a.tag, a.timeout, a.force); return
+    if a.cmd == 'finish':
+        finish(a.tag, a.score, not a.no_wait, a.timeout); return
     from .samples import V1
     ids = a.ids.split(',') if a.ids else sorted(json.loads((V1 / 'sampling.json').read_text())['render_ids'])[::10]
     variants, cams = a.variants.split(','), a.cameras.split(',')
     if a.cmd == 'stage':
         from . import winjob as wj
         print(stage(ids, variants, cams, a.profile, wj.LOCAL_TMP / (a.tag or 'stage')), 'views staged'); return
-    print(render_remote(ids, variants, cams, a.profile, a.tag or None, a.timeout, not a.no_sync))
+    print(render_remote(ids, variants, cams, a.profile, a.tag or None, a.timeout, not a.no_sync, a.score))
 
 
 if __name__ == '__main__':

@@ -37,7 +37,7 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 | Normal prior | `-m server.vhuman.metahuman.normal_prior_fit [--res 1024 --k 40 --workers 8]` -> `normal_prior_v1.npz` (+ report); `normal_prior_fit.write_png(prior, 'detail_xy', png)` encodes a Blender skin_normal.png |
 | Eye mapping | `-m server.vhuman.metahuman.eye_map calibrate` (UE eye close-ups -> `eye_colour_calibration_v1.json`), `eye_map params <id> [--version 1\|2]` (default 2 = sclera tint from the measured MH sclera); `compare_render --variant normal_eyes` / `normal_eyes2` renders with `head/fit_mh_eyes.json` (v1) / `fit_mh_eyes_v2.json`; `--eyes` / `--ears` score the eye and ear sets |
 | Windows UE worker | `-m server.vhuman.metahuman.winjob sync` / `render <ids> --env Studio\|VHStudio` / `compare <ids>` (`VHUMAN_WIN_HOST`, DX12 SM5 on RX 570; setup `../vhuman-win10.md`; pushes params/cameras, runs render_batch.py detached via WMI, pulls into `DATASET_ROOT/win_v1`); roots overridable via `VHUMAN_UE_ROOT` / `VHUMAN_MH_PROJECT` / `VHUMAN_MH_DATA` / `VHUMAN_MH_MODELS` / `VHUMAN_UE_RHI` |
-| Windows Cycles (CPU) | `-m server.vhuman.metahuman.win_cycles render <tag> [--ids] [--variants] [--cameras] [--profile fast]` / `pull <tag>`, then `compare_render --confirm --report --profile fast` (Linux stages heads with `offline_render.render(stage_only=True)`, the worker renders 512 px / 32 spp in ~15 s/view into `<variant>__fast` dirs; `../vhuman-win10.md` §10) |
+| Windows Cycles (CPU) | `-m server.vhuman.metahuman.win_cycles render <tag> [--ids] [--variants] [--cameras] [--profile fast]` / `pull <tag>` / `status|finish|resume <tag>` (disconnectable: `render --score <set>` records the scoring, `finish` waits, pulls and scores later), then `compare_render --confirm --report --profile fast` (Linux stages heads with `offline_render.render(stage_only=True)`, the worker renders 512 px / 32 spp in ~15 s/view into `<variant>__fast` dirs; `../vhuman-win10.md` §10) |
 | Material sweep | `compare_render --sweep` (renders SWEEP x SWEEP_IDS x SWEEP_CAMERAS on the GPU), then `--sweep --report --ue-env vhstudio` (CPU) -> `compare_v1/sweep_vhstudio.json` ranked by skin LPIPS |
 | Use the skin prior | `bake_portrait(..., skin_prior=PATH)`; `tmp/vhuman-ab-cycles/scripts/rebake.py ... --skin-prior PATH` |
 | Tests | `$P -m pytest -q server/vhuman/test_metahuman_prior.py` |
@@ -289,3 +289,16 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   Cycles ignores it on a fully transmissive (glass) Principled BSDF, so the cornea-reflection test did not run; lowering
   the IOR to 1.30 (less reflection) does not help either. Untested: an IOR ~1.0 (invisible) cornea; more likely causes
   of the grey iris are the iris texture brightness and the GNM-vs-MH eye placement.
+- UE-matched skin (2026-11-04, `compare_render.UE_SET`, `--ue-match`; values from the UE skin readout in
+  `skin_sss_survey.md`; 12 heads x front/+-40 = 36 views vs `normal`, fast profile, `compare_v1/ue_match_vhstudio__fast.json`):
+
+  | variant | dLPIPS | dDISTS | ddE | views better | heads better |
+  |---|---|---|---|---|---|
+  | ue_sss25 / 50 / 100 (SSS weight 1, UE mfp 1.05/.41/.26 mm x .25/.5/1) | +.0003 / +.0001 / +.0001 | +.0008 / +.0008 / +.0007 | -.12 / -.11 / -.08 | 12 / 14 / 17 | 2 / 4 / 6 |
+  | ue_spec (specular x1.8, F0 ~.05) | +.0065 | +.0052 | +.11 | 2 | 1 |
+  | ue_match (roughness x1.25, coat 0, ue_sss50) | -.0015 | -.0025 | -.65 | 27 | 9 |
+  | ue_match_spec (ue_match + specular x1.8) | -.0012 | -.0025 | -.96 | 24 | 8 |
+
+  SSS radius/amount is neutral at 512 px although Cycles' mfp is 2-7x UE's; UE's higher F0 alone hurts (UE's lobe mix /
+  cavity attenuation is not reproduced). ue_match dE ~5.0 -> 4.4 on every camera. Defaults unchanged pending the
+  6-camera confirm.
