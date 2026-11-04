@@ -313,3 +313,9 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 
   UE's SSS gives nothing on the wide views and removes the mouth gain; UE's F0 clearly hurts the mouth. The best setting
   stays roughness x1.25 + coat 0 with the current SSS/specular (mh_000145 worse with all three, +.011-.015).
+
+  s1/s2 photo check (2026-11-05, B8 = B7 + `material_overrides` roughness x1.25, coat 0; `render_matrix.py --plan mat`,
+  final 128 spp, `prior_report.py B7 B8`; LPIPS B7 -> B8): s1 face .424 -> .424, +40/-40 .502/.491 -> .504/.492, held-out
+  ears +90/-90 .553/.537 -> .548/.544; s2 face .498 -> .498, +40/-40 .533/.509 -> .535/.510, ears .558/.543 -> .560/.543.
+  A tie or slightly worse (DISTS flat to worse); the MetaHuman gain is matching UE's look, not photo realism.
+  Defaults unchanged.
