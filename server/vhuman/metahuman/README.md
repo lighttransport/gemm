@@ -232,3 +232,13 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   `compare_render` variants `sw_<param>_<value>` = 'normal' + one setting; SWEEP: roughness x .8/1.25/1.5, specular
   x .5/.75/1.25, skin coat 0/.05/.2, SSS weight .3/.45/.8, SSS scale .25/.75/1, normal strength .5/1.5, micro .0/.5 on
   mh_000000/145/300 x front/yaw_p40 (114 renders).
+
+  Result (2026-11-04, 3 heads x front/+40 vs VHStudio, `compare_v1/sweep_vhstudio.json`, aligned scoring; baseline
+  `normal` LPIPS .1155 / DISTS .1789 / dE 5.67). All effects are small (|dLPIPS| <= .011):
+  roughness x1.25 is best on average (LPIPS -.0027, DISTS -.0041, dE -.90) and x1.5 has the best DISTS (-.0048), but
+  per head it helps mh_000000 / mh_000300 and hurts mh_000145 (LPIPS +.006 on both views), so the gap is
+  identity-dependent (MH roughness varies per character), not a global scale; x0.8 is clearly worse (+.011, dE +1.5).
+  Specular x0.5-0.75 lowers LPIPS slightly but raises dE (+.5..+1.4, the skin gets darker); coat 0 is a small,
+  consistent gain (-.0013, 5 of 6 views); SSS weight/scale are flat (+-.001); normal strength 1.0 is optimal (0.5 and
+  1.5 both worse); micro-pores 0 is neutral (DISTS -.003), 0.5 worse. Candidate change: coat 0.10 -> 0 and roughness
+  x1.25, to confirm on more heads and on the s1/s2 photo metrics before changing defaults.
