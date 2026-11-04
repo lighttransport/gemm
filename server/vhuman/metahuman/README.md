@@ -287,8 +287,12 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
 
   All effects are at the 32 spp noise level; defaults unchanged. The Specular IOR Level rows are exactly zero because
   Cycles ignores it on a fully transmissive (glass) Principled BSDF, so the cornea-reflection test did not run; lowering
-  the IOR to 1.30 (less reflection) does not help either. Untested: an IOR ~1.0 (invisible) cornea; more likely causes
-  of the grey iris are the iris texture brightness and the GNM-vs-MH eye placement.
+  the IOR to 1.30 (less reflection) does not help either. More likely causes of the grey iris are the iris texture
+  brightness and the GNM-vs-MH eye placement.
+  IOR 1.0 cornea (2026-11-05, `compare_render.EYE_IOR1_SET`, `win_cycles --score eye_ior1`; 12 heads x eye_left/right,
+  front = 36 views vs `normal_eyes2`, `compare_v1/eye_ior1_vhstudio__fast.json`): an invisible cornea gives eye dE -.79
+  (19/35 views), eye LPIPS +.0025, eye DISTS +.0032, view LPIPS +.0036 (0/36 better; the cornea highlight is lost).
+  The cornea veil is not the eye gap (dE ~19-25); cornea unchanged.
 - UE-matched skin (2026-11-04, `compare_render.UE_SET`, `--ue-match`; values from the UE skin readout in
   `skin_sss_survey.md`; 12 heads x front/+-40 = 36 views vs `normal`, fast profile, `compare_v1/ue_match_vhstudio__fast.json`):
 

@@ -269,6 +269,8 @@ CONFIRM_CAMERAS = ('front', 'yaw_p40', 'yaw_m40', 'yaw_p90', 'yaw_m90', 'mouth')
 # Ear experiment (2026-11-04): the MH normal regressed ear views on 9/12 heads; fade it on the GNM ears.
 EYE_SET = dict(variants=('normal_eyes', 'normal_eyes2'), cameras=('eye_left', 'eye_right', 'front', 'yaw_p40', 'yaw_m40'))
 EYE_SWEEP_SET = dict(variants=EYE_SWEEP_VARIANTS, cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
+# 2026-11-05: cornea IOR 1.0 = an invisible cornea (no refraction, no reflection): is the cornea veil the eye dE gap?
+EYE_IOR1_SET = dict(variants=('ew_cornea_ior_1',), cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
 UE_SET = dict(variants=('ue_sss25', 'ue_sss50', 'ue_sss100', 'ue_spec', 'ue_match', 'ue_match_spec'), cameras=('front', 'yaw_p40', 'yaw_m40'))
 UE_CONFIRM_SET = dict(variants=('ue_match', 'ue_match_spec', 'mat_r125_c0'), cameras=CONFIRM_CAMERAS)
 EAR_SET = dict(variants=('', 'normal_ear0', 'normal_ear50'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))
