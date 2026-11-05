@@ -387,3 +387,134 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   original render, `normal` stays the experiment baseline): (a) MH pseudo-candidates place the eyeballs on the MH eye
   centres; (b) per-identity roughness x1.25 x MH roughness/1.03 + coat 0 for MH comparisons; (c) sclera x.85.
   Not proposed: iris specular 0 (mixed), the s1/s2 photo defaults (B8/B9 tie).
+- Follow-up round (2026-11-06, `goal-vhuman-next.md`; Windows worker Blender 5.2.3 CPU fast profile, baseline = the new
+  default `combo` unless stated; `c_<param>_<value>` = combo + one setting; DRAFT, results complete):
+  1. Iris hue diagnostics (`IRIS_DIAG_SET`, 12 heads x eye_left/right/front vs `combo`): hiding the cornea and tear film
+     from camera rays worsened eye LPIPS by .0281 and eye dE by 3.17 (2/35 and 3/35 better); unshaded iris texture
+     emission improved eye LPIPS by .0065 (21/35) but worsened eye dE by 2.59 (5/35). On the 17 eyes valid in all three
+     `eye_audit` runs, median absolute iris saturation error vs UE was .265 for combo, .221 with the cornea hidden, and
+     .167 with emission (11/17 and 14/17 closer than combo). This is a fixed-ring, automatically detected image-space
+     measurement: pupil detection, refraction and very dark/low-saturation irises can move or contaminate the sampled
+     ring; hue is unreliable for nearly grey pixels. The two tests implicate the image formation but do not isolate a
+     practical correction, and neither is a candidate default because eye dE worsens. A four-head follow-up is testing
+     additive iris-coloured fill at strengths .25/.5/1 while retaining the shaded material (`iris_fill4`, four heads,
+     36 views): eye LPIPS / DISTS / dE vs `combo` were -.0028 / -.0012 / -.54, -.0064 / -.0022 / -.98, and -.0093 /
+     -.0039 / -1.48, respectively; eye dE improved on 11/11 measurable views for each. This is only a small pilot and
+     is a nonphysical emission adjustment. For the eight matched close-up eyes, median absolute iris saturation error
+     was .394 / .359 / .333 for combo / fill .5 / fill 1; fill was closer on 5/8 eyes at either strength. Hue error
+     median was 10 -> 7 degrees on the six eyes where both measurements had saturation >= .1. An old queued UE job
+     unexpectedly overlapped this pilot; the pilot's code sync occurred while UE was running. All 36 outputs passed
+     asset validation. The .5/1 settings were rerendered for all four heads without a concurrent worker job: all 24 outputs passed
+     validation and differ from the pilot by a mean of .000019 RGB8 levels per channel (maximum .000036 over any view).
+     Combining the clean four-head repeat with the eight independent heads (35 measurable eye-region views), fill .5
+     changed eye LPIPS / DISTS / dE by -.0026 / -.0034 / -.60 (30 / 30 / 27 views and 11 / 9 / 10 heads better);
+     fill 1 by -.0054 / -.0037 / -.44 (24 / 23 / 23 views and 10 / 8 / 8 heads better). The aggregation is reproducible
+     with `tmp/vhuman-mh/iris_fill_combined.py`.
+     On the eight newly rendered heads alone (24 views), .5 changed them by -.0008 / -.0040 / -.42 (19 / 20 / 16
+     better), while 1 changed them by -.0036 / -.0037 / +.04 (15 / 14 / 12 better). Fill .5 is more consistent;
+     Photo checks (B11/B12 = B7 + fill .5/1, two subjects, final 1024²/128 spp, front/eye close-ups) do not establish a
+     broad eye-region improvement: s1 B7 -> B11 -> B12 eye LPIPS .2576 -> .2582 -> .2584 and mean dE 10.00 -> 10.07 ->
+     10.18; s2 .2656 -> .2658 -> .2662 and 11.83 -> 11.72 -> 11.84. These parsed eye regions include brows; this report
+     uses the ordinary parser mask, while the B10 `prior_report` below removes small components, so their B7 values differ. As a
+     supplemental, approximately projected horizontal iris-ring colour check against the front input, CIE dE76 for
+     right/left was s1 7.97/5.96 -> 8.78/5.15 -> 10.88/6.65, and s2 4.96/6.82 -> 3.41/.98 -> 4.58/3.58. Fill .5
+     improves 3/4 of these small samples, but the photo/render pupil centres are not independently registered and the
+     lighting differs; the native fit's pupil radius is a fixed .45x iris estimate, not a measured pupil boundary.
+     See `tmp/vhuman-ab-cycles/bench/iris_ring_projection.png` and `tmp/vhuman-ab-cycles/scripts/iris_photo_report.py`.
+     Close-up comparison: `tmp/vhuman-ab-cycles/bench/b7_b11_b12_eyes.jpg`. Results are mixed and the adjustment emits
+     light, so no photo or general default change is proposed. A non-emissive follow-up tests iris specular 0 combined
+     with albedo gain 1.5/2.5 (`iris_physical4`). Within the inner 90% of the iris radius, the 24 comparison heads'
+     source textures have a maximum linear channel value of .238, so gain 2.5 exceeds 1 in none of those pixels; this
+     is not a bound for other identities or the outer texture. The photo-subject iris textures are brighter: over the
+     same inner region, gain 2.5 exceeds 1 in 1.14% / .22% of s1/s2 pixels; gain 1.5 does not exceed 1 for either
+     (`tmp/vhuman-mh/iris_texture_range.py`).
+     On four heads / 11 eye-region views, LPIPS / DISTS / dE changed -.0165 / -.0092 / -2.04 and -.0171 / -.0089 / -1.96 versus combo;
+     both improve LPIPS and dE in 8 and 7 views respectively. The mean is driven by two heads: mh_000038 eye dE worsens
+     by 1.06 / .25 and mh_000145 by .22 / -1.02 (1.5 / 2.5). On eight new heads / 24 views, changes were -.0005 /
+     -.0018 / +.007 and -.0003 / -.0026 / +.109, with eye dE better on 9/24 views and 3/8 heads for each. Across all
+     12 heads / 35 measurable views, changes were -.0055 / -.0041 / -.64 and -.0056 / -.0046 / -.54; eye dE improved on
+     16/35 views and 5/12 or 6/12 heads. Per-head mean dE changes ranged from -5.96 to +1.18 at gain 1.5 and -5.28 to
+     +2.20 at 2.5. Over all 36 full views, LPIPS / DISTS / dE changed -.0010 / -.0027 / +.001 at 1.5 and -.0013 /
+     -.0026 / -.007 at 2.5. The strongest gains are on two highly saturated warm iris textures (mh_000020 and mh_000404), while
+     several low-saturation eyes regress; this small sample is not sufficient for a colour-conditioned default. Pilot
+     means therefore do not generalize to the new heads' broader eye crops.
+     Against the existing specular-0-only render, gain 1.5 / 2.5 changes eye LPIPS by
+     -.0036 / -.0042 and dE by -1.46 / -1.38 (10 / 9 of 11 eye-region views improve dE), suggesting the gain adds to
+     the specular change. Across the 12 heads, the approximate audit matched 18 close-up eyes: median absolute iris
+     saturation error was .270 for combo and .1405 / .1535 for gains 1.5 / 2.5 (12/18 eyes closer for either). On nine
+     paired eyes with saturation >= .1, median hue error was 10 -> 3 / 4 degrees (7 / 8 of 9 closer). Restricting to
+     the eight new heads, saturation was closer on 6/10 matched eyes; only three pairs met the hue threshold, with
+     median hue error 13 -> 30 / 28 degrees (1 / 2 of 3 closer). The pilot's hue gain does not generalize on this
+     small, detector-sensitive sample. Photo follow-up (B13/B14 = B7 + specular 0, gain 1.5/2.5; two subjects,
+     1024²/128 spp) yielded eye-region LPIPS / mean dE: s1 B7 .2576 / 10.00, B13 .2575 / 10.03, B14 .2582 / 10.27;
+     s2 .2656 / 11.83, .2653 / 11.88, .2657 / 12.24. Approximate right/left iris-ring dE76 was s1 7.97/5.96 ->
+     4.77/1.95 -> 8.49/4.97 and s2 4.96/6.82 -> 5.64/2.87 -> 12.01/7.76. As above, the rings are not independently
+     registered and lighting differs. Gain 1.5 improves 3/4 iris samples but the broad eye metrics are essentially flat
+     or worse; gain 2.5 is worse on most samples. Close-ups: `tmp/vhuman-ab-cycles/bench/b7_b13_b14_eyes.jpg`.
+     No default change is proposed from these results.
+  2. Iris size: the UE base-colour iris radius (`eye_colour_calibration_v1.json`, 240 eyes) is 1.03x the GNM 6 mm limbus
+     (p25-p75 .97-1.10). This compares physical sizes, not apparent rendered sizes, which can also differ with optics and
+     camera alignment. The existing render-based limbus detector is too noisy (left/right rays disagree 2-3x); a visual
+     check of mh_000020 still suggests a larger apparent Cycles iris. As an exploratory check, Hough circles on the 24
+     paired close-ups were manually screened (`tmp/vhuman-mh/iris_radius_probe/circles.jpg`; grayscale median filter 5,
+     OpenCV Hough gradient dp=1, minDist=30, edge threshold 80, accumulator 25, radii 25-65 px, first centre in
+     x=200..310/y=205..295): 10 pairs had plausible
+     circles on both images (both eyes of mh_000020/038/100/145, right 404, left 435), with median Cycles/UE radius 1.00
+     (range .97-1.06); mh_000020 left was 1.06. The other 14
+     were missing or visibly incorrect detections. This small, selected subset does not rule out a gap on other eyes;
+     the x.9/.95 scale test remains skipped pending a reliable projected-radius measurement. A follow-up constraining
+     Hough circles to within 8 px of the automatic pupil detector (`tmp/vhuman-mh/iris_radius_probe/constrained.jpg`)
+     still picked lids, pupils or the wrong centre on multiple eyes. A second attempt with a compact central dark-component
+     pupil anchor (`central.jpg`) improved some centres but still picked wrong iris radii; neither replaces screening.
+  3. Auto eye offsets: `compare_render.eye_place_offsets(sid)` writes `head/eye_place_offset.json` on first use (CPU
+     stage_only base under `tmp/vhuman-mh/eye_place`, ~40 s); recomputing from all 12 staged eye-map-v2 bases reproduced
+     the existing offsets exactly (24/24 sides, maximum x/y difference 0). The 12 new heads staged for the wider check
+     also reproduce their generated offsets exactly (another 24/24 sides).
+  4. Skin re-check on `combo` (specular x.75/1.25, SSS scale x.75, normal strength x1.5; 72 views each, vs `combo`;
+     LPIPS / DISTS / dE, views better, heads better): specular x.75 -.0005 / +.0004 / +.67, 29/72, 10/12; x1.25 +.0011 /
+     +.0002 / -.39, 30/72, 2/12; SSS scale x.75 +.0008 / +.0011 / -.01, 24/72; normal x1.5 +.0035 / +.0008 / +.16, 21/72
+     (ear LPIPS +.0141). No change wins on both LPIPS and dE: `combo` stays (specular trades structure for colour).
+  5. Ears (`EAR_ROUGH_SET`, ear_left/right + yaw +-90 + front, 60 views / 46 ear crops, all vs `normal`): `combo` ear dE
+     +.077 (23/46 better), ear LPIPS -.0034; ears-mask roughness x1 instead of the per-identity scale: ear dE -.052 (26/46),
+     ear LPIPS -.0021; x1.1: ear dE -.059 (26/46), ear LPIPS -.0033, ear DISTS -.0031 (combo -.0027); view LPIPS -.0056
+     for all three. Paired directly against `combo`, x1.1 changes ear LPIPS / DISTS / dE by +.00013 / -.00041 / -.136
+     (23 / 28 / 33 of 46 crops and 6 / 7 / 10 of 12 heads better). It is a small colour win with essentially tied
+     LPIPS (the per-identity scale reaches x1.39 on some heads; MH ear roughness ~.70).
+  6. Landmark eye placement (`eye_offset_fit.py`, 499 MH heads / 998 eyes, CPU): offset = MH corneal-cap centre - GNM iris
+     centre, median +1.20 mm lateral / -1.53 mm vertical; ridge on the 12 iBUG lid landmarks relative to the GNM iris
+     (x mirrored for the right eye), 5-fold CV by head: RMSE .52 mm (x .37 / y .36) vs 1.18 mm (x .56 / y 1.04) for the
+     median offset. On the 12 comparison heads (Cycles-measured offsets, per-side bias -.41/+.36 mm x corrected) RMSE
+     .39 / .52 mm. At the selected ridge penalty, held-out per-eye radial error median / p90 / p95 / maximum is
+     .415 / .794 / .899 / 1.53 mm (median-offset baseline .983 / 1.78 / 1.985 / 3.405 mm); median errors are .410 mm
+     left and .421 mm right. CV uses MetaHuman-derived fitted GNM heads, so it does not establish generalization to
+     photo-fitted heads. s1/s2 B10 = B7 + predicted offset (s1 L +.98/-1.24, R -.58/-1.34 mm; s2 L +1.05/-1.26, R -.70/-1.35
+     mm; B9 used -1.87/-1.91): all 28 final-quality Windows views completed. B7 -> B10 front eye-region LPIPS / DISTS /
+     mean dE: s1 .2526 / .2762 / 9.73 -> .2554 / .2771 / 10.10; s2 .2656 / .2486 / 11.83 -> .2651 / .2499 / 12.45.
+     Eye-mask IoU fell .854 -> .841 and .858 -> .844 respectively. The reference is each subject's front input image,
+     and the parsed eye region includes brows; the close-up renders do not have independently registered references.
+     A paired close-up sheet is at `tmp/vhuman-ab-cycles/bench/b7_b10_eye_closeups.png`. This is no consistent
+     improvement on these two subjects, so do not propose a photo default change.
+  7. Wider confirm: UE VHStudio references exist for 12 heads only and `/mnt/nvme01` had 5.7 GB free, so the confirm uses
+     `render_ids[::5]` = 24 heads (12 new UE VHStudio refs on the Windows worker, UE 5.8.4 DX12; light batch extended,
+     the 12 existing entries byte-identical). The 12 new sets completed and their 120 EXRs match the recorded SHA-256
+     values; all 36 eye/front EXRs decode at 1024² with finite, nonblack pixels, and the 12 left-eye previews show the
+     expected heads (`tmp/vhuman-mh/iris_radius_probe/new_reference_eyes.jpg`). The UE log reached shutdown before
+     its exit error. The batch overlapped the iris pilot, whose code sync
+     replaced the worker server tree while UE was running. The old queue was stopped before it could sync again.
+     Eye-only check (24 heads x front/eye_left/eye_right, `eye_wide24`, vs `normal`): `combo` view LPIPS / DISTS / dE
+     -.0147 / -.0158 / -.58 (69 / 68 / 64 of 72 views better; view LPIPS 22/24 heads). Eye LPIPS / DISTS / dE
+     -.0328 / -.0278 / -13.64 (64 / 68 / 71 of 71 eye-region views better). On the 12 new heads alone, eye LPIPS /
+     DISTS / dE were -.0252 / -.0225 / -12.22 (32 / 34 / 36 of 36 views better). The automatic colour audit retained
+     41/48 eye close-ups and reports median texture / UE / Cycles saturation .286 / .427 / .260; its centre-box gate
+     does not guarantee a correctly located pupil, as the visual diagnostics above show. The original eight-camera wide
+     confirmation completed and validated its remaining 120 views. Full eight-camera result (192 views): `combo` vs
+     `normal` LPIPS / DISTS / dE -.0105 / -.0096 / -.63 (171 / 165 / 176 views better; LPIPS 22/24 heads), close to the
+     earlier 12-head LPIPS -.0111. On the 12 new heads alone (96 views), LPIPS / DISTS / dE changed -.0099 / -.0086 /
+     -.58 (84 / 85 / 88 views better). The two head-level LPIPS regressions were small: mh_000145 +.00028 and mh_000425
+     +.00037. Every camera's mean view LPIPS and dE improved. Eye-region results are those above; on 44 measurable ear crops, ear LPIPS / DISTS /
+     dE changed -.0042 / -.0027 / +.42 (22 / 27 / 7 better), confirming a residual ear colour trade-off.
+  - Default proposals, pending user review: ears-mask roughness x1.1 is a small colour improvement over combo with
+    essentially tied ear LPIPS on the original 12 heads; it has not been confirmed on the wider 24-head set and no
+    change has been applied. Do not propose the landmark photo offset or iris emission
+    based on the mixed photo results. Do not propose the non-emissive iris alternative as a general default: its
+    held-out eye-region and photo results are mixed despite iris-colour gains in some samples.

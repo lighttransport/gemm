@@ -6,6 +6,7 @@ placement: pupil centre / iris radius / eye-opening box in the UE and Cycles hal
 color:     HSV of the vhuman iris texture annulus (cycles_<variant>/eye_<side>/iris.png) vs the rendered iris ring in
            both halves -- separates the colour mapping (texture) from the shading (render).
 usage: python -m server.vhuman.metahuman.eye_audit [--variant normal_eyes2__fast] [--out audit.json]
+       python -m server.vhuman.metahuman.eye_audit --variant combo__fast --compare c_iris_emit_1__fast
 """
 import argparse
 import colorsys
@@ -78,11 +79,50 @@ def audit(variant='normal_eyes2__fast'):
     return dict(summary=summary, rows=rows)
 
 
+def compare_audits(baseline, candidate, min_saturation=.1):
+    """Compare only eyes with valid colour samples in both audits; hue is circular and undefined for grey pixels."""
+    def valid(a):
+        return {(r['sid'], r['side']): r['hsv'] for r in a['rows'] if r['good'] and 'hsv' in r}
+
+    a, b = valid(baseline), valid(candidate)
+    keys = sorted(a.keys() & b.keys())
+    rows = []
+    for sid, side in keys:
+        key = (sid, side)
+        # Pupil detection may choose different UE sample locations for the two candidates.
+        row = dict(sid=sid, side=side)
+        for name, hsv in (('baseline', a[key]), ('candidate', b[key])):
+            ue, cyc = hsv['ue'], hsv['cycles']
+            row[name] = dict(saturation_error=abs(float(cyc[1]) - float(ue[1])),
+                             hue_error_degrees=(abs((float(cyc[0]) - float(ue[0]) + 180) % 360 - 180)
+                                                if min(cyc[1], ue[1]) >= min_saturation else None))
+        rows.append(row)
+    summary = dict(baseline_variant=baseline.get('summary', {}).get('variant'),
+                   candidate_variant=candidate.get('summary', {}).get('variant'),
+                   matched_eyes=len(rows), hue_min_saturation=min_saturation)
+    for name in ('baseline', 'candidate'):
+        sat = [r[name]['saturation_error'] for r in rows]
+        hue = [r[name]['hue_error_degrees'] for r in rows if r[name]['hue_error_degrees'] is not None]
+        summary[name] = dict(median_saturation_error=float(np.median(sat)) if sat else None,
+                             hue_eyes=len(hue), median_hue_error_degrees=float(np.median(hue)) if hue else None)
+    summary['candidate_saturation_closer'] = sum(r['candidate']['saturation_error'] < r['baseline']['saturation_error'] for r in rows)
+    paired_hue = [r for r in rows if all(r[n]['hue_error_degrees'] is not None for n in ('baseline', 'candidate'))]
+    summary['paired_hue_eyes'] = len(paired_hue)
+    summary['candidate_hue_closer'] = sum(r['candidate']['hue_error_degrees'] < r['baseline']['hue_error_degrees'] for r in paired_hue)
+    summary['paired_median_hue_error_degrees'] = {
+        name: float(np.median([r[name]['hue_error_degrees'] for r in paired_hue])) if paired_hue else None
+        for name in ('baseline', 'candidate')}
+    return dict(summary=summary, rows=rows)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--variant', default='normal_eyes2__fast'); ap.add_argument('--out')
+    ap.add_argument('--compare', help='compare this candidate with --variant on the same valid eyes')
     a = ap.parse_args()
     out = audit(a.variant)
+    if a.compare:
+        out = compare_audits(out, audit(a.compare))
     print(json.dumps(out['summary']))
     if a.out:
         open(a.out, 'w').write(json.dumps(out, indent=1))

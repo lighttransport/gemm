@@ -1,5 +1,30 @@
 # Resume prompt: vhuman MetaHuman priors, UE-vs-Cycles matching (after reboot, 2026-11-04 evening)
 
+## Eye-work continuation, 2026-11-06
+
+- `iris_fill12` finished and scored all 48 new views. `iris_fill_repeat` finished and scored its 24 views; they match
+  the pilot within .000036 RGB8 per-channel mean per view. Combining clean results, fill .5 improves eye LPIPS / DISTS /
+  dE by .0026 / .0034 / .60 over 35 eye-region views; see the README for per-head counts and the fill 1 trade-off.
+- The pilot tested additive iris emission (strengths .25/.5/1) and improved eye LPIPS and dE on four heads; see the
+  README follow-up draft. It overlapped an old UE queue, so `iris_fill_repeat` reruns the four pilot heads without
+  overlap. Do not sync while a worker render is active.
+- `eye_wide24` completed, validated and scored: 24 heads, eye LPIPS / DISTS / dE vs normal -.0328 / -.0278 / -13.64,
+  64 / 68 / 71 of 71 eye-region views better; the 12 new heads also improve. See the README for all counts.
+- `iris_physical12` completed and scored 12 heads: specular 0 plus albedo gain 1.5/2.5 improved mean eye LPIPS, but
+  eye dE improved in only 5/12 and 6/12 heads. Iris-only saturation improved for 12/18 approximate matches. Results use
+  checksummed baseline snapshots in `tmp/vhuman-mh/iris_physical_baseline` and `iris_physical_combined.py`.
+- `wide_full24` completed and scored all 192 views across 24 heads: LPIPS / DISTS / dE vs normal -.0105 / -.0096 /
+  -.63, LPIPS better on 171/192 views and 22/24 heads. Ear dE worsened .42 on 44 measurable crops; see the README.
+- All 28 B10 photo views are complete; the s1/s2 eye metrics do not support a photo default change. Paired iris-colour
+  audit and tests were added; existing defaults remain unchanged. `/mnt/nvme01` had 12 GB free at last check.
+- Photo candidates B11/B12 (B7 plus iris emission .5/1) completed 12 final-profile views as `iris_photo`; all passed asset
+  validation. Broad eye-region and approximate iris-ring scores were mixed; the README has results and review sheets.
+- Non-emissive photo candidates B13/B14 (B7 plus iris specular 0 and albedo gain 1.5/2.5) completed and scored 12 views
+  as `iris_photo_physical`; all passed validation. Gain 1.5 improved 3/4 approximate photo iris rings but broad eye scores
+  were flat or worse; gain 2.5 generally worsened photo colour. The README has exact results. The worker queue is empty.
+- The SSH system config in this sandbox fails ownership checks; direct `ssh -F /dev/null` works when network access is
+  permitted. Check host-level processes as well as worker PIDs: sandboxed `ps` alone does not show the old host queue.
+
 Paste this into a new session. Repo `/mnt/nvme02/work/gemm/pixal3d`, branch `pixal3d`. Plan:
 `~/.claude/plans/unreal-engine-eula-now-velvety-giraffe.md`. Memory: `vhuman-metahuman-priors` (also holds the Windows
 worker address, which is kept out of the repo). Docs: `server/vhuman/metahuman/README.md` (commands + all results),

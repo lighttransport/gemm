@@ -207,7 +207,8 @@ def test_goal_variants_2026_11_05():
     for v in ('mat_rmh_c0', 'ew_eye_place'):
         with pytest.raises(ValueError):
             cr.variant_options(v)        # per-identity variants need the sample id
-    for name in ('eye_ior1', 'eye_iris', 'eye_sat', 'eye_shadow', 'rmh', 'eye_place', 'dual', 'ear_sss'):
+    for name in ('eye_ior1', 'eye_iris', 'eye_sat', 'eye_shadow', 'rmh', 'eye_place', 'dual', 'ear_sss',
+                 'iris_fill', 'iris_fill_confirm', 'iris_fill_repeat', 'iris_physical', 'eye_wide'):
         assert name in wc.SCORE_SETS
     assert cr.DUAL_SET['baseline'] == 'mat_r125_c0'
 
@@ -220,3 +221,12 @@ def test_default_variant_2026_11_06():
         return
     mo = cr.variant_options(cr.DEFAULT_VARIANT, sid)['material_overrides']
     assert mo['sclera_gain'] == .85 and mo['skin_coat'] == 0. and 'eye_offset_left_m' in mo and 'iris_specular' not in mo
+    assert 'iris_emission_strength' not in mo
+    for value in (.25, .5, 1.):
+        opts = cr.variant_options(f'c_iris_emission_strength_{value:g}', sid)['material_overrides']
+        assert opts == dict(mo, iris_emission_strength=value)
+    for variant, value in zip(cr.IRIS_FILL_REPEAT_SET['variants'], (.5, 1.)):
+        assert cr.variant_options(variant, sid)['material_overrides'] == dict(mo, iris_emission_strength=value)
+    for variant, gain in zip(cr.IRIS_PHYSICAL_SET['variants'], (1.5, 2.5)):
+        assert cr.eye_version(variant) == 2
+        assert cr.variant_options(variant, sid)['material_overrides'] == dict(mo, iris_specular=0., iris_gain=gain)

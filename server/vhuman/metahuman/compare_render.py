@@ -205,6 +205,7 @@ EYE_SWEEP = {'cornea_roughness': (0., .08, .15), 'cornea_ior': (1.3, 1.336, 1.42
              'sclera_roughness': (.15, .4, .6), 'iris_roughness': (.3, .8)}
 EYE_SWEEP_IDS = ('mh_000000', 'mh_000145', 'mh_000300', 'mh_000358')
 EYE_SWEEP_CAMERAS = ('eye_left', 'eye_right', 'front')
+COMBO_EXTRA_PARAMS = ('iris_emit', 'iris_emission_strength', 'cornea_camera', 'ear_roughness_scale')   # c_ params: diagnostics + ears-only roughness
 EYE_EXTRA_PARAMS = ('iris_gain', 'iris_sat', 'cornea_shadow', 'sclera_sat', 'sclera_gain', 'iris_specular')   # ew_ params outside the original sweep (2026-11-05 iris brightness test)
 
 
@@ -221,7 +222,7 @@ EYE_SWEEP_VARIANTS = tuple(eye_variant(p, v) for p, values in EYE_SWEEP.items() 
 
 def eye_version(variant):
     """eye_map version a variant renders with (0 = template eyes)."""
-    return 2 if variant.startswith('ew_') or variant in ('combo', 'combo_is0') else MH_EYES.get(variant, 0)
+    return 2 if variant.startswith(('ew_', 'c_')) or variant in ('combo', 'combo_is0', 'combo_is0_gain15', 'combo_is0_gain25') else MH_EYES.get(variant, 0)
 
 
 # Default MetaHuman comparison render (2026-11-06, user-approved; README "12 h goal round" combined confirm): MH eye
@@ -252,26 +253,35 @@ def variant_options(variant, sid=None):
                 else:
                     opts['material_overrides'] = {param: value}
                 return opts
-    if variant in ('combo', 'combo_is0'):
+    if variant in ('combo', 'combo_is0', 'combo_is0_gain15', 'combo_is0_gain25'):
         # 2026-11-05 winners together: per-identity roughness + coat 0 (mat_rmh_c0) + MH eye placement (ew_eye_place),
         # sclera x.85, eye_map v2; combo_is0 also turns the iris's own specular off
         mo = dict(variant_options('mat_rmh_c0', sid)['material_overrides'], **variant_options('ew_eye_place', sid)['material_overrides'])
         mo['sclera_gain'] = .85        # item 3: sclera x.85 (eye dE -.74, 32/35 eyes, 12/12 heads)
-        if variant == 'combo_is0':
+        if variant != 'combo':
             mo['iris_specular'] = 0.
+        if variant in ('combo_is0_gain15', 'combo_is0_gain25'):
+            mo['iris_gain'] = 1.5 if variant.endswith('15') else 2.5
         return dict(VARIANTS['normal_eyes2'], material_overrides=mo)
     if variant == 'ew_eye_place':
         if sid is None:
             raise ValueError('ew_eye_place needs sid')
-        f = COMPARE_ROOT / sid / 'head' / 'eye_place_offset.json'
-        if not f.is_file():
-            raise FileNotFoundError(f'{f} missing: stage a base, then write_eye_place_offsets({sid!r}, <base>/scene_assets.npz)')
-        off = json.loads(f.read_text())
+        off = eye_place_offsets(sid)
         return dict(VARIANTS['normal_eyes2'], material_overrides={f'eye_offset_{s}_m': off[s] for s in ('left', 'right')})
     if variant == 'ew_shadow0_irisspec0':
         return dict(VARIANTS['normal_eyes2'], material_overrides=dict(cornea_shadow=0., iris_specular=0.))
     if variant == 'ew_shadow0_gain15':
         return dict(VARIANTS['normal_eyes2'], material_overrides=dict(cornea_shadow=0., iris_gain=1.5))
+    if variant.startswith('c_'):
+        # c_<param>_<value>: the default 'combo' + one setting (2026-11-06 follow-ups; skin RENDER_ARGS as render arguments)
+        for param in sorted((*EYE_SWEEP, *EYE_EXTRA_PARAMS, *SWEEP, *COMBO_EXTRA_PARAMS), key=len, reverse=True):
+            if variant.startswith(f'c_{param}_'):
+                opts = variant_options('combo', sid); value = float(variant[len(f'c_{param}_'):])
+                if param in RENDER_ARGS:
+                    opts[param] = value
+                else:
+                    opts['material_overrides'] = dict(opts['material_overrides'], **{param: value})
+                return opts
     if variant.startswith('ew_'):
         for param in (*EYE_SWEEP, *EYE_EXTRA_PARAMS):
             if variant.startswith(f'ew_{param}_'):
@@ -338,6 +348,22 @@ def write_eye_place_offsets(sid, scene_assets):
     return off
 
 
+def eye_place_offsets(sid, root=None):
+    """head/eye_place_offset.json, written on first use: stages a CPU-only eye_map v2 base (offline_render stage_only, no
+    Blender) under tmp/vhuman-mh/eye_place/<sid> and measures the iris centres in its scene_assets.npz."""
+    f = COMPARE_ROOT / sid / 'head' / 'eye_place_offset.json'
+    if f.is_file():
+        return json.loads(f.read_text())
+    from ..reconstruction.offline_render import render
+    base = Path(root or Path(__file__).resolve().parents[3] / 'tmp/vhuman-mh/eye_place') / sid
+    if not (base / 'scene_assets.npz').is_file():
+        if base.exists():
+            shutil.rmtree(base)
+        opts = dict(RENDER, **variant_options('normal')); opts.pop('preset'); opts.pop('samples'); opts.pop('material_overrides', None)
+        render(build_candidate(sid), base, device='cpu', preset='final', stage_only=True, head_fit=write_eye_fit(sid, 2), **opts)
+    return write_eye_place_offsets(sid, base / 'scene_assets.npz')
+
+
 # item 3: sclera texture saturation (red-veined MH sclera renders solid pink) and brightness
 EYE_SCLERA_SET = dict(variants=('ew_sclera_sat_0.5', 'ew_sclera_sat_0', 'ew_sclera_gain_0.85', 'ew_sclera_gain_1.15'),
                       cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
@@ -348,6 +374,26 @@ EYE_SHADOW_SET = dict(variants=('ew_cornea_shadow_0', 'ew_shadow0_gain15'), came
 UE_SET = dict(variants=('ue_sss25', 'ue_sss50', 'ue_sss100', 'ue_spec', 'ue_match', 'ue_match_spec'), cameras=('front', 'yaw_p40', 'yaw_m40'))
 UE_CONFIRM_SET = dict(variants=('ue_match', 'ue_match_spec', 'mat_r125_c0'), cameras=CONFIRM_CAMERAS)
 COMBO_SET = dict(variants=('combo', 'combo_is0'), cameras=CONFIRM_CAMERAS + ('eye_left', 'eye_right'))   # item 8, vs normal
+# 2026-11-06 goal (goal-vhuman-next.md), all vs the default 'combo':
+# item 1 iris hue diagnostics: camera rays skip the cornea/tear film; iris = emission of its texture (no shading)
+IRIS_DIAG_SET = dict(variants=('c_cornea_camera_0', 'c_iris_emit_1'), cameras=EYE_SWEEP_CAMERAS, baseline='combo')
+IRIS_FILL_SET = dict(variants=('c_iris_emission_strength_0.25', 'c_iris_emission_strength_0.5',
+                               'c_iris_emission_strength_1'), cameras=EYE_SWEEP_CAMERAS, baseline='combo')
+IRIS_FILL_CONFIRM_SET = dict(variants=('c_iris_emission_strength_0.5', 'c_iris_emission_strength_1'),
+                             cameras=EYE_SWEEP_CAMERAS, baseline='combo')
+# Alternate numeric spellings preserve the pilot while repeating those four heads without another worker job running.
+IRIS_FILL_REPEAT_SET = dict(variants=('c_iris_emission_strength_0.50', 'c_iris_emission_strength_1.0'),
+                            cameras=EYE_SWEEP_CAMERAS, baseline='combo')
+IRIS_PHYSICAL_SET = dict(variants=('combo_is0_gain15', 'combo_is0_gain25'), cameras=EYE_SWEEP_CAMERAS, baseline='combo')
+# item 4 skin re-check on the new baseline (SSS scale .375 = x.75 of .5)
+SKIN_RECHECK_SET = dict(variants=('c_specular_scale_0.75', 'c_specular_scale_1.25', 'c_subsurface_scale_0.375', 'c_skin_normal_strength_1.5'),
+                        cameras=CONFIRM_CAMERAS, baseline='combo')
+# item 5 ears dE: ears mask roughness unscaled (x1) / x1.1 instead of the per-identity scale; combo vs normal on ear cameras too
+EAR_ROUGH_SET = dict(variants=('combo', 'c_ear_roughness_scale_1', 'c_ear_roughness_scale_1.1'),
+                     cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'), baseline='normal')
+# item 7 wider confirm: the default on render_ids[::5] (24 heads; disk-limited), vs normal
+WIDE_SET = dict(variants=('combo',), cameras=CONFIRM_CAMERAS + ('eye_left', 'eye_right'))
+EYE_WIDE_SET = dict(variants=('combo',), cameras=EYE_SWEEP_CAMERAS, baseline='normal')
 RMH_SET = dict(variants=('mat_rmh_c0',), cameras=CONFIRM_CAMERAS)
 EAR_SSS_SET = dict(variants=('ear_sss2', 'ear_sss4'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))   # item 7: ear thin-part transmission (ear cameras)
 DUAL_SET = dict(variants=('mat_r125_dual',), cameras=CONFIRM_CAMERAS, baseline='mat_r125_c0')   # item 5: UE dual lobes   # 2026-11-05: per-identity roughness (item 6)

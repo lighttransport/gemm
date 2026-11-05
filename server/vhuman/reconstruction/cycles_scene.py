@@ -140,10 +140,16 @@ def full_skin_graph(skin,node,bound,out,request):
     r=math('MULTIPLY',rough,math('MULTIPLY_ADD',cavity,.6,value=1) if False else math('ADD',math('MULTIPLY',cavity,.6),1))
     # material_overrides (metahuman.compare_render --sweep; empty = the authored graph, no extra nodes):
     # roughness_scale, specular_scale, skin_coat (the .10 skin coat weight), subsurface_weight, subsurface_scale, subsurface_radius,
-    # ear_sss_scale (ears: SSS weight 1, scale x k), dual_lobe (UE-style two specular lobes via the coat), normal_ear_scale (per-texel skin normal strength on the ears; skin_normal_map only)
+    # ear_sss_scale (ears: SSS weight 1, scale x k), dual_lobe (UE-style two specular lobes via the coat), normal_ear_scale (per-texel skin normal strength on the ears; skin_normal_map only), ear_roughness_scale (ears-mask roughness scale)
     mo=dict(request.get('material_overrides') or {})
     r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True)
-    if mo.get('roughness_scale',1.)!=1.:r=math('MULTIPLY',r,float(mo['roughness_scale']),clamp=True)
+    if 'ear_roughness_scale' in mo:
+        # ears mask gets its own roughness scale: r x (s (1 - e) + s_ear e); s = roughness_scale (default 1)
+        if 'ears' not in maps.files:raise RuntimeError('ear_roughness_scale needs skin_templates with an ears map; rebuild them')
+        ear=float_image(nodes,'template_ears_rough',maps['ears']);esep=nodes.new('ShaderNodeSeparateColor');links.new(ear.outputs['Color'],esep.inputs['Color'])
+        s=float(mo.get('roughness_scale',1.));se=float(mo['ear_roughness_scale'])
+        r=math('MULTIPLY',r,math('ADD',math('MULTIPLY',esep.outputs['Red'],se-s),s),clamp=True)
+    elif mo.get('roughness_scale',1.)!=1.:r=math('MULTIPLY',r,float(mo['roughness_scale']),clamp=True)
     r_dual=r
     if mo.get('dual_lobe'):r=math('MULTIPLY',r,.8,clamp=True)   # UE SSP dual specular: lobes .8r / 1.1r, mix .5
     links.new(r,node.inputs['Roughness'])
@@ -515,7 +521,7 @@ def run(request):
     skin_full=full and '2c' not in ablate and (out/'skin_templates.npz').is_file()
     if skin_full:full_skin_graph(skin,node,bound,out,request)
     # eye material overrides (metahuman.compare_render EYE_SWEEP): sclera/iris/cornea roughness, cornea IOR, cornea
-    # Specular IOR Level, iris_/sclera_gain (texture x gain), iris_/sclera_sat (HSV saturation), cornea_shadow, iris_specular (Specular IOR Level), eye_offset_<side>_m; absent = the authored values.
+    # Specular IOR Level, iris_/sclera_gain (texture x gain), iris_/sclera_sat (HSV saturation), cornea_shadow, iris_specular (Specular IOR Level), eye_offset_<side>_m, iris_emit / iris_emission_strength / cornea_camera (diagnostics); absent = the authored values.
     eye_mo=dict(request.get('material_overrides') or {})
     for name,color,roughness in [('teeth',(.65,.6,.5),.25),('gums',(.35,.08,.07),.35),
         ('tongue',(.4,.09,.08),.4),('cavity',(.33,.09,.09),.45),('sclera',(.7,.65,.6),.25),
@@ -538,6 +544,14 @@ def run(request):
                 hsv.inputs['Saturation'].default_value=float(eye_mo[f'{name}_sat'])
                 materials[name].node_tree.links.new(color_out,hsv.inputs['Color']);color_out=hsv.outputs['Color']
             materials[name].node_tree.links.new(color_out,principled.inputs['Base Color'])
+            if name=='iris' and 'iris_emission_strength' in eye_mo:
+                # Optional diagnostic: add a controlled amount of iris-coloured fill while retaining surface shading.
+                materials[name].node_tree.links.new(color_out,principled.inputs['Emission Color'])
+                principled.inputs['Emission Strength'].default_value=float(eye_mo['iris_emission_strength'])
+            if name=='iris' and 'iris_emit' in eye_mo:   # diagnostic: iris = emission of its texture x iris_emit (no shading)
+                nt=materials[name].node_tree;emit=nt.nodes.new('ShaderNodeEmission')
+                emit.inputs['Strength'].default_value=float(eye_mo['iris_emit'])
+                nt.links.new(color_out,emit.inputs['Color']);nt.links.new(emit.outputs[0],nt.nodes.get('Material Output').inputs['Surface'])
     if full and '2e' not in ablate:full_mouth_materials(materials,out,request)
     materials['cornea'],cornea=material('cornea',(1,1,1),float(eye_mo.get('cornea_roughness',.025)),1,
                                         float(eye_mo.get('cornea_ior',config['optical_eyes']['ior'])))
@@ -587,6 +601,8 @@ def run(request):
                 obj.location=tuple(float(x) for x in eye_mo[f'eye_offset_{side}_m'])
         if part['material'] in ('cornea','tear') and eye_mo.get('cornea_shadow',1.)<.5:
             obj.visible_shadow=False   # cornea_shadow 0: shadow rays pass the glass, so the iris gets direct light (no caustic-only lighting)
+        if part['material'] in ('cornea','tear') and eye_mo.get('cornea_camera',1.)<.5:
+            obj.visible_camera=False   # diagnostic: camera rays skip the glass (no cornea reflection/refraction in view)
         if part['material']=='skin':
             modifier=obj.modifiers.new('skin_subdivision','SUBSURF');modifier.levels=1;modifier.render_levels=2
             if skin_full and hasattr(modifier,'use_adaptive_subdivision'):
