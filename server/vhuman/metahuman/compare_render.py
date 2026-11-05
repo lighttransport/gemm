@@ -224,6 +224,10 @@ def eye_version(variant):
     return 2 if variant.startswith('ew_') or variant in ('combo', 'combo_is0') else MH_EYES.get(variant, 0)
 
 
+# Default MetaHuman comparison render (2026-11-06, user-approved; README "12 h goal round" combined confirm): MH eye
+# placement + per-identity roughness x1.25 x MH roughness/1.03 + coat 0 + sclera x.85, eye_map v2 (LPIPS -.0111 vs
+# 'normal', 87/96 views, eye dE -15.1). 'normal' stays the experiment baseline name.
+DEFAULT_VARIANT = 'combo'
 MH_ROUGHNESS_MEAN = 1.03   # mean MetaHuman skin 'roughness' multiplier of the 12 comparison heads
 
 
@@ -259,7 +263,10 @@ def variant_options(variant, sid=None):
     if variant == 'ew_eye_place':
         if sid is None:
             raise ValueError('ew_eye_place needs sid')
-        off = json.loads((COMPARE_ROOT / sid / 'head' / 'eye_place_offset.json').read_text())
+        f = COMPARE_ROOT / sid / 'head' / 'eye_place_offset.json'
+        if not f.is_file():
+            raise FileNotFoundError(f'{f} missing: stage a base, then write_eye_place_offsets({sid!r}, <base>/scene_assets.npz)')
+        off = json.loads(f.read_text())
         return dict(VARIANTS['normal_eyes2'], material_overrides={f'eye_offset_{s}_m': off[s] for s in ('left', 'right')})
     if variant == 'ew_shadow0_irisspec0':
         return dict(VARIANTS['normal_eyes2'], material_overrides=dict(cornea_shadow=0., iris_specular=0.))
@@ -405,7 +412,7 @@ def write_eye_fit(sid, version=None):
     return path
 
 
-def render_sample(sid, cameras=CAMERAS, variant=''):
+def render_sample(sid, cameras=CAMERAS, variant=DEFAULT_VARIANT):
     from ..reconstruction.offline_render import render
     cand = build_candidate(sid)
     shift = np.asarray(json.loads((cand / 'manifest.json').read_text())['geometry']['metahuman_pseudo_candidate']['translation_m'])
@@ -419,7 +426,7 @@ def render_sample(sid, cameras=CAMERAS, variant=''):
             shutil.rmtree(out)
         v = cams[name]['vhuman']
         explicit = dict(origin=(np.asarray(v['origin']) + shift).tolist(), rotation=v['rotation'], focal_px=v['focal_px'], size=v['size'])
-        opts = dict(RENDER, **variant_options(variant)); preset = opts.pop('preset'); samples = opts.pop('samples')
+        opts = dict(RENDER, **variant_options(variant, sid)); preset = opts.pop('preset'); samples = opts.pop('samples')
         if eye_version(variant):
             opts['head_fit'] = write_eye_fit(sid, eye_version(variant))
         render(cand, out, device='hip', preset=preset, samples=samples, resolution=int(v['size'][0]), explicit_camera=explicit,
@@ -443,7 +450,7 @@ def box_down(x, size):
     return x.reshape(size, f, size, f, -1).mean((1, 3))
 
 
-def report(ids, cameras=CAMERAS, env='studio', variant='', write_summary=True, profile='full'):
+def report(ids, cameras=CAMERAS, env='studio', variant=DEFAULT_VARIANT, write_summary=True, profile='full'):
     """Score Cycles vs UE per view. Per-head compare<suffix>.json is merged (cameras not scored here are kept), so
     subset runs (sweep, confirm: write_summary=False) never drop results; summary<suffix>.json only from full runs.
     profile != 'full' reads win_cycles' <variant dir>__<profile> renders and box-downsamples the UE references to their size."""
@@ -506,7 +513,7 @@ def main():
     ap.add_argument('--ids', default=''); ap.add_argument('--every', type=int, default=10)
     ap.add_argument('--cameras', default=','.join(CAMERAS)); ap.add_argument('--build-only', action='store_true')
     ap.add_argument('--report', action='store_true')
-    ap.add_argument('--variant', default='', help='Cycles render variant: ' + ', '.join(VARIANTS) + ', or sw_<param>_<value> (sweep)')
+    ap.add_argument('--variant', default=DEFAULT_VARIANT, help=f'Cycles render variant (default {DEFAULT_VARIANT}; \'\' = original): ' + ', '.join(VARIANTS) + ', or sw_<param>_<value> (sweep)')
     ap.add_argument('--confirm', action='store_true', help='render (or with --report: score) the CONFIRM variants on the selected ids x CONFIRM_CAMERAS')
     ap.add_argument('--sweep', action='store_true', help='material sweep renders (SWEEP x SWEEP_IDS x SWEEP_CAMERAS); with --report: score and rank them')
     ap.add_argument('--update-normal', action='store_true', help='write the converted MH normal into existing pseudo-candidates')

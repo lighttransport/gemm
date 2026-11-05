@@ -210,3 +210,13 @@ def test_goal_variants_2026_11_05():
     for name in ('eye_ior1', 'eye_iris', 'eye_sat', 'eye_shadow', 'rmh', 'eye_place', 'dual', 'ear_sss'):
         assert name in wc.SCORE_SETS
     assert cr.DUAL_SET['baseline'] == 'mat_r125_c0'
+
+
+def test_default_variant_2026_11_06():
+    from server.vhuman.metahuman import compare_render as cr
+    assert cr.DEFAULT_VARIANT == 'combo' and cr.eye_version(cr.DEFAULT_VARIANT) == 2
+    sid = 'mh_000000'
+    if not (cr.COMPARE_ROOT / sid / 'head' / 'eye_place_offset.json').is_file():
+        return
+    mo = cr.variant_options(cr.DEFAULT_VARIANT, sid)['material_overrides']
+    assert mo['sclera_gain'] == .85 and mo['skin_coat'] == 0. and 'eye_offset_left_m' in mo and 'iris_specular' not in mo

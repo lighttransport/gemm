@@ -383,6 +383,7 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   `combo` LPIPS -.0111 (87/96 views, 11/12 heads), DISTS -.0106, dE -.68; eyes LPIPS -.0406, dE -15.1 (35/35);
   ears LPIPS -.0030, dE +.26. `combo_is0` LPIPS -.0113 (88/96), DISTS -.0113, eyes LPIPS -.0449, dE -14.3 (35/35).
   The gains add up (eye placement dominates the eyes, roughness the skin); iris specular 0 trades eye dE for LPIPS.
-  Proposed default changes (not applied, ask first): (a) MH pseudo-candidates place the eyeballs on the MH eye
+  Default changes (applied 2026-11-06: `compare_render.DEFAULT_VARIANT = 'combo'`, the `--variant` default; `''` = the
+  original render, `normal` stays the experiment baseline): (a) MH pseudo-candidates place the eyeballs on the MH eye
   centres; (b) per-identity roughness x1.25 x MH roughness/1.03 + coat 0 for MH comparisons; (c) sclera x.85.
   Not proposed: iris specular 0 (mixed), the s1/s2 photo defaults (B8/B9 tie).

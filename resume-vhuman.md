@@ -63,8 +63,8 @@ Windows queue: empty (last job `combo_fast`, chain scripts `tmp/vhuman-ab-cycles
 - Combined (`combo`, 96 views): LPIPS -.0111 (87/96, 11/12 heads), eye dE -15.1 (35/35).
 
 ## Next steps
-All goal items done (README "12 h goal round"). Awaiting the user: commit, and the proposed defaults (MH eye placement,
-per-identity roughness + coat 0, sclera x.85). Open: iris hue loss (shading, not texture).
+All goal items done and committed. Defaults (a)(b)(c) applied as `compare_render.DEFAULT_VARIANT = 'combo'`. New heads need
+`write_eye_place_offsets` first. Open: iris hue loss (shading, not texture).
 
 ## Resume checklist
 1. `git status`, `git log --oneline -6`; confirm the uncommitted list above.
