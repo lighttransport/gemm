@@ -329,3 +329,60 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   ears +90/-90 .553/.537 -> .548/.544; s2 face .498 -> .498, +40/-40 .533/.509 -> .535/.510, ears .558/.543 -> .560/.543.
   A tie or slightly worse (DISTS flat to worse); the MetaHuman gain is matching UE's look, not photo realism.
   Defaults unchanged.
+- 12 h goal round (2026-11-05, `goal-vhuman-12h.md`; all renders on the Windows worker, 12 heads, fast profile; DRAFT):
+  1. Iris saturation (`iris_sat` = HSV saturation of the iris texture, `EYE_SAT_SET`, 36 views vs `normal_eyes2`):
+     x1.5 / 2 / 3 eye dE +.41 / +.85 / +1.45 (11 / 11 / 8 of 35 eyes better), eye LPIPS -.0003 / +.0019 / +.0023.
+     Worse with every setting: the texture is not what is missing.
+  2. Iris colour audit (`eye_audit.py`, 18 measurable eyes): iris texture median saturation .21, UE render .42, Cycles
+     render .27, and the Cycles iris hue lands at ~20-30 deg (warm) whatever the texture hue (blue 228 deg -> 10-23 deg).
+     The mapping is right (mh_000020 texture hue 37 / sat .98 = UE 38 / .98); the shading loses it. Iris, cornea and
+     sclera geometry are fine (sclera never covers the iris). Cause under test: the iris is lit only through the glass
+     cornea (Cycles shadow rays stop at glass; the light arrives as noisy caustics that the denoiser removes), leaving
+     warm skin bounce. Test `cornea_shadow 0` (cornea + tear film cast no shadows, `EYE_SHADOW_SET`, 36 views): eye dE
+     +.63 (10/35 better), eye LPIPS +.0026; with iris gain x1.5 dE +1.80. The iris gets brighter but stays grey, so the
+     caustic lighting is not the cause. Next suspect: the iris's own specular (albedo ~.03 linear vs F0 ~.04 reflecting
+     the bright studio sky = a grey veil; a real iris sits under the aqueous humour). Test `iris_specular 0`, alone and
+     with cornea_shadow 0 (`EYE_IRISSPEC_SET`): iris specular 0 eye LPIPS -.0027, DISTS -.0025 (19-21/35), view LPIPS
+     12/12 heads, but eye dE +1.18 (7/35; the iris turns darker, not more coloured); with cornea_shadow 0 dE +.46.
+     Structure improves, colour does not: the remaining iris hue loss is not explained by lighting or the iris
+     specular (left open; next suspects: the iris texture's very low value (.17-.26) against UE's brighter, saturated
+     MH iris, i.e. the chart lookup's V at the dark end, and the cornea's refraction magnifying the grey limbal ring).
+  4. Eye placement (`compare_render.write_eye_place_offsets`, Cycles iris centre vs the MetaHuman eye camera target):
+     the GNM eye joints sit a median 1.87 mm higher (range -.7..+3.3 mm) and ~.9 mm medial of the MetaHuman eyes;
+     image check: pupil 14 px (512 px close-up) higher. Fix test `ew_eye_place` (eyeballs moved by the per-head x/y
+     offset, lids unchanged, `EYE_PLACE_SET`, 36 views vs `normal_eyes2`): **eye dE -6.62 (33/35 better), eye LPIPS
+     -.0317 (33/35), eye DISTS -.0144 (28/35), view LPIPS -.0036 (31/36 views, 11/12 heads)** -- the largest eye gain so
+     far; the iris now sits centred in the lid opening as in UE. Candidate default: place the eyeballs at the MetaHuman
+     eye centres (for the pseudo-candidates; the real-subject eye placement comes from the photo fit).
+  5. Dual-lobe specular (`dual_lobe`: base roughness .8r at half F0 + coat lobe 1.1r, IOR 1.27, `mat_r125_dual` vs
+     `mat_r125_c0`, 72 views): LPIPS +.0004 (22/72, 5/12 heads), DISTS +.0011, dE +.18, eye-region LPIPS/DISTS worse on
+     10/12 and 12/12 eye-region views (eye LPIPS +.0074). UE's dual lobes do not carry over; one lobe at x1.25 stays.
+  6. mh_000145: the per-head gain of roughness x1.25 follows MetaHuman's sampled skin roughness multiplier
+     (params.json skin.roughness .87-1.15; r = -.71 for sw_roughness_scale_1.25, -.72 for mat_r125_c0): heads at
+     .87-.92 (mh_000145 .91, mh_000100 .90) are hurt or flat, all heads >= 1.07 gain. Per-identity test `mat_rmh_c0`
+     (roughness x 1.25 x MH roughness / 1.03, coat 0, `RMH_SET`, 72 views vs `normal`): LPIPS -.0053 (57/72, 10/12
+     heads), DISTS -.0047, dE -.72, eye LPIPS -.0127 vs mat_r125_c0 -.0044 (54/72, 9/12) / -.0039 / -.67; mh_000145
+     +.0119 -> +.0050, mh_000358 +.0043 -> +.0028. Per-identity roughness is better than the global scale; on real
+     subjects the identity's roughness is unknown (s1/s2 were a tie at x1.25), so it applies to MH-matched rendering.
+  7. Ear thin-part transmission (`ear_sss_scale` k: SSS weight 1 and scale x k on the ears mask, `EAR_SSS_SET`,
+     ear cameras, 60 views / 46 ear regions vs `normal`): x2 ear LPIPS +.0013, DISTS +.0038, dE +.73 (23/46 better);
+     x4 +.0142 / +.0132 / +1.81 (17/46); view LPIPS +.0012 / +.0043 (4/12 heads). More ear transmission makes the ears
+     redder than UE's; the current random walk stays.
+  8. Windows render_matrix path (`win_matrix.py`: stage on Linux, Blender CPU on Windows, pull into
+     renders/<s>/<cand><suffix>); Linux/Windows equivalence (s1 B7 front, 1024 px / 128 spp: Linux RX 9070 XT 28 s vs
+     Windows CPU 65 s): LPIPS .00006, mean |diff| .0001, identical mean colour -- Windows renders can replace the Linux
+     GPU for s1/s2. s1/s2 B9 (= B7 + the median MH eye offset, down 1.87 mm / ~.8 mm outward; `win_matrix`, 28 views,
+     `prior_report.py B7 B9`; LPIPS B7 -> B9): s1 face .424 -> .425, +40/-40 .502/.491 -> .501/.491, ears .553/.537 ->
+     .552/.537; s2 face .498 -> .498, +40/-40 .533/.509 -> .532/.510, ears .558/.543 -> .557/.543. A tie at face scale
+     (the report has no eye-region row): the offset is specific to GNM-on-MH registration, not a general GNM eye bias.
+  3. Sclera (`sclera_sat` / `sclera_gain` on the sclera texture, `EYE_SCLERA_SET`, 36 views vs `normal_eyes2`):
+     saturation x.5 / 0 eye dE +.97 / +2.16 (6 / 5 of 35 better); brightness x.85 eye dE -.74 (32/35), eye LPIPS -.0029,
+     DISTS -.0015, view LPIPS better on 12/12 heads; x1.15 dE +.69 (3/35). The sclera colour is right, it is too bright.
+  Combined confirm (`COMBO_SET`: per-identity roughness + coat 0 + MH eye placement + sclera x.85, eye_map v2;
+  `combo_is0` + iris specular 0; 6 confirm cameras + eye close-ups vs `normal`, 96 views each):
+  `combo` LPIPS -.0111 (87/96 views, 11/12 heads), DISTS -.0106, dE -.68; eyes LPIPS -.0406, dE -15.1 (35/35);
+  ears LPIPS -.0030, dE +.26. `combo_is0` LPIPS -.0113 (88/96), DISTS -.0113, eyes LPIPS -.0449, dE -14.3 (35/35).
+  The gains add up (eye placement dominates the eyes, roughness the skin); iris specular 0 trades eye dE for LPIPS.
+  Proposed default changes (not applied, ask first): (a) MH pseudo-candidates place the eyeballs on the MH eye
+  centres; (b) per-identity roughness x1.25 x MH roughness/1.03 + coat 0 for MH comparisons; (c) sclera x.85.
+  Not proposed: iris specular 0 (mixed), the s1/s2 photo defaults (B8/B9 tie).

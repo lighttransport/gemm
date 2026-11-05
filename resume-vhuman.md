@@ -41,44 +41,30 @@ $E $P -m server.vhuman.metahuman.win_cycles resume <tag>     # worker rebooted /
 ```
 Never `sync` (render does it) while a worker render is running: it replaces `D:/work/gemm-vhuman/server`.
 
-## State at reboot
-Commits today (none pushed): `50c06fcb` win_cycles fast path, `77e2eab0` ear fade / eye_map v2 / region scores,
-`3bd882c0` eye_map v2 default + README + eye sweep variants, `8bd5014b` SSS survey + UE skin dump + ue_* variants,
-`e5908773` README eye sweep results.
-Uncommitted: `server/vhuman/metahuman/win_cycles.py` (status/resume/finish, `--score`), this file.
+## State (2026-11-05, 12 h goal round `goal-vhuman-12h.md`)
+Commits since the reboot (none pushed): `66b91228` UE confirm, `70d5c727` s1/s2 check of x1.25, `d1c64429` IOR 1.0 cornea,
+`1abb4752` iris brightness. Uncommitted: overrides in `cycles_scene` (iris_/sclera_ gain/sat, iris_specular,
+cornea_shadow, eye_offset_<side>_m, dual_lobe, ear_sss_scale), `compare_render` sets (EYE_SAT/SHADOW/IRISSPEC/PLACE/
+SCLERA, RMH, DUAL, EAR_SSS; per-identity variants take `sid`), `win_cycles` score sets, new `win_matrix.py`
+(render_matrix candidates on Windows), `eye_audit.py`, a test, the README "12 h goal round" draft, this file.
 
-Jobs: nothing runs on Windows. `ue_match_fast` (216 views: ue_sss25/50/100, ue_spec, ue_match, ue_match_spec x 12 heads
-x front/yaw_p40/yaw_m40) finished rendering 18:57; its first pull failed (nvme01 full), the re-run
-`win_cycles finish ue_match_fast` (log `tmp/vhuman-ab-cycles/logs/ue_match_finish.log`) was started ~19:05. **First thing
-after the reboot: check `compare_v1/ue_match_vhstudio__fast.json`; if missing or older than the log, re-run
-`finish ue_match_fast` (finish record already written).**
+Windows queue: empty (last job `combo_fast`, chain scripts `tmp/vhuman-ab-cycles/scripts/chain_goal{1..7}.sh`).
 
-Disk: `/mnt/nvme01` hit 100% at ~18:57 (it had ~43 GB free in the morning; no large new files found, the consumer is
-unknown, not ours). Freed 18 GB by deleting regenerable per-render files (`skin_detail.npz`, `beauty_noisy.exr`,
-`skin_templates.npz`, `scene_assets.npz`) in finished `compare_v1/*/cycles*` dirs. Check `df -h /mnt/nvme01` before any
-pull. `tmp/win/*_in.tar` / `*_out.tar` on nvme02 (~10 GB) are pulled transfer copies and can go once results are in.
+## Results this round (README "12 h goal round")
+- Eye placement is the eye gap: GNM eye joints ~1.9 mm high / ~.9 mm medial of the MH eyes; moving the eyeballs onto
+  the MH eye centres (`ew_eye_place`): eye dE -6.6, eye LPIPS -.032, 33/35 eyes, 11/12 heads.
+- Not the cause: iris brightness (x1.5 noise-level), iris saturation (worse), cornea shadow-off (worse), cornea IOR 1.0.
+  The rendered iris is still grey with the correct texture hue: testing the iris's own specular (`iris_specular 0`).
+- Per-identity roughness x1.25 x MH roughness/1.03 + coat 0: LPIPS -.0053 (57/72, 10/12) beats global x1.25 -.0044;
+  the x1.25 gain per head correlates with MH skin.roughness (r -.71).
 
-## Results so far (details in the metahuman README)
-- Fast confirm (72 views vs `normal`): roughness x1.25 LPIPS -.0043 (10/12 heads), coat 0 -.0015 (12/12). Defaults unchanged.
-- Ear normal fade: worse on every ear camera (ear0 ear LPIPS +.016, ear dE +1.9); default stays 1.
-- Eye mapping v2 (sclera tint from the measured MH sclera) is now the default (`eye_map.VERSION = 2`): eye dE -7.5,
-  12/12 heads. Remaining eye dE ~19-25.
-- Eye optics sweep: nothing beyond noise; cornea Specular IOR Level is a no-op on glass (test did not run).
-- UE skin readout (`ue_scripts/dump_skin_material.py` -> `v1/presets/skin_material.json`): SSP_skin_unified mfp
-  1.05/.41/.26 mm x material Opacity (Scatter Distance Base .5 x Global .5), dual lobes .8r/1.1r mix .5, no coat,
-  roughness ~.55-.65, F0 ~.06. Cycles: mfp 1.84/.69/.34 mm, SSS weight .6, roughness ~1.25x lower, coat .10, F0 .028.
-  The roughness x1.25 and coat-0 wins are what UE predicts.
+- Sclera x.85 wins (eye dE -.74, 12/12 heads); dual-lobe, ear SSS x2/x4, sclera desaturation: worse; Linux GPU ==
+  Windows CPU (LPIPS .00006); s1/s2 B9 (global eye offset) ties B7.
+- Combined (`combo`, 96 views): LPIPS -.0111 (87/96, 11/12 heads), eye dE -15.1 (35/35).
 
 ## Next steps
-1. Read `ue_match_vhstudio__fast.json`; report ue_sss* (SSS radius/amount), ue_spec (F0), ue_match(_spec) vs `normal`
-   (LPIPS/DISTS/dE, views and heads improved, per camera); add to the README and `skin_sss_survey.md` section 5 when
-   the user asks.
-2. If a UE-matched setting wins clearly: confirm on all 6 confirm cameras (`win_cycles render <tag> --variants ...
-   --cameras front,yaw_p40,yaw_m40,yaw_p90,yaw_m90,mouth --score confirm`, add the variants to the scored set) and on the
-   s1/s2 photo metrics before proposing a default change (ask the user).
-3. Eye gap: test an IOR ~1.0 cornea (true "no veil" check), then the iris texture brightness and the GNM-vs-MH eye placement.
-4. Still open from the plan: dual-lobe specular emulation in Cycles (two Principled lobes mixed .5, or roughness scaled
-   to the lobe average), UE thin-part transmission vs Cycles random walk on ears.
+All goal items done (README "12 h goal round"). Awaiting the user: commit, and the proposed defaults (MH eye placement,
+per-identity roughness + coat 0, sclera x.85). Open: iris hue loss (shading, not texture).
 
 ## Resume checklist
 1. `git status`, `git log --oneline -6`; confirm the uncommitted list above.

@@ -169,6 +169,9 @@ def update_normal(sid):
 
 VARIANTS = {'': {}, 'normal': dict(skin_normal_map=True), 'normal_eyes': dict(skin_normal_map=True),   # dir suffix -> render options
             'mat_r125_c0': dict(skin_normal_map=True, material_overrides=dict(roughness_scale=1.25, skin_coat=0.)),
+            'ear_sss2': dict(skin_normal_map=True, material_overrides=dict(ear_sss_scale=2.)),
+            'ear_sss4': dict(skin_normal_map=True, material_overrides=dict(ear_sss_scale=4.)),
+            'mat_r125_dual': dict(skin_normal_map=True, material_overrides=dict(roughness_scale=1.25, skin_coat=0., dual_lobe=1.)),
             # per-texel MH normal faded on the (coarser) GNM ears: strength x (1 - (1 - s) ear weight)
             'normal_ear0': dict(skin_normal_map=True, material_overrides=dict(normal_ear_scale=0.)),
             'normal_ear50': dict(skin_normal_map=True, material_overrides=dict(normal_ear_scale=.5)),
@@ -202,7 +205,7 @@ EYE_SWEEP = {'cornea_roughness': (0., .08, .15), 'cornea_ior': (1.3, 1.336, 1.42
              'sclera_roughness': (.15, .4, .6), 'iris_roughness': (.3, .8)}
 EYE_SWEEP_IDS = ('mh_000000', 'mh_000145', 'mh_000300', 'mh_000358')
 EYE_SWEEP_CAMERAS = ('eye_left', 'eye_right', 'front')
-EYE_EXTRA_PARAMS = ('iris_gain',)   # ew_ params outside the original sweep (2026-11-05 iris brightness test)
+EYE_EXTRA_PARAMS = ('iris_gain', 'iris_sat', 'cornea_shadow', 'sclera_sat', 'sclera_gain', 'iris_specular')   # ew_ params outside the original sweep (2026-11-05 iris brightness test)
 
 
 def sweep_variant(param, value):
@@ -218,11 +221,21 @@ EYE_SWEEP_VARIANTS = tuple(eye_variant(p, v) for p, values in EYE_SWEEP.items() 
 
 def eye_version(variant):
     """eye_map version a variant renders with (0 = template eyes)."""
-    return 2 if variant.startswith('ew_') else MH_EYES.get(variant, 0)
+    return 2 if variant.startswith('ew_') or variant in ('combo', 'combo_is0') else MH_EYES.get(variant, 0)
 
 
-def variant_options(variant):
-    """Render options of a variant name: VARIANTS entries, or sw_<param>_<value> = 'normal' + one sweep setting."""
+MH_ROUGHNESS_MEAN = 1.03   # mean MetaHuman skin 'roughness' multiplier of the 12 comparison heads
+
+
+def variant_options(variant, sid=None):
+    """Render options of a variant name: VARIANTS entries, or sw_<param>_<value> = 'normal' + one sweep setting.
+    mat_rmh_c0 (per identity, needs sid): roughness x 1.25 x (MH skin roughness / 1.03), coat 0 -- the x1.25 gain per head
+    correlates with MH's sampled roughness multiplier (r -.71), mh_000145 (.91) is hurt."""
+    if variant == 'mat_rmh_c0':
+        if sid is None:
+            raise ValueError('mat_rmh_c0 needs sid')
+        r = json.loads((V1 / 'samples' / sid / 'params.json').read_text())['skin']['roughness']
+        return dict(VARIANTS['normal'], material_overrides=dict(roughness_scale=1.25 * r / MH_ROUGHNESS_MEAN, skin_coat=0.))
     if variant in VARIANTS:
         return dict(VARIANTS[variant])
     if variant.startswith('sw_'):
@@ -235,6 +248,23 @@ def variant_options(variant):
                 else:
                     opts['material_overrides'] = {param: value}
                 return opts
+    if variant in ('combo', 'combo_is0'):
+        # 2026-11-05 winners together: per-identity roughness + coat 0 (mat_rmh_c0) + MH eye placement (ew_eye_place),
+        # sclera x.85, eye_map v2; combo_is0 also turns the iris's own specular off
+        mo = dict(variant_options('mat_rmh_c0', sid)['material_overrides'], **variant_options('ew_eye_place', sid)['material_overrides'])
+        mo['sclera_gain'] = .85        # item 3: sclera x.85 (eye dE -.74, 32/35 eyes, 12/12 heads)
+        if variant == 'combo_is0':
+            mo['iris_specular'] = 0.
+        return dict(VARIANTS['normal_eyes2'], material_overrides=mo)
+    if variant == 'ew_eye_place':
+        if sid is None:
+            raise ValueError('ew_eye_place needs sid')
+        off = json.loads((COMPARE_ROOT / sid / 'head' / 'eye_place_offset.json').read_text())
+        return dict(VARIANTS['normal_eyes2'], material_overrides={f'eye_offset_{s}_m': off[s] for s in ('left', 'right')})
+    if variant == 'ew_shadow0_irisspec0':
+        return dict(VARIANTS['normal_eyes2'], material_overrides=dict(cornea_shadow=0., iris_specular=0.))
+    if variant == 'ew_shadow0_gain15':
+        return dict(VARIANTS['normal_eyes2'], material_overrides=dict(cornea_shadow=0., iris_gain=1.5))
     if variant.startswith('ew_'):
         for param in (*EYE_SWEEP, *EYE_EXTRA_PARAMS):
             if variant.startswith(f'ew_{param}_'):
@@ -275,8 +305,45 @@ EYE_IOR1_SET = dict(variants=('ew_cornea_ior_1',), cameras=EYE_SWEEP_CAMERAS, ba
 # 2026-11-05: iris texture brightness (the rendered iris reads grey/dark vs UE): base colour x .7 / 1.5 / 2.5
 EYE_IRIS_SET = dict(variants=tuple(eye_variant('iris_gain', g) for g in (.7, 1.5, 2.5)), cameras=EYE_SWEEP_CAMERAS,
                     baseline='normal_eyes2')
+# 2026-11-05: iris saturation (Cycles irises read grey vs UE's brown/green/blue): HSV saturation x 1.5 / 2 / 3
+EYE_SAT_SET = dict(variants=tuple(eye_variant('iris_sat', s) for s in (1.5, 2, 3)), cameras=EYE_SWEEP_CAMERAS,
+                   baseline='normal_eyes2')
+# 2026-11-05: the iris is lit only through the glass cornea (caustic paths; Cycles' shadow rays stop at glass), so it
+# renders warm/grey from skin bounce. cornea_shadow 0 = cornea + tear film cast no shadows (iris gets direct light);
+# + iris_gain 1.5 (the brightness test's best).
+# 2026-11-05: GNM eye joints sit ~1.9 mm above (and ~.9 mm medial of) the MetaHuman eye centres; ew_eye_place moves
+# the eyeballs by the per-head x/y offset (head/eye_place_offset.json, write_eye_place_offsets).
+EYE_PLACE_SET = dict(variants=('ew_eye_place',), cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
+
+
+def write_eye_place_offsets(sid, scene_assets):
+    """head/eye_place_offset.json: per side [dx, dy, 0] (m) moving the Cycles iris centre onto the MetaHuman eye centre
+    (camera target) in x/y; scene_assets = a staged base's scene_assets.npz (scene frame = vhuman + candidate shift)."""
+    cams = json.loads((V1 / 'samples' / sid / 'cameras.json').read_text())
+    cand = build_candidate(sid)
+    shift = np.asarray(json.loads((cand / 'manifest.json').read_text())['geometry']['metahuman_pseudo_candidate']['translation_m'])
+    z = np.load(scene_assets)
+    off = {}
+    for side in ('left', 'right'):
+        d = np.asarray(cams['targets'][f'eye_{side}']) - (z[f'{side}_iris_positions'].mean(0) - shift)
+        off[side] = [float(d[0]), float(d[1]), 0.]
+    (COMPARE_ROOT / sid / 'head' / 'eye_place_offset.json').write_text(json.dumps(off, indent=1) + '\n')
+    return off
+
+
+# item 3: sclera texture saturation (red-veined MH sclera renders solid pink) and brightness
+EYE_SCLERA_SET = dict(variants=('ew_sclera_sat_0.5', 'ew_sclera_sat_0', 'ew_sclera_gain_0.85', 'ew_sclera_gain_1.15'),
+                      cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
+# the iris albedo is ~.03 linear, so its own F0 ~.04 reflection of the studio sky greys it out (a real iris sits under
+# the aqueous humour: almost no specular of its own); iris Specular IOR Level 0, alone and with cornea_shadow 0
+EYE_IRISSPEC_SET = dict(variants=('ew_iris_specular_0', 'ew_shadow0_irisspec0'), cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
+EYE_SHADOW_SET = dict(variants=('ew_cornea_shadow_0', 'ew_shadow0_gain15'), cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
 UE_SET = dict(variants=('ue_sss25', 'ue_sss50', 'ue_sss100', 'ue_spec', 'ue_match', 'ue_match_spec'), cameras=('front', 'yaw_p40', 'yaw_m40'))
 UE_CONFIRM_SET = dict(variants=('ue_match', 'ue_match_spec', 'mat_r125_c0'), cameras=CONFIRM_CAMERAS)
+COMBO_SET = dict(variants=('combo', 'combo_is0'), cameras=CONFIRM_CAMERAS + ('eye_left', 'eye_right'))   # item 8, vs normal
+RMH_SET = dict(variants=('mat_rmh_c0',), cameras=CONFIRM_CAMERAS)
+EAR_SSS_SET = dict(variants=('ear_sss2', 'ear_sss4'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))   # item 7: ear thin-part transmission (ear cameras)
+DUAL_SET = dict(variants=('mat_r125_dual',), cameras=CONFIRM_CAMERAS, baseline='mat_r125_c0')   # item 5: UE dual lobes   # 2026-11-05: per-identity roughness (item 6)
 EAR_SET = dict(variants=('', 'normal_ear0', 'normal_ear50'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))
 
 

@@ -155,20 +155,20 @@ def stage(ids, variants, cameras, profile, root):
         cams = json.loads((V1 / 'samples' / sid / 'cameras.json').read_text())['cameras']
         for v, c in todo:
             base_name, base_req = bases[cr.eye_version(v)]
-            req = view_request(base_req, cams[c]['vhuman'], shift, c, cr.variant_options(v), prof, cr.RENDER['micro_scale'])
+            req = view_request(base_req, cams[c]['vhuman'], shift, c, cr.variant_options(v, sid), prof, cr.RENDER['micro_scale'])
             jobs.append(dict(sid=sid, variant=v, camera=c, base=f'{sid}/{base_name}', candidate=f'{sid}/cand',
                              out=f'{sid}/{variant_dir(v, profile)}/{c}', request=req))
     (root / 'jobs.json').write_text(json.dumps(dict(repo=WIN_REPO, profile=profile, jobs=jobs), indent=1))
     return len(jobs)
 
 
-SCORE_SETS = ('confirm', 'ears', 'eyes', 'eye_sweep', 'ue_match', 'ue_confirm', 'eye_ior1', 'eye_iris')
+SCORE_SETS = ('confirm', 'ears', 'eyes', 'eye_sweep', 'ue_match', 'ue_confirm', 'eye_ior1', 'eye_iris', 'eye_sat', 'eye_shadow', 'rmh', 'eye_place', 'dual', 'ear_sss', 'eye_sclera', 'eye_irisspec', 'combo')
 
 
 def score_set(name, ids, profile, env='vhstudio'):
     """Run the compare_render scoring of a named experiment (CPU: set HIP_VISIBLE_DEVICES= CUDA_VISIBLE_DEVICES=)."""
     from . import compare_render as cr
-    exp = dict(confirm={}, ears=cr.EAR_SET, eyes=cr.EYE_SET, eye_sweep=cr.EYE_SWEEP_SET, ue_match=cr.UE_SET, ue_confirm=cr.UE_CONFIRM_SET, eye_ior1=cr.EYE_IOR1_SET, eye_iris=cr.EYE_IRIS_SET)[name]
+    exp = dict(confirm={}, ears=cr.EAR_SET, eyes=cr.EYE_SET, eye_sweep=cr.EYE_SWEEP_SET, ue_match=cr.UE_SET, ue_confirm=cr.UE_CONFIRM_SET, eye_ior1=cr.EYE_IOR1_SET, eye_iris=cr.EYE_IRIS_SET, eye_sat=cr.EYE_SAT_SET, eye_shadow=cr.EYE_SHADOW_SET, rmh=cr.RMH_SET, eye_place=cr.EYE_PLACE_SET, dual=cr.DUAL_SET, ear_sss=cr.EAR_SSS_SET, eye_sclera=cr.EYE_SCLERA_SET, eye_irisspec=cr.EYE_IRISSPEC_SET, combo=cr.COMBO_SET)[name]
     out = cr.confirm(ids, env, score=True, profile=profile, name=name, **exp)
     for v, r in out['variants'].items():
         print(v, json.dumps({k: x for k, x in r.items() if k != 'per_head_dlpips'}), flush=True)

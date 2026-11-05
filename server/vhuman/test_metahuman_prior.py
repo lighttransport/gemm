@@ -192,3 +192,21 @@ def test_eye_sweep_variants():
     assert [cr.eye_version(v) for v in ('normal', 'normal_eyes', 'normal_eyes2', 'ew_sclera_roughness_0.4')] == [0, 1, 2, 2]
     for v in cr.EYE_SWEEP_VARIANTS:
         assert cr.variant_options(v)['material_overrides']
+
+
+def test_goal_variants_2026_11_05():
+    """iris/cornea/eye-placement/roughness/dual-lobe/ear SSS variants of the 2026-11-05 round resolve to overrides."""
+    import pytest
+    from server.vhuman.metahuman import compare_render as cr, win_cycles as wc
+    assert cr.variant_options('ew_iris_gain_1.5')['material_overrides'] == {'iris_gain': 1.5}
+    assert cr.variant_options('ew_iris_sat_2')['material_overrides'] == {'iris_sat': 2.}
+    assert cr.variant_options('ew_cornea_shadow_0')['material_overrides'] == {'cornea_shadow': 0.}
+    assert cr.variant_options('ew_shadow0_gain15')['material_overrides'] == dict(cornea_shadow=0., iris_gain=1.5)
+    assert cr.variant_options('mat_r125_dual')['material_overrides']['dual_lobe'] == 1.
+    assert cr.variant_options('ear_sss4')['material_overrides'] == {'ear_sss_scale': 4.}
+    for v in ('mat_rmh_c0', 'ew_eye_place'):
+        with pytest.raises(ValueError):
+            cr.variant_options(v)        # per-identity variants need the sample id
+    for name in ('eye_ior1', 'eye_iris', 'eye_sat', 'eye_shadow', 'rmh', 'eye_place', 'dual', 'ear_sss'):
+        assert name in wc.SCORE_SETS
+    assert cr.DUAL_SET['baseline'] == 'mat_r125_c0'

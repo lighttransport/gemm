@@ -140,23 +140,40 @@ def full_skin_graph(skin,node,bound,out,request):
     r=math('MULTIPLY',rough,math('MULTIPLY_ADD',cavity,.6,value=1) if False else math('ADD',math('MULTIPLY',cavity,.6),1))
     # material_overrides (metahuman.compare_render --sweep; empty = the authored graph, no extra nodes):
     # roughness_scale, specular_scale, skin_coat (the .10 skin coat weight), subsurface_weight, subsurface_scale, subsurface_radius,
-    # normal_ear_scale (per-texel skin normal strength on the ears; skin_normal_map only)
+    # ear_sss_scale (ears: SSS weight 1, scale x k), dual_lobe (UE-style two specular lobes via the coat), normal_ear_scale (per-texel skin normal strength on the ears; skin_normal_map only)
     mo=dict(request.get('material_overrides') or {})
     r=math('SUBTRACT',r,math('MULTIPLY',lips,.12),clamp=True)
     if mo.get('roughness_scale',1.)!=1.:r=math('MULTIPLY',r,float(mo['roughness_scale']),clamp=True)
+    r_dual=r
+    if mo.get('dual_lobe'):r=math('MULTIPLY',r,.8,clamp=True)   # UE SSP dual specular: lobes .8r / 1.1r, mix .5
     links.new(r,node.inputs['Roughness'])
     # specular level = template*(1-.7 cavity)
     sp=math('MULTIPLY',spec,math('SUBTRACT',1.,math('MULTIPLY',cavity,.7)),clamp=True)
     if mo.get('specular_scale',1.)!=1.:sp=math('MULTIPLY',sp,float(mo['specular_scale']),clamp=True)
+    if mo.get('dual_lobe'):sp=math('MULTIPLY',sp,.5)   # half of F0 in the base lobe, the other half in the coat lobe
     links.new(sp,node.inputs['Specular IOR Level'])
     # second (sharper) lobe kept small so skin reads oily, not wet: coat .10(1-cavity)+.35 lips,
     # roughness .30 -> .12 on lips (the moist lip band)
     coat=math('ADD',math('MULTIPLY',math('SUBTRACT',1.,cavity),float(mo.get('skin_coat',.10))),math('MULTIPLY',lips,.35*float(request.get('lip_coat_scale',1.))),clamp=True);links.new(coat,node.inputs['Coat Weight'])
     cr=math('SUBTRACT',.30,math('MULTIPLY',lips,.30-float(request.get('lip_coat_roughness',.12))),clamp=True);links.new(cr,node.inputs['Coat Roughness'])
     node.inputs['Coat IOR'].default_value=1.4
+    if mo.get('dual_lobe'):
+        # second lobe = the coat: weight (1-.7 cavity) (+ lips), roughness 1.1r (lips keep their wet coat roughness),
+        # IOR 1.27 -> F0 .014 = half of the skin's .028
+        links.new(math('ADD',math('SUBTRACT',1.,math('MULTIPLY',cavity,.7)),math('MULTIPLY',lips,.35*float(request.get('lip_coat_scale',1.))),clamp=True),node.inputs['Coat Weight'])
+        r11=math('MULTIPLY',r_dual,1.1,clamp=True)
+        links.new(math('ADD',math('MULTIPLY',r11,math('SUBTRACT',1.,lips)),math('MULTIPLY',lips,float(request.get('lip_coat_roughness',.12))),clamp=True),node.inputs['Coat Roughness'])
+        node.inputs['Coat IOR'].default_value=1.27
     # random-walk skin subsurface (radii in metres, literature-scale skin profile)
     node.subsurface_method='RANDOM_WALK_SKIN'
     node.inputs['Subsurface Weight'].default_value=float(mo.get('subsurface_weight',.6));node.inputs['Subsurface Scale'].default_value=float(mo.get('subsurface_scale',.5))
+    if mo.get('ear_sss_scale'):
+        # thin-part transmission test: on the ears mask, SSS weight -> 1 and scale x k (UE adds a transmission profile)
+        if 'ears' not in maps.files:raise RuntimeError('ear_sss_scale needs skin_templates with an ears map; rebuild them')
+        ear=float_image(nodes,'template_ears_sss',maps['ears']);esep=nodes.new('ShaderNodeSeparateColor');links.new(ear.outputs['Color'],esep.inputs['Color'])
+        e=esep.outputs['Red'];w0=float(mo.get('subsurface_weight',.6));s0=float(mo.get('subsurface_scale',.5));k=float(mo['ear_sss_scale'])
+        links.new(math('ADD',math('MULTIPLY',e,1.-w0),w0,clamp=True),node.inputs['Subsurface Weight'])
+        links.new(math('ADD',math('MULTIPLY',e,s0*(k-1.)),s0),node.inputs['Subsurface Scale'])
     if mo:skin['material_overrides']=json.dumps(mo)
     # subsurface_radius override: per-channel mean free path in mm (e.g. UE SSP_skin_unified 1.05/.41/.26)
     node.inputs['Subsurface Radius'].default_value=tuple(float(x)*1e-3 for x in mo['subsurface_radius']) if 'subsurface_radius' in mo else (.00367,.00137,.00068)
@@ -498,12 +515,13 @@ def run(request):
     skin_full=full and '2c' not in ablate and (out/'skin_templates.npz').is_file()
     if skin_full:full_skin_graph(skin,node,bound,out,request)
     # eye material overrides (metahuman.compare_render EYE_SWEEP): sclera/iris/cornea roughness, cornea IOR, cornea
-    # Specular IOR Level, iris_gain (iris texture x gain); absent = the authored values.
+    # Specular IOR Level, iris_/sclera_gain (texture x gain), iris_/sclera_sat (HSV saturation), cornea_shadow, iris_specular (Specular IOR Level), eye_offset_<side>_m; absent = the authored values.
     eye_mo=dict(request.get('material_overrides') or {})
     for name,color,roughness in [('teeth',(.65,.6,.5),.25),('gums',(.35,.08,.07),.35),
         ('tongue',(.4,.09,.08),.4),('cavity',(.33,.09,.09),.45),('sclera',(.7,.65,.6),.25),
         ('iris',(.12,.065,.035),.55),('frame',(.12,.045,.025),.25),('pupil',(.001,.001,.001),1),('lash',(.025,.018,.012),.45)]:
         materials[name],principled=material(name,color,float(eye_mo.get(f'{name}_roughness',roughness)) if name in ('sclera','iris') else roughness)
+        if name=='iris' and 'iris_specular' in eye_mo:principled.inputs['Specular IOR Level'].default_value=float(eye_mo['iris_specular'])
         if name in ('gums','tongue'):
             principled.inputs['Subsurface Weight'].default_value=.1
             principled.inputs['Subsurface Radius'].default_value=(.0008,.0004,.0002)
@@ -511,10 +529,14 @@ def run(request):
         if name in ('sclera','iris'):
             texture=image_node(materials[name].node_tree.nodes,out/('sclera.png' if name=='sclera' else 'iris.png'))
             color_out=texture.outputs['Color']
-            if name=='iris' and 'iris_gain' in eye_mo:   # iris base-colour brightness test (absent = no extra node)
+            if f'{name}_gain' in eye_mo:   # iris base-colour brightness test (absent = no extra node)
                 gain=materials[name].node_tree.nodes.new('ShaderNodeVectorMath');gain.operation='SCALE'
-                gain.inputs['Scale'].default_value=float(eye_mo['iris_gain'])
+                gain.inputs['Scale'].default_value=float(eye_mo[f'{name}_gain'])
                 materials[name].node_tree.links.new(color_out,gain.inputs[0]);color_out=gain.outputs['Vector']
+            if f'{name}_sat' in eye_mo:   # iris saturation test (absent = no extra node)
+                hsv=materials[name].node_tree.nodes.new('ShaderNodeHueSaturation')
+                hsv.inputs['Saturation'].default_value=float(eye_mo[f'{name}_sat'])
+                materials[name].node_tree.links.new(color_out,hsv.inputs['Color']);color_out=hsv.outputs['Color']
             materials[name].node_tree.links.new(color_out,principled.inputs['Base Color'])
     if full and '2e' not in ablate:full_mouth_materials(materials,out,request)
     materials['cornea'],cornea=material('cornea',(1,1,1),float(eye_mo.get('cornea_roughness',.025)),1,
@@ -560,6 +582,11 @@ def run(request):
         obj=bpy.data.objects.new(name,mesh);bpy.context.collection.objects.link(obj);mesh.materials.append(materials[part['material']])
         objects[name]=obj
         for polygon in mesh.polygons:polygon.use_smooth=part['material'] not in ('glass',)
+        for side in ('left','right'):   # eye_offset_<side>_m [dx,dy,dz]: move the eyeball parts (not lids/tearline)
+            if f'eye_offset_{side}_m' in eye_mo and name in (f'{side}_cornea',f'{side}_sclera',f'{side}_iris',f'{side}_pupil_cup'):
+                obj.location=tuple(float(x) for x in eye_mo[f'eye_offset_{side}_m'])
+        if part['material'] in ('cornea','tear') and eye_mo.get('cornea_shadow',1.)<.5:
+            obj.visible_shadow=False   # cornea_shadow 0: shadow rays pass the glass, so the iris gets direct light (no caustic-only lighting)
         if part['material']=='skin':
             modifier=obj.modifiers.new('skin_subdivision','SUBSURF');modifier.levels=1;modifier.render_levels=2
             if skin_full and hasattr(modifier,'use_adaptive_subdivision'):
