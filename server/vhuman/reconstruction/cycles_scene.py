@@ -498,7 +498,7 @@ def run(request):
     skin_full=full and '2c' not in ablate and (out/'skin_templates.npz').is_file()
     if skin_full:full_skin_graph(skin,node,bound,out,request)
     # eye material overrides (metahuman.compare_render EYE_SWEEP): sclera/iris/cornea roughness, cornea IOR, cornea
-    # Specular IOR Level; absent = the authored values.
+    # Specular IOR Level, iris_gain (iris texture x gain); absent = the authored values.
     eye_mo=dict(request.get('material_overrides') or {})
     for name,color,roughness in [('teeth',(.65,.6,.5),.25),('gums',(.35,.08,.07),.35),
         ('tongue',(.4,.09,.08),.4),('cavity',(.33,.09,.09),.45),('sclera',(.7,.65,.6),.25),
@@ -510,7 +510,12 @@ def run(request):
             principled.inputs['Subsurface Scale'].default_value=1
         if name in ('sclera','iris'):
             texture=image_node(materials[name].node_tree.nodes,out/('sclera.png' if name=='sclera' else 'iris.png'))
-            materials[name].node_tree.links.new(texture.outputs['Color'],principled.inputs['Base Color'])
+            color_out=texture.outputs['Color']
+            if name=='iris' and 'iris_gain' in eye_mo:   # iris base-colour brightness test (absent = no extra node)
+                gain=materials[name].node_tree.nodes.new('ShaderNodeVectorMath');gain.operation='SCALE'
+                gain.inputs['Scale'].default_value=float(eye_mo['iris_gain'])
+                materials[name].node_tree.links.new(color_out,gain.inputs[0]);color_out=gain.outputs['Vector']
+            materials[name].node_tree.links.new(color_out,principled.inputs['Base Color'])
     if full and '2e' not in ablate:full_mouth_materials(materials,out,request)
     materials['cornea'],cornea=material('cornea',(1,1,1),float(eye_mo.get('cornea_roughness',.025)),1,
                                         float(eye_mo.get('cornea_ior',config['optical_eyes']['ior'])))

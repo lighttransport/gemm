@@ -293,6 +293,12 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
   front = 36 views vs `normal_eyes2`, `compare_v1/eye_ior1_vhstudio__fast.json`): an invisible cornea gives eye dE -.79
   (19/35 views), eye LPIPS +.0025, eye DISTS +.0032, view LPIPS +.0036 (0/36 better; the cornea highlight is lost).
   The cornea veil is not the eye gap (dE ~19-25); cornea unchanged.
+  Iris brightness (2026-11-05, `cycles_scene` override `iris_gain` = iris texture x gain, `compare_render.EYE_IRIS_SET`,
+  `win_cycles --score eye_iris`; same 36 views, `compare_v1/eye_iris_vhstudio__fast.json`; eye region dE / LPIPS / DISTS,
+  view LPIPS): x.7 +.62 / +.0012 / +.0027, +.0002 (eye DISTS better 5/35); x1.5 -.27 / -.0009 / -.0021, -.0002 (29/35);
+  x2.5 -.03 / +.0020 / -.0021, -.0003 (22/35). The iris is slightly too dark (x1.5 is the only setting better on every
+  metric) but the effect is at the noise level and dE barely moves: neither the cornea nor the iris brightness explains
+  the eye gap, which points at the GNM-vs-MH eye placement/size. Defaults unchanged.
 - UE-matched skin (2026-11-04, `compare_render.UE_SET`, `--ue-match`; values from the UE skin readout in
   `skin_sss_survey.md`; 12 heads x front/+-40 = 36 views vs `normal`, fast profile, `compare_v1/ue_match_vhstudio__fast.json`):
 

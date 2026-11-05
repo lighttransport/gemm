@@ -202,6 +202,7 @@ EYE_SWEEP = {'cornea_roughness': (0., .08, .15), 'cornea_ior': (1.3, 1.336, 1.42
              'sclera_roughness': (.15, .4, .6), 'iris_roughness': (.3, .8)}
 EYE_SWEEP_IDS = ('mh_000000', 'mh_000145', 'mh_000300', 'mh_000358')
 EYE_SWEEP_CAMERAS = ('eye_left', 'eye_right', 'front')
+EYE_EXTRA_PARAMS = ('iris_gain',)   # ew_ params outside the original sweep (2026-11-05 iris brightness test)
 
 
 def sweep_variant(param, value):
@@ -235,7 +236,7 @@ def variant_options(variant):
                     opts['material_overrides'] = {param: value}
                 return opts
     if variant.startswith('ew_'):
-        for param in EYE_SWEEP:
+        for param in (*EYE_SWEEP, *EYE_EXTRA_PARAMS):
             if variant.startswith(f'ew_{param}_'):
                 return dict(VARIANTS['normal_eyes2'], material_overrides={param: float(variant[len(f'ew_{param}_'):])})
     raise ValueError(f'unknown variant {variant!r}')
@@ -271,6 +272,9 @@ EYE_SET = dict(variants=('normal_eyes', 'normal_eyes2'), cameras=('eye_left', 'e
 EYE_SWEEP_SET = dict(variants=EYE_SWEEP_VARIANTS, cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
 # 2026-11-05: cornea IOR 1.0 = an invisible cornea (no refraction, no reflection): is the cornea veil the eye dE gap?
 EYE_IOR1_SET = dict(variants=('ew_cornea_ior_1',), cameras=EYE_SWEEP_CAMERAS, baseline='normal_eyes2')
+# 2026-11-05: iris texture brightness (the rendered iris reads grey/dark vs UE): base colour x .7 / 1.5 / 2.5
+EYE_IRIS_SET = dict(variants=tuple(eye_variant('iris_gain', g) for g in (.7, 1.5, 2.5)), cameras=EYE_SWEEP_CAMERAS,
+                    baseline='normal_eyes2')
 UE_SET = dict(variants=('ue_sss25', 'ue_sss50', 'ue_sss100', 'ue_spec', 'ue_match', 'ue_match_spec'), cameras=('front', 'yaw_p40', 'yaw_m40'))
 UE_CONFIRM_SET = dict(variants=('ue_match', 'ue_match_spec', 'mat_r125_c0'), cameras=CONFIRM_CAMERAS)
 EAR_SET = dict(variants=('', 'normal_ear0', 'normal_ear50'), cameras=('ear_left', 'ear_right', 'yaw_p90', 'yaw_m90', 'front'))
