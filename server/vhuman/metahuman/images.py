@@ -37,8 +37,20 @@ def write_exr(path, rgb):
     import cv2
     rgb = np.asarray(rgb, np.float32)
     bgr = rgb[..., ::-1] if rgb.shape[-1] == 3 else rgb[..., [2, 1, 0, 3]]
-    if not cv2.imwrite(str(path), np.ascontiguousarray(bgr), [cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_ZIP]):
-        raise IOError(f'cannot write {path}')
+    try:
+        written = cv2.imwrite(str(path), np.ascontiguousarray(bgr), [cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_ZIP])
+    except cv2.error:
+        written = False
+    if not written:
+        # Match read_exr's fallback for OpenCV builds without an EXR codec.
+        try:
+            import OpenEXR
+        except ImportError:
+            raise IOError(f'cannot write {path}: no OpenEXR codec') from None
+        names = ('R', 'G', 'B') if rgb.shape[-1] == 3 else ('R', 'G', 'B', 'A')
+        channels = {name: np.ascontiguousarray(rgb[..., i]) for i, name in enumerate(names)}
+        with OpenEXR.File({'compression': OpenEXR.ZIP_COMPRESSION}, channels) as exr:
+            exr.write(str(path))
 
 
 def requantise(img):

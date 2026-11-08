@@ -1,0 +1,4 @@
+# Offline full-quality Cycles preparation and profile finalization.
+# Blender is installed separately; OpenEXR reads its multipart lighting AOVs.
+-r requirements-rig.txt
+OpenEXR>=3.4.4,<4

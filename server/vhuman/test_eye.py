@@ -88,6 +88,7 @@ class ParamsTest(unittest.TestCase):
         self.assertAlmostEqual(P.pupil_ratio(P.validate({"pupil": {"dilation": 1.0}})), P.P_REF)
         self.assertAlmostEqual(P.pupil_ratio(P.validate({"pupil": {"scale": 2.2, "dilation": 1.2}})),
                                P.P_REF * 2.0 * 1.2)
+        self.assertEqual(P.validate({'sclera': {'vascularity_intensity': 1.8}})['sclera']['vascularity_intensity'], 1.8)
 
     def test_gnm_anatomy_and_saved_legacy_profile(self):
         fresh = P.defaults()
@@ -175,6 +176,103 @@ class OpticsTest(unittest.TestCase):
 
 
 class IrisTest(unittest.TestCase):
+    def test_radial_color_mask_selects_secondary_inside(self):
+        p = P.defaults()
+        p['iris'].update(blend_method='Radial', color_blend=.5, color_blend_softness=.1,
+                         primary_color_u=0., primary_color_v=0., secondary_color_u=1., secondary_color_v=1.,
+                         global_saturation=1., shadow_details=0.)
+        masks = np.array([[.5, 1., 0., 0.], [.5, 1., 1., 0.]])
+        colors = iris.custom_iris(masks, p)
+        np.testing.assert_allclose(colors[0], iris.chart.pick(0., 0.), atol=1e-6)
+        np.testing.assert_allclose(colors[1], iris.chart.pick(1., 1.), atol=1e-6)
+
+    def test_layered_iris_calibration_does_not_change_sclera(self):
+        p = P.defaults(); it, st = assets.structures(p, 128)
+        original = assets.eye_basecolor(p, it, st, 128)
+        adjusted, inner, outer = assets.eye_basecolor_layered_calibrated(p, it, st, 128, [.1, .08, .06], [.12, .09, .07])
+        r = np.linalg.norm(assets.uv_grid(128) - .5, axis=-1)
+        outside = r > p['cornea']['size'] + .5 * p['cornea']['limbus_softness'] + .002
+        np.testing.assert_allclose(adjusted[outside], original[outside], atol=1e-6)
+        self.assertTrue(np.isfinite(adjusted).all())
+        self.assertTrue(((inner >= .5) & (inner <= 3.)).all())
+        self.assertTrue(((outer >= .5) & (outer <= 2.)).all())
+        bands, _, _ = assets.eye_basecolor_layered_calibrated(
+            p, it, st, 128, [.1, .08, .06], [.12, .09, .07],
+            radial_targets=[[.1, .08, .06], [.08, .09, .12], [.05, .08, .14]])
+        np.testing.assert_allclose(bands[outside], original[outside], atol=1e-6)
+        self.assertTrue(np.isfinite(bands).all())
+        self.assertGreater(float(np.mean(np.abs(bands - adjusted))), .0001)
+        targets = [[.1, .08, .04], [.08, .09, .09], [.04, .08, .12]]
+        no_fibers, _, _ = assets.eye_basecolor_layered_calibrated(
+            p, it, st, 128, targets[0], targets[-1], radial_targets=targets)
+        fibers, _, _ = assets.eye_basecolor_layered_calibrated(
+            p, it, st, 128, targets[0], targets[-1], radial_targets=targets, fiber_chroma=.6)
+        np.testing.assert_allclose(fibers[outside], original[outside], atol=1e-6)
+        self.assertTrue(np.isfinite(fibers).all())
+        self.assertGreater(float(np.mean(np.abs(fibers - no_fibers))), .0001)
+        with self.assertRaises(ValueError):
+            assets.eye_basecolor_layered_calibrated(p, it, st, 128, [.1, .08, .06], [.12, .09, .07], radial_targets=[[1, 2, 3]])
+
+    def test_outer_iris_calibration_preserves_inner_and_outer_sclera(self):
+        p = P.defaults(); uv = assets.uv_grid(128); r = np.linalg.norm(uv - .5, axis=-1) / p['cornea']['size']
+        color = np.empty((128, 128, 3), np.float32); color[:] = [.1, .05, .01]
+        adjusted, gains = assets.calibrate_iris_outer(color, p, [.2, .025, .02])
+        np.testing.assert_allclose(gains, [2., .5, 2.], atol=1e-6)
+        np.testing.assert_allclose(adjusted[r < .5], color[r < .5], atol=1e-6)
+        np.testing.assert_allclose(adjusted[r > 1.1], color[r > 1.1], atol=1e-6)
+        self.assertGreater(float(adjusted[..., 0][(r > .7) & (r < .85)].mean()), .18)
+
+    def test_baked_iris_calibration_preserves_sclera_and_bounds_dark_channels(self):
+        p = P.defaults(); uv = assets.uv_grid(128)
+        r = np.linalg.norm(uv - .5, axis=-1)
+        color = np.empty((128, 128, 3), np.float32); color[:] = [.1, .05, .001]
+        corrected, gains = assets.calibrate_iris_color(color, p, [.2, .025, .3])
+        np.testing.assert_allclose(gains, [2., .5, 1.], atol=1e-6)
+        np.testing.assert_allclose(corrected[64, 64], [.2, .025, .001], atol=1e-6)
+        np.testing.assert_allclose(corrected[r > .3], color[r > .3], atol=1e-6)
+
+    def test_angular_contrast_calibration_preserves_radial_mean_and_sclera(self):
+        p = P.defaults()
+        uv = assets.uv_grid(128); x, y = uv[..., 0] - .5, uv[..., 1] - .5
+        r = np.hypot(x, y); field = .5 + .2 * np.cos(np.arctan2(y, x))
+        color = np.repeat(field[..., None], 3, axis=-1).astype(np.float32)
+        adjusted = assets.reduce_iris_angular_contrast(color, p, .6)
+        ring = (r > .08) & (r < .12)
+        self.assertLess(adjusted[..., 0][ring].std(), .5 * color[..., 0][ring].std())
+        self.assertAlmostEqual(float(adjusted[..., 0][ring].mean()), float(color[..., 0][ring].mean()), places=5)
+        np.testing.assert_array_equal(adjusted[r > .3], color[r > .3])
+
+    def test_angular_contrast_ignores_radial_brightness(self):
+        uv = assets.uv_grid(256); x, y = uv[..., 0] - .5, uv[..., 1] - .5
+        r = np.hypot(x, y) * 2.
+        sector = np.ones_like(r, dtype=bool)
+        radial = .2 + r * .3
+        patterned = radial * (1. + .3 * np.cos(8. * np.arctan2(y, x)))
+        self.assertLess(iris.angular_contrast(radial, r, sector), .02)
+        self.assertGreater(iris.angular_contrast(patterned, r, sector), .1)
+        self.assertIsNone(iris.angular_contrast(radial, r, np.zeros_like(sector)))
+
+    def test_chromatic_fiber_signal_rejects_radial_gradient(self):
+        uv = assets.uv_grid(128); x, y = uv[..., 0] - .5, uv[..., 1] - .5
+        r = np.hypot(x, y) * 2.; sector = np.ones_like(r, dtype=bool)
+        lum = .2 + .1 * r
+        base = np.repeat(lum[..., None], 3, axis=-1)
+        pattern = .15 * np.cos(9. * np.arctan2(y, x))
+        varied = base * (1. + pattern[..., None] * np.array([1., -.2, -1.]))
+        inner, outer = np.array([.3, .2, .1]), np.array([.1, .2, .3])
+        self.assertLess(iris.chromatic_fiber_signal(base, r, sector, inner, outer), .001)
+        self.assertGreater(iris.chromatic_fiber_signal(varied, r, sector, inner, outer), .05)
+        self.assertIsNone(iris.chromatic_fiber_signal(base, r, sector, inner, inner))
+
+    def test_baked_normal_rotates_with_iris_and_flattens_pupil(self):
+        p = P.validate({'iris': {'rotation': .25}, 'pupil': {'dilation': 1., 'scale': 1.}})
+        n = np.broadcast_to(np.array([.6, 0., .8], np.float32), (64, 64, 3)).copy()
+        tex = iris.IrisTextures(64, np.zeros((64, 64, 4), np.float32), n, None)
+        baked = iris.bake_normal(tex, p, 64)
+        np.testing.assert_allclose(baked[32, 43], [0., .6, .8], atol=1e-5)
+        np.testing.assert_allclose(baked[32, 32], [0., 0., 1.], atol=1e-5)
+        np.testing.assert_allclose(baked[0, 0], [0., 0., 1.], atol=1e-5)
+
     def test_layout_and_colour(self):
         p = P.preset("blue")
         tex = iris.build(p, 512)
@@ -235,6 +333,127 @@ class IrisTest(unittest.TestCase):
 
 
 class ScleraTest(unittest.TestCase):
+    def test_sclera_microtexture_is_deterministic_and_excludes_iris(self):
+        p = P.defaults()
+        f = assets.eye_sclera_microfactor(p, 128, .2)
+        np.testing.assert_array_equal(f, assets.eye_sclera_microfactor(p, 128, .2))
+        np.testing.assert_allclose(f[64, 64], [.5, .5, .5], atol=1e-6)
+        self.assertGreater(float(f[10:30, 10:30, 0].std()), .005)
+        with self.assertRaises(ValueError):
+            assets.eye_sclera_microfactor(p, 128, .5)
+        surface = assets.eye_sclera_surface_microfactor(p, 128, .1)
+        np.testing.assert_array_equal(surface, assets.eye_sclera_surface_microfactor(p, 128, .1))
+        np.testing.assert_allclose(surface[64, 64], [.5, .5, .5], atol=1e-6)
+        self.assertGreater(float(surface[10:30, 10:30, 0].std()), .005)
+        fine = assets.eye_sclera_surface_microfactor(p, 128, .05, fine=True)
+        np.testing.assert_array_equal(fine, assets.eye_sclera_surface_microfactor(p, 128, .05, fine=True))
+        np.testing.assert_allclose(fine[64, 64], [.5, .5, .5], atol=1e-6)
+        self.assertGreater(float(np.mean(np.abs(fine - surface))), .005)
+
+    def test_tissue_factor_is_reproducible_and_preserves_iris(self):
+        p = P.validate({'sclera': {'vascularity_intensity': 1.8}})
+        f = assets.eye_tissue_factor(p, 128)
+        np.testing.assert_array_equal(f, assets.eye_tissue_factor(p, 128))
+        np.testing.assert_allclose(f[64, 64], [.5, .5, .5], atol=1e-6)
+        self.assertGreater(float(f[64, 113, 0]), float(f[64, 113, 1]))
+        low = assets.eye_tissue_factor(P.validate({'sclera': {'vascularity_intensity': 0.}}), 128)
+        self.assertLess(float(f[64, 113, 1]), float(low[64, 113, 1]))
+
+    def test_whole_globe_vessels_are_reproducible_and_cover_all_quadrants(self):
+        p = P.defaults()
+        mask = sclera.isotropic_vessels(p, 256)
+        np.testing.assert_array_equal(mask, sclera.isotropic_vessels(p, 256))
+        y, x = np.mgrid[:256, :256] - 127.5
+        r = np.hypot(x, y)
+        for region in (x > 2 * np.abs(y), x < -2 * np.abs(y), y > 2 * np.abs(x), y < -2 * np.abs(x)):
+            self.assertGreater(float(mask[region & (r > 60) & (r < 105)].mean()), .001)
+        self.assertLess(float(mask[r < 40].max()), .01)
+        curved = sclera.isotropic_vessels(p, 256, curvy=True)
+        np.testing.assert_array_equal(curved, sclera.isotropic_vessels(p, 256, curvy=True))
+        self.assertGreater(float(np.mean(np.abs(curved - mask))), .002)
+        irregular = sclera.irregular_vessels(p, 256)
+        np.testing.assert_array_equal(irregular, sclera.irregular_vessels(p, 256))
+        self.assertTrue(np.isfinite(irregular).all())
+        self.assertGreater(float(irregular.mean()), .001)
+        self.assertLess(float(irregular[r < 40].max()), .01)
+        dense = sclera.irregular_vessels(p, 256, dense=True)
+        np.testing.assert_array_equal(dense, sclera.irregular_vessels(p, 256, dense=True))
+        self.assertGreater(float(dense.mean()), float(irregular.mean()))
+        self.assertLess(float(dense[r < 40].max()), .01)
+        lines = sclera.irregular_vessels(p, 256, dense=True, mottling=False)
+        self.assertTrue(np.all(lines <= dense + 1e-6))
+        self.assertGreater(float(np.mean(dense - lines)), .005)
+        sparse = sclera.irregular_vessels(p, 256, dense=True, mottling=False, density=0.)
+        np.testing.assert_array_equal(sparse, sclera.irregular_vessels(p, 256, dense=True, mottling=False, density=0.))
+        self.assertLess(float(sparse.mean()), float(lines.mean()))
+        organic = sclera.irregular_vessels(p, 256, dense=True, mottling=False, density=0., organic=True)
+        np.testing.assert_array_equal(organic, sclera.irregular_vessels(p, 256, dense=True, mottling=False, density=0., organic=True))
+        self.assertGreater(float(organic.mean()), 0.)
+        self.assertLess(float(organic[r < 40].max()), .01)
+        self.assertGreater(float(np.mean(np.abs(organic - sparse))), .0001)
+        organic_dense = sclera.irregular_vessels(p, 256, dense=True, mottling=False, density=0., organic=True, organic_dense=True)
+        np.testing.assert_array_equal(organic_dense, sclera.irregular_vessels(p, 256, dense=True, mottling=False, density=0., organic=True, organic_dense=True))
+        self.assertGreater(float(np.mean(organic_dense > .01)), float(np.mean(organic > .01)))
+        self.assertLess(float(organic_dense.max()), float(organic.max()))
+        with self.assertRaises(ValueError):
+            sclera.irregular_vessels(p, 256, organic_dense=True)
+        np.testing.assert_array_equal(lines, sclera.irregular_vessels(p, 256, dense=True, mottling=False, density=1.))
+        with self.assertRaises(ValueError):
+            sclera.irregular_vessels(p, 256, density=1.1)
+
+    def test_guided_vessel_paths_reduce_looping(self):
+        def paths(pull):
+            return sclera._grow(noise.rng(123, 55), 1024, .2, 60, (1., 3.), .004, .04, 0.,
+                                start_r=(.3, .5), reach=(.3, 1.), inward_pull=.01, turn_noise=.32,
+                                initial_turn=1.15, max_steps=100, width_decay=.975, heading_pull=pull)
+        def loop_fraction(branches):
+            ratios = [np.linalg.norm(points[-1] - points[0]) / np.linalg.norm(np.diff(points, axis=0), axis=1).sum()
+                      for points, _, _, _ in branches if len(points) > 20]
+            self.assertGreater(len(ratios), 50)
+            return float(np.mean(np.asarray(ratios) < .3))
+        self.assertLess(loop_fraction(paths(.05)), loop_fraction(paths(0.)))
+        with self.assertRaises(ValueError):
+            sclera.irregular_vessels(P.defaults(), 256, guided=True)
+
+    def test_vessel_crossing_is_trimmed_after_join_region(self):
+        t = np.linspace(-.4, .4, 17)
+        horizontal = np.stack((t, np.zeros_like(t)), axis=-1)
+        vertical = np.stack((np.zeros_like(t), t), axis=-1)
+        branch = lambda points: (points, np.ones(len(points) - 1), .8, np.zeros(len(points)))
+        result = sclera._stop_at_crossings([branch(horizontal), branch(vertical)], 128)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result[0][0]), len(horizontal))
+        self.assertLess(len(result[1][0]), len(vertical))
+        self.assertLess(result[1][0][-1, 1], 0.)
+        with self.assertRaises(ValueError):
+            sclera.irregular_vessels(P.defaults(), 256, avoid_crossings=True)
+
+    def test_self_crossing_is_trimmed_without_trimming_other_branches(self):
+        loop = np.array([[0., 0.], [.1, 0.], [.2, 0.], [.2, .1], [.2, .2],
+                         [.1, .2], [0., .2], [0., .1], [0., 0.], [-.1, 0.]])
+        line = np.array([[-.3, .05], [.3, .05]])
+        branch = lambda points: (points, np.ones(len(points) - 1), .8, np.zeros(len(points)))
+        result = sclera._stop_at_crossings([branch(loop), branch(line)], 128,
+                                           inter_branch=False, self_crossing=True)
+        self.assertEqual(len(result), 2)
+        self.assertLess(len(result[0][0]), len(loop))
+        self.assertEqual(len(result[1][0]), len(line))
+        with self.assertRaises(ValueError):
+            sclera.irregular_vessels(P.defaults(), 256, avoid_self=True)
+
+    def test_vessel_overlay_is_deterministic_and_laterally_biased(self):
+        p = P.defaults()
+        tex = sclera.build(p, 256)
+        mask = assets.sclera_vessel_texture(tex, 256)
+        self.assertEqual(mask.shape, (256, 256, 3))
+        np.testing.assert_array_equal(mask, assets.sclera_vessel_texture(sclera.build(p, 256), 256))
+        y, x = np.mgrid[:256, :256] - 127.5
+        r = np.hypot(x, y)
+        annulus = (r > 55) & (r < 105)
+        horizontal = annulus & (np.abs(x) > 2 * np.abs(y))
+        vertical = annulus & (np.abs(y) > 2 * np.abs(x))
+        self.assertGreater(float(mask[..., 0][horizontal].mean()), float(mask[..., 0][vertical].mean()))
+
     def test_irritation_area(self):
         """Vessels show outside the selected coverage radius
         radius, so a larger 'coverage' keeps the veins further out."""

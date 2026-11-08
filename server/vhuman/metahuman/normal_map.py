@@ -90,12 +90,61 @@ def encode(n):
     return np.uint8(np.clip(np.rint((np.asarray(n) * .5 + .5) * 255), 0, 255))
 
 
-def convert(mh_normal, mh_vertices, gnm_skin_vertices, tmap, res=None):
+def smooth_transfer_frame(normals, base, valid, weight, sigma_px):
+    """Smooth only the transferred mesh-normal field, retaining texture detail.
+
+    The shortest rotation from each original base normal to its normalized,
+    validity-weighted Gaussian estimate is applied to the full tangent normal.
+    Weight confines the adjustment to an authored region. This is an optional
+    look experiment: it can change genuine shape-dependent shading.
+    """
+    normals, base, weight = (np.asarray(x, np.float32) for x in (normals, base, weight))
+    valid = np.asarray(valid, bool)
+    if normals.ndim != 3 or normals.shape[-1] != 3 or base.shape != normals.shape:
+        raise ValueError('matching HxWx3 normals required')
+    if valid.shape != normals.shape[:2] or weight.shape != valid.shape:
+        raise ValueError('validity and weight must match normal dimensions')
+    if not all(np.isfinite(x).all() for x in (normals, base, weight)) or (weight < 0).any() or (weight > 1).any():
+        raise ValueError('finite normals and region weights in [0,1] required')
+    if not np.isfinite(sigma_px) or not 0 <= sigma_px <= 16:
+        raise ValueError('frame smoothing sigma must be in [0,16] pixels')
+    if sigma_px < 1e-6 or not np.any(valid & (weight > 0)):
+        return normals.copy()
+    from scipy.ndimage import gaussian_filter
+    valid_f = valid.astype(np.float32)
+    total = gaussian_filter(valid_f, sigma_px, mode='nearest')
+    target = gaussian_filter(base * valid_f[..., None], sigma=(sigma_px, sigma_px, 0), mode='nearest')
+    target /= np.maximum(total[..., None], 1e-8)
+    target /= np.maximum(np.linalg.norm(target, axis=-1, keepdims=True), 1e-8)
+    base = base / np.maximum(np.linalg.norm(base, axis=-1, keepdims=True), 1e-8)
+    cross = np.cross(base, target)
+    cosine = np.clip((base * target).sum(-1), -1, 1)
+    first = np.cross(cross, normals)
+    rotated = normals + first + np.cross(cross, first) / np.maximum(1 + cosine[..., None], 1e-5)
+    rotated /= np.maximum(np.linalg.norm(rotated, axis=-1, keepdims=True), 1e-8)
+    amount = weight * valid * (cosine > -.99) * (total > 1e-8)
+    mixed = normals * (1 - amount[..., None]) + rotated * amount[..., None]
+    mixed /= np.maximum(np.linalg.norm(mixed, axis=-1, keepdims=True), 1e-8)
+    return np.where(amount[..., None] > 0, mixed, normals)
+
+
+def convert(mh_normal, mh_vertices, gnm_skin_vertices, tmap, res=None, *, frame_sigma_px=0., frame_weight=None):
     """MH tangent normal map (MH UV) -> GNM skin_normal (res x res x 3 unit vectors, Blender convention) and valid mask.
 
     mh_vertices: that identity's MH head (24049, 3, vhuman frame); gnm_skin_vertices: its bound GNM skin vertices
-    (binding.evaluate). tmap: binding_v1/texel_map_<res>.npz contents."""
+    (binding.evaluate). tmap: binding_v1/texel_map_<res>.npz contents.
+    Optional frame smoothing requires an explicit atlas region weight and does
+    not alter texels outside it. The default preserves the original conversion.
+    """
     res = res or tmap['valid'].shape[0]
+    if not np.isfinite(frame_sigma_px) or not 0 <= frame_sigma_px <= 16:
+        raise ValueError('frame smoothing sigma must be in [0,16] pixels')
+    if frame_sigma_px:
+        if frame_weight is None:
+            raise ValueError('frame smoothing requires an explicit region weight')
+        weight = np.asarray(frame_weight)
+        if weight.shape != (res, res) or not np.isfinite(weight).all() or (weight < 0).any() or (weight > 1).any():
+            raise ValueError('frame weight must match the atlas and be finite in [0,1]')
     mh = mh_template.load(); g = load_gnm()
     sampled, ok = resample(np.asarray(mh_normal)[..., :3], tmap)
     n_mh = decode(sampled)
@@ -110,6 +159,13 @@ def convert(mh_normal, mh_vertices, gnm_skin_vertices, tmap, res=None):
     # Blender reads green along +V (up): B_up = -dpos/drow. corner_frames' B follows +row, so flip green.
     local[:, 1] *= -1
     out = np.tile(FLAT, (res, res, 1)); out[yy, xx] = _normalize(local)
+    if frame_sigma_px >= 1e-6:
+        base_local = np.einsum('nkj,nj->nk', f_g, f_mh[:, 2])
+        base_local[:, 1] *= -1
+        base = np.tile(FLAT, (res, res, 1)); base[yy, xx] = _normalize(base_local)
+        smoothed = smooth_transfer_frame(out, base, ok, frame_weight, frame_sigma_px)
+        selected = ok & (weight > 0)
+        out[selected] = smoothed[selected]
     return out, ok
 
 
@@ -148,17 +204,33 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('sid'); ap.add_argument('--res', type=int, default=2048); ap.add_argument('--out')
     ap.add_argument('--check', action='store_true'); ap.add_argument('--converted', help='--check: converted map to test')
+    ap.add_argument('--frame-sigma-px', type=float, default=0., help='experimental smoothing of transferred mesh normals in atlas pixels')
+    ap.add_argument('--orbital-mask-npz', help='skin_detail.npz supplying the orbital region weights')
     a = ap.parse_args()
+    if not np.isfinite(a.frame_sigma_px) or not 0 <= a.frame_sigma_px <= 16:
+        ap.error('--frame-sigma-px must be in [0,16]')
+    if a.frame_sigma_px and not a.orbital_mask_npz:
+        ap.error('--frame-sigma-px requires --orbital-mask-npz')
     if a.check:
         print(json.dumps(check(a.sid, a.converted), indent=1)); return
     from PIL import Image
     from .binding import evaluate, load_binding
     from .samples import V1, load_sample, to_vhuman
+    weight = None
+    if a.frame_sigma_px:
+        with np.load(a.orbital_mask_npz, allow_pickle=False) as z:
+            regions = z['region_masks']
+            if regions.ndim != 3 or regions.shape[0] < 4 or regions.shape[1:] != (a.res, a.res):
+                ap.error('orbital mask dimensions must match --res')
+            weight = np.clip(regions[2] + regions[3], 0, 1)
+            if not np.isfinite(weight).all():
+                ap.error('orbital mask must be finite')
     s = load_sample(V1 / 'samples' / a.sid)
     mh_v = to_vhuman(s['face']['head'][0]).astype(np.float64)
     skin = evaluate(load_binding(), mh_v)
     tm = dict(np.load(OUT_DIR / f'texel_map_{a.res}.npz'))
-    n, ok = convert(np.asarray(Image.open(V1 / 'samples' / a.sid / 'tex' / 'normal.png')), mh_v, skin, tm)
+    n, ok = convert(np.asarray(Image.open(V1 / 'samples' / a.sid / 'tex' / 'normal.png')), mh_v, skin, tm,
+                    frame_sigma_px=a.frame_sigma_px, frame_weight=weight)
     out = Path(a.out or f'{a.sid}_skin_normal.png')
     Image.fromarray(encode(n)).save(out)
     print(out, 'valid', float(ok.mean()))

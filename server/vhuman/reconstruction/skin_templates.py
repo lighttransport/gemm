@@ -6,6 +6,7 @@ strength mask, plus a tileable pore micro-normal. Per-subject variation is limit
 so the maps are priors, not measurements, and are labelled as such in the manifest.
 """
 import json
+import hashlib
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -29,7 +30,24 @@ REGION_TEMPLATE = (
 DEFAULT = (.55, .42, .50)   # scalp, neck and any unlisted exterior skin
 
 
-def micro_normal(res=512, seed=7, pore_density=28., strength=.35):
+def ensure_isotropic_pores(out):
+    """Cache a separate pore asset without replacing historical staged grain."""
+    out=Path(out)
+    seed=int(json.loads((out/'skin_templates.json').read_text())['seed'])
+    target=out/'skin_micro_isotropic.png';stamp=out/'skin_micro_isotropic.json'
+    recipe=dict(seed=seed,grain='isotropic',numpy_version=np.__version__,
+                source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    if target.is_file() and stamp.is_file() and json.loads(stamp.read_text())==recipe:
+        return target
+    pending=out/'skin_micro_isotropic.pending.png'
+    Image.fromarray(micro_normal(seed=seed,grain='isotropic')).save(pending)
+    pending.replace(target)
+    pending_stamp=out/'skin_micro_isotropic.pending.json'
+    pending_stamp.write_text(json.dumps(recipe,indent=2));pending_stamp.replace(stamp)
+    return target
+
+
+def micro_normal(res=512, seed=7, pore_density=28., strength=.35, grain='legacy'):
     """Tileable pore micro-normal (tangent space, RGB8) from periodic cellular + fractal noise."""
     rng = np.random.default_rng(seed)
     y, x = np.mgrid[0:res, 0:res] / res
@@ -40,9 +58,21 @@ def micro_normal(res=512, seed=7, pore_density=28., strength=.35):
     for px, py, r, d in zip(cx, cy, radius, depth):
         dx = (x - px + .5) % 1 - .5; dy = (y - py + .5) % 1 - .5
         height -= d * np.exp(-(dx * dx + dy * dy) / (2 * r * r))
-    # fine periodic grain
+    if grain not in ('legacy', 'isotropic', 'none'):
+        raise ValueError('unknown pore grain mode')
+    # Legacy crossed sine waves produce visible diagonal grids in specular.
+    # A periodic random Fourier band has no privileged surface direction.
     for k, amp in ((48, .08), (96, .05), (192, .03)):
-        height += amp * (np.sin(2 * np.pi * (k * x + rng.random())) * np.sin(2 * np.pi * (k * y + rng.random())))
+        if grain == 'legacy':
+            height += amp * (np.sin(2 * np.pi * (k * x + rng.random())) * np.sin(2 * np.pi * (k * y + rng.random())))
+        elif grain == 'isotropic':
+            frequency=np.fft.fftfreq(res)*res
+            radial=np.hypot(frequency[:,None],frequency[None,:])
+            center=min(k*np.sqrt(2),res*.35)
+            band=np.exp(-.5*((radial-center)/(center*.2))**2)
+            band[0,0]=0
+            noise=np.fft.ifft2(np.fft.fft2(rng.normal(size=(res,res)))*band).real
+            height += amp*.5*noise/max(noise.std(),1e-12)
     height = (height - height.mean()) / (height.std() + 1e-9) * strength
     gx = (np.roll(height, -1, 1) - np.roll(height, 1, 1)) * res / 2
     gy = (np.roll(height, -1, 0) - np.roll(height, 1, 0)) * res / 2

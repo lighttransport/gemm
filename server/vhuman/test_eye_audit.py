@@ -1,4 +1,5 @@
 import unittest
+import numpy as np
 
 from server.vhuman.metahuman.eye_audit import compare_audits
 
@@ -8,6 +9,21 @@ def row(sid, side, ue, cycles, good=True):
 
 
 class EyeAuditComparisonTest(unittest.TestCase):
+    def test_ring_detail_detects_narrow_band(self):
+        from server.vhuman.metahuman.eye_ring_audit import ring_detail
+        flat = np.ones(49)
+        ring = flat.copy(); ring[23:26] += .2
+        np.testing.assert_allclose(ring_detail(flat), 0., atol=1e-12)
+        self.assertGreater(float(ring_detail(ring)[24]), .1)
+
+    def test_ring_selection_requires_a_finite_improvement(self):
+        from server.vhuman.metahuman.eye_ring_select import select, select_errors
+        self.assertEqual(select_errors(.2, .1), 'neutral')
+        self.assertEqual(select_errors(.1, .1), 'baseline')
+        self.assertEqual(select_errors(.1, float('nan')), 'baseline')
+        with self.assertRaises(ValueError):
+            select('sample', '.', side='center')
+
     def test_matches_eyes_and_uses_circular_hue(self):
         baseline = dict(rows=[row('a', 'left', [359, .8, .4], [1, .4, .4]),
                               row('b', 'left', [10, .8, .4], [10, .8, .4])])

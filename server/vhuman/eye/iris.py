@@ -45,6 +45,46 @@ PUPIL_MASKS = (0.5, 0.0, 1.0, 1.0)                  # masks inside the texture p
 REC709 = np.array([0.2126, 0.7152, 0.0722])
 
 
+def angular_contrast(luminance: np.ndarray, normalized_radius: np.ndarray, sector: np.ndarray) -> float | None:
+    """Robust relative angular contrast after removing the median of radial bands."""
+    luminance = np.asarray(luminance, np.float64)
+    normalized_radius = np.asarray(normalized_radius, np.float64)
+    sector = np.asarray(sector, bool)
+    if luminance.shape != normalized_radius.shape or sector.shape != luminance.shape:
+        raise ValueError('iris contrast inputs must have matching shapes')
+    residuals = []
+    for lo in np.linspace(.45, .8, 8):
+        mask = sector & (normalized_radius >= lo) & (normalized_radius < lo + .05) & (luminance > .005)
+        if mask.sum() > 15:
+            v = luminance[mask]; median = np.median(v)
+            residuals.append((v - median) / (median + .01))
+    return float(np.median(np.abs(np.concatenate(residuals)))) if residuals else None
+
+
+def chromatic_fiber_signal(rgb: np.ndarray, normalized_radius: np.ndarray, sector: np.ndarray,
+                           inner: np.ndarray, outer: np.ndarray) -> float | None:
+    """Median angular chroma deviation, with radial bands removed."""
+    rgb = np.asarray(rgb, np.float64)
+    radius = np.asarray(normalized_radius, np.float64)
+    sector = np.asarray(sector, bool)
+    if rgb.shape != radius.shape + (3,) or sector.shape != radius.shape:
+        raise ValueError('iris chroma inputs must have matching shapes')
+    lum = rgb @ REC709
+    a, b = np.asarray(inner, np.float64), np.asarray(outer, np.float64)
+    direction = a / max(float(a @ REC709), .01) - b / max(float(b @ REC709), .01)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return None
+    projected = (rgb / np.maximum(lum[..., None], .01)) @ (direction / norm)
+    residuals = []
+    for lo in np.arange(.45, .8, .05):
+        mask = sector & (radius >= lo) & (radius < lo + .05) & (lum > .01)
+        if mask.sum() > 15:
+            v = projected[mask]
+            residuals.append(v - np.median(v))
+    return float(np.median(np.abs(np.concatenate(residuals)))) if residuals else None
+
+
 @dataclass
 class IrisTextures:
     res: int
@@ -404,3 +444,27 @@ def bake_color(tex: IrisTextures, p: dict, res: int | None = None, sclera_fn=Non
     limbus_t = optics.CORNEA_SIZE_REF / p["cornea"]["size"]
     angle = noise.smoothstep(limbus_t, limbus_t + 0.03, t)[..., None]
     return (col + (ANGLE_COLOR - col) * angle).astype(np.float32)
+
+
+def bake_normal(tex: IrisTextures, p: dict, res: int | None = None) -> np.ndarray:
+    """Bake the iris normal through the same pupil warp and rotation as its colour.
+
+    Normals use tangent coordinates with +Y up. Outside the iris and inside the
+    pupil opening the disk has no iris detail, so fade smoothly to a flat normal.
+    """
+    p = P.validate(p)
+    res = res or tex.res
+    c = (np.arange(res, dtype=np.float64) + 0.5) / res - 0.5
+    x, y = c[None, :] / optics.IRIS_TEX_SCALE, -c[:, None] / optics.IRIS_TEX_SCALE
+    t = np.hypot(x, y)
+    theta = 2 * math.pi * p['iris']['rotation']
+    phi = np.arctan2(y, x) - theta
+    radius = np.minimum(optics.pupil_scale(t, P.pupil_scale(p)), 1.)
+    n = sample_masks(tex.normal, radius, phi).astype(np.float64)
+    nx, ny = n[..., 0].copy(), n[..., 1].copy()
+    n[..., 0] = nx * math.cos(theta) - ny * math.sin(theta)
+    n[..., 1] = nx * math.sin(theta) + ny * math.cos(theta)
+    edge = .005 + .04 * p['pupil']['feather']
+    w = noise.smoothstep(P.P_REF - edge, P.P_REF + edge, radius) * (1 - noise.smoothstep(.98, 1.03, t))
+    n = n * w[..., None] + np.array([0., 0., 1.]) * (1 - w[..., None])
+    return optics.normalize(n).astype(np.float32)

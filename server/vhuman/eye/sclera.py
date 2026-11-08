@@ -31,7 +31,8 @@ class ScleraTextures:
 
 
 def _grow(g, res2: int, r_stop: float, count: int, width_px: tuple, step: float, branch_p: float,
-          exposed_bias: float, start_r=START_R, reach=(0.55, 1.05)):
+          exposed_bias: float, start_r=START_R, reach=(0.55, 1.05), *, inward_pull=.07, turn_noise=.16,
+          initial_turn=.35, max_steps=600, width_decay=.988, opacity_range=(.55, 1.), heading_pull=0.):
     """Branching random walks inward. Returns branches as
     (points (n, 2) in UV-centred coordinates, widths (n-1,), opacity,
     progress (n,)); progress is 0 beyond PROGRESS_OUTER and 1 at the limbus."""
@@ -43,22 +44,25 @@ def _grow(g, res2: int, r_stop: float, count: int, width_px: tuple, step: float,
         else:
             phi = g.uniform(0, 2 * math.pi)
         r0 = g.uniform(*start_r)
-        stack = [(r0 * math.cos(phi), r0 * math.sin(phi), phi + math.pi + g.normal(0, 0.35),
-                  g.uniform(*width_px), g.uniform(0.55, 1.0), 0.0, g.uniform(*reach))]
+        stack = [(r0 * math.cos(phi), r0 * math.sin(phi), phi + math.pi + g.normal(0, initial_turn),
+                  g.uniform(*width_px), g.uniform(*opacity_range), 0.0, g.uniform(*reach))]
         while stack:
             x, y, heading, width, opacity, progress, limit = stack.pop()
+            initial_heading = heading
             pts, widths, prog = [(x, y)], [], [progress]
-            for _ in range(600):
+            for _ in range(max_steps):
                 r = math.hypot(x, y)
                 if r < r_stop or progress > limit or width < 0.25:
                     break
                 inward = math.atan2(-y, -x)
                 d = (inward - heading + math.pi) % (2 * math.pi) - math.pi
-                heading += 0.07 * d + g.normal(0, 0.16)
+                if heading_pull:
+                    heading += heading_pull * ((initial_heading - heading + math.pi) % (2 * math.pi) - math.pi)
+                heading += inward_pull * d + g.normal(0, turn_noise)
                 x, y = x + step * math.cos(heading), y + step * math.sin(heading)
                 progress = min(1.0, max(0.0, (PROGRESS_OUTER - math.hypot(x, y)) / span))
                 pts.append((x, y)); widths.append(width); prog.append(progress)
-                width *= 0.988
+                width *= width_decay
                 if g.random() < branch_p:
                     side = 1 if g.random() < 0.5 else -1
                     stack.append((x, y, heading + side * g.uniform(0.35, 1.0), width * g.uniform(0.55, 0.8),
@@ -69,6 +73,43 @@ def _grow(g, res2: int, r_stop: float, count: int, width_px: tuple, step: float,
 
 
 CHUNK = 6       # segments per polyline call: widths change slowly along a vessel
+
+
+def _stop_at_crossings(branches, res: int, *, join_segments: int = 3, inter_branch: bool = True,
+                       self_crossing: bool = False):
+    """Trim later vessel paths when they reach an already drawn path.
+
+    A short initial overlap lets a child emerge from its parent. The raster is
+    only used for collision detection; rendering keeps the original polylines.
+    """
+    if join_segments < 1:
+        raise ValueError('join_segments must be positive')
+    occupied = np.zeros((res, res), bool)
+    own = np.zeros((res, res), np.int32) if self_crossing else None
+    output = []
+    for epoch, (points, widths, opacity, progress) in enumerate(branches, start=1):
+        xy = np.stack(((.5 + points[:, 0]) * res, (.5 - points[:, 1]) * res), axis=-1)
+        samples = []
+        kept = 0
+        for i, (start, end) in enumerate(zip(xy[:-1], xy[1:])):
+            steps = max(1, int(np.ceil(np.max(np.abs(end - start)) * 2.)))
+            pixel = np.floor(start + np.linspace(0., 1., steps + 1)[:, None] * (end - start)).astype(np.int32)
+            valid = (pixel[:, 0] >= 0) & (pixel[:, 0] < res) & (pixel[:, 1] >= 0) & (pixel[:, 1] < res)
+            pixel = pixel[valid]
+            if i >= join_segments:
+                if own is not None:
+                    old = samples[i - join_segments]
+                    own[old[:, 1], old[:, 0]] = epoch
+                if len(pixel) and ((inter_branch and occupied[pixel[:, 1], pixel[:, 0]].any()) or
+                                   (own is not None and (own[pixel[:, 1], pixel[:, 0]] == epoch).any())):
+                    break
+            samples.append(pixel); kept += 1
+        if kept:
+            output.append((points[:kept + 1], widths[:kept], opacity, progress[:kept + 1]))
+            if inter_branch and samples:
+                pixels = np.concatenate(samples)
+                occupied[pixels[:, 1], pixels[:, 0]] = True
+    return output
 
 
 def _chunks(branches, res2: int) -> list:
@@ -154,6 +195,75 @@ def build(p: dict, res: int = 1024) -> ScleraTextures:
     while len(_CACHE) > 16:
         _CACHE.popitem(last=False)
     return tex
+
+
+def isotropic_vessels(p: dict, res: int = 512, *, curvy: bool = False) -> np.ndarray:
+    """A deterministic whole-globe vessel overlay for exposed-eye diagnostics.
+
+    Unlike the eyelid-biased atlas in build(), this distributes branching vessels
+    in all directions around the iris. Returned values are a linear opacity mask.
+    """
+    p = P.validate(p)
+    seed = p['structure']['seed'] * 104729 + (0 if p['optics']['side'] == 'left' else 1)
+    g = noise.rng(seed, 0x5C2)
+    res2 = res * 2
+    scale = res2 / 2048.0
+    step = 3.0 / res2 + .0015
+    stop = optics.CORNEA_SIZE_REF + .004
+    walk = dict(inward_pull=.06, turn_noise=.20) if curvy else {}
+    veins = _grow(g, res2, stop, 50, (1.6 * scale * 2, 4.2 * scale * 2), step, .045, 0., **walk)
+    fine = _grow(g, res2, stop, 150, (.5 * scale * 2, 1.4 * scale * 2), step, .03, 0.,
+                 start_r=(.26, .46), reach=(.3, .9), **walk)
+    return np.clip(_down(_draw(_chunks(veins + fine, res2), res2, value='opacity'), res), 0., 1.)
+
+
+def irregular_vessels(p: dict, res: int = 512, *, dense: bool = False, mottling: bool = True,
+                      density: float | None = None, organic: bool = False, organic_dense: bool = False,
+                      guided: bool = False, avoid_crossings: bool = False, avoid_self: bool = False) -> np.ndarray:
+    """Experimental multiscale, less radial vascular network, linear opacity."""
+    p = P.validate(p)
+    seed = p['structure']['seed'] * 104729 + (0 if p['optics']['side'] == 'left' else 1)
+    g = noise.rng(seed, 0x5C3)
+    res2 = res * 2
+    scale = res2 / 2048.
+    step = 3. / res2 + .0015
+    stop = optics.CORNEA_SIZE_REF + .004
+    if organic_dense and not organic:
+        raise ValueError('organic_dense requires organic vessels')
+    if guided and not organic:
+        raise ValueError('guided vessels require organic vessels')
+    if avoid_crossings and not guided:
+        raise ValueError('crossing avoidance requires guided vessels')
+    if avoid_self and not guided:
+        raise ValueError('self-crossing avoidance requires guided vessels')
+    walk = (dict(inward_pull=.01, turn_noise=.32, initial_turn=1.15, max_steps=100, width_decay=.975,
+                 opacity_range=(.35, .75) if organic_dense else (.55, 1.), heading_pull=.05 if guided else 0.)
+            if organic else dict(inward_pull=.015, turn_noise=.23, initial_turn=1.15))
+    if density is not None and not 0. <= density <= 1.:
+        raise ValueError('vessel density must be between 0 and 1')
+    n_large = round(12 + 78 * density) if density is not None else (90 if dense else 30)
+    n_small = round(25 + 215 * density) if density is not None else (240 if dense else 80)
+    if organic_dense:
+        n_large = round(n_large * 1.3); n_small = round(n_small * 1.8)
+    large_width = (2. * scale * 2, 5. * scale * 2) if organic else (3. * scale * 2, 7. * scale * 2)
+    large = _grow(g, res2, stop, n_large, large_width, step, .07 if organic else .055, 0.,
+                  start_r=(.28, .53), reach=(.35, 1.2), **walk)
+    small = _grow(g, res2, stop, n_small, (1. * scale * 2, 2.5 * scale * 2), step, .055, 0.,
+                  start_r=(.25, .50), reach=(.3, 1.), **walk)
+    branches = large + small
+    if avoid_crossings or avoid_self:
+        branches = _stop_at_crossings(branches, res2, inter_branch=avoid_crossings, self_crossing=avoid_self)
+    chunks = _chunks(branches, res2)
+    sharp = _down(_draw(chunks, res2, value='opacity'), res)
+    diffuse = _down(_draw(chunks, res2, value='opacity', blur=3. * scale * 2), res)
+    result = .75 * sharp + .32 * diffuse
+    if dense and mottling:
+        field = noise.spectral((res // 2, res // 2), seed, beta=2.5, kmin=4, salt=0x5C4)
+        field = np.asarray(Image.fromarray(field).resize((res, res), Image.BICUBIC), np.float32)
+        c = (np.arange(res, dtype=np.float32) + .5) / res - .5
+        fade = noise.smoothstep(stop + .01, stop + .08, np.hypot(c[:, None], c[None, :]))
+        result += .10 * np.clip(.5 + .25 * field, 0., 1.) * fade
+    return np.clip(result, 0., 1.)
 
 
 def sample(masks: np.ndarray, uv) -> np.ndarray:

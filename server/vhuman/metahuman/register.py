@@ -22,9 +22,9 @@ from scipy.spatial import cKDTree
 
 from . import MH_PLUGIN, MODELS_ROOT
 from . import template as mh_template
+from ..face_assets import asset_path
 
 ROOT = Path(__file__).resolve().parents[3]
-GNM_PATH = ROOT / 'tmp/vhuman-rig/models/gnm-v3/gnm_head.npz'
 GNM_LM68 = ROOT / 'server/vhuman/reconstruction/data/gnm_landmarks68.txt'
 FACE_LANDMARKS = MH_PLUGIN / 'Content/Face/IdentityTemplate/face_landmarks.json'
 OUT_DIR = MODELS_ROOT / 'binding_v1'
@@ -125,7 +125,7 @@ def graph_laplacian(n, f):
 
 # ---------------------------------------------------------------- data
 def load_gnm():
-    z = np.load(GNM_PATH, allow_pickle=True)
+    z = np.load(asset_path('gnm'), allow_pickle=True)
     names = [str(n) for n in z['vertex_group_names']]
     groups = {n: z['vertex_groups'][i] > .5 for i, n in enumerate(names)}
     skin = groups['skin']

@@ -1,5 +1,213 @@
 # MetaHuman-derived priors for vhuman / GNM
 
+Current rendering default: **`peri_profile5`**. Full-quality rendering includes
+native-preserving skin diffusion, regional normals and a localized optical layer
+crossing the eye/skin contact. See [the eye-side contact default](#eye-side-contact-default-2026-11-08)
+for validation and opt-outs. Earlier dated defaults below are historical.
+
+The experimental `material_overrides: {"eye_contact_thin_aperture": 1}`
+helps retain eye-side contact coverage when a nearly closed aperture becomes
+fragmented by antialiasing. It groups nearby samples and fades the fallback
+for weak, round, thick or depth-inconsistent components and tiny requested
+contact widths. It requires the skin profile and eye-contact blur, and is off
+by default: grouping can join unrelated nearby eye
+samples, and the treatment can change opaque eye pixels in a thin aperture.
+In two authored eight-pose blink sequences it reduced the excess band change
+above the change in eye coverage; those poses are geometric proposals with
+unvalidated optical contact, not captured natural blinks (`boundary146`,
+`boundary147`). At 128 samples, one selected transition reduced maximum excess
+from .367 to zero; the other already had only .008 excess and also fell to
+zero (`boundary148`). The second identity was held out from tuning the
+component confidence.
+The public portrait and posed layered-eye HIP renders passed saved-image
+recomposition, preserved alpha and pixels outside the eye, and matched an
+omitted option to explicit zero. The open-eye portrait was unchanged; the
+posed eye changed 110 pixels (`boundary149`, `boundary150`, peak whole-device
+usage 10170 and 10727 MiB).
+
+The separate experimental `material_overrides: {"eye_contact_skin_coverage": 1}`
+uses nearby fractional eye coverage to make the skin-side contact band vary
+more continuously as an edge moves. It requires a positive skin-side contact
+strength and is off by default. A depth-aware local confidence rejects isolated
+fractional samples, and an 8-10 mm depth fade limits cross-surface gathering. The
+gather fades back to the original band between projected widths of 31 and 32 pixels
+and when estimated coverage or gather work becomes large, so very wide or expensive
+close-up bands retain the original behavior. On two
+authored blink sequences the maximum excess band change above the eye-coverage
+change fell for every tested transition; selected 128-sample repeats also
+improved (`boundary151`). Still-image comparisons were mixed and the authored
+blinks are not captured motion (`boundary152`, `boundary153`), so this remains
+an experiment. In 20 synthetic moving-edge cases across five angles and four
+widths, peak excess fell in every case, while total excess rose in two
+(`boundary167`). In a synthetic depth-crossing test the fade reduced the
+largest band step from .618 to .012 (`boundary161`). It can be combined with
+`eye_contact_thin_aperture`.
+For MetaHuman comparisons, `peri_profile5_temporal` selects profile5 with both
+options enabled; the normal default remains `peri_profile5`. Its named
+layered-eye HIP render passed saved-image, alpha and support checks
+(`boundary170`, peak 11174 MiB).
+On this CPU, an upscaled portrait-mask benchmark took about .015, .062 and
+.35 seconds at 512, 1024 and 2048 pixels, respectively; peak process RSS in
+the 2048 run was about 433 MiB (`boundary151/bench_final.json`). Cost depends
+on the eye-region size and projected width; a 1024-pixel eye close-up with a
+roughly 19-pixel band took about .62 seconds in the prototype.
+Combined public-portrait and posed layered-eye HIP renders reproduced their
+saved images exactly, preserved alpha and left pixels outside each treatment's
+support unchanged (`boundary163`, `boundary164`; peak whole-device usage
+10170 and 10723 MiB). Explicit zero matched omission for both options.
+An angled HIP view with an actual depth discontinuity also passed those
+checks (`boundary171`, peak 10737 MiB). In the depth-confidence ablation,
+nine pixels changed by at most .00445 in scene-linear RGB (`boundary165`).
+Across the two authored blink sequences, the combined options reduced the
+mean, 99th-percentile and maximum frame-to-frame change of the isolated
+contact-only RGB correction in all 14 transitions (`boundary168`). Averaged
+99th-percentile changes fell from .00498 to .00285. This does not measure the
+stability of the underlying posed geometry or lighting. The selected
+128-sample transitions also reduced this 99th-percentile change, from
+.00381 to .00200 and .00230 to .00138 (`boundary169`).
+A third identity, not used to tune these options, showed lower mean,
+99th-percentile and maximum correction changes on all seven transitions;
+the average 99th percentile fell from .00205 to .00159 (`boundary173`, 32
+samples). Its geometric blink had to be limited to a smaller range to avoid
+inverted triangles, and is likewise not captured motion.
+For full rendered RGB over the same regions, the average mean change was
+.00838 versus .00834, while peak changes were mixed (`boundary172`). The
+contact-only result therefore does not establish a broadly smoother animation.
+On two further identities at 128 samples, the combined options produced small,
+mixed still-image changes; both eye-crop metrics worsened slightly for identity
+300 in its front and angled views (`boundary160`).
+
+An experimental option, `material_overrides: {"skin_indirect_firefly_guard": 1}`,
+captures a guided, denoised indirect-light pass and substitutes it only for
+extreme positive indirect samples before skin diffusion. It is **off by default**.
+This addresses isolated dark skin pixels caused when a noisy indirect-light
+spike is subtracted from a denoised beauty image. On three studio-lit eyes and
+one high-contrast light setup, most flagged values were closer to a 128-sample
+estimate, but a few were worse; the scene-linear threshold may also suppress
+real concentrated indirect light and is not exposure invariant. Crop similarity
+results were mixed. Treat this as a diagnostic option, not a validated general
+lighting model. Evidence: `tmp/vhuman-eye-quality/iris83` through `iris86`.
+The public GPU render path was also exercised at 512 px / 16 samples with the
+option enabled: it recorded 420 guarded opaque-skin pixels, reproduced its
+stored image exactly when recomposed, and preserved alpha. Peak whole-device
+usage was 10169 MiB (`tmp/vhuman-eye-quality/iris87`).
+Mode `skin_indirect_firefly_guard: 2` is a separate experiment that scales the
+threshold per pixel using direct illumination, so uniform light-intensity scaling
+does not change the selection. It avoids a frame-wide statistic that varies with
+camera framing. Tests at studio, dim, high-contrast and bounced-light settings
+showed fewer missed dim-light spikes than mode 1, but some selected samples still
+became less accurate against a 128-sample estimate; neither mode is a default.
+The direct-light floor becomes zero under purely indirect illumination, and
+isolated genuine caustics may still be classified as outliers. See
+`tmp/vhuman-eye-quality/iris88` through `iris91`.
+A synthetic narrow indirect highlight with a blurred guide demonstrates this
+failure explicitly: either mode can replace its true peak with the dimmer guide
+(`tmp/vhuman-eye-quality/iris93`).
+In a separate rendered glass-sphere scene, a broad refractive light pool was
+visible in the indirect pass. Both modes changed one of the 328 pixels with
+the strongest on/off signal and reduced mean error in that region against a
+1024-sample estimate (`sss169`). This is one broad light pattern, not evidence
+that the guard preserves narrow caustics in general. A second sphere/light
+configuration also produced a broad pool and changed none of its 328 strongest
+signal pixels (`sss170`); neither experiment resolves the narrow-highlight case.
+A smaller glass sphere produced a resolved 10-by-8-pixel signal region against
+a 4096-sample on/off reference. Neither guard selected any of its 56 pixels
+(`sss171`). A still smaller rendered caustic occupied a 3-by-3-pixel region.
+Against an 8192-sample reference, both guards reduced its mean intensity and
+increased error in three of four 64-sample seeds; one seed improved (`sss176`,
+`sss177`). This is direct evidence that either guard can erase real narrow
+indirect light, and reinforces keeping them off by default. Subpixel features
+remain untested.
+
+The separate experimental `skin_scatter_correction_sigma_m` override filters
+only the additive diffusion-lighting correction using a separable Gaussian
+with skin coverage, geometric-normal and depth rejection. It leaves beauty,
+albedo and specular inputs unfiltered. For comparison, `.00013` means 0.13 mm
+projected at median visible skin depth; projected sigma is capped at 8 pixels.
+The default is zero, which bypasses this filter. Tests on three 512-pixel views
+reduced low-sample error against a 128-sample estimate; two 1024-pixel
+development crops improved LPIPS while DISTS was mixed. It also suppresses
+legitimate high-frequency changes in the diffusion correction, so it remains
+experimental pending wider full-resolution and lighting validation. See
+`tmp/vhuman-eye-quality/sss108` through `sss124`.
+On this CPU, isolated filter measurements were about 0.21 s at 512 pixels,
+1.49 s at 1024, and 18.1 s at 2048 for projected sigmas of 1, 2 and 4 pixels;
+the 2048 synthetic test used about 620 MiB peak process RSS (`sss118`).
+The public portrait and layered-eye HIP paths passed with the option enabled;
+their stored results recompose exactly, preserve alpha, and match an explicit
+zero to the disabled path (`sss124`, `sss125`). On the previously examined
+005/194 identities, fresh 1024-pixel / 128-sample captures improved both
+LPIPS and DISTS with the separable filter (`sss131`). Those are resolution
+checks, not unseen-identity validation.
+In a 512-pixel 194 view, the 128-sample correction filter increased skin MAE
+against a 512-sample Blender estimate from 0.00481 to 0.00562 (`sss130`).
+At 1024 pixels it also reduced the high-frequency softening produced by the
+subsurface effect in two views (`sss132`); Unreal and Blender geometry differ,
+so those frequency comparisons are descriptive. These results argue against
+enabling the correction filter by default.
+Two further held-out identities at 512 pixels improved LPIPS with the filter,
+but DISTS improved in only one (`sss127`); this does not resolve the
+high-sample and frequency-response concerns.
+
+The optional `skin_scatter_denoise` selects guided denoising of the diffuse
+lighting used to compute the scattering correction: `1` denoises indirect
+light, and `2` denoises both direct and indirect light. The default `0` uses
+the original passes. This does not denoise the native beauty or the albedo.
+Mode 2 reduced skin error against 128- and 512-sample Blender estimates in
+two views (`sss134`, `sss135`), but 32-sample comparisons against Unreal
+regressed in some views (`iris81`), and guided denoising can erase legitimate
+small lighting features. It is experimental and cannot be combined with
+`skin_indirect_firefly_guard`.
+The public portrait HIP path with mode 2 and the layered-eye HIP path with
+mode 1 passed saved-image recomposition and alpha checks (`sss136`, `sss138`).
+
+The opt-in `skin_scatter_symmetric=1` uses fourfold-symmetric diffusion
+samples. It removes 90-degree rotational asymmetry for a point light on a flat surface
+and reduced error against a 3072-sample estimate on four skin-lighting crops,
+but its point-light error against that estimate was slightly higher and two
+Unreal image comparisons were mixed (`sss139`, `sss140`). It therefore remains
+experimental and defaults to zero; fourfold symmetry does not guarantee
+rotational invariance at other angles.
+Two additional held-out identities also had mixed perceptual results
+(`sss143`). The public portrait HIP render passed saved-image recomposition,
+disabled-path and alpha checks (`sss141`).
+
+For MetaHuman-to-GNM normal-map conversion, the experimental
+`normal_map --frame-sigma-px 1 --orbital-mask-npz <skin_detail.npz>` smooths
+the transferred mesh-normal field within the supplied orbital weights while
+retaining the source texture detail. Sigma is measured in atlas pixels (the
+studies used a 2048-pixel atlas); zero is the unchanged default. In one view
+it softened a jagged upper-lid highlight, but comparisons across identities
+and metrics were mixed (`sss157`, `sss159`, `sss160`). It is a conversion
+option for the MetaHuman comparison workflow, not a general reconstruction
+default, and it may alter valid shape-dependent shading.
+The Gaussian is validity-weighted but does not identify UV islands, so use a
+matching mask and inspect atlas boundaries before applying it to other layouts.
+At 1024 pixels and 128 samples, the softened highlight remained visible;
+LPIPS worsened in both tested views and DISTS improved in one (`sss162`).
+Two additional full-resolution native views changed little visually; LPIPS
+increased slightly in both and DISTS improved in one (`sss164`).
+In a further paired 512-pixel, 128-sample front/yaw comparison on identities
+145 and 256, eye-crop LPIPS decreased in all four views, while DISTS decreased
+in three and increased in the other (`sss180`). The changes were visually
+subtle, and these identities helped select the smoothing amount, so they are
+not an independent identity holdout. The staged normal texture hashes and
+rendered alpha were verified for every pair.
+
+The eye-contact band also follows fractional eye coverage immediately beside
+the opaque aperture. This reduces the cutoff at 50% coverage without applying
+the treatment to isolated fractional samples elsewhere. Interior distance is
+also interpolated through fractional coverage; in a synthetic subpixel-motion
+check the maximum step in contact weight fell from 0.453 to 0.010
+(`boundary112`). Ten cached views
+showed small, mixed perceptual changes; the full-resolution crop averages
+changed LPIPS from 0.19164 to 0.19149 and DISTS from 0.15541 to 0.15539,
+while boundary MAE changed from 23.255 to 23.282 (`boundary115`). Alpha and
+pixels outside the newly treated partial-coverage band are preserved.
+The public portrait and layered-eye HIP renders recomposed exactly and
+preserved alpha and all nonfractional eye pixels (`boundary116`, `boundary117`).
+
+
 Statistics learned from MetaHuman Creator characters generated locally (UE 5.8.4, Linux, headless) feed vhuman's
 reconstruction: a GNM-UV skin albedo/cavity prior, a dense-ear shape/colour prior, eye parameter presets and a GNM
 identity prior. Plan: `~/.claude/plans/unreal-engine-eula-now-velvety-giraffe.md`.
@@ -518,3 +726,1076 @@ Raw meshes/textures stay under the dataset root; artifacts carry `report.json` p
     change has been applied. Do not propose the landmark photo offset or iris emission
     based on the mixed photo results. Do not propose the non-emissive iris alternative as a general default: its
     held-out eye-region and photo results are mixed despite iris-colour gains in some samples.
+
+
+### Isolated eyeball shading experiments
+
+`ue_scripts/eye_isolate.py` captures only the MetaHuman eye material sections with the existing VHStudio lighting and
+eye cameras zoomed 2.5x, including a separate base-colour pass. Results are written under
+`eye_isolate_eyeball/<identity>` on the Windows worker; re-running an identity overwrites its earlier captures. Set
+`include_eye_occlusion` in the batch only to inspect the separate translucent eyelid-occlusion shell. The first
+`eye_isolate_ue02/03` references included this shell and are not clean eyeball-only references.
+
+The Windows Cycles comparison runner accepts `iso_base`, `iso_vessel1`, `iso_vessel2`, `iso_sss03`, `iso_sss06`,
+`iso_vessel1_sss03`, `iso_ue_n05`, `iso_ue_n1`, `iso_ue_n1_gain15`, `iso_unified`, `iso_unified_sss03`,
+`iso_unified_rect`, `iso_unified_rect_sss03`, `iso_tissue*`, `iso_iris3*` and `iso_sclera_*`. These hide the face and other accessories, use the same 2.5x camera zoom, and independently test
+procedural sclera vessel strength and random-walk sclera subsurface weight. A separate unrotated vessel mask keeps
+the vessel distribution laterally anchored even when the authored sclera atlas is rotated. Both controls are opt-in;
+existing renders retain their authored material. These isolated comparisons are visual diagnostics: eye geometry,
+exposure and lighting are not fully matched, so pixel differences are not a measure of shader quality alone.
+
+The Unreal source `Engine/Shaders/Private/ShadingModels.ush` EyeBxDF uses a separate iris normal and a light-dependent
+caustic factor, followed by subsurface-profile scattering. The measured preset has iris normal strength 1, cornea
+roughness .075 and IOR 1.41; `r.Substrate=0` in the captured material dump. The translucent eyeshell is instead the
+separate unlit eyelid-occlusion material. The `iso_ue_n*` variants connect the generated iris normal, with the same
+pupil warp and rotation as its albedo. The `iso_unified*` variants test a single-surface principled approximation,
+not a literal implementation of UE's eye BxDF. The `_rect` variants use square area lights of the same area as the
+normal disk lamps, because the reference rig uses UE RectLights.
+
+A first fast 512 px / 32 sample sweep used both eyes of `mh_000020` and `mh_000038`. The procedural overlay makes
+vessels visible on the former, but adds too much redness on the latter, which already has vessels in its baked sclera.
+The tested .3/.6 subsurface weights produce only subtle visual differences. UE retains a softer limbus, more detailed
+iris and different reflections; the reference preview and Cycles preview also use different display pipelines. This
+does not establish a UE-quality match or justify a shared default. Side-by-side sheets are under
+`tmp/vhuman-mh/eye_isolate/`, and individual Cycles results are under `compare_v1/<identity>/cycles_iso_*__fast/`.
+
+The cleaned reference exposed a missing peripheral tissue gradient in the generated sclera. A seeded, low-frequency
+procedural factor adds a vascularity-dependent red tint outside the limbus; `iso_tissue_base` and `iso_tissue1` test it
+on the base-color and lit eye respectively. `eye_tissue_audit.py` compares median linear RGB in two outer sclera annuli
+normalized by the fitted eyeball silhouette; it is not a registered image metric and geometry, coverage and lighting
+still differ. On the six left eyes used to develop the factor it improved 3/6, mean .0754 -> .0553. Four additional left
+eyes improved 2/4, .0531 -> .0316; ten right eyes improved 5/10, .0665 -> .0464. The earlier fixed-screen-annulus
+figures (6/6, 4/4, 8/10) were sensitive to differences in eye size and should not be used. Reports are in
+`tmp/vhuman-mh/eye_isolate/`. The mixed result does not justify a universal material default.
+The MetaHuman eye source allows vascularity intensity up to 2 and limbus softness up to .15; diagnostic mapping
+version 3 retains those ranges and samples iris colours only in the horizontal sectors to reduce eyelid contamination.
+Version 4 also anchors the iris measurement radius to camera geometry, rather than assuming the largest color gradient
+is the iris edge. The established version 2 mapping and default render selection remain unchanged. The bounded iris
+calibration matches the baked texture's inner median to the UE-derived measurement; it is a per-character reference fit,
+not an independent prediction. On a separately captured zoomed view, the silhouette-normalized approximate inner-iris
+linear-RGB error fell from .0167 to .0074 on 10/10 eyes with version 3; version 4 changed it to .0080 (3/10 improved).
+The earlier fixed-screen-radius estimates (.0153 -> .0055 -> .0033) are affected by framing differences and should not
+be used to choose a general mapping. `eye_iris_audit.py` documents that metric's remaining registration limitations.
+The separate square-light
+orientation experiment aligns the emitter's vertical axis with vhuman +Y / UE +Z; the source baseline uses Blender's
+default +Z up. A stronger procedural sclera normal makes the wet reflection irregular, but needs further validation.
+
+The measured v4 sclera already incorporates some of UE's transmission tint; applying the full authored tint again can
+darken the limbus twice. On six eyes, compensating half of that tint improved 4/6 in two silhouette-normalized
+near-limbus annuli, mean linear RGB error .0378 -> .0302; full compensation was less consistent (.0355). A separate
+bounded fit of tissue strength to each left-eye UE reference, evaluated with actual right-eye base-color renders,
+improved 8/10, mean .0670 -> .0324 (one tie, one slight regression). This uses per-character UE measurements and is not
+a reference-free or independent-character result. `eye_tissue_audit.py --fit-out` writes the diagnostic strength table.
+
+`eye_zoom_fit.py` optionally computes per-eye diagnostic focal lengths from UE and Cycles silhouette radii. The
+`iso_iris4_framed*` variants use these per-reference fits and fitted tissue strengths from `tissue_strengths.json`;
+they are reference-driven comparison aids, not a portrait camera or material default.
+
+The initial UV-space sclera microtexture improved a contrast statistic but produced obvious radial streaks and is
+rejected. A seeded spherical-field version at strength .05 improved the difference-of-Gaussians sclera contrast on
+4/4 eyes (.00550 -> .00288); the stronger .1 version looked over-patterned. This narrow statistic does not measure
+whether the texture looks anatomical. The `iso_iris4_split*` shader approximates UE's separate iris-diffuse and
+surface-specular normals using Cycles nodes, without reproducing UE's per-light caustic. In four highlight-excluded
+inner-iris samples, split normals reduced the error on three eyes; the palest eye changed .138 -> .088 in linear RGB.
+The experimental independent-eye material uses each eye's own UE input and fitted iris measurements and has been
+smoke-tested on one asymmetric character; it is not yet a general-quality conclusion.
+
+An outer-iris gain applied after mixing sclera (`iso_iris4_radial*`) improved 4/6 outer-annulus samples against the
+same transmission-compensated baseline (.0176 -> .0090), but introduced a bright limbal halo on a light iris outside
+that subset. It is rejected. The ten-eye comparison against an uncompensated baseline improved 7/10 but worsened mean
+error .0167 -> .0224; it also confounds the effect of transmission compensation. `iso_iris4_layered*`
+instead applies bounded iris gains before the iris/sclera mix; it is a separate experiment to avoid scaling sclera.
+In six controlled eyes, this layered variant improved outer-annulus error on 4/6 (.0176 -> .0081) and removed the
+visible halo on the inspected light iris. A combined reference-fitted comparison rendered both eyes of six characters
+and reloaded each scene to validate its separate-eye textures and iris-normal attributes. Comparison sheets are under
+`tmp/vhuman-mh/eye_isolate/combined_left.jpg` and `combined_right.jpg`.
+
+The `iso_iris4_curvy*` experiments use a more curved procedural vascular network. The four-character renders show
+additional branching, but the vessels remain too thin and radial compared with UE's irregular, mottled sclera; this
+is not yet a visual match. `iso_iris4_contrast*` additionally tests a bounded per-eye angular smoothing estimated from
+the UE base-color reference. It is reference-driven and must be evaluated on separate renders before drawing a
+quality conclusion. Four left-eye base-color/lit comparisons completed; on the inspected blue/gold eye the adaptive
+version restores some radial detail but still misses the reference's distinct blue and gold structure. See
+`tmp/vhuman-mh/eye_isolate/contrast_100.jpg`.
+
+UE's material dump identifies a dedicated sclera base-color texture and distinct irritation controls. The experimental
+`iso_iris4_irregular*` overlay uses less inward-biased, multiscale procedural branches. Against `iso_iris4_layeredbase`,
+four isolated eyes improved the medium-frequency contrast error .00551 -> .00408, but the inspected lit image still
+shows predominantly radial vessels from the existing baked sclera. This contrast statistic does not assess anatomical
+shape. `iso_iris4_clean_irregular*` separately removes those baked vessel layers before adding the new overlay.
+The clean-base experiment revealed an overly sparse network, with contrast error .00551 -> .00691 (1/4 improved)
+against the original layered base; the inspected high-vascularity eye visibly loses too much structure. It is not a
+replacement for the baked texture. See `tmp/vhuman-mh/eye_isolate/clean_irregular_038.jpg`.
+The `iso_iris4_dense_irregular*` experiment triples the number of branches, adds a soft peripheral field and increases
+overlay strength. Against the sparse clean-base version, medium-frequency contrast error improved on 4/4 eyes
+(.00691 -> .00260). The result remains too heavily veined on the zero-vascularity eye, although it looks closer on
+the highly vascular eye; see `tmp/vhuman-mh/eye_isolate/dense_020.jpg` and `dense_038.jpg`. The separate
+`iso_iris4_vascular*` experiment scales this dense overlay by the MetaHuman left-eye vascularity input; its linear
+mapping is a provisional diagnostic, not a validated general mapping.
+It reduces excessive veins on the zero-vascularity eye, but also suppresses the shared tissue field, leaving that eye
+too smooth; the four-eye contrast error rose .00260 -> .00634 versus fixed dense strength. Separate vascular and
+nonvascular tissue layers are needed. See `tmp/vhuman-mh/eye_isolate/vascular_020.jpg`.
+Adding the independent .05 spherical field (`iso_iris4_vascular_surface*`) improved that contrast error on 4/4
+(.00634 -> .00376), but the low-vascularity eye shows an overly regular cloudy pattern. The separate
+`iso_iris4_vascular_fine*` test uses a finer spherical field and removes the built-in mottling from the vessel mask;
+neither version is a validated default. See `tmp/vhuman-mh/eye_isolate/vascular_surface_020.jpg`.
+The finer field and vessel-only mask improved the same statistic 4/4 (.00376 -> .00351) and reduced the broad ripples,
+but the low-vascularity eye remains too uniformly patterned and has too few visible veins. This comparison changes both
+the field frequency and the vessel mask, so it does not isolate either effect. See
+`tmp/vhuman-mh/eye_isolate/vascular_fine_020.jpg`.
+`iso_iris4_vascular_sparse*` instead maps the left-eye vascularity input to the number of generated vessels while
+keeping individual lines visible. Compared with the faded dense network, medium-frequency contrast improved on 2/4
+eyes, mean error .00351 -> .00289. The quiet eye now has visible isolated veins, although some are too dark and
+straight; the highly vascular eye retains dense branching. See `vascular_sparse_020.jpg` and
+`vascular_sparse_038.jpg` in the same directory. This is a small reference-driven diagnostic, not a validated mapping.
+The combined `iso_iris4_sparse_split*` renders apply the earlier separate iris/surface normal approximation to this
+newer sclera. Four left eyes were rendered with and without stronger shell normal and sclera roughness. On the two
+inspected eyes the stronger normal breaks up the large wet highlight more like UE, but also distorts a secondary
+reflection and adds streaks; the split-normal effect is subtle. UE's per-light caustic is still absent. Compare
+`sparse_split_020.jpg` and `sparse_split_038.jpg` in the same directory.
+The `iso_iris4_sparse_bump*` variants replace the amplified vessel-derived normal with bump from the independent fine
+spherical tissue field. At .0001 m the secondary reflection is smoother but the main highlight stays too regular; at
+.0004 m it breaks up but produces an obvious pebbled surface. Neither is accepted as a UE match. See
+`sparse_bump_020.jpg` and `sparse_bump_038.jpg` in the same directory.
+`iso_iris4_sparse_patch*` modulates the fine bump with a broader spherical field. In the two inspected eyes the
+stronger localized version breaks up the main reflection while retaining the secondary reflection more coherently
+than uniform .0004 m bump, but some pebbled patches remain. It is a visual diagnostic, not a validated UE normal
+texture. See `sparse_patch_020.jpg` and `sparse_patch_038.jpg` in the same directory.
+The reference-driven angular-contrast fit was also combined with the clean sclera and localized wet highlight as
+`iso_iris4_sparse_adapt*`. On the inspected blue/gold eye it restores some radial detail but does not recover the
+reference's distinct colors. Four base-color inner-iris median RGB errors changed .0045 -> .0046 (2/4 improved); that
+metric does not measure detail and the same character's UE data are used to fit the texture. See
+`sparse_adapt_100.jpg` in the same directory.
+The opt-in `iso_iris4_sparse_bands*` experiment adds three reference-derived radial RGB targets, with bounded gains
+applied to the iris before sclera compositing. In four eyes the inner-annulus median error changed .0046 -> .0025
+(2/4 improved) and outer error .0077 -> .0053 (3/4 improved). These are the same characters used for the fit, and
+the statistics do not assess fiber shape. The blue/gold eye still lacks the reference's distinct fibers; the inspected
+light eye shows no new bright scleral halo, but still differs substantially. See `sparse_bands_100.jpg` and
+`sparse_bands_300.jpg` in the same directory.
+The procedural radial mask favors the secondary chart color near the pupil, whereas the current MetaHuman mapping
+places the measured inner color in the primary slot. `iso_iris4_sparse_swap*` tests swapping the slots before bounded
+band calibration. On four eyes, inner error changed .0025 -> .0026 (2/4 improved) and outer .0053 -> .0052 (1/4
+improved); the blue/gold fibers remain missing in the inspected image. This does not justify changing the default.
+See `sparse_swap_100.jpg` in the same directory.
+`iso_iris4_sparse_fibers*` colors the generated fiber detail using the difference between measured inner and outer
+chromaticity, without copying reference pixels. It adds visible warm fibers to the blue/gold eye, but introduces an
+artificial blue ring on the light eye. Four-eye inner median RGB error improved on 3/4 (.0025 -> .0020); that metric
+does not capture the artifact. It is reference-driven and not a generally acceptable mapping. See
+`sparse_fibers_100.jpg` and `sparse_fibers_300.jpg` in the same directory.
+`iso_iris4_sparse_fibers_fit*` estimates median angular chroma variation after subtracting narrow radial-band medians,
+then maps it through a provisional bounded strength curve. On the four development eyes it retains full fiber strength
+for 100 and suppresses it for 300, removing the visible blue ring; inner median RGB error changes .0025 -> .0024
+(2/4 improved). The curve was chosen from these same examples, and each eye uses its UE reference; neither the curve nor
+the generality is validated on held-out identities. See `fibers_fit_100.jpg` and `fibers_fit_300.jpg`.
+In four additional identities (145, 178, 194, 256), the measured signal falls below the provisional threshold and
+selects zero added fiber color. These eyes can check for unwanted changes but cannot validate the active portion of
+the curve; identity 358 has a nonzero signal and is a more informative follow-up.
+The 358 comparison selected strength .123 and looked nearly unchanged; its inner median RGB error rounded to .0025
+for both variants (the fitted value was slightly worse). Both show an iris ring missing from UE. One nonzero held-out
+eye is insufficient to validate the curve; see `fibers_fit_holdout_358.jpg`.
+For 358, the bright ring is already present in the base-color pass and aligns with the mapped procedural limbal ring.
+`iso_iris4_ring_soft*` broadens its transition and `iso_iris4_ring_none*` neutralizes the limbal tint, each recalibrating
+the same iris bands. On that eye, a local base-color luminance bump at normalized sphere radius .27 relative to .23
+and .31 is .00318 in UE, .02005 in the baseline, .01491 with softening and .00964 with neutralization. The neutral
+variant visibly reduces the ring; the inspected blue/gold eye changes less. This is a local diagnostic on three eyes,
+not grounds for a default change. See `ring_358.jpg` and `ring_100.jpg`.
+Six additional eyes were rendered and compared with their existing baselines using `eye_ring_audit.py`, which removes
+a broad trend from silhouette-normalized horizontal base-color profiles. Across nine eyes, neutralization improved
+the diagnostic on 6/9, mean error .02614 -> .01998, and worsened it on three. The result is reference-driven and the
+metric is sensitive to registration and iris size; it is not a perceptual score. See `ring_audit_expanded.json`,
+`ring_194.jpg` (improved diagnostic) and `ring_178.jpg` (worsened diagnostic) in the same directory.
+`eye_ring_select.py` compares each unzoomed UE base-color radial profile with the two staged iris textures and writes
+an opt-in `iso_iris4_ring_select*` choice table. On these nine eyes it agrees with the separate isolated-eye radial
+diagnostic on 8/9; selecting from the already-rendered candidates changes mean radial error .02614 -> .01925.
+Actual base-color and lit selector renders for 178 (baseline) and 194 (neutral) were pixel-identical to the chosen
+variants. This is not independent-character validation: each texture and choice use that eye's UE reference, and the
+unzoomed and isolated views are related. It does not establish full visual quality or justify changing the default.
+The opt-in `iso_iris4_bilateral*` path now builds the clean iris and vascular textures independently for each side,
+and selects the right limbal-ring treatment from the right UE reference instead of reusing the left selection. Its
+right split-normal mask uses right-eye cornea parameters; Blender reload validation checks this mask and the packed
+materials. Two characters were rendered in both eyes (base color and lit), and all eight views passed. Their left and
+right cornea sizes happened to be equal, so this does not test unequal-size inputs. The visual comparison to the
+earlier `side_layered` variant also changes framing and material details; it cannot isolate the bilateral change.
+The sclera remains too pebbled. See `bilateral_100_left.jpg` and `bilateral_100_right.jpg` in the same directory.
+The right sclera roughness transition now shifts with the right iris size as well as the split-normal mask. The
+synthetic `iso_iris4_bilateral_asymprobe` increases only the right texture-space cornea size from .20485 to .22485;
+its Windows Blender render and scene-reload checks passed for packed materials, the iris mask and the roughness
+transition. This is a controlled implementation check, not an Unreal visual comparison of an unequal-size character.
+`iso_iris4_bilateral_smooth` and `iso_iris4_bilateral_bump15` hold the bilateral textures and ring choices fixed while
+removing the localized bump or reducing its distance from .0004 to .00015 m. In two inspected eyes the gentler surface
+reduces pebbled sclera but makes the main wet reflection smoother than UE; at this resolution the smooth and gentle
+versions are similar. Eight views across two characters and both sides completed with scene validation. See
+`bilateral_surface_100_right.jpg` and `bilateral_surface_020_left.jpg` in the same directory.
+`iso_iris4_bilateral_framed` applies the earlier per-eye silhouette-fitted zoom to the gentler bilateral material.
+Across both eyes of two characters, mean normalized-frame radius error changed .02759 -> .00115 (4/4 improved).
+The zoom is fitted from related UE/Cycles references, so this is a diagnostic registration aid rather than a
+reference-free camera result. It does not address the remaining iris, sclera and reflection differences. See
+`bilateral_framed_020_left.jpg`, `bilateral_framed_100_right.jpg`, and `bilateral_framing_audit.json`.
+Both eyes of 020 were also rendered with the full 1024 px / 128-sample profile and passed the packed-material and
+split-normal reload checks. The eye textures remain 512 px. Shared-display comparison sheets are
+`bilateral_full_020_left.jpg` and `bilateral_full_020_right.jpg`; UE/Cycles lighting and scene-linear units are not
+fully calibrated. The full renders still show sclera color, vessel shape, iris detail and highlight mismatches.
+`iso_iris4_bilateral_framed_tissue*` applies the earlier left-eye reference-fitted tissue strength to the current
+bilateral material. For 020, outer base-color linear RGB error changed .0775 -> .0306 on the fitted left eye and
+.0763 -> .0297 on the right eye; the latter is a cross-eye check within the same character. Both lit eyes were also
+rendered at 1024 px / 128 samples and passed scene reload validation. The sclera is less pink but still too uniform,
+and vessels and reflections remain mismatched. This is reference-driven and not yet a general result. See
+`bilateral_tissue_full_020_left.jpg`, `bilateral_tissue_full_020_right.jpg`, and the corresponding fast base-color audits.
+The `iso_iris4_bilateral_organic` diagnostic uses shorter, more curved and faster-tapering vessel walks, with the
+current bilateral tissue and camera settings. Four fast views across two characters passed Blender material and
+split-normal reload checks. The inspected results have fewer long straight vessels but are too sparse in places and
+still contain some abrupt dark branches. See `bilateral_organic_020_left.jpg` and `bilateral_organic_100_right.jpg`.
+Only the four EXRs were retrieved to `tmp/vhuman-mh/organic_selective`, not complete render packages, because the
+workspace ran out of space while creating the transfer archive.
+`iso_iris4_bilateral_organic_dense` increases the number of short branches while lowering their opacity. The focused
+mask test shows more coverage and a lower peak on the default seed, but the inspected rendered eyes remain too faint
+and sparse compared with UE. Four views passed the material and split-normal reload checks. Only EXRs were retrieved;
+see `organic_dense_020_left.jpg` and `organic_dense_100_right.jpg` in the same directory.
+`iso_iris4_bilateral_organic_gain15` and `..._gain2` use the identical denser mask at 1.5x and 2x bounded shader
+strength. The 1.5x version is more visible without the darkest 2x lines in the inspected eyes, but some loops are
+conspicuous and vessel structure still differs from UE. Eight views passed material and split-normal reload checks;
+only EXRs were retrieved. See `organic_gain_020_left.jpg` and `organic_gain_100_right.jpg`.
+`iso_iris4_bilateral_organic_guided` adds a weak attraction to each branch's initial heading. A fixed-seed path test
+reduced the fraction of long branches with end-to-end/path-length ratio below .3, but the rendered network still has
+loop-like intersections and some darker, straighter lines. Four views passed scene reload checks; this is not yet a
+reliable visual improvement. See `organic_guided_020_left.jpg` and `organic_guided_100_right.jpg`.
+`iso_iris4_bilateral_organic_nocross` trims later centerline paths when they meet earlier paths, allowing a short
+parent–child join. A synthetic crossing test passes, and four rendered views passed scene reload checks. The inspected
+quiet eye still has a conspicuous loop, while the other eye loses some coverage; the check does not detect a path
+crossing itself or every near-crossing. This is not yet a visual improvement. Only comparison EXRs were retrieved;
+see `organic_nocross_020_left.jpg` and `organic_nocross_100_right.jpg`.
+`iso_iris4_bilateral_organic_selfsafe` instead trims crossings within each individual path, while allowing separate
+paths to overlap. A synthetic self-crossing test and four rendered scene reload checks passed. The prominent loop in
+020 remains in the procedural mask; the clean base texture does not contain it. The new check changes only a small
+fraction of mask pixels, and this experiment is not yet a visual improvement. Only comparison EXRs were retrieved;
+see `organic_selfsafe_020_left.jpg` and `organic_selfsafe_100_right.jpg`.
+Combining inter-path and self-crossing checks is not an obvious fix: at a mask threshold of .02, coverage fell from
+.1845 to .0971 for the 020 left eye and from .3418 to .1501 for the 100 left eye. Adding the self check did not
+change either rounded result beyond the inter-path check. These are texture-space diagnostics, not perceptual scores.
+UE's `DeferredShadingCommon.ush` documents that the eye base color is applied after subsurface scattering, while the
+optional Cycles random-walk material scatters with its colored input. The guided-vessel comparison above does not
+enable Cycles subsurface scattering, so this ordering difference does not describe that particular render. An SSS
+comparison is needed before judging a lighting/recombination approach.
+`eye_sss_recombine.recombine` provides the corresponding linear RGB operation from UE's
+`PostProcessSubsurface.usf`: interpolate sharp and scattered lighting using the faded profile tint, multiply by
+stored base color, and add the separate specular component. It is a tested arithmetic reference only; it does not
+generate the filtered lighting or render passes and is not connected to the Cycles renderer. The two pending
+`iso_iris4_bilateral_organic_guided_sss03` and `...sss06` variants instead test Cycles random-walk scattering.
+For the guided fast captures, mean scene-linear luminance within 90% of each fitted eyeball radius is UE/Cycles
+.512/.491 and .487/.478 for 020 left/right, and .589/.615 and .575/.599 for 100 left/right. At luminance above
+2.828, the corresponding pixel fractions are .73%/.81%, .21%/.30%, .77%/.81%, and .32%/.33%. The captures are
+not registered or radiometrically calibrated between engines, and the region includes diffuse and specular light;
+these values cannot isolate either component or establish perceptual similarity. They do show that a uniform exposure
+change alone would move the two identities in opposite directions relative to their references.
+The opt-in `iso_iris4_bilateral_caustic*` variants approximate UE's EyeBxDF caustic for the fixed studio key using a
+per-point light direction and an approximate concave normal. The node scales iris albedo, so it also changes indirect
+lighting and does not model per-light shadows or area-light integration; non-studio lighting is rejected. Across two
+characters and both eyes, full strength worsened a lit inner-iris median RGB error on 3/4 views, while the visible
+effect was subtle. The UE and Cycles lighting is not fully radiometrically calibrated, and this statistic is not a
+perceptual score. The experiment is not accepted as a match. See `bilateral_caustic_100_right.jpg`,
+`bilateral_caustic_020_left.jpg`, and `bilateral_caustic_inner.json` in the same directory.
+
+For non-MetaHuman reconstructions, `offline_render.render(..., material_overrides={...})` and the CLI's
+`--material-overrides` JSON option expose the uncalibrated eye controls, including `eye_only`, `eye_unified`,
+`sclera_vessel_all_strength`, `sclera_tissue_strength`, `sclera_surface_microtexture` (.05 or .1),
+`unified_sclera_roughness`, `unified_shell_normal_strength`, `sclera_sss_weight` and `eye_ue_split`. The offline
+preparation path creates the optional surface texture when requested. The `iris_calibrate`, `eye_per_side`, framing
+and fitted tissue variants rely on UE references and are currently comparison-runner features, not portrait defaults.
+
+### Fresh physically layered eye (`server/vhuman/eye2`, `iso_layered2*`, 2026-11-06)
+
+A new eye path replaces the stacked `iso_iris4_*` texture fixes for eye-only comparisons. It is opt-in
+(`material_overrides.eye_model_layered2`); existing renders are unchanged. `eye2.bake` writes per-eye meshes
+(`eye2_<side>.npz`, eye-local frame) and polar/spherical textures. `cycles_scene.eye2_layered` places them on the
+template eyes: it sphere-fits the old sclera, takes the axis through its corneal apex and hides the old eye meshes.
+
+- Geometry. One smooth outer shell (smooth-max of the sclera and cornea spheres, no corneoscleral crease) whose
+  material blends from clear cornea to sclera across a ~0.9 mm soft limbus via a per-vertex alpha. A closed aqueous
+  chamber sits behind it, with a displaced iris annulus inside and a dark pupil cup. Proportions use adult ratios to
+  the fitted eyeball radius (limbus 5.85/12, cornea 7.8/12, chamber depth 3/12). vhuman's `optics` block pairs a
+  14.6 mm eyeball with a 6 mm limbus, which made the iris visibly too small against UE. The shell's back faces over
+  the sclera are a dark uvea, which removes a pale limbal halo.
+- Sclera texture. Base colour lerps from a near-limbus to a peripheral colour, with cloudy pale patches and a narrow
+  limbal band. Vessels are a grown forest: deep trunks from the equator branch toward the limbus with Murray-law
+  widths, and short tortuous conjunctival capillaries fill the periphery. Tips stop before touching any other vessel,
+  so the drawn paths never cross (`textures.crossings` = 0 on all 8 baked eyes). The old visible loop came from
+  crossings; it cannot occur here. Surface relief drives a wet clear coat (bump 80 µm at 12 mm scale).
+- Iris texture. Polar stroma: radial fibres, crypts, a wandering collarette, broken furrows, a pupillary ruff and a
+  limbal ring. Each zone's median is calibrated to the measured inner/outer colour; mesh displacement plus a bump map
+  supply the relief.
+- Lighting. Shadow rays pass the clear cornea (Light Path "is shadow" → transparent), as in UE's EyeBxDF, where the
+  iris is lit without corneal attenuation. Camera and indirect rays refract. `eye2_cornea_shadow=1` restores physical
+  shadowing; with MNEE caustics (`.cycles.is_caustics_*`, verified on Blender 5.2) the iris is darker, not brighter.
+  UE's caustic gain has no physical counterpart here.
+- Identity inputs (labelled). Colours are medians of each eye's UE base-colour capture
+  (`eye_<side>_basecolor.exr`): iris inner/outer, sclera near/far. These are material inputs, not lit pixels; when no
+  capture exists the staged angular texture is used. Pupil fraction comes from the staged vhuman texture; vascularity
+  from MH params. Nothing is fitted to the lit UE renders. The framing (per-eye zoom) and offsets are the guided
+  baseline's reference-fitted ones.
+- SSS. Cycles random-walk sclera SSS (radius 1/0.45/0.3 mm) reddens the whole sclera, because UE multiplies base
+  colour after scattering. The default is therefore weight 0; `iso_layered2_sss1`, `_sss05` and `_sssr025` keep the
+  scattering tests.
+
+Validation (fast 512 px / 32 spp, worker Blender 5.2.3 CPU, every view passed the scene-reload check). Dev
+identities are 020/100; holdouts are 038/300 (bases from `eye_clean_irregular01`, no right-eye-specific inputs).
+The metric is `tmp/vhuman-mh/eye_layered2/metric.py`: silhouette-normalised horizontal-sector median linear RGB,
+highlights excluded, mean abs error versus the lit UE capture. It is unregistered, uncalibrated across engines and
+not perceptual. Mean over 8 views (guided baseline: 4 dev views only):
+
+| variant | iris | sclera mid (r .6–.72) | sclera edge (r .85–.95) |
+|---|---|---|---|
+| guided baseline (dev only) | .0094 | .0508 | .0833 |
+| layered2, staged-texture colours (dev10) | .0804 | .0781 | .1492 |
+| layered2, UE base-colour colours, SSS 1 (dev11) | .0378 | .1110 | .0413 |
+| layered2, SSS .5 | .0376 | .0934 | .0420 |
+| **layered2, SSS 0 (default)** | .0375 | .0749 | .0436 |
+
+The UE base-colour source mainly fixed the holdouts (038 iris error .092 → .039, 300 .19 → .08). Sheets:
+`tmp/vhuman-mh/eye_layered2/final/eye_layered2_dev12_<id>_<side>.jpg` (UE | guided | layered2 variants).
+
+Visually, layered2 matches UE better than the guided baseline in:
+- iris size;
+- the soft limbus;
+- broken wet highlights;
+- red peripheral tissue;
+- the branching vessel network with no loops.
+
+It remains worse or different in:
+- The mid-sclera is pinker and darker than UE's bright white band, and is still the largest band error on dev.
+- Holdout irises are darker than UE (no caustic gain). 300's UE iris is pale with a yellow collarette, which the
+  zone model does not reproduce.
+- UE vessels in high-vascularity eyes (038, 300) are denser and more saturated than ours.
+- Sparkles from the bump near the limbus are stronger than in UE.
+
+Not yet done:
+- full-quality renders;
+- more identities;
+- a portrait-camera (non-isolated) check.
+`tmp/vhuman-mh/eye_layered2/round.sh` and `stage_from.py` derive jobs from existing staged bases (the local disk lacks
+the 4 GiB staging headroom).
+
+#### Iris/sclera boundary round (2026-11-07, full 1024 px / 128 spp)
+
+The user asked for a natural limbus and allowed non-physical, UE-like blending where it helps. Changes, in order:
+- **Veil limbus (default).** The outer shell stays clear over the iris centre, then turns into opaque sclera over a
+  soft ramp centred on the limbus. The width follows MH `limbus_softness` (1.4 mm + 12 × softness at 12 mm scale,
+  capped at 2.8 mm). The painted iris→sclera colour blend (`iso_layered2_paint`) left a brown/dark halo because MH
+  iris rims are dark; it is kept only as an option.
+- **No dark limbal rings.** The iris texture's limbal darkening is nearly removed and the sclera's limbal shadow band
+  is gone. A non-physical neutral white band (~4 mm) replaces it, because UE renders the near-limbus sclera grey-white
+  even on red eyes (038, 300). Without it the veil read as a red ring.
+- **Light hidden skirt.** The hidden iris skirt beyond the limbus has the white-band colour, so a partly transparent
+  veil never reveals a dark gap. Feathering past the limbus over a dark gap produced a pink-grey ring (full04/05).
+- **Limbus ratio 5.1/12.** The visible-iris figure (HVID 11.7 mm) includes corneal magnification. With 5.85/12 the
+  silhouette-normalised iris edge was 0.60–0.62 against UE's 0.47–0.55.
+- **Less sparkle and SSS.** Sclera bump fades with the veil (`blend^3`); iris SSS defaults to 0.
+- **Vessels.** Denser, finer capillaries now sprout from existing vessels; the tree still has no crossings.
+
+`tmp/vhuman-mh/eye_layered2/limbus_profile.py` measures the left horizontal sector, normalised by the silhouette
+radius, highlights excluded. It gives the 20–80 % iris→sclera rise and the minimum within the rise (a dark ring shows
+as a negative dip). Right-eye sectors contain the key highlight, so those figures are unreliable.
+
+| eye (left) | UE edge / width / dip | layered2 edge / width / dip |
+|---|---|---|
+| 020 (dev) | .52–.58 / .06 / −.03 | .52–.57 / .05 / −.03 |
+| 100 (dev) | .51–.56 / .05 / −.05 | .53–.57 / .04 / −.06 |
+| 038 (holdout) | .47–.52 / .05 / +.01 | .55–.56 / .01 / −.07 |
+| 300 (holdout) | .30–.43 / .13 / +.19 | .56–.58 / .02 / −.24 |
+
+The limbus ratio and feather were tuned on 020/100. On those the edge position and width now match UE. On the
+holdouts the edge is still too sharp and too far out, and 300 keeps a dark dip. UE's 300 iris fades over a very wide
+band with a yellow collarette. These are holdout failures, not fixed results.
+
+Sheets: `tmp/vhuman-mh/eye_layered2/final2/overview.jpg`, `limbus_zoom.jpg` and `full_<id>_<side>.jpg`.
+
+Remaining visible differences:
+- a thin pink-grey band at the iris edge on 038/300;
+- small bump glints on the sclera just outside the limbus;
+- vessels still sparser and less saturated than UE's dense reticular network;
+- the iris is darker than UE (no caustic gain).
+
+### Periocular study (face-visible eye cameras, 2026-11-07)
+
+`compare_render.REGION_METRICS['periocular']` crops a window around the parser eye and brow labels with margin .45,
+covering lids, canthi, lashes and the brow band. LPIPS and DISTS score the whole window; ΔE scores the labels.
+- Score: `tmp/vhuman-mh/peri_score.sh <variant>`. It uses the ROCm venv on CPU; set `LD_LIBRARY_PATH` to all
+  `/opt/rocm/core-*/lib`, because the system ROCm moved `libroctx64`/`librocm_smi64`.
+- Render rounds: `tmp/vhuman-mh/peri_round.sh TAG VARIANTS`.
+- Variants: the `PERI` dict in `compare_render.py`, layered on the default `combo` with eye_map v2 bases.
+- New staging: `win_cycles.stage` now bakes eye2 assets with UE base-colour colours and builds periocular geometry
+  parts into the shared base. `cycles_scene` renders them only when the variant enables them. Pulls exclude the
+  regenerable eye textures; a pull filled /mnt/nvme01 once.
+
+Fast 512 px, dev 020/100 and holdouts 038/300, both eyes (8 views). Columns: mean periocular LPIPS / DISTS / ΔE, and
+the number of views better than `peri_l2`:
+
+| variant | LPIPS | DISTS | ΔE | vs `peri_l2` |
+|---|---|---|---|---|
+| `combo` (default MH comparison render) | .3328 | .2390 | 14.01 | — |
+| `peri_l2` = combo + layered eye2 | .3080 | .2280 | 13.08 | 8/8 better than combo |
+| + eye AO .6 (`peri_l2_ao`) | .3038 | .2262 | 13.19 | 6/8 |
+| + AO + UE-replica rect lights (`peri_l2_rect` / `peri_r2`, with canthal redness) | .2950 / .2948 | .2218 | 13.6 | 8/8 |
+| `peri_r2` + upper tear meniscus (`peri_r2_men`) | **.2935** | .2192 | 13.72 | 5/8 vs `peri_r2` |
+| caruncle v1 (protruding glossy bead) | .3299 | .2387 | 13.02 | rejected |
+| caruncle v2 (recessed, duller), + AO | .3059 | .2271 | 13.27 | ~neutral vs AO; not adopted |
+| thin-lid SSS ×2 on the orbital masks (`peri_r2_lid`) | .3240 | .2297 | 13.76 | rejected |
+
+- **Eye AO** (`peri_eye_ao`) is a non-physical, labelled emulation of UE's translucent eye-occlusion shell: the AO of
+  the lids within 2 mm darkens the eye2 base colour.
+- **Rect lights** change the whole face lighting to match the UE rig; the slight ΔE rise comes from the skin.
+- **Canthal redness** is in the eye2 sclera texture (asset v20) and is neutral on this metric.
+
+The best current periocular variant is `peri_r2_men`. Visually it fixes the most obvious defect of `combo`: a flat,
+opaque, wrong-colour eyeball with round highlights. Sheets: `tmp/vhuman-mh/eye_layered2/dev/peri03_sheet.jpg`
+(UE | combo | rect | car2) and `peri02_sheet.jpg`.
+
+Still unlike UE:
+- The eyeball reads brighter and whiter, with less shading under the upper lid and at the corners.
+- UE's lower lid shows a wet pink margin and a translucent pink-purple infraorbital area; ours is flatter and browner.
+- Skin on 038/300 is more orange and grainier.
+- Lashes and brows are not yet upgraded (Phase 3 of the plan).
+- No full-quality confirm yet.
+
+#### Periocular rounds 5–10 (2026-11-07, fast 512 px, 8 views)
+
+| variant | LPIPS | DISTS | ΔE | note |
+|---|---|---|---|---|
+| `peri_r3_ao5`: eye AO 1.0 within 5 mm + rect + meniscus | .2934 | .2173 | 13.63 | ties `peri_r2_men` |
+| lower-lid wet rim tube v1 / v2 | .3062 / .2939 | | | rejected (v1 sat on the eyeball) / neutral |
+| `peri_r3_back`: eyeball 0.8 mm deeper | .2883 | .2145 | 12.90 | better on 5/8 views |
+| `peri_r3_back14`: 1.4 mm deeper | .2874 | .2137 | 12.70 | black line under the lower lid |
+| `+ peri_socket` (dark mucosa shell behind the eye) | .2874 | | | no pixel change: the line was not void |
+| without tear lines (038/300 only) | ≈ equal | | | line gone, so the floating glass tear tube caused it |
+| **`peri_r5`: 1.4 mm deeper; tear lines move back with the eye (×0.7)** | **.2840** | **.2116** | **12.55** | best; eye LPIPS .3135; better than `back14` on 6/8 views |
+
+`peri_r5` vs the default `combo` (.3328 / .2390 / 14.01) is better on all 8 views. Sheet:
+`tmp/vhuman-mh/eye_layered2/dev/peri10_sheet.jpg` (UE | combo | peri_r5).
+
+The deeper seating (`peri_eye_back`) is a reconstruction-level change: the template sphere fit leaves the eyeball too
+far forward relative to the lids. It is a fixed offset tuned on these four heads, not a fitted per-identity value.
+
+Still different from UE:
+- 300's sclera is white where UE's is red (eye colour inputs come from older staged textures for that head);
+- UE's lower lid shows a pink wet waterline and translucent infraorbital skin;
+- the skin on 038/300 is more orange and grainier;
+- lashes and brows are not yet upgraded;
+- no full-quality confirm yet.
+Results now live on /mnt/nvme02 (`/mnt/nvme02/tmp/vhuman-compare`, symlinked from `compare_v1`).
+
+#### Fast local sweep loop and periocular knobs (2026-11-07)
+
+- **Local GPU Cycles.** Official Blender 5.2.3 runs on the RX 9070 XT via HIP; see `resume-vhuman-eye.md` for the
+  environment.
+- **Persistent bases.** `win_cycles.render_local` / `render_cached` keep staged bases across rounds.
+- **In-session sweeps.** `peri_sweep.py` + `peri_sweep_blender.py` render many hypotheses from one built scene, at about
+  10.6 s per hypothesis-view.
+- **Fast scorer.** `peri_sweep --score` scores the periocular region only, at about 12 s per variant.
+- **Determinism.** The local sweep reproduces worker scores exactly.
+
+Knob sweep on `peri_r7k` (`peri_r5` + skin SSS scale 1.0 + eye AO .7, LPIPS .2789). Knob defaults are now reset per
+hypothesis; the first run (`knobs1`) leaked settings and is discarded.
+
+| hypothesis | periocular LPIPS | DISTS | ΔE | views better |
+|---|---|---|---|---|
+| lid (orbital-mask) roughness ×0.8 | **.2568** | .2036 | 12.20 | 8/8, incl. both holdouts |
+| lid ×0.8 + infraorbital ×0.8 | .2559 | .2033 | 12.25 | 7/8 |
+| lid ×0.65 / ×0.5 | .2756 / .3038 | | | worse |
+| colour tint 1.03/1.11/1.14 on the lid and infraorbital masks | .2790 | | | no effect |
+| infraorbital roughness ×0.8 alone | .2788 | | | no effect |
+
+New best: `peri_r8` = `peri_r7k` + `peri_k_lid_rough` .8 (periocular LPIPS .2568 vs `combo` .3328). The default
+per-identity skin roughness boost (×~1.32) appears too rough on the eyelids; UE's lids read glossier. A ×0.8 lid
+correction is a fixed value tuned on 020/100 and improves 038/300 too. Sheet: `tmp/vhuman-mh/eye_layered2/dev/knobs2_sheet.jpg`.
+
+### Contact-shading experiment (2026-11-07, implementation pass)
+
+Added `peri_contact01`, based on the frozen `peri_r8`, with a smooth 0.5 mm
+metric distance band along staged lid margins. The band reduces roughness and
+blends local skin SSS toward weight .8 / scale 1.0; eye AO uses a smoothstep
+ramp. These are experimental authored controls, not fitted tissue measurements.
+The field is stored on skin vertices, so narrow-band accuracy remains limited by
+mesh resolution. The existing tear geometry has not yet been replaced.
+
+Local Blender 5.2.3 / HIP RX 9070 XT, 512 px / 32 spp, both eyes of
+020/100 (development) and 038/300 (previously examined validation):
+
+| variant | periocular LPIPS | DISTS | delta E | render wall time |
+|---|---|---|---|---|
+| standalone peri_r8 | .2567 | .2047 | 12.432 | 276 s |
+| peri_contact01 | .2590 | .2041 | 12.389 | 315 s |
+
+**Not accepted as default:** LPIPS regressed and inspected development crops
+show only subtle contact changes. No full-quality or fresh-identity acceptance
+has been established. No claim of improved skin translucency is made.
+
+Artifacts: `tmp/vhuman-eye-quality/first-contact.jpg` (UE | r8 | contact01),
+`scores.json` (development and previous-validation scores separately).
+Fresh UE 5.8 DX12 captures were completed on Windows for 020/100 (job
+`eye_contact_ref01`, exit 0, 107 s); retrieved under
+`tmp/vhuman-eye-quality/ue/`. They remain separate from the frozen references
+used above. Eye-capture mean absolute linear differences from older references
+range .0049–.0117, so they must not silently replace scoring inputs.
+
+Sweep reliability: restore AO, SSS radius, denoising and dicing per hypothesis;
+reject unknown named controls; hash scene inputs and shader sources before
+reusing built sweep scenes. Metric distance tests cover segment endpoints,
+duplicate path points, rigid transforms and invalid inputs.
+
+Commands: `TMPDIR=$PWD/tmp bash tmp/vhuman-mh/peri_local.sh peri_r8` and
+`... peri_contact01`; `TMPDIR=$PWD/tmp tmp/vhuman-cpu-venv/bin/python -m unittest
+server.vhuman.test_periocular` (3 passed); Python compilation and `git diff
+--check` passed.
+
+Still required: per-pixel/atlas contact-field accuracy, waterline replacement,
+independent UE SSS/occlusion diagnostics, wider regional skin-scattering work,
+full 1024/128 confirmation, front/isolated-eye checks and new identities before
+promoting any new shading default.
+
+### Diffuse-only skin SSS continuation (2026-11-07)
+
+A new **experimental** UE-inspired skin-lighting diffusion path is promising;
+no production/default switch has been made yet. UE is still captured on Windows
+(DX12); all new Cycles renders use Linux HIP / RX 9070 XT.
+
+- `ue_scripts/peri_diagnostics.py` captures SSS on/off × eye-occlusion on/off
+  without touching frozen references. Corrected run `peri_diag03` completed
+  successfully on 020/100: 15 files per head, all SHA-256 verified. An earlier
+  `peri_diag02` produced images but failed light cleanup; do not use its overall
+  job status as a success. The corrected script restores the SSS cvar.
+- UE's ablation shows strong smoothing of skin-lighting detail and warm lid
+  transitions from SSS. Eye occlusion mainly changes exposed eyeball shading.
+  Sheet: `tmp/vhuman-eye-quality/ue_ablation02.jpg` (earlier run's completed
+  images); authoritative successful captures are under `ue_diag03/`.
+- `reconstruction/periocular.py::build_contact_atlas` now evaluates metric lid
+  distance at 2048² texel centres, rather than interpolating sparse vertex
+  distances. UV seam, mirrored-chart, geometry-cache, and analytic-distance
+  tests pass. It is staged by both offline_render and win_cycles.
+- `peri_passes_blender.py` exports genuine multi-part EXR diffuse lighting,
+  diffuse colour, world position, geometric normal, skin mask and beauty.
+  Named compositor inputs are required: the trailing empty input is virtual.
+  `peri_scatter.load_passes` validates material masks and geometric normals to
+  reject unconnected default-value passes.
+- `reconstruction/skin_scatter.py` filters **lighting only**, using a normalized
+  Burley radial profile with skin/depth/geometric-normal rejection, then
+  recombines diffuse colour and leaves other beauty contributions unchanged.
+  This is a labelled screen-space approximation, not Cycles volume transport;
+  offscreen transport and thin-part transmission are not reproduced. Do not
+  promote it globally without front/ear/lighting regression checks.
+- The frozen candidate uses mean-free paths [1.05, .4069, .2625] mm × **0.5**,
+  weight 1, 48 deterministic gather samples; native skin SSS is disabled in
+  its capture to avoid double diffusion. No tuning on 038/300 was performed
+  in this continuation. Those heads were already examined in earlier rounds,
+  so report them as previous validation rather than unseen holdouts.
+
+Fast 512 px / 32 spp, native dicing 2, both eyes (same scorer and references):
+
+| set | native r8 LPIPS / DISTS | diffuse-only LPIPS / DISTS |
+|---|---|---|
+| development 020/100, 4 views | .2276 / .1901 | **.2042 / .1692** |
+| previous validation 038/300, 4 views | .2858 / .2193 | **.2568 / .1889** |
+| all 8 views | .2567 / .2047 | **.2305 / .1790** |
+
+All eight views improve LPIPS. These results are `peri_scatter06`, generated
+with the frozen half-scale profile; source provenance is beside each EXR.
+Sheets inspected: `tmp/vhuman-eye-quality/scatter06_eye_left.jpg` and
+`scatter06_eye_right.jpg` (fixed baseline exposure for both Cycles columns).
+Skin lighting is softer, but geometry/waterline differences and 300's iris
+remain visible. Metrics do not establish a complete UE match.
+
+A separate **fixed reference crop + fixed baseline exposure** check on the
+2 development left-eye views also improved: LPIPS .2265 → .2069, DISTS
+.1882 → .1688, skin-only ΔE 4.21 → 3.97. The standard periocular ΔE uses
+*eye/brow labels*, not skin; its small rise is not evidence of worse skin
+colour. Details: `fixed_score05.json` and `scatter06_summary.json`.
+
+Rejected/not adopted in this continuation:
+- Simply changing native SSS weight/method/radius (`material04.json`, 2 dev
+  left eyes): no setting improves both LPIPS and DISTS over r8. Native ref
+  .2390/.1920; weight 1 .2415/.2034; Burley 1 .2406/.1840; radius scale 1.4
+  .2427/.1981; UE-radius random walk .2481/.1937.
+- Removing procedural micro-normal looked promising with coarse dicing but
+  does not improve native-quality scores (.2397/.1959 vs .2390/.1920).
+  Do not adopt from the coarse screen.
+- Atlas contact band alone `peri_surface02`: dev 4-view LPIPS .2290 vs r8
+  .2276. Tube-free surface coat `peri_waterline04`: .2317. Both remain
+  experiments. Waterline coat composes with existing coat and uses tear-film
+  IOR 1.336, but the current highlighted rim is still too prominent.
+
+Verification: 10 focused distance/atlas/scattering tests pass, including
+energy conservation, red/blue diffusion extent, pigment/specular preservation,
+alpha preservation, and eye-boundary exclusion. Four existing comparison/
+variant workflow tests pass. Python compilation and git diff --check pass.
+
+In flight / next steps:
+1. Paired full-quality 1024 px / 128 spp confirmation (`full07.py`, log
+   `tmp/vhuman-eye-quality/full07.log`) on 020/100/038/300, both eyes, frozen
+   settings. First attempt hit the 14336 MiB VRAM guard and stopped cleanly.
+   Current attempt uses 256 px Cycles tiles with the same resolution/samples/
+   dicing. Poll the existing process before any restart. Outputs are
+   `peri_capture07_native` and `peri_scatter07` under full-profile paths.
+2. Four additional identities 005/145/178/194 are being staged by the live
+   CPU job into `tmp/win/peri_holdout06`; log `holdout06_stage.log`. Includes
+   front and both eye cameras. Do not retune the frozen SSS profile on these.
+3. Validate fresh identities, front views, and thin-part/backlighting effects.
+   The current whole-skin native-SSS-off prototype cannot replace physical ear
+   transmission; preserve it in any production integration.
+4. Integrate a validated profile into the full-quality default rendering path,
+   retaining explicit overrides and frozen historical variants. Currently the
+   new diffusion path is a diagnostic CLI, **not** the default render path.
+5. Continue waterline/inner-corner work, then the remaining eye2 holdout limbus
+   gaps. Do not claim the boundary is solved by the SSS improvement alone.
+
+Useful commands (repo root; scratch only under repository tmp/):
+```
+TMPDIR=$PWD/tmp tmp/vhuman-cpu-venv/bin/python -m unittest server.vhuman.test_periocular server.vhuman.test_skin_scatter
+TMPDIR=$PWD/tmp tmp/vhuman-cpu-venv/bin/python -m pytest -q server/vhuman/test_metahuman_prior.py -k 'win_cycles or eye_sweep or default_variant' --basetemp=tmp/vhuman-eye-quality/pytest
+# Rendering scripts use VHUMAN_BLENDER and VHUMAN_BLENDER_LD_LIBRARY_PATH as in the handoff.
+# peri_scatter needs OpenEXR; use the existing ROCm venv (CPU venv lacks it).
+LD_LIBRARY_PATH=$VHUMAN_BLENDER_LD_LIBRARY_PATH tmp/vhuman-rocm-venv/bin/python -m server.vhuman.metahuman.peri_scatter CAPTURE.exr OUT.exr --scale .5
+```
+
+Current worktree is still uncommitted. Preserve all earlier eye work. No push.
+
+### Native-preserving face diffusion and optical eye contact (2026-11-07)
+
+The full-quality default `material_overrides.skin_lighting_profile=1` captures unscattered
+Cycles diffuse lighting in a second render, diffuses that lighting with a
+normalized Burley radial profile, then restores albedo and the other beauty
+contributions. Default channel radii are `[1.05, .4069, .2625] * .5` mm. It uses
+actual camera depth, surface normals and skin-material rejection rather than
+blurring the beauty image. Exact point-attribute anatomical weights retain the
+native render on ears, lips and non-skin surfaces; native alpha is retained.
+
+`eye_contact_blur=1` adds a localized optical scene-colour blend at the lid
+boundary. This is a nonphysical approximation of MetaHuman's eye occlusion
+material blur, separate from the diffuse skin SSS above. The eye-side kernel has
+sigma .25mm, band1.2mm, strength.847213 and the UE material's warm tint.
+Profiles1–4 retain their prior eye-side strength.357397. The new
+skin-side band has the same sigma/width and strength1; actual skin coverage and
+a10mm camera-depth bound restrict its footprint. Central iris, alpha and pixels
+beyond the contact band are preserved. Kernels are fitted to matched UE blur-on/off
+development captures, independently of validation beauty images.
+Explicit overrides include `skin_scatter_scale`, `skin_scatter_weight`,
+`eye_contact_width_m`, `eye_contact_sigma_m`, `eye_contact_strength`,
+`eye_contact_skin_width_m` and `eye_contact_skin_strength`. The latter set to0
+limits the contact layer to the eye side. `eye_contact_blur=0` disables both
+contact bands; `skin_lighting_profile=0` disables the extra lighting pass.
+The profile is enabled by default for `offline_render` full-quality skin and the
+MetaHuman comparison default `peri_profile5`; baseline quality and historical
+comparison variants retain their previous settings. Explicit
+`material_overrides={"skin_lighting_profile": 0}` restores native rendering.
+Install offline-render dependencies from `requirements-render.txt`; this includes
+OpenEXR for the lighting/normal AOVs. Multipart reads and signed RGBA round trips
+were verified with both OpenEXR3.4.4 and3.5.3.
+
+At 1024px/128spp/dicing2, eight paired eye views (020/100 development and previously
+examined 038/300 validation) give:
+
+| Group | Native LPIPS / DISTS | Profile + contact LPIPS / DISTS |
+|---|---|---|
+| Development, four views | .2222 / .1835 | .2072 / .1677 |
+| Previously examined validation, four views | .2867 / .2147 | .2596 / .1930 |
+
+All eight LPIPS improve. The fixed-native-exposure sheet was visually inspected;
+diffuse skin softens while pigment remains. Specular sheen, eyelid geometry and
+the 300 iris remain mismatches. These results do not establish new-identity
+performance. The treatment requires a second GPU render and retains
+`beauty_native.exr` for comparison. `head.blend` reproduces the native pass; final
+beauty requires the profile finalizer. Detailed evidence is under repository
+`tmp/vhuman-eye-quality/full14_scores.json` and `full14_sheet.jpg`.
+
+Fresh validation on 005/145/178/194 used the frozen recipe, with no retuning.
+Seven parser-valid eye crops improve from LPIPS/DISTS .2518/.1862 to .2281/.1680;
+145 right has no valid parser crop in either version. A separate fixed-camera,
+fixed-native-exposure comparison includes all eight views: .2178/.1722 to
+.2123/.1639. Identity194 is mixed (DISTS worse in both views and LPIPS slightly
+worse in one), so the gain is not universal. Six front views give skin/nose
+LPIPS .1121→.1115, DISTS .1651→.1671, and skin ΔE4.30→4.10: modest mixed changes.
+Fresh-eye and front sheets were inspected (`validation18_sheet.jpg`,
+`front19_sheet.jpg`). Physical thin-part and non-skin shading remains native.
+The real-head production capture finished at 13.7GiB whole-device peak and
+agrees with the static diagnostic to mean absolute scene-linear difference
+.0000652; the difference reflects the exact anatomical/eye material AOVs.
+
+### Procedural pore grid and normal-composition audit (2026-11-07)
+
+The legacy pore generator adds crossed sine waves at three frequencies. Their
+normal gradients create a visible specular crosshatch. The optional
+`micro_normal(grain='isotropic')` retains Gaussian pore locations and replaces
+that fine grain with periodic random Fourier bands of similar height RMS.
+The strongest normal-map Fourier-bin fraction drops .0470→.00142. The generator
+stays legacy-compatible; the accepted full-quality profile selects a separate
+isotropic asset.
+
+The measured/procedural whiteout blend also scales each layer's XY but leaves
+its Z active. Consequently, disabling procedural pore strength still multiplies
+measured normal slopes by `1 / pore_normal.z` (median1.154, p951.861 on the
+current texture). The `skin_normal_weighted_blend=1` control normalizes each
+slope-weighted layer before whiteout; a zero-strength layer becomes (0,0,1).
+The accepted regional default retains legacy calibration inside the anatomical
+protection masks and applies this correction outside them.
+This is independent of the skin-diffusion and optical-contact treatment.
+Development-only paired captures and fixed-native-exposure comparisons are under
+`tmp/vhuman-eye-quality/grain23` and `weighted24`. These development results led
+to the global and then regional confirmations described below.
+
+Development screen (020/100 left eye,512px/32spp/dicing2, existing diffuse profile
+and optical contact held fixed, full eye-camera frame and baseline exposure):
+
+| Normal/pore treatment | LPIPS | DISTS |
+|---|---:|---:|
+| Previous default | .18055 | .12542 |
+| Corrected blend, legacy grain | .17732 | .12368 |
+| Corrected blend, isotropic grain | .17634 | .12443 |
+| Corrected blend, no procedural pores | .16800 | .12801 |
+| Corrected blend, half-strength isotropic pores | **.16047** | **.11946** |
+
+Half-strength isotropic pores were selected on these two development views and
+frozen for further validation (`selection27.json`). `peri_profile2` exposes this
+opt-in recipe: `skin_normal_weighted_blend=1`, `skin_micro_isotropic=1`,
+`skin_pore_scale=.5`. The separate isotropic PNG is cached with seed, generator
+source and NumPy-version provenance. Synthetic spectrum/cache tests pass, and
+the production graph matches the experimental graph to mean scene-linear error
+~1.95e-7. The production-generated pore PNG matches the experimental PNG exactly.
+
+Initial005/194 validation is mixed: fixed-reference eye crops average
+LPIPS/DISTS .21027/.15693→.20714/.15766; fixed camera frames average
+.21375/.15172→.20278/.14718. Identity194 right regresses. Subsequent full128spp
+tight-eye confirmation regressed .21099/.16603→.21603/.17328, so the global
+recipe was not promoted. The regional treatment below addresses that tradeoff.
+
+
+### Regional normal default (2026-11-07)
+
+The accepted default is `peri_profile3`: the existing native-preserving diffuse
+skin profile and optical eye contact, plus corrected normal-layer weighting and
+half-strength isotropic added pores outside the orbital/infraorbital regions.
+The existing GNM anatomical masks retain the previous calibrated normal treatment
+on those regions. Unit tangent normals are mixed in the shader; no beauty-image
+blend or skin-color blur is added. With procedural-only normals, the same masks
+blend legacy/isotropic pore textures at the existing pore strength.
+
+The global version `peri_profile2` remains opt-in: it removed the grid but
+regressed both full-quality tight eye crops. The regional version was selected
+on development020/100 and confirmed with a frozen recipe. All displayed
+comparisons use UE-only fixed crops and fixed previous-default exposure.
+
+| Comparison | Previous LPIPS / DISTS | Regional default LPIPS / DISTS |
+|---|---|---|
+| Full1024/128, two development eye crops | .21099 / .16603 | .20671 / .16615 |
+| Same two whole eye-camera frames | .18078 / .12370 | .15533 / .11725 |
+| Six validation eye crops,005/194/038/300 | .22316 / .16664 | .21297 / .16545 |
+| Same six whole frames | .21816 / .15043 | .19760 / .14398 |
+| Two development front skin crops | .11698 / .16144 | .11793 / .16190 |
+
+Seven of eight eye-crop LPIPS improve;194 right is slightly worse
+(.20995→.21233). Full-quality tight-crop DISTS is essentially flat, and front
+changes slightly regress. Full/validation/front sheets were visually inspected;
+the surrounding crosshatch is removed while calibrated eyelid detail remains.
+The full-quality captures retain dicing2 and reached14251MiB whole-device usage,
+below the14336MiB guard. Both public API branches (measured normal map and
+procedural-only) passed paired GPU capture/finalization and saved-scene reload
+validation on Linux HIP. Tests:24unittest +4 targeted prior tests pass.
+
+The four explicit normal controls are:
+```
+skin_normal_weighted_blend: 1
+skin_micro_isotropic: 1
+skin_pore_scale: 0.5
+skin_normal_preserve_lids: 1
+```
+They are defaults when full skin and the skin lighting profile are enabled.
+Explicit overrides win. To retain the previous SSS/contact treatment with its
+previous normals, use comparison variant `peri_profile`, or set the four controls
+to0,0,1,0 respectively. Setting `skin_lighting_profile=0` with no explicit normal
+controls disables the default bundle. Baseline quality and historical comparison
+variants remain unchanged; cached legacy pore assets are not replaced.
+
+An independent signed world-normal audit captured fresh UE references on the
+Windows worker (UE5.8.4-58902052,D3D12; actual capture log/source hash verified)
+and Cycles fields on Linux HIP (Blender5.2.3), using identical Cycles geometry
+between variants. Mean common-skin angular error on the two development left-eye
+frames improves7.25°→6.54°; periocular skin improves8.15°→7.91°. These errors also
+include residual UE/GNM geometry correspondence differences. Measured-only
+normals improve the angle further but do not improve beauty consistently, so
+that result was not promoted. The remaining bright lid-contour error bands
+suggest geometry/BRDF calibration deserves further study; this is an inference,
+not proof of a tangent-convention bug.
+
+Evidence under `tmp/vhuman-eye-quality/`: `regional35/summary.json`, `scores.json`,
+`full_sheet.jpg`, `validation_sheet.jpg`, `additional_sheet.jpg`, `front_sheet.jpg`;
+`production36.log`; `normal38/audit/report.json` and `world_normals.png`.
+UE reference file hashes were verified. `peri_profile`, `peri_profile2` and the
+legacy generator remain available for reproducible comparisons.
+
+
+Full-quality held-out confirmation also completed on038/300 at1024px/128spp,
+dicing2, with the recipe unchanged:
+
+| Full-quality group | Previous eye-crop LPIPS / DISTS | New default LPIPS / DISTS |
+|---|---|---|
+| Development020/100 | .21099 / .16603 | .20671 / .16615 |
+| Validation038/300 | .24857 / .18738 | .23745 / .18314 |
+| All four full-quality views | .22978 / .17671 | .22208 / .17464 |
+
+All four full-quality eye-crop LPIPS improve. Whole-frame mean LPIPS/DISTS improve
+.20279/.13683→.17583/.12776. The final four-row full-quality comparison was
+visually inspected: `tmp/vhuman-eye-quality/regional39/full_confirm_sheet.jpg`;
+metadata and split summaries are in `regional39/scores.json` and
+`regional39/full_summary.json`. The normal-field capture's actual UE build,
+D3D12 adapter choice and source hash are recorded in
+`normal37/capture_provenance.json`. All owned render jobs completed.
+
+### Eye-aperture diagnostics (2026-11-08)
+
+`ue_scripts/eye_aperture.py` captures original beauty plus an opaque white-eye,
+black-head mask in the Windows UE worker, restoring material slots/sections and
+removing temporary assets afterwards. Translucent shells, lacrimal edges and
+lashes are hidden. This separates mesh intersections from their optical shading;
+material replacement also removes UE vertex/depth offsets, so the mask is not the
+final photometric eye opening. The matching Cycles capture keeps skin displacement.
+
+`python -m server.vhuman.metahuman.aperture_audit --ue-root <UE-captures>
+--cycles-root <Cycles-captures> --out <report-directory>` compares fixed-camera
+masks without alignment fitting, reports IoU and symmetric outline distances,
+and overlays cyan UE/magenta vhuman on the matching captured UE beauty. Source
+image SHA256 hashes and method limitations are included. Three synthetic tests
+cover known translation, isolated speckles/holes, and invalid masks.
+
+Development020/100 left/right,512px: vhuman's opaque eye opening is slightly
+larger; IoU .887/.950/.947/.966, mean outline distance2.51/1.10/1.27/.85px.
+Adding .3 or .6mm of eye depth improves every outline IoU. These diagnostics use
+Linux Blender5.2.3 HIP, visible dicing2 and offscreen dicing16; Windows references
+use UE5.8.4 D3D12. They do not justify a geometry default without beauty validation.
+Artifacts: `tmp/vhuman-eye-quality/aperture41`, `aperture42/audit`, `aperture43`.
+
+A separate paired512/32 development study replaced glass tearline tubes with a
+Fresnel surface film, removed all/upper tubes, or undid their backward following.
+Film/removal changes were negligible (eye LPIPS changes below .0003); bringing
+existing tubes forward worsened both heads (.20538→.21785, .18813→.19620).
+No tearline material change was accepted. Skin/SSS/profile3 remained fixed.
+Artifacts: `tmp/vhuman-eye-quality/waterline40/{scores.json,comparison.jpg}`.
+
+A follow-up raw-mesh CPU z-buffer reproduces the UE opaque masks at IoU
+.9921–.9947 (mean boundary .14–.19px). Removing the cartilage component changes
+zero eye-opening pixels in these four views. Substituting the UE eye meshes only
+for this diagnostic under the raw GNM skin raises the largest mismatch,020left,
+from .887 to .966 IoU; all four hybrid openings reach about .965–.971. No UE eye
+geometry was added to the renderer. These controls point primarily at globe
+shape/placement, with a smaller remaining skin binding/subdivision discrepancy.
+
+The staged candidate globes have radius about14.6mm in all four checked
+identities, while rear-hemisphere sphere fits of UE eyes range about13.0–14.6mm.
+The front UE sclera is also recessed relative to that fitted sphere. Centers
+and dimensions must be compared after the camera-derived frame translation;
+untranslated UE and GNM coordinates have different origins. This is a mesh
+measurement, not a general claim about human eye dimensions. Raw audit artifacts:
+`cartilage48`, `skin49` and `aperture43/globe_dimensions.json` under the same
+scratch root.
+
+A fixed extra.3mm depth (total1.7mm) improves development020/100 fast eye-crop
+LPIPS .19675→.19172, but frozen038/300 validation is essentially flat
+(.23700→.23693), with038 slightly worse. The accepted default remains unchanged.
+Scleral-shape studies keep the calibrated cornea/iris positions and accepted skin
+profile fixed; outline agreement alone does not establish a beauty improvement.
+
+### Skin-side contact default (2026-11-08)
+
+`peri_profile4` extends the existing optical contact layer onto a narrow skin-side
+band. The matched UE blur-on/off captures show a substantial effect outside the
+opaque eye opening: a shared1.2mm band/.25mm sigma/strength1 explains about80%
+of that development difference. The earlier eye-only fit omitted this area.
+This is a scene-colour approximation of the translucent eye layer; skin SSS
+continues to use the separate diffuse-lighting profile. It adds no GPU render pass.
+
+The new controls are `eye_contact_skin_width_m=.0012` and
+`eye_contact_skin_strength=1`. New full-quality offline renders enable them;
+explicit overrides win. `peri_profile`, `peri_profile2` and `peri_profile3` retain
+skin strength0. The low-level contact helper also defaults to0 for compatibility.
+Skin coverage restricts the new band; skin farther than10mm in camera depth from
+the nearest visible eye pixel is rejected. Alpha and zero-weight pixels remain
+exactly unchanged. Iris centres are preserved.
+
+Recipe selection used only the four Windows UE blur-on/off development captures,
+with a fixed common exterior region; validation beauty images did not tune it.
+Native Cycles captures use Linux HIP, Blender5.2.3, visible dicing2 and diagnostic
+offscreen dicing16. Fresh paired controls share those settings.
+
+| Fixed UE eye crops | Previous LPIPS / DISTS | New LPIPS / DISTS |
+|---|---|---|
+| Full1024/128, development020/100 | .20570 / .16591 | .19878 / .15986 |
+| Six512/32 validation views005/194LR+038/300L | .21279 / .16511 | .20918 / .16328 |
+
+All eight distinct eye views improve crop and whole-frame LPIPS. Both full crops
+improve DISTS; validation DISTS improves5/6 (194left slightly worse). Pixel boundary
+MAE is mixed: full23.545→23.786, validation19.435→19.339 (5/6 improve). The
+perceptual gain should not be described as a universal pixel-error improvement.
+The final comparisons use the same eye-material AOV as the public renderer;
+original skin and position AOVs match the cached controls exactly. Full and
+six-view comparison sheets were visually inspected. Remaining iris,
+canthus and skin-material differences are visible in the comparisons.
+
+Artifacts under `tmp/vhuman-eye-quality/`: `contact56/report.json` records the
+matched-ablation fit and image hashes; `contact57/{summary.json,full_comparison.jpg,
+validation_comparison.jpg}` records the frozen experiment. `contact58/verification.json`
+checks the production implementation on all ten cached cases (fast/full repeats
+included): new output exactly matches the prototype, and strength0 exactly
+reproduces the old output. Final actual-AOV confirmation is recorded in
+`mask60` and `contact61/{summary.json,verification.json,full_comparison.jpg,
+validation_comparison.jpg}`. All ten cases preserve alpha and zero-weight pixels
+exactly; the full capture peak was14208MiB below14336MiB. Tests cover the localized footprint, foreground depth
+rejection, invalid inputs, alpha, default opt-outs and historical variants.
+
+Production API validation also passes with measured normal maps and procedural-only
+normals on Linux HIP, including saved-scene reload. Both actual eye/skin AOV
+compositions change the intended contact pixels while preserving alpha and every
+zero-weight pixel exactly. Peak device usage was10190MiB, below14336MiB. Runtime
+records: `tmp/vhuman-eye-quality/production59_summary.json`.
+
+Workspace validation commands (17 unit checks +1 prior/default check pass):
+```sh
+TMPDIR=$PWD/tmp tmp/vhuman-cpu-venv/bin/python -m unittest server.vhuman.test_eye_contact server.vhuman.test_skin_profile server.vhuman.test_aperture_audit -q
+TMPDIR=$PWD/tmp tmp/vhuman-cpu-venv/bin/python -m pytest -q server/vhuman/test_metahuman_prior.py::test_default_variant_2026_11_08 --basetemp=tmp/vhuman-eye-quality/pytest58
+```
+
+### Eye-side contact default (2026-11-08)
+
+`peri_profile5` strengthens the eye-side contact blend to.8472126447375768.
+The original fit used a face-parsing mask; fitting the existing kernel to the
+independently captured opaque UE eye openings gives a more accurate boundary.
+On those same four development blur-on/off captures, normalized residual SSE
+falls.61956→.42854 (about31% lower), improving all four cases. Width1.2mm,
+sigma.25mm and the skin-side treatment follow the existing profile. Selection
+used only the UE ablations, before checking development/validation beauty scores.
+
+New full-quality render requests receive this strength through `default_overrides`.
+Explicit values win. `peri_profile4` and older named profiles explicitly keep
+.35739718109334984, and low-level helper/old-request fallbacks retain their prior
+values. Use `peri_profile4` or that explicit `eye_contact_strength` to reproduce
+the previous default. The new setting changes only pixels in the existing
+visible eye-side band; alpha and pixels outside that band are exact.
+
+| Fixed UE eye crops, previous-default exposure | Profile4 LPIPS / DISTS | Profile5 LPIPS / DISTS |
+|---|---|---|
+| Full1024/128 development020/100 | .19875 / .15982 | .19164 / .15536 |
+| Six512/32 validation005/194LR+038/300L | .20908 / .16332 | .20764 / .16238 |
+
+All eight unique eye crops improve LPIPS and boundary MAE. Full boundary MAE
+23.793→23.251; validation19.339→18.857. DISTS improves6/8 (194LR worsens), and
+whole-frame LPIPS improves7/8 (005right slightly worsens .135483→.135585).
+Full and six-view comparison sheets were visually inspected. This is still a
+scene-colour approximation of the UE contact layer, separate from skin SSS.
+
+Artifacts under `tmp/vhuman-eye-quality/`: `eye62/fit.json` contains the frozen
+fit, per-case residuals and source-image hashes. `contact63/{summary.json,
+full_comparison.jpg,validation_comparison.jpg}` contains the actual material-AOV
+comparison. Native GPU captures are reused because this change affects only
+composition. `contact64/verification.json` confirms all ten cached cases: the
+new default matches the candidate exactly, old profile4 reproduces its output
+exactly, and alpha/outside-band pixels are exact.
+
+Both public Linux HIP rendering branches (measured/procedural normal maps) pass,
+including saved-scene reload and actual AOV composition checks against profile4.
+Peak device usage10185MiB<14336MiB; results in `production65_summary.json`.
+The targeted17 unit checks and prior/default pytest check pass (same commands
+above; latest pytest scratch directory `pytest65`). No new GPU render pass or
+render dependency is introduced.
+
+### Experimental wider eye-side contact
+
+`peri_profile6` is an opt-in comparison variant. It keeps profile5's skin-side
+width and uses a separate 0.25 mm skin blur sigma, while widening the eye-side
+band to 1.8 mm with a 0.35 mm sigma and strength 0.5855533446742217. The
+default remains `peri_profile5`. A fit to Windows UE blur-on/off ablations on
+020/100 reduced pooled residual SSE from .42854 to .31183. On newly captured
+005/194 left and right eye ablations and independently captured opaque eye
+openings, the frozen candidate reduced pooled SSE from .39634 to .31914 and
+improved all four cases. These measures isolate the UE optical layer; they do
+not establish overall face quality.
+
+With the actual eye material AOV, six 512-pixel validation crops improved mean
+LPIPS .207660 to .207187 and boundary MAE 18.857 to 18.647, while DISTS changed
+.162344 to .162528. Two 1024-pixel development crops changed mean LPIPS .191635
+to .192071 and DISTS .155406 to .156934. Those image results and a visual review
+are mixed, so the variant is not a new default. The prototype and production
+composition differ by at most 0.000089 in scene-linear RGB in the ten cached
+views because their skin blur uses a slightly different median depth. Evidence:
+`tmp/vhuman-eye-quality/boundary94` through `boundary98` and `aperture95`.
+The public Blender GPU render path also passed a 512-pixel / 16-sample test with
+the separate sigmas: the saved image recomposed exactly and preserved alpha;
+peak whole-device usage was 10169 MiB (`boundary98`).
+The named `peri_profile6` layered-eye staging and saved-asset reload path also
+completed on Blender HIP at 512 pixels / 32 samples, with 11174 MiB peak
+whole-device usage (`boundary99`).
+
+`peri_profile7` is a second opt-in comparison that keeps profile6's eye width
+and sigma while using an independently specified, nearly neutral eye-side tint
+and strength .670908. The skin-side tint and sigma remain the profile6 values.
+Fitting tint and strength on the 020/100 UE ablations reduced pooled residual
+SSE .31183 to .24408; on the frozen 005/194 holdout it changed .31914 to
+.27250, improving three of four eyes. On cached 1024-pixel development beauty
+renders, mean LPIPS changed .192009 to .191056, DISTS .156857 to .156483 and
+boundary MAE 23.199 to 23.545; six validation crops give mixed DISTS and boundary
+errors. Visual differences are subtle and the default stays `peri_profile5`.
+See `boundary101` through `boundary104` under `tmp/vhuman-eye-quality/`.
+The named layered-eye Blender HIP path, including saved-asset reload, passed at
+512 pixels / 32 samples with 11177 MiB peak whole-device usage (`boundary104`).
+Directly against profile5, the six 512-pixel validation crops changed mean
+LPIPS .207660 to .207012 and boundary MAE 18.857 to 18.643, but the two
+1024-pixel crops changed DISTS .155406 to .156502 and boundary MAE 23.255 to
+23.544. This supports keeping the default unchanged (`boundary105`).
+On two additional 512-pixel left-eye crops, both variants improved LPIPS and
+DISTS for identity 256 and worsened them for identity 145 (`boundary120`).
+Fresh UE blur-on/off captures and opaque aperture masks for both eyes of those
+identities gave pooled relative SSE .35917 / .30841 / .24419 for profiles
+5 / 6 / 7, respectively; all four eye cases improved in this isolated optical
+test (`boundary118`, `aperture119`). The 256 right-eye ablation has a much
+smaller signal and a large relative error for all three profiles. Overall
+beauty results remain mixed, so profile5 remains the default.
+
+`peri_profile8` is an opt-in experiment based on profile7. It estimates each
+visible eye's long axis and varies the eye-side contact strength between
+0.7702 at the upper lid and 0.4295 at the lower lid; skin-side settings are
+unchanged. The weights were fitted to UE 020/100 optical ablations. On fresh
+038/300 left- and right-eye ablations, actual production contact code reduced
+pooled relative SSE from .16319 for profile7 to .12465, improving all four
+eyes (`boundary134`). Overall beauty results remain mixed: two 1024-pixel
+development crops changed mean LPIPS .19093 to .19149 and DISTS .15629 to
+.15849 (`boundary141`). The axis is inferred from screen-space coverage,
+not anatomical landmarks; very small, nearly closed, round or near-vertical
+components fade toward neutral weights. Fractional coverage makes that fade
+smoother as the eye closes, but upside-down eyes are not disambiguated. The
+default remains profile5.
+Against profile5 directly, six 512-pixel validation crops changed mean LPIPS
+.20768 to .20692 and boundary MAE 18.830 to 18.591, while two 1024-pixel
+crops changed DISTS .15542 to .15846 (`boundary142`). On the additional
+145/256 left-eye views, profile8 worsened both LPIPS and DISTS for 145 and
+slightly improved both for 256 (`boundary143`).
+The public portrait and named layered-eye HIP paths passed saved-scene reload
+and exact recomposition; the split changed only the eye-contact band and
+preserved alpha (`boundary132`, `boundary133`; peak whole-device usage 11176
+and 10172 MiB, respectively).
+Two additional full-face front and 40-degree yaw comparisons also show mixed
+results: profile8 slightly improved both eye-crop LPIPS and DISTS in the two
+front views, while the 256 yaw view worsened both. The differences are small
+except for DISTS on that yaw view; the assets also differ in face shape and
+skin texture (`boundary138`). All four saved HIP renders passed exact baseline
+recomposition and alpha checks, with a peak of 11039 MiB (`boundary137`).
+
+An independent on/off skin-scattering diagnostic on those front and yaw views
+showed a substantial identity dependence. At a two-pixel high-pass scale, the
+UE on/off RMS ratios were .970/.960 for 145 and .905/.911 for 256; the Blender
+ratios were .946/.942 and .956/.974, respectively (`sss166`). The comparison
+uses eroded common skin masks, but differing geometry, materials and 32-sample
+Blender renders limit its physical interpretation. It does not justify a
+global increase in scattering strength.
+Repeating the two yaw views at 128 samples changed the corresponding Blender
+ratios from .942/.974 to .931/.916 (UE .960/.911), using common eroded skin
+masks (`sss168`). This sample-count sensitivity is another reason to avoid
+fitting scattering strength to the 32-sample diagnostic.
+Two more 128-sample identities showed the same stronger red than blue
+high-frequency attenuation in both renderers. For the front views, Unreal's
+RGB on/off ratios were [.796, .942, .976] and [.913, .979, .992]; Blender's
+were [.778, .935, .969] and [.903, .980, .993] (`sss175`). The geometry and
+materials differ, so these are descriptive comparisons of the scattering
+response rather than a physical equivalence test.

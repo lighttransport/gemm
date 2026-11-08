@@ -222,20 +222,474 @@ EYE_SWEEP_VARIANTS = tuple(eye_variant(p, v) for p, values in EYE_SWEEP.items() 
 
 def eye_version(variant):
     """eye_map version a variant renders with (0 = template eyes)."""
-    return 2 if variant.startswith(('ew_', 'c_')) or variant in ('combo', 'combo_is0', 'combo_is0_gain15', 'combo_is0_gain25') else MH_EYES.get(variant, 0)
+    if variant.startswith(('iso_iris4', 'iso_layered2')):
+        return 4
+    if variant.startswith('iso_iris3'):
+        return 3
+    return 2 if variant.startswith(('ew_', 'c_', 'iso_', 'peri_')) or variant in ('combo', 'combo_is0', 'combo_is0_gain15', 'combo_is0_gain25') else MH_EYES.get(variant, 0)
 
 
 # Default MetaHuman comparison render (2026-11-06, user-approved; README "12 h goal round" combined confirm): MH eye
 # placement + per-identity roughness x1.25 x MH roughness/1.03 + coat 0 + sclera x.85, eye_map v2 (LPIPS -.0111 vs
 # 'normal', 87/96 views, eye dE -15.1). 'normal' stays the experiment baseline name.
-DEFAULT_VARIANT = 'combo'
+DEFAULT_VARIANT = 'peri_profile5'
 MH_ROUGHNESS_MEAN = 1.03   # mean MetaHuman skin 'roughness' multiplier of the 12 comparison heads
+
+
+def vascular_overlay_strength(vascularity):
+    """Experimental mapping from MetaHuman vascularity to overlay strength."""
+    return min(1., max(0., .15 + .46 * float(vascularity)))
+
+
+# Periocular study variants (2026-11-07): face-visible eye cameras, layered on the default 'combo'.
+PERI = {
+    'peri_l2': {'eye_model_layered2': 1.},
+    'peri_l2_car': {'eye_model_layered2': 1., 'peri_caruncle': 1.},
+    'peri_l2_men': {'eye_model_layered2': 1., 'peri_meniscus': 1.},
+    'peri_l2_ao': {'eye_model_layered2': 1., 'peri_eye_ao': .6},
+    'peri_l2_all': {'eye_model_layered2': 1., 'peri_caruncle': 1., 'peri_meniscus': 1., 'peri_eye_ao': .6},
+    'peri_l2_ao10': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .003},
+    'peri_l2_rect': {'eye_model_layered2': 1., 'peri_eye_ao': .6, 'eye_rect_lights': 1., 'eye_rect_align': 1.},
+    'peri_l2_car2': {'eye_model_layered2': 1., 'peri_eye_ao': .6, 'peri_caruncle': 1.},
+    'peri_r2': {'eye_model_layered2': 1., 'peri_eye_ao': .6, 'eye_rect_lights': 1., 'eye_rect_align': 1.},
+    'peri_r2_lid': {'eye_model_layered2': 1., 'peri_eye_ao': .6, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_lid_sss': 2.},
+    'peri_r2_men': {'eye_model_layered2': 1., 'peri_eye_ao': .6, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1.},
+    'peri_r3_ao5': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                    'eye_rect_align': 1., 'peri_meniscus': 1.},
+    'peri_r3_back': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                     'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0008},
+    'peri_r3_back14': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                       'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014},
+    'peri_r4_sock': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                     'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'peri_socket': 1.},
+    'peri_r4_sock08': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                       'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0008, 'peri_socket': 1.},
+    'peri_r4_notear': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                       'eye_rect_align': 1., 'peri_eye_back': .0014, 'peri_no_tearline': 1.},
+    'peri_r5': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014},   # tear lines follow the eye (.7)
+    'peri_r5_ue1': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_weight': 1., 'subsurface_radius': [1.05, .41, .26], 'subsurface_scale': 1.},
+    'peri_r5_w1': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_weight': 1.},
+    'peri_r5_s1': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_scale': 1.},
+    'peri_r6': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_weight': 1., 'subsurface_scale': 1.},
+    'peri_r6_veil': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_weight': 1., 'subsurface_scale': 1., 'peri_lid_veil': .7},
+    'peri_r5_s07': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_scale': .7},
+    'peri_r5_s1w8': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_scale': 1., 'subsurface_weight': .8},
+    'peri_r5_loc': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014},     # = peri_r5, rendered on the local GPU (agreement check)
+    'peri_r7k': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_scale': 1., 'peri_eye_ao': .7, 'peri_knobs': 1.},   # sweep base: r5 + s1.0 + ao .7 + knobs
+    # best periocular variant (2026-11-07 knobs2 sweep: lid roughness x.8 -> .2568, 8/8 views better than peri_r7k)
+    'peri_r8': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1., 'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_eye_back': .0014, 'subsurface_scale': 1., 'peri_eye_ao': .7, 'peri_knobs': 1., 'peri_k_lid_rough': .8},
+    'peri_r3_margin2': {'eye_model_layered2': 1., 'peri_eye_ao': 1., 'peri_eye_ao_dist': .005, 'eye_rect_lights': 1.,
+                        'eye_rect_align': 1., 'peri_meniscus': 1., 'peri_margin': 1.},
+    'peri_r3_margin': {'eye_model_layered2': 1., 'peri_eye_ao': .6, 'eye_rect_lights': 1., 'eye_rect_align': 1.,
+                       'peri_meniscus': 1., 'peri_margin': 1.},
+}
+PERI['peri_contact01'] = dict(PERI['peri_r8'], peri_contact_shading=1., peri_contact_width_m=.0005)
+PERI['peri_surface02'] = dict(PERI['peri_r8'], peri_contact_shading=1., peri_contact_atlas=1., peri_contact_width_m=.0005)
+PERI['peri_material03'] = dict(PERI['peri_r8'])
+PERI['peri_profile'] = dict(PERI['peri_r8'], skin_lighting_profile=1.,
+                            skin_scatter_scale=.5, skin_scatter_weight=1., eye_contact_blur=1.,
+                            eye_contact_strength=.35739718109334984,
+                            eye_contact_skin_strength=0.,
+                            skin_normal_weighted_blend=0., skin_micro_isotropic=0., skin_pore_scale=1.,
+                            skin_normal_preserve_lids=0.)
+PERI['peri_profile2'] = dict(PERI['peri_profile'], skin_normal_weighted_blend=1.,
+                             skin_micro_isotropic=1., skin_pore_scale=.5)
+PERI['peri_profile3'] = dict(PERI['peri_profile2'], skin_normal_preserve_lids=1.)
+PERI['peri_profile4'] = dict(PERI['peri_profile3'], eye_contact_skin_strength=1.,
+                             eye_contact_skin_width_m=.0012)
+PERI['peri_profile5'] = dict(PERI['peri_profile4'], eye_contact_strength=.8472126447375768)
+PERI['peri_profile6'] = dict(PERI['peri_profile5'], eye_contact_width_m=.0018,
+                             eye_contact_sigma_m=.00035, eye_contact_skin_sigma_m=.00025,
+                             eye_contact_strength=.5855533446742217)
+PERI['peri_profile7'] = dict(PERI['peri_profile6'], eye_contact_strength=.6709080431492216,
+                             eye_contact_tint=[.9969585649012283,1.,1.],
+                             eye_contact_skin_tint=[1.,.904661,.896269])
+PERI['peri_profile8'] = dict(PERI['peri_profile7'], eye_contact_upper_strength=.7701849107616328,
+                             eye_contact_lower_strength=.42947561568953274)
+PERI['peri_profile5_temporal'] = dict(PERI['peri_profile5'], eye_contact_thin_aperture=1.,
+                                     eye_contact_skin_coverage=1.)
+PERI['peri_waterline04'] = dict(PERI['peri_surface02'], peri_no_tearline=1., peri_contact_wetness=0.,
+    peri_contact_sss_weight=.6, peri_contact_sss_scale=1., peri_waterline_coat=.7)
+
+
+
+# iso_layered2 sub-variants: eye2_* material overrides on top of the layered eye defaults (cycles_scene.eye2_layered).
+LAYERED2 = {
+    'iso_layered2': {},                                                 # veil limbus (default)
+    'iso_layered2_paint': {'eye2_limbus_paint': 1.},                   # UE-style painted iris->sclera colour blend
+    'iso_layered2_mnee': {'eye2_cornea_shadow': 1.},
+    'iso_layered2_bump2': {'eye2_bump': 2.},
+    'iso_layered2_sss1': {'eye2_sclera_sss': 1.},                       # 2026-11-06 default before dev12
+    'iso_layered2_sss05': {'eye2_sclera_sss': .5},
+    'iso_layered2_sss0': {'eye2_sclera_sss': 0.},                       # = current default
+    'iso_layered2_sssr025': {'eye2_sclera_sss': 1., 'eye2_sss_scale': .25},
+}
 
 
 def variant_options(variant, sid=None):
     """Render options of a variant name: VARIANTS entries, or sw_<param>_<value> = 'normal' + one sweep setting.
     mat_rmh_c0 (per identity, needs sid): roughness x 1.25 x (MH skin roughness / 1.03), coat 0 -- the x1.25 gain per head
     correlates with MH's sampled roughness multiplier (r -.71), mh_000145 (.91) is hurt."""
+    if variant in PERI:
+        # periocular study: default MH comparison render ('combo', face visible) + the layered eye and periocular toggles
+        opts = variant_options('combo', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], **PERI[variant])
+        return opts
+    if variant in LAYERED2:
+        # Fresh physically layered eye (server/vhuman/eye2). Inherits the guided baseline's camera framing, lights and
+        # staged per-eye textures (used only as colour/pupil measurements); the old eye meshes are hidden.
+        opts = variant_options('iso_iris4_bilateral_organic_guided', sid)
+        keep = ('roughness_scale', 'skin_coat', 'eye_only', 'eye_zoom', 'eye_rect_lights', 'eye_rect_align')
+        mo = {k: v for k, v in opts['material_overrides'].items() if k in keep or k.startswith(('eye_zoom_', 'eye_offset_'))}
+        opts['material_overrides'] = dict(mo, eye_model_layered2=1., **LAYERED2[variant])
+        return opts
+    if variant in ('iso_iris4_bilateral_organic_guided_sss03', 'iso_iris4_bilateral_organic_guided_sss06'):
+        opts = variant_options('iso_iris4_bilateral_organic_guided', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_sss_weight=.3 if variant.endswith('03') else .6)
+        return opts
+    if variant == 'iso_iris4_bilateral_organic_selfsafe':
+        opts = variant_options('iso_iris4_bilateral_organic_guided', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_selfsafe=1.)
+        return opts
+    if variant == 'iso_iris4_bilateral_organic_nocross':
+        opts = variant_options('iso_iris4_bilateral_organic_guided', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_nocross=1.)
+        return opts
+    if variant == 'iso_iris4_bilateral_organic_guided':
+        opts = variant_options('iso_iris4_bilateral_organic_gain15', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_guided=1.)
+        return opts
+    if variant in ('iso_iris4_bilateral_organic_gain15', 'iso_iris4_bilateral_organic_gain2'):
+        opts = variant_options('iso_iris4_bilateral_organic_dense', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'],
+                                          sclera_vessel_all_strength=1.5 if variant.endswith('15') else 2.)
+        return opts
+    if variant == 'iso_iris4_bilateral_organic_dense':
+        opts = variant_options('iso_iris4_bilateral_organic', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_organic_dense=1.)
+        return opts
+    if variant == 'iso_iris4_bilateral_organic':
+        opts = variant_options('iso_iris4_bilateral_framed_tissue', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_organic=1.)
+        return opts
+    if variant in ('iso_iris4_bilateral_framed_colorbase', 'iso_iris4_bilateral_framed_tissuebase',
+                   'iso_iris4_bilateral_framed_tissue'):
+        opts = variant_options('iso_iris4_bilateral_framed', sid)
+        mo = dict(opts['material_overrides'])
+        if 'tissue' in variant:
+            path = ROOT / 'tmp/vhuman-mh/eye_isolate/tissue_strengths.json'
+            fitted = json.loads(path.read_text())
+            if fitted.get('side') != 'left' or sid not in fitted.get('strengths', {}):
+                raise ValueError(f'{path} has no left-eye tissue fit for {sid}')
+            mo['sclera_tissue_strength'] = float(fitted['strengths'][sid])
+        if variant.endswith('base'):
+            mo['eye_basecolor_only'] = 1.
+            for name in ('eye_ue_split', 'unified_surface_bump_distance', 'unified_surface_bump_patchy'):
+                mo.pop(name, None)
+        opts['material_overrides'] = mo
+        return opts
+    if variant == 'iso_iris4_bilateral_framed':
+        if sid is None:
+            raise ValueError('bilateral framing requires a sample id')
+        path = ROOT / 'tmp/vhuman-mh/eye_isolate/zoom_fit.json'
+        sample = json.loads(path.read_text()).get('samples', {}).get(sid)
+        if not sample or not all(side in sample for side in ('left', 'right')):
+            raise ValueError(f'{path} has no complete eye-camera fit for {sid}')
+        opts = variant_options('iso_iris4_bilateral_bump15', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'],
+                                          eye_zoom_left=float(sample['left']['zoom']),
+                                          eye_zoom_right=float(sample['right']['zoom']))
+        return opts
+    if variant in ('iso_iris4_bilateral_caustic05', 'iso_iris4_bilateral_caustic1'):
+        opts = variant_options('iso_iris4_bilateral_bump15', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], unified_key_caustic_strength=.5 if variant.endswith('05') else 1.)
+        return opts
+    if variant in ('iso_iris4_bilateral_smooth', 'iso_iris4_bilateral_bump15'):
+        opts = variant_options('iso_iris4_bilateral', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'])
+        if variant.endswith('smooth'):
+            opts['material_overrides'].pop('unified_surface_bump_distance', None)
+            opts['material_overrides'].pop('unified_surface_bump_patchy', None)
+        else:
+            opts['material_overrides']['unified_surface_bump_distance'] = .00015
+        return opts
+    if variant == 'iso_iris4_bilateral_asymprobe':
+        opts = variant_options('iso_iris4_bilateral', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], eye_right_probe_size_offset=.02)
+        return opts
+    if variant in ('iso_iris4_bilateral', 'iso_iris4_bilateralbase'):
+        opts = variant_options('iso_iris4_ring_selectbase' if variant.endswith('base') else 'iso_iris4_ring_select', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], eye_per_side=1., eye_bilateral_select=1.)
+        return opts
+    if variant in ('iso_iris4_ring_select', 'iso_iris4_ring_selectbase'):
+        if sid is None:
+            raise ValueError('ring selection requires a sample id')
+        path = ROOT / 'tmp/vhuman-mh/eye_isolate/ring_selection.json'
+        sample = json.loads(path.read_text())['samples'].get(sid)
+        if not sample or sample.get('choice') not in ('neutral', 'baseline'):
+            raise ValueError(f'{path} has no valid ring selection for {sid}')
+        selected = 'iso_iris4_ring_none' if sample['choice'] == 'neutral' else 'iso_iris4_sparse_bands'
+        return variant_options(selected + ('base' if variant.endswith('base') else ''), sid)
+    if variant in ('iso_iris4_ring_soft', 'iso_iris4_ring_softbase', 'iso_iris4_ring_none', 'iso_iris4_ring_nonebase'):
+        opts = variant_options('iso_iris4_sparse_bandsbase' if variant.endswith('base') else 'iso_iris4_sparse_bands', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_ring_soft=1. if '_soft' in variant else 0.,
+                                          iris_ring_none=1. if '_none' in variant else 0.)
+        return opts
+    if variant in ('iso_iris4_sparse_fibers_fit', 'iso_iris4_sparse_fibers_fitbase'):
+        opts = variant_options('iso_iris4_sparse_fibersbase' if variant.endswith('base') else 'iso_iris4_sparse_fibers', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_fiber_chroma_fit=1.)
+        return opts
+    if variant in ('iso_iris4_sparse_fibers', 'iso_iris4_sparse_fibersbase'):
+        opts = variant_options('iso_iris4_sparse_bandsbase' if variant.endswith('base') else 'iso_iris4_sparse_bands', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_fiber_chroma=.6)
+        return opts
+    if variant in ('iso_iris4_sparse_swap', 'iso_iris4_sparse_swapbase'):
+        opts = variant_options('iso_iris4_sparse_bandsbase' if variant.endswith('base') else 'iso_iris4_sparse_bands', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_swap_regions=1.)
+        return opts
+    if variant in ('iso_iris4_sparse_bands', 'iso_iris4_sparse_bandsbase'):
+        opts = variant_options('iso_iris4_sparse_adaptbase' if variant.endswith('base') else 'iso_iris4_sparse_adapt', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_radial_bands=1.)
+        return opts
+    if variant in ('iso_iris4_sparse_adapt', 'iso_iris4_sparse_adaptbase'):
+        opts = variant_options('iso_iris4_vascular_sparsebase' if variant.endswith('base') else 'iso_iris4_sparse_patch4', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_adaptive_contrast=1.)
+        return opts
+    if variant in ('iso_iris4_sparse_patch2', 'iso_iris4_sparse_patch4'):
+        opts = variant_options('iso_iris4_sparse_bump1', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], unified_surface_bump_patchy=1.,
+                                          unified_surface_bump_distance=.0002 if variant.endswith('2') else .0004)
+        return opts
+    if variant in ('iso_iris4_sparse_bump1', 'iso_iris4_sparse_bump4'):
+        opts = variant_options('iso_iris4_sparse_split', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], unified_sclera_roughness=.12,
+                                          unified_surface_bump_distance=.0001 if variant.endswith('1') else .0004)
+        return opts
+    if variant in ('iso_iris4_sparse_split', 'iso_iris4_sparse_split_n4'):
+        opts = variant_options('iso_iris4_vascular_sparse', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], eye_ue_split=1.)
+        if variant.endswith('_n4'):
+            opts['material_overrides'].update(unified_sclera_roughness=.12, unified_shell_normal_strength=4.)
+        return opts
+    if variant in ('iso_iris4_vascular_sparse', 'iso_iris4_vascular_sparsebase'):
+        opts = variant_options('iso_iris4_vascular_finebase' if variant.endswith('base') else 'iso_iris4_vascular_fine', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_density=1., sclera_vessel_all_strength=1.)
+        return opts
+    if variant in ('iso_iris4_vascular_fine', 'iso_iris4_vascular_finebase'):
+        opts = variant_options('iso_iris4_vascular_linesbase' if variant.endswith('base') else 'iso_iris4_vascular_lines', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_surface_fine=1.)
+        return opts
+    if variant in ('iso_iris4_vascular_lines', 'iso_iris4_vascular_linesbase'):
+        opts = variant_options('iso_iris4_vascular_surfacebase' if variant.endswith('base') else 'iso_iris4_vascular_surface', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_lines_only=1.)
+        return opts
+    if variant in ('iso_iris4_vascular_surface', 'iso_iris4_vascular_surfacebase'):
+        opts = variant_options('iso_iris4_vascularbase' if variant.endswith('base') else 'iso_iris4_vascular', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_surface_microtexture=.05)
+        return opts
+    if variant in ('iso_iris4_vascular', 'iso_iris4_vascularbase'):
+        if sid is None:
+            raise ValueError('vascular diagnostic requires a sample id')
+        from .eye_map import mh_eye
+        settings = json.loads((V1 / 'samples' / sid / 'params.json').read_text())['eyes']['settings']
+        vascularity = float(mh_eye(settings, 'left')['sclera']['vascularity_intensity'])
+        opts = variant_options('iso_iris4_dense_irregularbase' if variant.endswith('base') else 'iso_iris4_dense_irregular', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_vessel_all_strength=vascular_overlay_strength(vascularity))
+        return opts
+    if variant in ('iso_iris4_dense_irregular', 'iso_iris4_dense_irregularbase'):
+        opts = variant_options('iso_iris4_clean_irregularbase' if variant.endswith('base') else 'iso_iris4_clean_irregular', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_dense_vessels=1., sclera_vessel_all_strength=1.)
+        return opts
+    if variant in ('iso_iris4_clean_irregular', 'iso_iris4_clean_irregularbase'):
+        opts = variant_options('iso_iris4_irregularbase' if variant.endswith('base') else 'iso_iris4_irregular', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_clean_base=1.)
+        return opts
+    if variant in ('iso_iris4_irregular', 'iso_iris4_irregularbase'):
+        opts = variant_options('iso_iris4_layeredbase' if variant.endswith('base') else 'iso_iris4_layered', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_irregular_vessels=1., sclera_vessel_all_strength=.5)
+        return opts
+    if variant in ('iso_iris4_curvy', 'iso_iris4_curvybase'):
+        opts = variant_options('iso_iris4_trans05base' if variant.endswith('base') else 'iso_iris4_trans05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], sclera_curvy_vessels=1., sclera_vessel_all_strength=.5)
+        return opts
+    if variant in ('iso_iris4_framed_layered', 'iso_iris4_side_layered', 'iso_iris4_side_layeredbase'):
+        if variant == 'iso_iris4_side_layeredbase':
+            opts = variant_options('iso_iris4_adapt_trans05', sid)
+            opts['material_overrides'] = dict(opts['material_overrides'], eye_basecolor_only=1., eye_per_side=1.)
+        else:
+            opts = variant_options('iso_iris4_side_split' if variant == 'iso_iris4_side_layered' else 'iso_iris4_framed_split', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_layered_calibrate=1.)
+        return opts
+    if variant in ('iso_iris4_framed_split', 'iso_iris4_side_split'):
+        opts = variant_options('iso_iris4_framed_n4_surface05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], eye_ue_split=1.)
+        if variant == 'iso_iris4_side_split':
+            opts['material_overrides']['eye_per_side'] = 1.
+        return opts
+    if variant in ('iso_iris4_contrast', 'iso_iris4_contrastbase'):
+        opts = variant_options('iso_iris4_layeredbase' if variant.endswith('base') else 'iso_iris4_layered', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_adaptive_contrast=1.)
+        return opts
+    if variant in ('iso_iris4_layered', 'iso_iris4_layeredbase'):
+        opts = variant_options('iso_iris4_trans05base' if variant.endswith('base') else 'iso_iris4_trans05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_layered_calibrate=1.)
+        return opts
+    if variant in ('iso_iris4_radial', 'iso_iris4_radialbase'):
+        opts = variant_options('iso_iris4_trans05base' if variant.endswith('base') else 'iso_iris4_trans05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], iris_radial_calibrate=1.)
+        return opts
+    if variant in ('iso_iris4_side', 'iso_iris4_sidebase', 'iso_iris4_side_radial', 'iso_iris4_side_radialbase'):
+        if variant == 'iso_iris4_side_radialbase':
+            opts = variant_options('iso_iris4_adapt_trans05', sid)
+            opts['material_overrides'] = dict(opts['material_overrides'], eye_basecolor_only=1.)
+        else:
+            opts = variant_options('iso_iris4_adaptbase' if variant.endswith('base') else 'iso_iris4_framed_n4_surface05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], eye_per_side=1.)
+        if 'radial' in variant:
+            opts['material_overrides']['iris_radial_calibrate'] = 1.
+        return opts
+    if variant in ('iso_iris4_surface05', 'iso_iris4_surface10', 'iso_iris4_surface05base', 'iso_iris4_surface10base'):
+        opts = variant_options('iso_iris4_trans05base' if variant.endswith('base') else 'iso_iris4_trans05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'],
+                                          sclera_surface_microtexture=.05 if 'surface05' in variant else .1)
+        return opts
+    if variant in ('iso_iris4_split', 'iso_iris4_split_n4', 'iso_iris4_split_sss03'):
+        opts = variant_options('iso_iris4_trans05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], eye_ue_split=1.)
+        if variant.endswith('n4'):
+            opts['material_overrides'].update(unified_sclera_roughness=.12, unified_shell_normal_strength=4.)
+        if variant.endswith('sss03'):
+            opts['material_overrides']['sclera_sss_weight'] = .3
+        return opts
+    if variant in ('iso_iris4_micro10', 'iso_iris4_micro20', 'iso_iris4_micro10base', 'iso_iris4_micro20base'):
+        opts = variant_options('iso_iris4_trans05base' if variant.endswith('base') else 'iso_iris4_trans05', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'],
+                                          sclera_microtexture=.1 if 'micro10' in variant else .2)
+        return opts
+    if variant in ('iso_iris4_framed', 'iso_iris4_framed_trans', 'iso_iris4_framed_trans05',
+                   'iso_iris4_framed_n4', 'iso_iris4_framed_n4_sss03',
+                   'iso_iris4_framed_n4_surface05', 'iso_iris4_framed_n4_surface05_sss03'):
+        if sid is None:
+            raise ValueError(f'{variant} requires a sample id')
+        fit_path = ROOT / 'tmp/vhuman-mh/eye_isolate/zoom_fit.json'
+        fit = json.loads(fit_path.read_text())
+        sample = fit.get('samples', {}).get(sid)
+        if not sample or not all(side in sample for side in ('left', 'right')):
+            raise ValueError(f'{fit_path} has no complete eye-camera fit for {sid}')
+        base = ('iso_iris4_adapt_trans05' if variant.endswith('trans05') or '_n4' in variant else
+                'iso_iris4_adapt_trans' if variant.endswith('trans') else 'iso_iris4_adapt')
+        opts = variant_options(base, sid)
+        opts['material_overrides'] = dict(opts['material_overrides'],
+                                          eye_zoom_left=float(sample['left']['zoom']),
+                                          eye_zoom_right=float(sample['right']['zoom']))
+        if '_n4' in variant:
+            opts['material_overrides'].update(unified_sclera_roughness=.12, unified_shell_normal_strength=4.)
+        if 'surface05' in variant:
+            opts['material_overrides']['sclera_surface_microtexture'] = .05
+        if variant.endswith('sss03'):
+            opts['material_overrides']['sclera_sss_weight'] = .3
+        return opts
+    if variant in ('iso_iris4_adapt', 'iso_iris4_adaptbase', 'iso_iris4_adapt_trans', 'iso_iris4_adapt_trans05'):
+        if sid is None:
+            raise ValueError(f'{variant} requires a sample id')
+        fit_path = ROOT / 'tmp/vhuman-mh/eye_isolate/tissue_strengths.json'
+        fit = json.loads(fit_path.read_text())
+        if fit.get('side') != 'left' or sid not in fit.get('strengths', {}):
+            raise ValueError(f'{fit_path} has no left-eye tissue fit for {sid}')
+        base = ('iso_iris4_calbase' if variant.endswith('base') else
+                'iso_iris4_trans05' if variant.endswith('trans05') else
+                'iso_iris4_trans1' if variant.endswith('trans') else 'iso_iris4_rectalign')
+        opts = variant_options(base, sid)
+        opts['material_overrides'] = dict(opts['material_overrides'],
+                                          sclera_tissue_strength=float(fit['strengths'][sid]))
+        return opts
+    isolated = {
+        'iso_base': {}, 'iso_vessel1': {'sclera_vessel_strength': 1.},
+        'iso_vessel2': {'sclera_vessel_strength': 2.},
+        'iso_sss03': {'sclera_sss_weight': .3}, 'iso_sss06': {'sclera_sss_weight': .6},
+        'iso_vessel1_sss03': {'sclera_vessel_strength': 1., 'sclera_sss_weight': .3},
+        'iso_ue_n1': {'iris_normal_strength': 1., 'cornea_roughness': .075},
+        'iso_ue_n05': {'iris_normal_strength': .5, 'cornea_roughness': .075},
+        'iso_ue_n1_gain15': {'iris_normal_strength': 1., 'cornea_roughness': .075, 'iris_gain': 1.5},
+        'iso_unified': {'eye_unified': 1.},
+        'iso_unified_sss03': {'eye_unified': 1., 'sclera_sss_weight': .3},
+        'iso_unified_rect': {'eye_unified': 1., 'eye_rect_lights': 1.},
+        'iso_unified_weld': {'eye_unified': 1., 'eye_rect_lights': 1.},
+        'iso_unified_basecolor': {'eye_unified': 1., 'eye_basecolor_only': 1.},
+        'iso_unified_v2': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5},
+        'iso_tissue05': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': .5},
+        'iso_tissue1': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': 1.},
+        'iso_tissue_base': {'eye_unified': 1., 'eye_basecolor_only': 1., 'sclera_tissue_strength': 1.},
+        'iso_iris3': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': 1.},
+        'iso_iris3_soft': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                           'sclera_tissue_strength': 1., 'iris_blend_softness_floor': .7},
+        'iso_iris3_smooth': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                             'sclera_tissue_strength': 1., 'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6},
+        'iso_iris3_smoothbase': {'eye_unified': 1., 'eye_basecolor_only': 1., 'sclera_tissue_strength': 1.,
+                                 'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6},
+        'iso_iris3_cal': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                          'sclera_tissue_strength': 1., 'iris_blend_softness_floor': .7,
+                          'iris_angular_smoothing': .6, 'iris_calibrate': 1.},
+        'iso_iris3_calbase': {'eye_unified': 1., 'eye_basecolor_only': 1., 'sclera_tissue_strength': 1.,
+                              'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6, 'iris_calibrate': 1.},
+        'iso_iris4_cal': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                          'sclera_tissue_strength': 1., 'iris_blend_softness_floor': .7,
+                          'iris_angular_smoothing': .6, 'iris_calibrate': 1.},
+        'iso_iris4_calbase': {'eye_unified': 1., 'eye_basecolor_only': 1., 'sclera_tissue_strength': 1.,
+                              'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6, 'iris_calibrate': 1.},
+        'iso_iris4_plainbase': {'eye_unified': 1., 'eye_basecolor_only': 1., 'sclera_tissue_strength': 0.,
+                                'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6, 'iris_calibrate': 1.},
+        'iso_iris4_rectalign': {'eye_unified': 1., 'eye_rect_lights': 1., 'eye_rect_align': 1.,
+                                'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': 1.,
+                                'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6, 'iris_calibrate': 1.},
+        'iso_iris4_normal4': {'eye_unified': 1., 'eye_rect_lights': 1., 'eye_rect_align': 1.,
+                              'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': 1.,
+                              'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6, 'iris_calibrate': 1.,
+                              'unified_sclera_roughness': .12, 'unified_shell_normal_strength': 4.},
+        'iso_iris4_normal8': {'eye_unified': 1., 'eye_rect_lights': 1., 'eye_rect_align': 1.,
+                              'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': 1.,
+                              'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6, 'iris_calibrate': 1.,
+                              'unified_sclera_roughness': .12, 'unified_shell_normal_strength': 8.},
+        'iso_iris4_trans05': {'eye_unified': 1., 'eye_rect_lights': 1., 'eye_rect_align': 1.,
+                              'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': 1.,
+                              'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6,
+                              'iris_calibrate': 1., 'sclera_transmission_compensation': .5},
+        'iso_iris4_trans1': {'eye_unified': 1., 'eye_rect_lights': 1., 'eye_rect_align': 1.,
+                             'sclera_vessel_all_strength': .5, 'sclera_tissue_strength': 1.,
+                             'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6,
+                             'iris_calibrate': 1., 'sclera_transmission_compensation': 1.},
+        'iso_iris4_trans05base': {'eye_unified': 1., 'eye_basecolor_only': 1., 'sclera_tissue_strength': 1.,
+                                  'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6,
+                                  'iris_calibrate': 1., 'sclera_transmission_compensation': .5},
+        'iso_iris4_trans1base': {'eye_unified': 1., 'eye_basecolor_only': 1., 'sclera_tissue_strength': 1.,
+                                 'iris_blend_softness_floor': .7, 'iris_angular_smoothing': .6,
+                                 'iris_calibrate': 1., 'sclera_transmission_compensation': 1.},
+        'iso_iris4_sss03': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                            'sclera_tissue_strength': 1., 'iris_blend_softness_floor': .7,
+                            'iris_angular_smoothing': .6, 'iris_calibrate': 1., 'sclera_sss_weight': .3},
+        'iso_iris4_sss07': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                            'sclera_tissue_strength': 1., 'iris_blend_softness_floor': .7,
+                            'iris_angular_smoothing': .6, 'iris_calibrate': 1., 'sclera_sss_weight': .7},
+        'iso_iris4_sss07x3': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                              'sclera_tissue_strength': 1., 'iris_blend_softness_floor': .7,
+                              'iris_angular_smoothing': .6, 'iris_calibrate': 1., 'sclera_sss_weight': .7,
+                              'unified_sss_radius_scale': 3.},
+        'iso_sclera_r12': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                           'sclera_tissue_strength': 1., 'unified_sclera_roughness': .12},
+        'iso_sclera_r25': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                           'sclera_tissue_strength': 1., 'unified_sclera_roughness': .25},
+        'iso_sclera_normal': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5,
+                              'sclera_tissue_strength': 1., 'unified_sclera_roughness': .12, 'unified_shell_normal_strength': 1.},
+        'iso_unified_rect_sss03': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_sss_weight': .3},
+        'iso_unified_all025': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .25},
+        'iso_unified_all05': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': .5},
+        'iso_unified_all1': {'eye_unified': 1., 'eye_rect_lights': 1., 'sclera_vessel_all_strength': 1.},
+    }
+    if variant in isolated:
+        opts = variant_options('combo_is0', sid)
+        opts['material_overrides'] = dict(opts['material_overrides'], eye_only=1., eye_zoom=2.5, **isolated[variant])
+        return opts
     if variant == 'mat_rmh_c0':
         if sid is None:
             raise ValueError('mat_rmh_c0 needs sid')
@@ -459,6 +913,13 @@ def write_eye_fit(sid, version=None):
 
 
 def render_sample(sid, cameras=CAMERAS, variant=DEFAULT_VARIANT):
+    if variant in ('peri_profile','peri_profile2','peri_profile3','peri_profile4','peri_profile5','peri_profile6','peri_profile7','peri_profile8','peri_profile5_temporal'):
+        # The layered-eye profile needs the per-eye assets from the persistent
+        # staging path, including their source/version checks.
+        from .win_cycles import render_local
+        render_local([sid], [variant], cameras, 'full', root_name='peri_profile_local', device='hip')
+        return [name for name in cameras if
+                (COMPARE_ROOT / sid / f'cycles_{variant}' / name / 'render_result.json').is_file()]
     from ..reconstruction.offline_render import render
     cand = build_candidate(sid)
     shift = np.asarray(json.loads((cand / 'manifest.json').read_text())['geometry']['metahuman_pseudo_candidate']['translation_m'])
@@ -473,6 +934,8 @@ def render_sample(sid, cameras=CAMERAS, variant=DEFAULT_VARIANT):
         v = cams[name]['vhuman']
         explicit = dict(origin=(np.asarray(v['origin']) + shift).tolist(), rotation=v['rotation'], focal_px=v['focal_px'], size=v['size'])
         opts = dict(RENDER, **variant_options(variant, sid)); preset = opts.pop('preset'); samples = opts.pop('samples')
+        opts['material_overrides']=dict(opts.get('material_overrides') or {})
+        opts['material_overrides'].setdefault('skin_lighting_profile',0.)
         if eye_version(variant):
             opts['head_fit'] = write_eye_fit(sid, eye_version(variant))
         render(cand, out, device='hip', preset=preset, samples=samples, resolution=int(v['size'][0]), explicit_camera=explicit,
@@ -482,7 +945,11 @@ def render_sample(sid, cameras=CAMERAS, variant=DEFAULT_VARIANT):
 
 
 REGION_METRICS = {'ear': (('ear_', 'yaw_p90', 'yaw_m90'), ('left_ear', 'right_ear')),
-                  'eyes': (('eye_', 'front'), ('left_eye', 'right_eye'))}
+                  'eyes': (('eye_', 'front'), ('left_eye', 'right_eye')),
+                  # periocular window: eyes + brows with a wide margin (lids, canthi, lashes, brow band); LPIPS/DISTS score
+                  # the whole window, delta E the eye+brow labels
+                  'periocular': (('eye_',), ('left_eye', 'right_eye', 'left_brow', 'right_brow'))}
+REGION_MARGIN = {'periocular': .45}
 REGION_KEYS = tuple(f'{r}_{m}' for r in REGION_METRICS for m in ('lpips', 'dists', 'delta_e'))
 
 
@@ -496,6 +963,9 @@ def box_down(x, size):
     return x.reshape(size, f, size, f, -1).mean((1, 3))
 
 
+_PARSER = None
+
+
 def report(ids, cameras=CAMERAS, env='studio', variant=DEFAULT_VARIANT, write_summary=True, profile='full'):
     """Score Cycles vs UE per view. Per-head compare<suffix>.json is merged (cameras not scored here are kept), so
     subset runs (sweep, confirm: write_summary=False) never drop results; summary<suffix>.json only from full runs.
@@ -503,7 +973,10 @@ def report(ids, cameras=CAMERAS, env='studio', variant=DEFAULT_VARIANT, write_su
     from .win_cycles import variant_dir
     from ..face_parsing import FaceParser
     from ..reconstruction import ab_metrics as am
-    parser = FaceParser(); rows = {}
+    global _PARSER
+    if _PARSER is None:
+        _PARSER = FaceParser()   # cached: batch scoring of many variants in one process
+    parser = _PARSER; rows = {}
     suffix = ('' if env == 'studio' else f'_{env}') + (f'_{variant}' if variant else '') + ('' if profile == 'full' else f'__{profile}')
     for sid in ids:
         rec = {}
@@ -533,7 +1006,7 @@ def report(ids, cameras=CAMERAS, env='studio', variant=DEFAULT_VARIANT, write_su
                              lpips=r.get('lpips'), dists=r.get('dists'), delta_e=(r.get('delta_e') or {}).get('mean'), status=r['status'])
             for key, (prefixes, labels) in REGION_METRICS.items():      # region-only scores (parser labels) on its views
                 if name.startswith(prefixes):
-                    e = am.compare_region(a, b, parser, list(labels), aligned=True)
+                    e = am.compare_region(a, b, parser, list(labels), aligned=True, margin=REGION_MARGIN.get(key, .25))
                     rec[name].update({f'{key}_lpips': e.get('lpips'), f'{key}_dists': e.get('dists'),
                                       f'{key}_delta_e': (e.get('delta_e') or {}).get('mean'), f'{key}_status': e['status']})
             Image.fromarray(np.concatenate([a, b], 1)).save(COMPARE_ROOT / sid / f'{name}_ue{suffix}_cycles.png')

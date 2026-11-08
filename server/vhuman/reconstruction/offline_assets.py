@@ -196,7 +196,7 @@ def enamel_tip(positions, triangles, *, upper):
 
 
 def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_fit=None,parsing_model=None,
-            include_hair=True,fit_eyes=False,eyes=None):
+            include_hair=True,fit_eyes=False,eyes=None,material_overrides=None):
     """eyes: optional eye_personalize output directory (eyes.json [+ iris_plate.npz]); its eye_param_overrides are
     applied before validation and the photo iris plate replaces the procedural iris structure."""
     import cv2
@@ -309,7 +309,48 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
     else:
         it,st=assets.structures(eye_params,512)
     Image.fromarray(assets.srgb_u8(iris.bake_color(it,eye_params,iris_res,sclera.sampler(st,eye_params)))).save(out/'iris.png')
-    Image.fromarray(assets.shell_textures(eye_params,st,512)['base']).save(out/'sclera.png')
+    Image.fromarray(assets.normal_u8(iris.bake_normal(it,eye_params,iris_res))).save(out/'iris_normal.png')
+    Image.fromarray(assets.srgb_u8(assets.eye_basecolor(eye_params,it,st,iris_res))).save(out/'eye_unified.png')
+    Image.fromarray(assets.to_u8(assets.eye_tissue_factor(eye_params,512))).save(out/'eye_tissue_factor.png')
+    shell_textures=assets.shell_textures(eye_params,st,512)
+    Image.fromarray(shell_textures['base']).save(out/'sclera.png')
+    Image.fromarray(shell_textures['normal']).save(out/'eye_shell_normal.png')
+    Image.fromarray(assets.sclera_vessel_texture(st,512)).save(out/'sclera_vessels.png')
+    Image.fromarray(assets.to_u8(sclera.isotropic_vessels(eye_params,512))).save(out/'sclera_vessels_all.png')
+    eye_mo = material_overrides or {}
+    if eye_mo.get('sclera_curvy_vessels',0.) >= .5:
+        Image.fromarray(assets.to_u8(sclera.isotropic_vessels(eye_params,512,curvy=True))).save(out/'sclera_vessels_curvy.png')
+    if eye_mo.get('sclera_irregular_vessels',0.) >= .5:
+        Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512))).save(out/'sclera_vessels_irregular.png')
+        if eye_mo.get('sclera_dense_vessels',0.) >= .5:
+            Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True))).save(out/'sclera_vessels_dense.png')
+            if eye_mo.get('sclera_vessel_lines_only',0.) >= .5:
+                Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True,mottling=False))).save(out/'sclera_vessels_lines.png')
+                if eye_mo.get('sclera_vessel_density',0.) >= .5:
+                    density = min(1., max(0., eye_params['sclera']['vascularity_intensity'] / 2.))
+                    Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True,mottling=False,density=density))).save(out/'sclera_vessels_sparse.png')
+                    if eye_mo.get('sclera_vessel_organic',0.) >= .5:
+                        Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True,mottling=False,density=density,organic=True))).save(out/'sclera_vessels_organic.png')
+                        if eye_mo.get('sclera_vessel_organic_dense',0.) >= .5:
+                            Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True,mottling=False,density=density,organic=True,organic_dense=True))).save(out/'sclera_vessels_organic_dense.png')
+                            if eye_mo.get('sclera_vessel_guided',0.) >= .5:
+                                Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True,mottling=False,density=density,organic=True,organic_dense=True,guided=True))).save(out/'sclera_vessels_guided.png')
+                                if eye_mo.get('sclera_vessel_selfsafe',0.) >= .5:
+                                    Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True,mottling=False,density=density,organic=True,organic_dense=True,guided=True,avoid_self=True))).save(out/'sclera_vessels_selfsafe.png')
+                                if eye_mo.get('sclera_vessel_nocross',0.) >= .5:
+                                    Image.fromarray(assets.to_u8(sclera.irregular_vessels(eye_params,512,dense=True,mottling=False,density=density,organic=True,organic_dense=True,guided=True,avoid_crossings=True))).save(out/'sclera_vessels_nocross.png')
+    if 'sclera_surface_microtexture' in eye_mo:
+        strength = float(eye_mo['sclera_surface_microtexture'])
+        if strength not in (.05, .1):raise ValueError('sclera_surface_microtexture must be .05 or .1')
+        name = 'eye_surface05.png' if strength == .05 else 'eye_surface10.png'
+        Image.fromarray(assets.to_u8(assets.eye_sclera_surface_microfactor(eye_params,512,strength))).save(out/name)
+        if eye_mo.get('sclera_surface_fine',0.) >= .5:
+            Image.fromarray(assets.to_u8(assets.eye_sclera_surface_microfactor(eye_params,512,strength,fine=True))).save(out/'eye_surface_fine.png')
+    if 'sclera_microtexture' in eye_mo:
+        strength = float(eye_mo['sclera_microtexture'])
+        if strength not in (.1, .2):raise ValueError('sclera_microtexture must be .1 or .2')
+        name = 'eye_micro10.png' if strength == .1 else 'eye_micro20.png'
+        Image.fromarray(assets.to_u8(assets.eye_sclera_microfactor(eye_params,512,strength))).save(out/name)
     ocular_reports={};runtime_eye_reports={}
     from .dense_landmarks import attachments
     lid_ids,lid_weights,_=attachments();skin_ids=np.flatnonzero(model.group('skin_exterior'))
@@ -463,9 +504,38 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
     if not np.array_equal(skin_ids,np.flatnonzero(skin)):raise ValueError('skin component ids changed during preparation')
     lash_paths=[];lash_ids=[];lash_weights=[]
     for side,(lower,upper) in LID_MARGINS.items():
+        meniscus=eye_mo.get('peri_meniscus',0.) >= .5 or eye_mo.get('peri_contact_atlas',0.) >= .5
         tearpath=lid_points[lower]+[0,0,.00015]
         v,t,binding=bound_tubes([tearpath],[skin_ids[lid_ids[lower]]],[lid_weights[lower]],full,.00012)
         part(side+'_tearline',v,t,np.zeros((len(t),3,2)),'tear',surface=binding)
+        if meniscus:
+            # periocular study: upper-lid tear meniscus too (UE shows a wet line on both margins)
+            v,t,binding=bound_tubes([lid_points[upper]+[0,0,.0001]],[skin_ids[lid_ids[upper]]],[lid_weights[upper]],full,.0001)
+            part(side+'_tearline_upper',v,t,np.zeros((len(t),3,2)),'tear',surface=binding)
+        if eye_mo.get('peri_margin',0.) >= .5:
+            # lower-lid margin rim: rounded wet pink mucosa strip just inside the lower margin (UE shows the waterline)
+            inner=lid_points[lower[1:-1]];inner=inner+np.array([0,-.0002,-.00015])   # on the lid edge, not over the eye
+            v,t,binding=bound_tubes([inner],[skin_ids[lid_ids[lower[1:-1]]]],[lid_weights[lower[1:-1]]],full,.0003)
+            part(side+'_lid_margin',v,t,np.zeros((len(t),3,2)),'caruncle',surface=binding)
+        if eye_mo.get('peri_caruncle',0.) >= .5:
+            # caruncle: flattened wet pink mound recessed in the medial canthus (offline port of head/eyeedge.caruncle)
+            corner=lid_points[upper[-1]];lateral=lid_points[upper[0]]-corner;lateral/=np.linalg.norm(lateral)
+            up=np.array([0.,1.,0.]);up-=lateral*np.dot(up,lateral);up/=np.linalg.norm(up);fwd=np.cross(lateral,up)
+            if fwd[2]<0:fwd=-fwd
+            rings,segs=10,24;a_=np.linspace(0,np.pi,rings+1)[1:-1];f_=np.arange(segs)*(2*np.pi/segs)
+            aa,ff=np.meshgrid(a_,f_,indexing='ij')
+            unit=np.concatenate([[[0,0,1]],np.stack([np.sin(aa)*np.cos(ff),np.sin(aa)*np.sin(ff),np.cos(aa)],-1).reshape(-1,3),[[0,0,-1]]])
+            radii=np.array([.0011,.0007,.0005])
+            centre=corner+lateral*.0013-fwd*.0011   # recessed: only its crest shows in the corner
+            verts=centre+(unit*radii)@np.stack([lateral,up,fwd])
+            tri=[]
+            for j in range(segs):
+                n_=(j+1)%segs;tri.append((0,1+n_,1+j))
+                for i in range(rings-2):
+                    v0,w0=1+i*segs+j,1+i*segs+n_;tri.extend([(v0,w0,v0+segs),(w0,w0+segs,v0+segs)])
+                v0,w0=1+(rings-2)*segs+j,1+(rings-2)*segs+n_;tri.append((v0,w0,len(unit)-1))
+            tri=np.asarray(tri)
+            part(side+'_caruncle',verts,tri,np.zeros((len(tri),3,2)),'caruncle')
         p=lid_points[upper]
         for i in range(len(p)-1):
             for t in np.linspace(0,1,5,endpoint=False):
@@ -491,6 +561,9 @@ def prepare(candidate, out, *, accessories='keep', detail_preset='mature',head_f
         arrays[name+'_enamel_tip']=enamel_tip(arrays[name+'_positions'],arrays[name+'_triangles'],upper=name.startswith('upper'))
     for name in [p['name'] for p in parts if p['material']=='tongue']:
         v=arrays[name+'_positions'];z=v[:,2];arrays[name+'_tongue_axis']=((z.max()-z)/max(float(np.ptp(z)),1e-6)).astype(np.float32)
+    from .profile_assets import skin_profile_weights
+    excluded=model.group('ears')|model.group('upper_lip')|model.group('lower_lip')
+    arrays['skin_profile_weight']=skin_profile_weights(arrays,excluded)
     np.savez_compressed(out/'scene_assets.npz',**arrays)
     detail=build(candidate,out,preset=detail_preset)
     (out/'eye_params.json').write_text(json.dumps(eye_params,indent=1))

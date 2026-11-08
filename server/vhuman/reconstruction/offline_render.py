@@ -47,6 +47,8 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
     from .render_cameras import CAMERAS
     if device not in ('hip', 'cuda', 'optix', 'cpu') or preset not in PRESETS:
         raise ValueError('invalid render device or preset')
+    if material_overrides is not None and not isinstance(material_overrides,dict):
+        raise ValueError('material_overrides must be a JSON object')
     if not 1024 <= hard_limit_mib <= 14336:
         raise ValueError('hard GPU limit must be 1024..14336 MiB')
     if lighting not in LIGHTING or not -180<=yaw<=180 or not -89<=pitch<=89:
@@ -63,6 +65,9 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
         raise ValueError('exposure must be -3..3 EV and SSS weight 0..1')
     if quality not in QUALITY or any(a not in ABLATIONS for a in ablate):
         raise ValueError('quality must be baseline/full; ablate entries must be stage ids 2a..2f')
+    from . import skin_profile
+    material_overrides=skin_profile.default_overrides(quality,ablate,material_overrides)
+    skin_profile.preflight(dict(quality=quality,ablate=ablate,material_overrides=material_overrides))
     if samples is not None and not 1<=samples<=8192:raise ValueError('samples must be 1..8192')
     if resolution is not None and not (256<=resolution<=4096 and resolution%64==0):raise ValueError('resolution must be a multiple of 64 in 256..4096')
     hdri_record=None
@@ -83,10 +88,17 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
         raise RuntimeError('offline rendering requires 4 GiB free disk headroom')
     eyes_dir=None if (eyes is None or '2d' in ablate or quality!='full') else Path(eyes).resolve()
     prepare(candidate, out, accessories=accessories, detail_preset=detail_preset,head_fit=head_fit,
-            parsing_model=parsing_model,include_hair=include_hair,fit_eyes=fit_eyes,eyes=eyes_dir)
+            parsing_model=parsing_model,include_hair=include_hair,fit_eyes=fit_eyes,eyes=eyes_dir,
+            material_overrides=material_overrides)
+    if (material_overrides or {}).get('peri_contact_atlas'):
+        from .periocular import build_contact_atlas
+        build_contact_atlas(out)
     if quality=='full' and '2c' not in ablate:
         from .skin_templates import build as build_templates
         build_templates(candidate,out,res=2048 if preset=='hero' else 1024)
+        if material_overrides.get('skin_micro_isotropic'):
+            from .skin_templates import ensure_isotropic_pores
+            ensure_isotropic_pores(out)
     if quality=='full' and '2f' not in ablate:
         from .wrinkle_library import augment
         augment(out/'skin_detail.npz')   # appends strain-driven wrinkle channels + drivers (wrinkle_library.json)
@@ -176,10 +188,20 @@ def render(candidate, out, *, device='hip', preset='draft', accessories='keep',
                     except subprocess.TimeoutExpired:
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
+            if skin_profile.enabled(request):
+                def profile_usage():
+                    if device=='hip':return int(usage_path.read_text())/1024**2
+                    if backend=='cuda':
+                        status=gpu.gpu_status(gpu_index,'cuda')
+                        if status is None:raise RuntimeError('NVIDIA memory monitor unavailable')
+                        return status['total_mib']-status['free_mib']
+                    return 0.
+                peak=max(peak,skin_profile.finish(request,blender,env=env,hard_limit_mib=hard_limit_mib,
+                    memory_usage=profile_usage if backend!='cpu' else None,cancel=cancel))
     # Reopen in a fresh Blender process: live generated buffers can render
     # correctly yet disappear or lose signed values when a scene is saved.
     with (out/'cycles.log').open('a') as log:
-        subprocess.run([str(blender),'-b',str(out/'head.blend'),'--python-exit-code','1',
+        subprocess.run([str(blender),'-b','--factory-startup',str(out/'head.blend'),'--python-exit-code','1',
             '--python',str(Path(__file__).with_name('cycles_validate.py')),'--',str(out)],
             stdout=log,stderr=subprocess.STDOUT,env=env,check=True)
     validation=json.loads((out/'asset_validation.json').read_text())
@@ -227,6 +249,8 @@ def main():
     parser.add_argument('--yaw',type=float,default=0)
     parser.add_argument('--exposure',type=float,default=-1.5,help='display exposure in EV')
     parser.add_argument('--sss-weight',type=float,default=.08,help='authored subsurface weight')
+    parser.add_argument('--material-overrides',type=json.loads,default=None,
+                        help='JSON object of optional material controls, including experimental eye settings')
     args = parser.parse_args()
     print(json.dumps(render(**vars(args)), indent=2))
 

@@ -41,7 +41,16 @@ def _srgb_lab(linear):
     return srgb_to_lab(np.rint(linear_to_srgb(np.asarray(linear)) * 255).astype(np.uint8))
 
 
-def measure(sid, side):
+def _median_iris_ring(img, lum, rr, a, b, sector=None):
+    m = (rr >= a) & (rr < b) & (lum > .005)
+    if sector is not None:
+        m &= sector
+    if not m.any():
+        raise ValueError('no valid pixels in iris colour ring')
+    return np.median(img[m], 0).tolist(), int(m.sum())
+
+
+def measure(sid, side, *, sector_only=False, geometric_iris=False, radial_bands=False, chroma_detail=False):
     """Iris colours and pupil ratio from the base-colour close-up of eye_<side>."""
     d = V1 / 'samples' / sid
     cams = json.loads((d / 'cameras.json').read_text())
@@ -66,12 +75,16 @@ def measure(sid, side):
     prof = np.array([np.median(lum[sector & (np.abs(rad - r) < 1.)]) if (sector & (np.abs(rad - r) < 1.)).any() else np.nan for r in radii])
     step = prof[4:] - prof[:-4]
     r_iris = float(radii[2 + int(np.nanargmax(step))]) if np.isfinite(step).any() else r_geo
+    if geometric_iris:
+        # Soft or weak limbal edges can make the largest gradient land on
+        # eyelid/sclera tissue. Keep the camera-derived estimate as a separately
+        # testable option rather than silently changing the legacy fit.
+        r_iris = r_geo
     rr = rad / r_iris
     pupil_ratio = r_pupil / r_iris
 
     def ring(a, b):
-        m = (rr >= a) & (rr < b) & (lum > .005)
-        return np.median(img[m], 0).tolist(), int(m.sum())
+        return _median_iris_ring(img, lum, rr, a, b, sector if sector_only else None)
     inner, ni = ring(.45, .65); outer, no = ring(.65, .9); whole, nw = ring(max(pupil_ratio + .05, .3), .9)
     # sclera: horizontal sectors 1.15-1.6 R (inside the eye opening at the canthi side), brightest half (vessels excluded)
     sm = sector & (rr >= 1.15) & (rr < 1.6)
@@ -80,7 +93,12 @@ def measure(sid, side):
     # the lids on narrow eyes (dark skin then pulls it down: mh_000300 .10/.04/.03 vs .32/.10/.09 here)
     band = (np.abs(yy - cy) < .3 * r_iris) & (np.abs(xx - cx) > 1.1 * r_iris) & (np.abs(xx - cx) < 1.45 * r_iris)
     sclera_band = np.median(img[band & (lum >= np.percentile(lum[band], 75))], 0).tolist() if band.sum() > 40 else None
-    return dict(inner_linear=inner, outer_linear=outer, median_linear=whole, pupil_ratio=pupil_ratio, iris_radius_px=r_iris, geometric_radius_px=float(r_geo),
+    from ..eye.iris import angular_contrast, chromatic_fiber_signal
+    contrast = angular_contrast(lum, rr, sector)
+    radial_linear = [ring(a, b)[0] for a, b in ((.40, .55), (.55, .70), (.70, .85))] if radial_bands else None
+    chroma = chromatic_fiber_signal(img, rr, sector, inner, outer) if chroma_detail else None
+    return dict(inner_linear=inner, outer_linear=outer, median_linear=whole, angular_contrast=contrast, radial_linear=radial_linear, chroma_fiber_signal=chroma,
+                pupil_ratio=pupil_ratio, iris_radius_px=r_iris, geometric_radius_px=float(r_geo),
                 center_px=[float(cx), float(cy)], sclera_linear=sclera, sclera_band_linear=sclera_band, pixels=dict(inner=ni, outer=no, whole=nw, sclera=int(sm.sum())))
 
 
@@ -143,12 +161,13 @@ def to_vhuman(mh, measured, version=VERSION):
     p['iris'].update(iris_match.color_controls(np.asarray(measured['median_linear']), blend))
     p['pupil'].update(dilation=float(np.clip(measured['pupil_ratio'] / P_REF, .25, 2.)), feather=float(pupil['feather']))
     p['cornea'].update(size=float(np.clip(.2 * float(cornea['size']) / MH_CORNEA_DEFAULT, .1, .3)),
-                       limbus_softness=float(np.clip(cornea['limbus_softness'], .001, .1)), limbus_color=col('cornea', 'limbus_color', cornea))
+                       limbus_softness=float(np.clip(cornea['limbus_softness'], .001, .15 if version >= 3 else .1)),
+                       limbus_color=col('cornea', 'limbus_color', cornea))
     p['sclera'].update(rotation=float(sclera.get('rotation', 0.)) % 1., use_custom_tint=bool(sclera.get('use_custom_tint', False)),
                        tint=[min(c, 1.) for c in col('sclera', 'tint', sclera)],
                        transmission_spread=float(np.clip(sclera['transmission_spread'], .001, .4)),
                        transmission_color=col('sclera', 'transmission_color', sclera),
-                       vascularity_intensity=float(np.clip(sclera['vascularity_intensity'], 0, 1)),
+                       vascularity_intensity=float(np.clip(sclera['vascularity_intensity'], 0, 2 if version >= 3 else 1)),
                        vascularity_coverage=float(np.clip(sclera['vascularity_coverage'], 0, .7)))
     if version >= 2 and measured.get('sclera_band_linear'):
         from ..eye.sclera import SCLERA_ALBEDO
@@ -169,7 +188,7 @@ def to_vhuman(mh, measured, version=VERSION):
 
 def params_for(sid, side='left', version=VERSION):
     settings = json.loads((V1 / 'samples' / sid / 'params.json').read_text())['eyes']['settings']
-    return to_vhuman(mh_eye(settings, side), measure(sid, side), version)
+    return to_vhuman(mh_eye(settings, side), measure(sid, side, sector_only=version >= 3, geometric_iris=version >= 4), version)
 
 
 def calibrate(version=VERSION):

@@ -43,6 +43,16 @@ class RuntimeTest(unittest.TestCase):
             with patch.dict(os.environ, VHUMAN_DATA_ROOT=str(Path(td)/'explicit-face-root')):
                 self.assertEqual(asset_path('gnm').parent.parent, Path(td)/'explicit-face-root')
 
+    def test_metahuman_registration_uses_current_face_asset_root(self):
+        from .metahuman import register
+        for name in ('first', 'second'):
+            root = gpu.ROOT/'tmp'/name
+            with patch.dict(os.environ, VHUMAN_DATA_ROOT=str(root)), \
+                 patch.object(register.np, 'load', side_effect=RuntimeError('stop before loading')) as load:
+                with self.assertRaisesRegex(RuntimeError, 'stop before loading'):
+                    register.load_gnm()
+                load.assert_called_once_with(root/'gnm-v3/gnm_head.npz', allow_pickle=True)
+
     def test_rocm_library_set_includes_the_smi_abi_required_by_torch(self):
         from .rocm_runtime import library_path
         with patch.object(Path, 'is_file', lambda p: str(p).startswith('/opt/rocm/core-10.0/')):
