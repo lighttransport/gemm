@@ -430,7 +430,7 @@ def assemble(head_dir: Path, out: Path, model_path: Path | None = None,
               "seconds": round(time.perf_counter() - start, 2),
               "limitations": [f"{bm.label} pose correctives are baked at the generated bind pose",
                               "A single source view does not determine unseen garment geometry"]
-              + ([] if bm.name == "mhr" else ["garment fitting on this body model is not validated"])}
+              + ([] if bm.name == "mhr" else ["garment fitting on this body model has been checked on a single subject only"])}
     report["mhr_decoder"] = decode_report
     (out / "body_report.json").write_text(json.dumps(report, indent=1, default=float))
     return report

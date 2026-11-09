@@ -109,13 +109,30 @@ Hugging Face cache); `VHUMAN_SOMA_DEVICE=cuda` runs the converter on a GPU.
 `body-motion` reads the model from the avatar's `avatar.json` and supports the
 `sam3d` backend only; `terra` and `musclemimic` need MHR avatars.
 
-Quality notes: the MHR to SOMA fit is gated on its mean vertex residual
-(at most 1 cm); the maximum, typically a few centimetres at the extremities,
-is reported as `mhr_parity_max_m`. Face landmarks use fixed SOMA vertices
-(`soma_landmarks.json`, regenerated with `soma_runner.py --landmarks-from`).
-Garment fitting is topology-agnostic but has not been validated on SOMA.
-Tests: `python3 -m server.vhuman.body.test_soma` (the runner tests need
-`VHUMAN_SOMA_PYTHON`).
+Quality notes (measured on one real SAM 3D Body subject with the same head
+rig for both models):
+
+- The MHR to SOMA fit is gated on its mean vertex residual (at most 1 cm); the
+  maximum is reported as `mhr_parity_max_m`. The subject gave 6.7 mm mean,
+  3.0 cm at the 99th percentile and 5.6 cm maximum. The maximum is inside the
+  head (mouth and eye bags, which SOMA excludes from pose inversion and the
+  vhuman face rig replaces anyway); hips, spine and legs sit 1.5 to 3 cm off
+  the MHR surface because SOMA's MHR identity reproduces the body shape only
+  approximately. SOMA's `autograd_iters` refinement does not reduce this (mean
+  8.7 mm with 30 iterations), so the default stays at 0.
+- Face landmarks use fixed SOMA vertices (`soma_landmarks.json`, regenerated
+  with `soma_runner.py --landmarks-from`). They add about 2 mm to the face/body
+  alignment error over MHR's own keypoints (27.5 mm vs 25.8 mm here); the
+  error itself reflects how well the head matches the body (the gate is 35 mm).
+- Garment fitting is topology-agnostic. Shirt and pants were accepted with fit
+  scales within 2% of the MHR run, but SOMA garment fitting has been checked on
+  this one subject only.
+- The MHR path produces identical body joints (bind transforms within 2e-7) and
+  mesh (within 1 micrometre) before and after the body-model refactor.
+
+Tests: `python3 -m server.vhuman.test_all` includes `body/test_*.py` (except
+the Terra tests, which need mujoco in the Terra interpreter); the SOMA runner
+tests additionally need `VHUMAN_SOMA_PYTHON`.
 
 ## Fit uploaded pose or motion
 
