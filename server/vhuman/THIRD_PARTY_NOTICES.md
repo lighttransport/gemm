@@ -97,3 +97,11 @@ encoder is the stock Qwen2.5-VL-7B-Instruct (Apache-2.0). No weights are shipped
 
 `reconstruction/mv_qwen.py` mattes the portrait reference with BiRefNet (https://github.com/ZhengPeng7/BiRefNet,
 MIT), loaded from a local copy at run time.
+
+The optional SOMA-X body model (`--body-model soma`) uses the separately
+installed [`py-soma-x`](https://github.com/NVlabs/SOMA-X) package (Apache-2.0)
+and its assets from https://huggingface.co/nvidia/SOMA-X, fetched at setup time
+and not bundled here. The assets include MHR TorchScript models and an Anny
+identity backend that retain their own upstream terms (MHR is Apache-2.0; check
+the Anny terms before use). SMPL, SMPL-H, SMPL-X and MANO backends are not used.
+SOMA-X additionally requires `torch` and `warp-lang` in a separate interpreter.

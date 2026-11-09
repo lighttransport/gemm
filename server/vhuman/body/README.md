@@ -84,6 +84,39 @@ MHR model):
 python3 -m server.vhuman.cli --mock body --head HEAD_ID --quality preview
 ```
 
+## Body model: MHR (default) or SOMA-X
+
+`body --body-model {mhr,soma}` (or `"body_model"` in the `/v1/jobs` request)
+chooses the body mesh and skeleton. SAM 3D Body always predicts MHR
+parameters; with `soma` they are converted to
+[SOMA-X](https://github.com/NVlabs/SOMA-X) (Apache-2.0): the MHR identity and
+scale carry over directly and the pose is recovered by SOMA's analytic pose
+inversion. The result is the 18,056-vertex SOMA mesh with 78 joints
+(`soma_Root`, `soma_Hips`, ..., metres, Y-up), the facial rig attaches to
+`soma_Head`, and the neck cut uses `soma_Neck1`. SOMA has no facial
+blendshapes, so faces still use the vhuman rig.
+
+Setup (torch and Warp stay out of the framework-free rig interpreter):
+
+```sh
+server/vhuman/body/setup_soma.sh tmp/vhuman-soma-venv
+export VHUMAN_SOMA_PYTHON=$PWD/tmp/vhuman-soma-venv/bin/python
+python3 -m server.vhuman.cli body --head HEAD_ID --body-model soma
+```
+
+`VHUMAN_SOMA_ASSETS` points at a local SOMA-X asset directory (default: the
+Hugging Face cache); `VHUMAN_SOMA_DEVICE=cuda` runs the converter on a GPU.
+`body-motion` reads the model from the avatar's `avatar.json` and supports the
+`sam3d` backend only; `terra` and `musclemimic` need MHR avatars.
+
+Quality notes: the MHR to SOMA fit is gated on its mean vertex residual
+(at most 1 cm); the maximum, typically a few centimetres at the extremities,
+is reported as `mhr_parity_max_m`. Face landmarks use fixed SOMA vertices
+(`soma_landmarks.json`, regenerated with `soma_runner.py --landmarks-from`).
+Garment fitting is topology-agnostic but has not been validated on SOMA.
+Tests: `python3 -m server.vhuman.body.test_soma` (the runner tests need
+`VHUMAN_SOMA_PYTHON`).
+
 ## Fit uploaded pose or motion
 
 For floor/step/ramp reconstruction and offline policy refinement with native

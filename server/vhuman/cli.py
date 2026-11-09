@@ -339,7 +339,7 @@ def cmd_body(args) -> dict:
     svc = EyeService(Path(args.work))
     return body_job.body_job(svc, {"head_id": args.head, "outfit": args.outfit, "seed": args.seed,
                               "quality": args.quality, "steps": args.steps,
-                              "qwen_preset": args.qwen_preset,
+                              "qwen_preset": args.qwen_preset, "body_model": args.body_model,
                               "garments": [x.strip() for x in args.garments.split(",") if x.strip()]},
                              _progress, threading.Event(), python=args.qwen_python,
                              rig_python=args.rig_python, model_dir=args.sam3d_body_model,
@@ -673,6 +673,8 @@ def main(argv=None) -> int:
     sp.add_argument("--qwen-preset", choices=("auto", "fast12", "low8"), default="auto",
                     help="select Qwen memory preset automatically from free GPU memory")
     sp.add_argument("--garments", default="shirt,pants,shoes", help="comma-separated SAM 3 garment prompts")
+    sp.add_argument("--body-model", choices=("mhr", "soma"), default="mhr",
+                    help="body model: mhr (default) or soma (SOMA-X; needs $VHUMAN_SOMA_PYTHON with py-soma-x)")
     sp.set_defaults(fn=cmd_body)
     sp = sub.add_parser("body-motion", help="fit uploaded image/video pose to an existing MHR avatar")
     sp.add_argument("--head", required=True, help="head with an assembled body avatar")

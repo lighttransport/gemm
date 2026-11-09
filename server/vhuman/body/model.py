@@ -52,7 +52,12 @@ MHR = BodyModel(name="mhr", label="MHR", prefix="mhr_", root_joint="mhr_root",
                 head_joint="mhr_c_head", neck_joint="mhr_c_neck", unit_to_m=.01,
                 pose_dim=204, identity_dim=45, bind_note="SAM 3D Body prediction")
 
-MODELS = {"mhr": MHR}
+SOMA = BodyModel(name="soma", label="SOMA-X", prefix="soma_", root_joint="soma_Root",
+                 head_joint="soma_Head", neck_joint="soma_Neck1", unit_to_m=1.0,
+                 pose_dim=204, identity_dim=45,
+                 bind_note="SAM 3D Body prediction (MHR identity, SOMA pose inversion)")
+
+MODELS = {"mhr": MHR, "soma": SOMA}
 DEFAULT = "mhr"
 
 
@@ -76,4 +81,7 @@ def _impl(name: str):
     if name == "mhr":
         from . import mhr_backend
         return mhr_backend
+    if name == "soma":
+        from . import soma_backend
+        return soma_backend
     raise ValueError(f"no implementation for body model {name!r}")

@@ -1,0 +1,4 @@
+{"indices": [43, 13740, 9496, 698, 16407],
+ "order": ["nose", "left_eye", "right_eye", "left_ear", "right_ear"],
+ "source": "nearest SOMA-X mid-LOD vertex to MHR70 keypoints 0-4 (head_pose.keypoint_mapping) on the neutral MHR mesh transferred to SOMA topology; soma_runner.py --landmarks-from",
+ "nearest_distance_m": [0.0003, 0.0047, 0.0045, 0.0048, 0.0055]}

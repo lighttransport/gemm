@@ -287,6 +287,11 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
         reason = ("body model or rig interpreter missing: " + ", ".join(avail["missing"])) \
                  if avail["missing"] else avail["reason"]
         raise ValueError(reason)
+    from . import model as body_models
+    body_model = body_models.get(request.get("body_model")).name
+    if body_model == "soma" and not mock:
+        from . import soma_backend
+        soma_backend.python()  # fail early if no SOMA-X interpreter is configured
     quality = request.get("quality", "standard")
     if quality not in ("preview", "standard", "high"):
         raise ValueError("quality must be preview, standard or high")
@@ -317,12 +322,12 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
         except (RuntimeError, OSError, ValueError) as exc:
             pixal = {"status": "fallback_photo", "reason": str(exc)}
         garment_report = _garments(out, names, mock, cancel, progress, sam3_model, clip_bpe)
-        progress(.77, "assembling MHR body and facial rig")
+        progress(.77, f"assembling {body_models.get(body_model).label} body and facial rig")
         res = {"preview": 1024, "standard": 2048, "high": 4096}[quality]
         cmd = [str(rig_python), "-m", "server.vhuman.body.assemble", str(head),
                "--out", str(out), "--mhr-assets", str(model_dir / "safetensors"),
                "--head-assets", str(model_dir / "safetensors/sam3d_body_mhr_head.safetensors"),
-               "--res", str(res)]
+               "--res", str(res), "--body-model", body_model]
         with gpu.device_session(2048, cancel) if gpu.backend() == "cuda" else nullcontext():
             _run(cmd, cancel, timeout=1200)
         report = json.loads((out / "body_report.json").read_text())
@@ -330,7 +335,7 @@ def body_job(service, request: dict, progress, cancel, *, python=None, rig_pytho
         report["sam3d_body"] = sam
         report["pixal3d_run"] = {k: pixal.get(k) for k in ("runner", "seconds", "status", "reason") if k in pixal}
         report["garment_attempts"] = garment_report
-        report["provenance"] = {"head_id": head_id, "sam3d_body_model_dir": str(model_dir),
+        report["provenance"] = {"head_id": head_id, "body_model": body_model, "sam3d_body_model_dir": str(model_dir),
                                 "mhr_assets": str(model_dir / "safetensors"),
                                 "sam3_model": str(sam3_model) if names else None,
                                 "clip_bpe": str(clip_bpe) if names else None}
