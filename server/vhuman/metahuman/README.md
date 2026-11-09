@@ -1114,6 +1114,48 @@ Remaining visible differences:
 - vessels still sparser and less saturated than UE's dense reticular network;
 - the iris is darker than UE (no caustic gain).
 
+#### Scleral near-limbus band round (`iris95`, 2026-11-08, diagnostic only)
+
+The neutral near-limbus whitening band (`T.sclera_maps`, `base += .85*wb*(white - base)` with the fixed
+`white = max(base)*[.98,.97,.96]`) was suspected of erasing the per-identity warm transition UE renders for 300/038.
+Evidence first: radial medians of the *staged* textures matched UE basecolour within .0078/channel on 020/100/038/300
+(this pass re-implemented iris70's pupil-aware mapping densely), so the texture *colour source* was not the residual
+gap — the whitening band itself was. A full-size CPU rebuild with the existing `.85` strength reproduced the staged
+texture to mean |.0007-.0009| (8-bit level), and the variants changed only the whitening zone.
+
+Paired 512/32 dicing2/offscreen16 HIP renders with per-mode fresh baselines, production pipeline (scatter, hybrid,
+profile5 eye-contact), scoring on fixed UE eye crops. Identities: 020, 038, 300 (dev/previous examined) and
+recorded *iris95-only held-outs* 005, 194. Columns: crop LPIPS / DISTS / boundary MAE.
+
+| eye (left) | baseline | band0 (whiten strength 0) | band50 | tint (target = near/max(near), strength .85) |
+|---|---|---|---|---|
+| 020 | .19274/.17986/24.08 | .19257/.18130/23.41 | .19248/.18068/23.78 | .19250/.18152/23.45 |
+| 038 | .19182/.14985/16.50 | .19132/.15484/15.41 | .19122/.15206/15.93 | .19132/.15469/15.43 |
+| 300 | .26697/.20147/33.83 | .26263/.19763/27.20 | .26396/.19875/31.28 | .26102/.19774/29.04 |
+| 005 (held out here) | .23695/.16802/11.56 | .23649/.16663/11.04 | .23683/.16817/11.27 | .23653/.16660/11.05 |
+| 194 (held out here) | .17496/.15702/13.20 | .17675/.16128/13.04 | .17561/.15776/13.11 | .17648/.16000/13.08 |
+
+The chroma-clamped target (`tint`, tested second round) beat strength 0 everywhere: 300 crop LPIPS .26697 → .26102
+and boundary 33.83 → 29.04, 005 equal, 194's band0 crop penalty softened. Boundary MAE improved in all ten
+identity/mode pairs tested. DISTS still consistently worse than baseline outside 300/005 (+.0013-.0048), so this is
+*not* a default promotion: the learned crop metric penalises colour detail that the reference's neutral band
+appears to carry while LPIPS/boundary reward the removal of the grey-white drift. Visual:
+`tmp/vhuman-eye-quality/iris95/comparison_zoom.jpg` — 300's grey donut is replaced by a warmer UE-like blend under
+band0 with a middle ground under tint; 020/038 unharmed.
+
+Distinguishing this from earlier failed attempts (iris66/69/…): those moved geometry/veil strength/opacity; the
+visible mismatch source was the *fixed 4 mm neutral white band* painted over measured sclera. `iris95` measured that
+exactly and verified reproduction (`variants_report.json`: `mh_000300 rebuild(.85) vs staged meanabs .0007`) before
+any render.
+
+Remaining work before considering a default:
+- extend identities (145/256/358/178 need staged scenes + UE render references; per-identity `near` colour is
+  already measured per eye in the staged bake, no new fit);
+- the rendered transition still includes UE's own limbal veil/shadow and lid-geometry effects (previous failed
+  attempts), so tint cannot close 300 fully;
+- no source default change: variant textures live under `tmp/vhuman-eye-quality/iris95/`
+  (`<sid>_band{85,50,00,tint}_sclera_left.png`); production default stays `peri_profile5` with untouched textures.
+
 ### Periocular study (face-visible eye cameras, 2026-11-07)
 
 `compare_render.REGION_METRICS['periocular']` crops a window around the parser eye and brow labels with margin .45,
