@@ -165,18 +165,20 @@ def _sam_frame(image: Path, out: Path, bbox: tuple[int, ...], model_dir: Path, c
     return sidecar
 
 
-def _decode(model_path: Path | None, identity: np.ndarray, sidecars: list[Path], *, mhr_assets=None) -> tuple[list[str], np.ndarray]:
-    from . import mhr
+def _decode(model_path: Path | None, identity: np.ndarray, sidecars: list[Path], *, mhr_assets=None,
+            body_model: str = "mhr") -> tuple[list[str], np.ndarray]:
+    from . import model as body_models
+    bm = body_models.get(body_model)
     poses = []
     for path in sidecars:
         p = np.asarray(json.loads(path.read_text())["model_params"], np.float32)
-        if p.shape != (204,) or not np.isfinite(p).all():
+        if p.shape != (bm.pose_dim,) or not np.isfinite(p).all():
             raise ValueError(f"invalid MHR pose in {path.name}")
         poses.append(p)
     if not poses:
         raise ValueError("MHR motion requires at least one pose")
-    _, state, rig, _ = mhr.decode(mhr.resolve_assets(mhr_assets, model_path),
-                                 np.stack(poses), identity, skeleton_only=True)
+    _, state, rig, _ = bm.decode(bm.resolve_assets(mhr_assets, model_path),
+                                np.stack(poses), identity, skeleton_only=True)
     global_q = state[:, :, 3:7].astype(np.float64)
     global_q /= np.maximum(np.linalg.norm(global_q, axis=2, keepdims=True), 1e-9)
     local = global_q.copy()
@@ -252,6 +254,11 @@ def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DI
         rig_python=body_job.DEFAULT_RIG_PYTHON, mock=False, musclemimic_python=None,
         musclemimic_assets=None, musclemimic_device="cpu", terra_python=None, terra_assets=None, terra_device="cpu") -> dict:
     backend = request.get("backend", "sam3d")
+    from . import model as body_models
+    avatar_def = json.loads(service.body_file(request.get("head_id"), "avatar.json").read_text())
+    bm = body_models.from_avatar(avatar_def)
+    if bm.name != "mhr" and backend != "sam3d":
+        raise ValueError(f"backend {backend} supports MHR avatars only; this avatar uses {bm.label}")
     if backend == "terra":
         from .terra import fit as terra_fit
         return terra_fit(service, request, progress, cancel, model_dir=model_dir,
@@ -275,8 +282,13 @@ def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DI
     model_dir = Path(model_dir)
     rig_python = Path(rig_python)
     from .mhr import ASSET_FILES
+    # SAM 3D Body always predicts MHR parameters, so its native assets are needed for every body model.
     if not rig_python.is_file() or any(not (model_dir / "safetensors" / n).is_file() for n in ASSET_FILES):
         raise ValueError("Native MHR assets or rig Python is missing")
+    if bm.name == "soma":
+        from . import soma_backend
+        if not mock:
+            soma_backend.python()
     take_id = uuid.uuid4().hex[:12]
     root = avatar.parent / "motions"
     stage = root / ("." + take_id)
@@ -296,7 +308,7 @@ def fit(service, request: dict, progress, cancel, *, model_dir=body_job.MODEL_DI
         cmd = [str(rig_python), "-m", "server.vhuman.body.motion", "decode",
                "--avatar-json", str(avatar_json), "--identity", str(body_meta),
                "--mhr-assets", str(model_dir / "safetensors"),
-               "--source-glb", str(avatar), "--output", str(output),
+               "--body-model", bm.name, "--source-glb", str(avatar), "--output", str(output),
                "--kind", upload_meta["kind"], "--fps", str(FPS),
                *map(str, sidecars)]
         body_job._run(cmd, cancel, timeout=300)
@@ -330,26 +342,30 @@ def decode_main(argv=None) -> int:
     ap.add_argument("--identity", type=Path, required=True)
     ap.add_argument("--model", type=Path, help="legacy locator; use --mhr-assets")
     ap.add_argument("--mhr-assets", type=Path)
+    ap.add_argument("--body-model", default="mhr", help="body model backend (default mhr)")
     ap.add_argument("--source-glb", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--kind", choices=("image", "video"), required=True)
     ap.add_argument("--fps", type=float, required=True)
     ap.add_argument("sidecars", nargs="+")
     a = ap.parse_args(argv)
+    from . import model as body_models
     definition = json.loads(a.avatar_json.read_text())
     identity = np.asarray(json.loads(a.identity.read_text())["shape"], np.float32)
-    names, rotations = _decode(a.model, identity, list(map(Path, a.sidecars)), mhr_assets=a.mhr_assets)
+    names, rotations = _decode(a.model, identity, list(map(Path, a.sidecars)), mhr_assets=a.mhr_assets,
+                                body_model=a.body_model)
     avatar_names = {j["name"] for j in definition["joints"]}
     if not set(names) <= avatar_names:
-        raise ValueError("avatar MHR skeleton differs from decoder")
+        raise ValueError("avatar skeleton differs from decoder")
     rotations = _continuous(rotations)
     times = np.arange(len(rotations), dtype=np.float32) / a.fps
     result = {"version": 1, "kind": a.kind, "fps": a.fps if len(times) > 1 else 0,
               "duration": float(times[-1]), "joints": names,
               "frames": [{"t": float(t), "rotations": r.tolist()} for t, r in zip(times, rotations)],
-              "root_translation": "avatar_bind", "space": "MHR local xyzw"}
+              "root_translation": "avatar_bind", "space": f"{body_models.get(a.body_model).label} local xyzw"}
     a.output.write_text(json.dumps(result, separators=(",", ":")))
-    _export_glb(a.source_glb, a.output.with_suffix(".glb"), names, rotations, times)
+    _export_glb(a.source_glb, a.output.with_suffix(".glb"), names, rotations, times,
+                root_joint=body_models.get(a.body_model).root_joint)
     print(json.dumps({"frames": len(times), "joints": len(names), "duration": result["duration"]}))
     return 0
 

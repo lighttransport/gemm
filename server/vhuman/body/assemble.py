@@ -44,15 +44,15 @@ def _safetensor(path: Path, name: str) -> np.ndarray:
                      shape=tuple(spec["shape"]))
 
 
-def _state_matrix(state: np.ndarray) -> np.ndarray:
-    """MHR global state: translation cm, xyzw quaternion, uniform scale."""
+def _state_matrix(state: np.ndarray, unit_to_m: float = .01) -> np.ndarray:
+    """Global joint state: translation in native units, xyzw quaternion, uniform scale."""
     x, y, z, w = state[3:7]
     r = np.array([[1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
                   [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
                   [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)]])
     out = np.eye(4)
     out[:3, :3] = r * float(state[7])
-    out[:3, 3] = state[:3] * .01
+    out[:3, 3] = state[:3] * unit_to_m
     return out
 
 
@@ -84,13 +84,13 @@ def _similarity(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, flo
 
 
 def _face_alignment(face_dir: Path, vertices: np.ndarray, state: np.ndarray,
-                    mapping: np.ndarray) -> tuple[np.ndarray, float]:
+                    mapping: np.ndarray, unit_to_m: float = .01) -> tuple[np.ndarray, float]:
     feat = json.loads((face_dir / "features.json").read_text())
     eyes = {e["side"]: e["center"] for e in feat["eyes"]}
     pts = feat["points"]
     src = np.asarray([pts["nose_tip"], eyes["left"], eyes["right"],
                       pts["ear_left"], pts["ear_right"]], np.float64)
-    combined = np.vstack([vertices, state[:, :3] * .01])
+    combined = np.vstack([vertices, state[:, :3] * unit_to_m])
     dst = np.asarray(mapping[:5], np.float64) @ combined
     # MHR70 is nose, left eye, right eye, left ear, right ear. In MHR's
     # +Y-up frame the face points toward +Z, like vhuman's head frame.
@@ -172,7 +172,7 @@ def _atlas_body(vertices: np.ndarray, faces: np.ndarray, joints: np.ndarray, wei
     # toward the MHR surface before export, so this hidden overlap avoids a gap.
     faces = faces[vertices[faces].mean(axis=1)[:, 1] <= neck_y + .025]
     if not len(faces):
-        raise ValueError("MHR body vanished at neck trim")
+        raise ValueError("body vanished at neck trim")
     grid = math.ceil(math.sqrt(len(faces)))
     idx = np.arange(len(faces))
     col, row = idx % grid, idx // grid
@@ -295,10 +295,10 @@ def _face_parts(face_dir: Path, alignment: np.ndarray, joints_offset: int,
     return parts, mats
 
 
-def _mhr_rig(rig, state: np.ndarray):
+def _mhr_rig(rig, state: np.ndarray, unit_to_m: float = .01):
     names = rig["names"]
     parents = rig["parents"]
-    bind = np.stack([_state_matrix(s) for s in state])
+    bind = np.stack([_state_matrix(s, unit_to_m) for s in state])
     joints = [_joint_entry(n, names[parents[i]] if parents[i] >= 0 else None,
                            bind[i], bind[parents[i]] if parents[i] >= 0 else None)
               for i, n in enumerate(names)]
@@ -321,33 +321,44 @@ def _face_rig(face_dir: Path, alignment: np.ndarray, body_head_bind: np.ndarray,
 
 
 def assemble(head_dir: Path, out: Path, model_path: Path | None = None,
-             head_assets: Path = DEFAULT_HEAD, res: int = 2048, *, mhr_assets: Path | None = None) -> dict:
-    from . import mhr
+             head_assets: Path = DEFAULT_HEAD, res: int = 2048, *, mhr_assets: Path | None = None,
+             body_model: str = "mhr") -> dict:
+    from . import model as body_models
+    bm = body_models.get(body_model)
     start = time.perf_counter()
     out.mkdir(parents=True, exist_ok=True)
     face_dir = head_dir / "rig"
     meta = json.loads((out / "body_mhr.glb.json").read_text())
     model_params = np.asarray(meta["model_params"], np.float32)
     shape = np.asarray(meta["shape"], np.float32)
-    if model_params.shape != (204,) or shape.shape != (45,):
-        raise ValueError("SAM 3D Body sidecar lacks decoded MHR pose or identity")
-    vertices_batch, state_batch, rig, decode_report = mhr.decode(
-        mhr.resolve_assets(mhr_assets, model_path), model_params[None], shape)
-    vertices = vertices_batch[0].astype(np.float64) * .01
+    bm.check_params(model_params, shape)
+    vertices_batch, state_batch, rig, decode_report = bm.decode(
+        bm.resolve_assets(mhr_assets, model_path), model_params[None], shape)
+    vertices = vertices_batch[0].astype(np.float64) * bm.unit_to_m
     state = state_batch[0].astype(np.float64)
-    faces = np.asarray(_safetensor(head_assets, "head_pose.faces"), np.int32)
-    parity_max = None
-    if (out / "body_mhr.glb").is_file():
-        source = GLB.load(out / "body_mhr.glb")
-        prim = source.doc["meshes"][0]["primitives"][0]
-        predicted = source.accessor(prim["attributes"]["POSITION"])
-        if predicted.shape != vertices.shape:
-            raise ValueError("SAM 3D Body and MHR vertex counts differ")
-        parity_max = float(np.max(np.abs(predicted * FLIP_CAMERA - vertices)))
-        if parity_max > .02:
-            raise ValueError(f"decoded MHR mesh differs from SAM 3D Body by {parity_max:.4f} m")
+    faces = np.asarray(rig["faces"], np.int32) if "faces" in rig else bm.faces(head_assets)
+    parity_max = parity_mean = None
+    if bm.name == "mhr":
+        if (out / "body_mhr.glb").is_file():
+            source = GLB.load(out / "body_mhr.glb")
+            prim = source.doc["meshes"][0]["primitives"][0]
+            predicted = source.accessor(prim["attributes"]["POSITION"])
+            if predicted.shape != vertices.shape:
+                raise ValueError("SAM 3D Body and MHR vertex counts differ")
+            parity_max = float(np.max(np.abs(predicted * FLIP_CAMERA - vertices)))
+            if parity_max > .02:
+                raise ValueError(f"decoded MHR mesh differs from SAM 3D Body by {parity_max:.4f} m")
+    else:
+        # The SAM GLB is on MHR topology; the backend measured the MHR -> body-model
+        # conversion residual instead. Mean error gates; the maximum is reported.
+        residual = decode_report.get("mhr_to_soma_error_m")
+        if residual is None:
+            raise ValueError(f"{bm.label} decoder did not report its MHR conversion residual")
+        parity_max, parity_mean = float(residual["max"]), float(residual["mean"])
+        if parity_mean > .01:
+            raise ValueError(f"{bm.label} fit differs from the SAM 3D Body pose by {parity_mean:.4f} m on average")
     if not (out / "body_mhr.glb").is_file():
-        raw = GLBBuilder("MHR body mock geometry")
+        raw = GLBBuilder(f"{bm.label} body mock geometry")
         prim = {"attributes": {"POSITION": raw.accessor(vertices.astype(np.float32))},
                 "indices": raw.accessor(faces, indices=True), "mode": 4}
         raw.doc["meshes"].append({"name": "body", "primitives": [prim]})
@@ -358,20 +369,20 @@ def assemble(head_dir: Path, out: Path, model_path: Path | None = None,
     joints4 = np.take_along_axis(joint_ids, order, 1).astype(np.uint16)
     weights4 = np.take_along_axis(skin_weights, order, 1).astype(np.float64)
     weights4 /= np.maximum(weights4.sum(1, keepdims=True), 1e-9)
-    body_joints, names, bind = _mhr_rig(rig, state)
-    head_index = names.index("mhr_c_head")
-    neck_index = names.index("mhr_c_neck")
+    body_joints, names, bind = _mhr_rig(rig, state, bm.unit_to_m)
+    head_index = names.index(bm.head_joint)
+    neck_index = names.index(bm.neck_joint)
     neck_y = float(bind[neck_index, 1, 3])
-    mapping = _safetensor(head_assets, "head_pose.keypoint_mapping")
-    alignment, landmark_error = _face_alignment(face_dir, vertices, state, mapping)
+    mapping = bm.landmark_mapping(head_assets)
+    alignment, landmark_error = _face_alignment(face_dir, vertices, state, mapping, bm.unit_to_m)
     if landmark_error > .035:
         raise ValueError(f"face/body landmark registration error {landmark_error:.3f} m")
     definition, face_joints = _face_rig(face_dir, alignment, bind[head_index], names[head_index])
     # Keep the original facial control namespace; body joints have distinct
     # names so speech tracks and 52 expression morphs remain addressable.
     definition["joints"] = body_joints + face_joints
-    definition["body"] = {"model": "MHR", "joints": len(body_joints),
-                          "bind_pose": "SAM 3D Body prediction", "pose_correctives": "baked at bind pose"}
+    definition["body"] = {"model": bm.label, "joints": len(body_joints),
+                          "bind_pose": bm.bind_note, "pose_correctives": "baked at bind pose"}
     for item in ([definition["ml_deformer"]["model"]] if definition.get("ml_deformer") else []):
         shutil.copyfile(face_dir / item, out / item)
     for item in (entry["file"] for entry in definition.get("wrinkles", {}).get("maps", [])):
@@ -411,12 +422,15 @@ def assemble(head_dir: Path, out: Path, model_path: Path | None = None,
     report = {"version": 1, "body_vertices": len(vertices), "body_triangles": len(body_part.tris),
               "body_joints": len(body_joints), "face_joints": len(face_joints),
               "landmark_error_m": round(landmark_error, 5),
+              "body_model": bm.name,
               "mhr_parity_max_m": round(parity_max, 6) if parity_max is not None else None,
+              "mhr_parity_mean_m": round(parity_mean, 6) if parity_mean is not None else None,
               "pixal3d": pixal_report,
               "texture": bake_report, "garments": garment_report, "glb": gltf_stats, "usd": usd_stats,
               "seconds": round(time.perf_counter() - start, 2),
-              "limitations": ["MHR pose correctives are baked at the generated bind pose",
-                              "A single source view does not determine unseen garment geometry"]}
+              "limitations": [f"{bm.label} pose correctives are baked at the generated bind pose",
+                              "A single source view does not determine unseen garment geometry"]
+              + ([] if bm.name == "mhr" else ["garment fitting on this body model is not validated"])}
     report["mhr_decoder"] = decode_report
     (out / "body_report.json").write_text(json.dumps(report, indent=1, default=float))
     return report
@@ -430,8 +444,10 @@ def main(argv=None) -> int:
     ap.add_argument("--mhr-assets", type=Path)
     ap.add_argument("--head-assets", type=Path, default=DEFAULT_HEAD)
     ap.add_argument("--res", type=int, choices=(1024, 2048, 4096), default=2048)
+    ap.add_argument("--body-model", default="mhr", help="body model backend (default mhr)")
     args = ap.parse_args(argv)
-    print(json.dumps(assemble(args.head_dir, args.out, args.model, args.head_assets, args.res, mhr_assets=args.mhr_assets), default=float),
+    print(json.dumps(assemble(args.head_dir, args.out, args.model, args.head_assets, args.res,
+                              mhr_assets=args.mhr_assets, body_model=args.body_model), default=float),
           flush=True)
     return 0
 
