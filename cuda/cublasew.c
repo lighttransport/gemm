@@ -1729,3 +1729,17 @@ int cublasew_gemm_fp8_e4m3_f32out_rowmajor_nt(cublasew_context *ctx,
                                0, 0,
                                n_tok, n_out, n_in);
 }
+
+static int cublasew_dt_of(int t) { return t == 0 ? CUDA_R_32F : t == 1 ? CUDA_R_16BF : CUDA_R_16F; }
+int cublasew_gemm_ex_rm(cublasew_context *ctx, int w_kn, int M, int N, int K,
+                        CUdeviceptr W, int ldw, int wtype, CUdeviceptr X, int ldx, int xtype,
+                        CUdeviceptr Y, int ldy, int ytype, float beta) {
+    const float alpha = 1.0f;
+    if (!ctx || !ctx->handle || M <= 0 || N <= 0 || K <= 0) return -1;
+    return p_cublasGemmEx(ctx->handle, w_kn ? CUBLAS_OP_N : CUBLAS_OP_T, CUBLAS_OP_N,
+                          N, M, K, &alpha,
+                          (const void *)(uintptr_t)W, cublasew_dt_of(wtype), ldw,
+                          (const void *)(uintptr_t)X, cublasew_dt_of(xtype), ldx,
+                          &beta, (void *)(uintptr_t)Y, cublasew_dt_of(ytype), ldy,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS ? 0 : -1;
+}

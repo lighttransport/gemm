@@ -193,6 +193,12 @@ ref/sam3.1/*
 !ref/svdquant/*.py
 !ref/svdquant/README.md
 !ref/svdquant/.gitignore
+!ref/praxis/
+!ref/praxis/*.py
+!ref/praxis/README.md
+!ref/cosmos3/
+!ref/cosmos3/*.py
+!ref/cosmos3/README.md
 result/
 
 # Local (uncommitted) runner scripts — per-box model paths / env
@@ -402,3 +408,7 @@ ref/minimax_h3_native/*
 !ref/terra/*.py
 !ref/terra/*.patch
 !ref/terra/*.md
+
+# praxis / cosmos3 built binaries
+cuda/praxis/praxis_e2e
+cuda/cosmos3/cosmos3_policy

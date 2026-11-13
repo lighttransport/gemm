@@ -58,6 +58,24 @@ test_gemma4_st: test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE
           ../../common/gemma4_audio_encoder.h ../../common/gemma4_audio_mel.h
 	$(CC) $(CFLAGS) -o $@ test_gemma4_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
 
+test_qwen35_st: test_qwen35_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE_CUBIN) $(FA2_CUBIN) \
+          cuda_llm_runner.h half_convert.h ../cuew.h ../cublasew.h
+	$(CC) $(CFLAGS) -o $@ test_qwen35_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(LDFLAGS)
+
+# Parity check of the Qwen3.5-2B safetensors text tower against the HF fp32 dump
+# (tmp/praxis_ref/text, from ref/praxis/gen_text_ref.py): all 25 hidden states + cond must pass
+# compare.py (rel-L2 <= 0.005, cos >= 0.9999). Override QWEN35_DIR / QWEN35_REF as needed.
+QWEN35_DIR ?= /mnt/disk1/praxis/qwen3.5-2b
+QWEN35_REF ?= tmp/praxis_ref/text
+QWEN35_OUT ?= tmp/praxis_out/text_check
+.PHONY: test_qwen35_st_check
+test_qwen35_st_check: test_qwen35_st
+	@test -f ../../$(QWEN35_REF)/cond.npy || { echo "missing reference $(QWEN35_REF): run python3 ref/praxis/gen_text_ref.py --out $(QWEN35_REF)"; exit 1; }
+	cd ../.. && ./cuda/llm/test_qwen35_st $(QWEN35_DIR) -i $(QWEN35_REF)/ids.npy -o $(QWEN35_OUT) -p 32 --prof
+	cd ../.. && python3 ref/praxis/compare.py --ref-dir $(QWEN35_REF) --ours-dir $(QWEN35_OUT) --skip-missing --tol 0.005 | tee $(QWEN35_OUT)/compare.log
+	@test "`grep -c '^PASS' ../../$(QWEN35_OUT)/compare.log`" = 26 || { echo "test_qwen35_st_check: FAILED (expected 26 PASS: layer_00..24 + cond)"; exit 1; }
+	@echo "test_qwen35_st_check: OK"
+
 run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <model.gguf> [-t \"prompt\"] [-n max_tokens] [-s max_seq_len]"
 

@@ -352,6 +352,14 @@ int cublasew_gemm_fp8_e4m3_f32out_rowmajor_nt(cublasew_context *ctx,
                                               int n_out,
                                               int n_in);
 
+
+/* Generic row-major GEMM  Y[M][N] = X[M][K] * Wop + beta*Y with explicit row strides and element types
+ * (0 = f32, 1 = bf16, 2 = f16; compute FP32). w_kn == 0: W is [N][K] (nn.Linear), ldw >= K;
+ * w_kn == 1: W is [K][N], ldw >= N. Returns 0 on success. */
+int cublasew_gemm_ex_rm(cublasew_context *ctx, int w_kn, int M, int N, int K,
+                        CUdeviceptr W, int ldw, int wtype, CUdeviceptr X, int ldx, int xtype,
+                        CUdeviceptr Y, int ldy, int ytype, float beta);
+
 #ifdef __cplusplus
 }
 #endif

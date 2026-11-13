@@ -9128,6 +9128,9 @@ struct cuda_llm_runner {
     float rms_norm_eps;
     int debug_layers;       /* if > 0, print hidden state norm after each layer */
     int max_layers;         /* if > 0, process only first N layers (debug) */
+    float *hidden_dump;     /* if set, qwen35 prefill dumps [n_layers_run+1][n_tokens][n_embd] (host) */
+    int hidden_dump_only;   /* >=0: dump ONLY slot k (embeddings=0, output of layer k-1) into hidden_dump[0..n*n_embd) */
+    float *hidden_dump_normed; /* if set, receives the final-norm'd output of the last run layer [n_tokens][n_embd] (host) */
     int n_deepstack;        /* number of deepstack layers (VLM injection, 0 = none) */
     int hidden_snapshot_layers[3];
     int n_hidden_snapshots;
@@ -9290,6 +9293,8 @@ struct cuda_llm_runner {
     /* GPU weights */
     int token_embd_type;        /* GGML_TYPE_F16 or GGML_TYPE_Q8_0 */
     CUdeviceptr d_token_embd;   /* F16 or Q8_0 [n_vocab * n_embd] */
+    st_context *host_embd_shard; /* qwen35 st "host embed" mode: token table stays in the mmap'd bf16 file, */
+    const uint16_t *host_embd_bf16; /* rows are gathered on the host per prefill (no 1 GB upload; no LM head) */
     CUdeviceptr d_output_norm;  /* F32 [n_embd] */
     CUdeviceptr d_output_w;    /* lm_head [n_vocab * n_embd] */
     int output_w_type;
@@ -11168,6 +11173,22 @@ static int cllm_open_safetensors_shards(const char *model_path, st_context **sha
             }
             if (!found) break;
         }
+        /* Alternate naming: model.safetensors-00001-of-0000N.safetensors */
+        for (int i = 1; n_shards == 0 && i <= 1; i++) {
+            for (int total = 1; total <= max_shards; total++) {
+                snprintf(path, sizeof(path), "%s/model.safetensors-%05d-of-%05d.safetensors",
+                         model_path, i, total);
+                if (stat(path, &sb) != 0) continue;
+                for (int j = 1; j <= total && n_shards < max_shards; j++) {
+                    snprintf(path, sizeof(path), "%s/model.safetensors-%05d-of-%05d.safetensors",
+                             model_path, j, total);
+                    st_context *s = safetensors_open(path);
+                    if (!s) break;
+                    shards[n_shards++] = s;
+                }
+                break;
+            }
+        }
         /* Fallback: a single un-sharded model.safetensors in the directory. */
         if (n_shards == 0) {
             char path[512];
@@ -11188,7 +11209,9 @@ static int cllm_open_safetensors_shards(const char *model_path, st_context **sha
 
 static void cllm_close_safetensors_shards(st_context **shards, int n_shards) {
     for (int i = 0; i < n_shards; i++) {
-        if (shards[i]) safetensors_close(shards[i]);
+        if (shards[i]) {
+            safetensors_close(shards[i]);
+        }
     }
 }
 
@@ -12508,6 +12531,235 @@ static double cllm_json_num(const json_val *o, const char *k, double dflt) {
     if (!o || o->type != JSON_OBJECT) return dflt;
     const json_val *v = json_obj_get(o, k);
     return (v && v->type == JSON_NUMBER) ? v->num : dflt;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Qwen3.5 (hybrid Gated-DeltaNet + gated full attention) DIRECT safetensors  */
+/* loader (HF tensor names model.language_model.*).  Mirrors the GGUF qwen35  */
+/* tensor conventions of llama.cpp's converter:                               */
+/*   ssm_a = -exp(A_log); conv1d squeezed to [qkv_dim, k]; every RMSNorm      */
+/*   weight except linear_attn.norm gets +1 ((1+w) form); q_proj keeps HF     */
+/*   per-head [q|gate] interleaving (launch_deinterleave_qgate expects it).   */
+/* Matrices (bf16) are uploaded as F16 via upload_weight_matrix.              */
+/* ------------------------------------------------------------------------ */
+static int cllm_st_upload_f32_vec(cuda_llm_runner *r, CUdeviceptr *dst,
+                                  st_context **shards, int n_shards,
+                                  const char *name, int n, int mode) {
+    /* mode 0: plain, 1: +1 (RMSNorm), 2: -exp(x) (A_log) */
+    (void)r;
+    qtensor t = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+    if (!t.data) return -1;
+    float *f = (float *)malloc((size_t)n * sizeof(float));
+    if (!f) return -1;
+    dequant_row(t.type, t.data, f, n);
+    for (int i = 0; i < n; i++) {
+        if (mode == 1) f[i] += 1.0f;
+        else if (mode == 2) f[i] = -expf(f[i]);
+    }
+    CUresult e = cuMemAlloc(dst, (size_t)n * sizeof(float));
+    if (e == CUDA_SUCCESS) e = cuMemcpyHtoD(*dst, f, (size_t)n * sizeof(float));
+    free(f);
+    return e == CUDA_SUCCESS ? 0 : -1;
+}
+
+int cuda_llm_load_weights_qwen35_safetensors(cuda_llm_runner *r,
+                                             const char *model_path,
+                                             int max_seq_len) {
+    if (!r || !model_path) return -1;
+    if (cuda_llm_bind_context(r) != 0) return -1;
+    /* Defaults tuned for the praxis text tower (override with the env vars):
+     *  - bf16->F16 conversion on the GPU (bit-identical to the host loop, ~4x faster load;
+     *    the host path also never hits the f16 sidecar cache for this checkpoint's file naming)
+     *  - cuBLAS tensor-core batched GEMMs (the fallback F16 kernel is ~15x slower at >=256 tokens) */
+    setenv("CUDA_LLM_GPU_BF16_TO_F16", "1", 0);
+    { const char *ce = getenv("CUDA_LLM_USE_CUBLAS"); if (!ce || atoi(ce) != 0) r->use_cublas = 1; }
+    cllm_f16cache_begin(model_path, r->verbose);
+
+    st_context *shards[16] = {0};
+    int n_shards = cllm_open_safetensors_shards(model_path, shards, 16);
+    if (n_shards <= 0) {
+        fprintf(stderr, "cuda_llm: failed to open qwen35 safetensors %s\n", model_path);
+        cllm_f16cache_end(0, r->verbose);
+        return -1;
+    }
+    #define Q35_FAIL() do { cllm_close_safetensors_shards(shards, n_shards); cllm_f16cache_end(0, r->verbose); return -1; } while (0)
+
+    const char *LM = "model.language_model.";
+    char name[256];
+
+    /* config.json defaults (Qwen3.5-2B) */
+    float rms_eps = 1e-6f, rope_theta = 1e7f, partial_rotary = 0.25f;
+    int head_dim = 256, n_heads = 8, n_kv = 2, interval = 4, conv_k = 4;
+    int lk_heads = 16, lv_heads = 16, lk_dim = 128, lv_dim = 128;
+    {
+        char cfg_path[512];
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", model_path);
+        FILE *f = fopen(cfg_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char *buf = (char *)malloc(sz > 0 ? sz : 1);
+            if (buf && sz > 0 && fread(buf, 1, sz, f) == (size_t)sz) {
+                json_val *root = json_parse(buf, (int)sz);
+                json_val *tc = root ? json_obj_get(root, "text_config") : NULL;
+                if (!tc) tc = root;
+                if (tc) {
+                    rms_eps  = (float)cllm_json_num(tc, "rms_norm_eps", rms_eps);
+                    head_dim = (int)cllm_json_num(tc, "head_dim", head_dim);
+                    n_heads  = (int)cllm_json_num(tc, "num_attention_heads", n_heads);
+                    n_kv     = (int)cllm_json_num(tc, "num_key_value_heads", n_kv);
+                    interval = (int)cllm_json_num(tc, "full_attention_interval", interval);
+                    conv_k   = (int)cllm_json_num(tc, "linear_conv_kernel_dim", conv_k);
+                    lk_heads = (int)cllm_json_num(tc, "linear_num_key_heads", lk_heads);
+                    lv_heads = (int)cllm_json_num(tc, "linear_num_value_heads", lv_heads);
+                    lk_dim   = (int)cllm_json_num(tc, "linear_key_head_dim", lk_dim);
+                    lv_dim   = (int)cllm_json_num(tc, "linear_value_head_dim", lv_dim);
+                    json_val *rp = json_obj_get(tc, "rope_parameters");
+                    if (rp && rp->type == JSON_OBJECT) {
+                        rope_theta     = (float)cllm_json_num(rp, "rope_theta", rope_theta);
+                        partial_rotary = (float)cllm_json_num(rp, "partial_rotary_factor", partial_rotary);
+                    }
+                }
+                if (root) json_free(root);
+            }
+            free(buf);
+            fclose(f);
+        }
+    }
+    if (lk_heads != lv_heads) {
+        fprintf(stderr, "cuda_llm: qwen35 st: num_k_heads != num_v_heads not supported (needs V-head reorder)\n");
+        Q35_FAIL();
+    }
+
+    int n_layers = 0;
+    for (int s = 0; s < n_shards; s++)
+        for (int i = 0; i < shards[s]->n_tensors; i++) {
+            const char *nm = safetensors_name(shards[s], i);
+            if (strncmp(nm, "model.language_model.layers.", 28) == 0) {
+                int l = atoi(nm + 28); if (l + 1 > n_layers) n_layers = l + 1;
+            }
+        }
+    if (n_layers <= 0) { fprintf(stderr, "cuda_llm: qwen35 st: no layers\n"); Q35_FAIL(); }
+
+    snprintf(name, sizeof(name), "%sembed_tokens.weight", LM);
+    qtensor embd = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+    if (!embd.data) Q35_FAIL();
+    snprintf(name, sizeof(name), "%slayers.0.mlp.gate_proj.weight", LM);
+    qtensor ff0 = cllm_st_load_tensor_multi(shards, n_shards, name, 1);
+    if (!ff0.data) Q35_FAIL();
+
+    r->n_embd = embd.n_cols;
+    r->n_vocab = embd.n_rows;
+    r->n_layers = n_layers;
+    r->n_heads = n_heads;
+    r->n_kv_heads = n_kv;
+    r->head_dim = head_dim;
+    r->n_ff = ff0.n_rows;
+    r->rms_norm_eps = rms_eps;
+    r->rope_freq_base = rope_theta;
+    r->n_rope_pairs = (int)(partial_rotary * head_dim) / 2;   /* 0.25*256/2 = 32 */
+    r->is_gemma4 = 0; r->is_moe = 0; r->n_deepstack = 0;
+    r->is_hybrid = 1;
+    r->full_attn_interval = interval;
+    r->ssm_conv_kernel = conv_k;
+    r->ssm_d_state = lk_dim;
+    r->ssm_n_group = lk_heads;
+    r->ssm_dt_rank = lv_heads;
+    r->ssm_d_inner = lv_heads * lv_dim;
+    r->ssm_qkv_dim = lk_dim * lk_heads * 2 + r->ssm_d_inner;
+    if (max_seq_len <= 0) max_seq_len = 2048;
+    r->max_seq_len = max_seq_len;
+
+    if (r->verbose >= 1)
+        fprintf(stderr, "cuda_llm: qwen35 safetensors n_embd=%d layers=%d heads=%d/%d hd=%d ff=%d rope_pairs=%d theta=%.0f ssm(qkv=%d inner=%d)\n",
+                r->n_embd, n_layers, n_heads, n_kv, head_dim, r->n_ff, r->n_rope_pairs, rope_theta,
+                r->ssm_qkv_dim, r->ssm_d_inner);
+
+    snprintf(name, sizeof(name), "%sembed_tokens.weight", LM);
+    /* Hidden-state use (praxis text encoder) never needs the LM head: keep the bf16 table in the
+     * mmap and gather rows on the host (saves a 1 GB read+upload+convert, ~25% of load time).
+     * CUDA_LLM_QWEN35_FULL_EMBED=1 restores the GPU table (needed for token decode / logits). */
+    int host_embed = (n_shards == 1 && embd.type == GGML_TYPE_BF16 && !getenv("CUDA_LLM_QWEN35_FULL_EMBED"));
+    if (host_embed) {
+        r->host_embd_bf16 = (const uint16_t *)embd.data;
+        r->token_embd_type = GGML_TYPE_F16;
+        r->has_lm_head = 0;
+    } else {
+        if (upload_weight_matrix(r, &r->d_token_embd, &embd, &r->token_embd_type, name) != 0) Q35_FAIL();
+        r->has_lm_head = 1;
+    }
+    snprintf(name, sizeof(name), "%snorm.weight", LM);
+    if (cllm_st_upload_f32_vec(r, &r->d_output_norm, shards, n_shards, name, r->n_embd, 1) != 0) Q35_FAIL();
+    r->d_output_w = r->d_token_embd;
+    r->output_w_type = r->token_embd_type;
+
+    r->layers = (cuda_layer *)calloc(n_layers, sizeof(cuda_layer));
+    if (!r->layers) Q35_FAIL();
+
+    #define Q35_MAT(field, tfield, rows, cols, suffix) do { \
+        snprintf(name, sizeof(name), "%slayers.%d." suffix, LM, l); \
+        qtensor _t = cllm_st_load_tensor_multi(shards, n_shards, name, 1); \
+        if (!_t.data) Q35_FAIL(); \
+        cl->rows = _t.n_rows; cl->cols = _t.n_cols; \
+        if (upload_weight_matrix(r, &cl->field, &_t, &cl->tfield, name) != 0) Q35_FAIL(); \
+    } while (0)
+    #define Q35_VEC(field, suffix, n, mode) do { \
+        snprintf(name, sizeof(name), "%slayers.%d." suffix, LM, l); \
+        if (cllm_st_upload_f32_vec(r, &cl->field, shards, n_shards, name, n, mode) != 0) Q35_FAIL(); \
+    } while (0)
+
+    for (int l = 0; l < n_layers; l++) {
+        cuda_layer *cl = &r->layers[l];
+        int is_ssm = (interval > 0 && (l + 1) % interval != 0);
+        cl->is_ssm = is_ssm;
+        cl->is_swa = 0;
+        cl->shared_kv_source = -1;
+        cl->n_kv_heads = r->n_kv_heads;
+
+        Q35_VEC(attn_norm_w, "input_layernorm.weight", r->n_embd, 1);
+        if (is_ssm) {
+            Q35_MAT(ssm_qkv_w,  ssm_qkv_type,  ssm_qkv_rows,  ssm_qkv_cols,  "linear_attn.in_proj_qkv.weight");
+            Q35_MAT(ssm_gate_w, ssm_gate_type, ssm_gate_rows, ssm_gate_cols, "linear_attn.in_proj_z.weight");
+            Q35_MAT(ssm_alpha_w, ssm_alpha_type, ssm_alpha_rows, ssm_alpha_cols, "linear_attn.in_proj_a.weight");
+            Q35_MAT(ssm_beta_w,  ssm_beta_type,  ssm_beta_rows,  ssm_beta_cols,  "linear_attn.in_proj_b.weight");
+            Q35_MAT(ssm_out_w,  ssm_out_type,  ssm_out_rows,  ssm_out_cols,  "linear_attn.out_proj.weight");
+            Q35_VEC(ssm_a,        "linear_attn.A_log",      r->ssm_dt_rank, 2);
+            Q35_VEC(ssm_dt_bias,  "linear_attn.dt_bias",    r->ssm_dt_rank, 0);
+            Q35_VEC(ssm_conv1d_w, "linear_attn.conv1d.weight", r->ssm_qkv_dim * conv_k, 0);
+            Q35_VEC(ssm_norm_w,   "linear_attn.norm.weight", r->ssm_d_state, 0);
+            size_t conv_bytes = (size_t)(conv_k - 1) * r->ssm_qkv_dim * sizeof(float);
+            CHECK_CU(cuMemAlloc(&cl->d_conv_state, conv_bytes));
+            CHECK_CU(cuMemsetD8(cl->d_conv_state, 0, conv_bytes));
+            size_t rec_bytes = (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float);
+            CHECK_CU(cuMemAlloc(&cl->d_recurrent_state, rec_bytes));
+            CHECK_CU(cuMemsetD8(cl->d_recurrent_state, 0, rec_bytes));
+        } else {
+            Q35_MAT(attn_q_w, attn_q_type, attn_q_rows, attn_q_cols, "self_attn.q_proj.weight");
+            Q35_MAT(attn_k_w, attn_k_type, attn_k_rows, attn_k_cols, "self_attn.k_proj.weight");
+            Q35_MAT(attn_v_w, attn_v_type, attn_v_rows, attn_v_cols, "self_attn.v_proj.weight");
+            Q35_MAT(attn_output_w, attn_output_type, attn_output_rows, attn_output_cols, "self_attn.o_proj.weight");
+            cl->has_v_proj = 1;
+            cl->has_qk_norm = 1;
+            Q35_VEC(attn_q_norm_w, "self_attn.q_norm.weight", head_dim, 1);
+            Q35_VEC(attn_k_norm_w, "self_attn.k_norm.weight", head_dim, 1);
+        }
+        Q35_VEC(ffn_norm_w, "post_attention_layernorm.weight", r->n_embd, 1);
+        Q35_MAT(ffn_gate_w, ffn_gate_type, ffn_gate_rows, ffn_gate_cols, "mlp.gate_proj.weight");
+        Q35_MAT(ffn_up_w,   ffn_up_type,   ffn_up_rows,   ffn_up_cols,   "mlp.up_proj.weight");
+        Q35_MAT(ffn_down_w, ffn_down_type, ffn_down_rows, ffn_down_cols, "mlp.down_proj.weight");
+    }
+    #undef Q35_MAT
+    #undef Q35_VEC
+
+    {
+        int kv_dim = r->n_kv_heads * r->head_dim;
+        int q_dim = r->n_heads * r->head_dim;
+        if (cuda_llm_alloc_runtime_buffers(r, q_dim, kv_dim, max_seq_len) != 0) Q35_FAIL();
+    }
+    #undef Q35_FAIL
+    if (r->host_embd_bf16) { r->host_embd_shard = shards[0]; shards[0] = NULL; }   /* keep the mmap alive */
+    cllm_close_safetensors_shards(shards, n_shards);
+    cllm_f16cache_end(1, r->verbose);
+    return 0;
 }
 
 int cuda_llm_load_weights_gemma4_safetensors(cuda_llm_runner *r,
@@ -17112,8 +17364,16 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
     const char *stop_attn_env = getenv("CUDA_LLM_STOP_AFTER_ATTN_RESIDUAL");
     int stop_after_attn_residual = stop_attn_env && stop_attn_env[0] && strcmp(stop_attn_env, "0") != 0;
 
+    if (r->hidden_dump && (r->hidden_dump_only < 0 || r->hidden_dump_only == 0)) {
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(r->hidden_dump, d_batch_x, batch_embd_bytes);
+    }
     for (int l = 0; l < n_layers; l++) {
         cuda_layer *cl = &r->layers[l];
+        if (l > 0 && r->hidden_dump && (r->hidden_dump_only < 0 || r->hidden_dump_only == l)) {
+            cuStreamSynchronize(r->stream);
+            cuMemcpyDtoH(r->hidden_dump + (r->hidden_dump_only >= 0 ? 0 : (size_t)l * n_tokens * n_embd), d_batch_x, batch_embd_bytes);
+        }
 
         cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd_bytes, r->stream);
         {
@@ -17569,6 +17829,18 @@ static float *cuda_llm_prefill_qwen35(cuda_llm_runner *r, const int32_t *token_i
             }
             launch_add(r, d_batch_x, d_batch_xb, n_tokens * n_embd);
         }
+    }
+
+    if (r->hidden_dump && (r->hidden_dump_only < 0 || r->hidden_dump_only == n_layers)) {
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(r->hidden_dump + (r->hidden_dump_only >= 0 ? 0 : (size_t)n_layers * n_tokens * n_embd), d_batch_x, batch_embd_bytes);
+    }
+    if (r->hidden_dump_normed) {   /* post-final-norm (HF hidden_states[-1]) */
+        cuMemcpyDtoDAsync(d_batch_xb, d_batch_x, batch_embd_bytes, r->stream);
+        void *na[] = { &d_batch_xb, &r->d_output_norm, &n_embd, &eps, &n_tokens };
+        cuLaunchKernel(r->fn_batch_rmsnorm_f32, n_tokens, 1, 1, 256, 1, 1, 0, r->stream, na, NULL);
+        cuStreamSynchronize(r->stream);
+        cuMemcpyDtoH(r->hidden_dump_normed, d_batch_xb, batch_embd_bytes);
     }
 
     if (do_prof) {
@@ -18374,6 +18646,72 @@ cleanup:
     return result;
 }
 
+/* Run the first n_run_layers (<=0: all) layers of a hybrid qwen35 model on
+ * token_ids (fresh state, start_pos 0) and return the hidden states BEFORE the
+ * final norm for all tokens.  out_final: [n_tokens*n_embd] (may be NULL);
+ * out_per_layer: [(n_run+1)*n_tokens*n_embd] or NULL; slot 0 = embeddings,
+ * slot k = output after layer k-1. Returns 0 on success. */
+int cuda_llm_prefill_hidden_ex(cuda_llm_runner *r, const int32_t *token_ids, int n_tokens,
+                               int n_run_layers, int start_pos, int dump_only_slot,
+                               float *out_per_layer, float *out_normed) {
+    if (!r || !r->weights_loaded || !r->is_hybrid || !token_ids || n_tokens <= 0 || start_pos < 0) return -1;
+    if (start_pos + n_tokens > r->max_seq_len) {
+        fprintf(stderr, "cuda_llm: prefill of %d tokens at pos %d exceeds max_seq_len %d\n",
+                n_tokens, start_pos, r->max_seq_len);
+        return -1;
+    }
+    if (cuda_llm_bind_context(r) != 0) return -1;
+    int n_run = (n_run_layers > 0 && n_run_layers < r->n_layers) ? n_run_layers : r->n_layers;
+    if (start_pos == 0) {   /* fresh sequence: reset recurrent state (continuation keeps it + the KV cache) */
+        for (int l = 0; l < r->n_layers; l++) {
+            cuda_layer *cl = &r->layers[l];
+            if (!cl->is_ssm) continue;
+            cuMemsetD8(cl->d_conv_state, 0, (size_t)(r->ssm_conv_kernel - 1) * r->ssm_qkv_dim * sizeof(float));
+            cuMemsetD8(cl->d_recurrent_state, 0, (size_t)r->ssm_dt_rank * r->ssm_d_state * r->ssm_d_state * sizeof(float));
+        }
+    }
+    int save_max = r->max_layers;
+    r->max_layers = n_run;
+    r->hidden_dump = out_per_layer;
+    r->hidden_dump_only = dump_only_slot;
+    r->hidden_dump_normed = out_normed;
+    float *res;
+    if (r->host_embd_bf16) {   /* gather bf16 rows on the host -> F32 embeddings */
+        size_t ne = (size_t)r->n_embd;
+        float *emb = (float *)malloc((size_t)n_tokens * ne * sizeof(float));
+        if (!emb) { r->max_layers = save_max; return -1; }
+        for (int t = 0; t < n_tokens; t++) {
+            int32_t id = token_ids[t];
+            if (id < 0 || id >= r->n_vocab) { free(emb); r->max_layers = save_max; fprintf(stderr, "cuda_llm: token id %d out of range\n", id); return -1; }
+            const uint16_t *row = r->host_embd_bf16 + (size_t)id * ne;
+            uint32_t *o = (uint32_t *)(emb + (size_t)t * ne);
+            for (size_t i = 0; i < ne; i++) o[i] = (uint32_t)row[i] << 16;
+        }
+        res = cuda_llm_prefill_qwen35(r, NULL, emb, r->n_embd, n_tokens, start_pos);
+        free(emb);
+    } else {
+        res = cuda_llm_prefill_qwen35(r, token_ids, NULL, r->n_embd, n_tokens, start_pos);
+    }
+    r->hidden_dump = NULL;
+    r->hidden_dump_only = -1;
+    r->hidden_dump_normed = NULL;
+    r->max_layers = save_max;
+    return res ? 0 : -1;
+}
+
+int cuda_llm_prefill_hidden_all(cuda_llm_runner *r, const int32_t *token_ids, int n_tokens,
+                                int n_run_layers, float *out_final, float *out_per_layer) {
+    if (!r || !r->weights_loaded || !r->is_hybrid || !token_ids || n_tokens <= 0) return -1;
+    int n_run = (n_run_layers > 0 && n_run_layers < r->n_layers) ? n_run_layers : r->n_layers;
+    size_t per = (size_t)n_tokens * r->n_embd;
+    float *buf = out_per_layer ? out_per_layer : (float *)malloc((size_t)(n_run + 1) * per * sizeof(float));
+    if (!buf) return -1;
+    int rc = cuda_llm_prefill_hidden_ex(r, token_ids, n_tokens, n_run, 0, -1, buf, NULL);
+    if (rc == 0 && out_final) memcpy(out_final, buf + (size_t)n_run * per, per * sizeof(float));
+    if (!out_per_layer) free(buf);
+    return rc;
+}
+
 float *cuda_llm_prefill_logits(cuda_llm_runner *r, const int32_t *token_ids,
                                 const float *embeddings, int embd_stride,
                                 int n_tokens, int start_pos) {
@@ -19072,6 +19410,7 @@ void cuda_llm_free(cuda_llm_runner *r) {
     }
 
     /* Free global weights */
+    if (r->host_embd_shard) safetensors_close(r->host_embd_shard);
     if (r->d_token_embd) cuMemFree(r->d_token_embd);
     if (r->d_output_norm) cuMemFree(r->d_output_norm);
     if (r->d_output_w && r->d_output_w != r->d_token_embd) cuMemFree(r->d_output_w);

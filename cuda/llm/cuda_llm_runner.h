@@ -46,6 +46,33 @@ int cuda_llm_load_weights_gemma4_safetensors(cuda_llm_runner *r,
                                              const char *model_path,
                                              int max_seq_len);
 
+/* Load Qwen3.5 (hybrid Gated-DeltaNet + gated attention, e.g. Qwen3.5-2B)
+ * DIRECTLY from HF safetensors (model.language_model.* names, bf16 -> F16 GPU
+ * weights, norms +1, A_log -> -exp). model_path = dir with config.json. */
+int cuda_llm_load_weights_qwen35_safetensors(cuda_llm_runner *r,
+                                             const char *model_path,
+                                             int max_seq_len);
+
+/* Run the first n_run_layers (<=0: all) layers of a hybrid qwen35 model on
+ * token_ids and return hidden states BEFORE the final norm for all tokens
+ * (host float [n_tokens*n_embd]). out_per_layer (optional) receives
+ * [(n_run+1)][n_tokens][n_embd]: slot 0 = embeddings, slot k = output after
+ * layer k-1. Recurrent state is reset first. Returns 0 on success. */
+int cuda_llm_prefill_hidden_all(cuda_llm_runner *r, const int32_t *token_ids, int n_tokens,
+                                int n_run_layers, float *out_final, float *out_per_layer);
+
+/* Extended qwen35 hidden-state prefill. start_pos==0 resets the recurrent
+ * state; start_pos>0 CONTINUES a previous prefill (conv/recurrent state + KV
+ * cache are kept), so a long prompt can be fed in chunks. Requires
+ * start_pos+n_tokens <= max_seq_len given to the loader.
+ *  dump_only_slot >= 0: out_per_layer receives ONLY that slot [n_tokens][n_embd]
+ *     (0 = embeddings, k = output of layer k-1); <0: all [(n_run+1)][n_tokens][n_embd].
+ *  out_normed (optional): [n_tokens][n_embd] output of the last run layer after
+ *     the final RMSNorm (HF hidden_states[-1] when n_run == n_layers). */
+int cuda_llm_prefill_hidden_ex(cuda_llm_runner *r, const int32_t *token_ids, int n_tokens,
+                               int n_run_layers, int start_pos, int dump_only_slot,
+                               float *out_per_layer, float *out_normed);
+
 /* Run one token through the transformer. Returns pointer to F32 hidden state [n_embd].
  * The returned pointer is valid until the next call (host-side buffer). */
 float *cuda_llm_forward(cuda_llm_runner *r, int32_t token_id, int position);
