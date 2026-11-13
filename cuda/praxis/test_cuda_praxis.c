@@ -86,7 +86,7 @@ static void load_inputs(const char *ref, inputs_t *in) {
     in->text_u = rd(ref, "in_text_u", &nd, sh, &n); in->Su = (int)sh[1];
     in->anchor = rd(ref, "in_anchor", &nd, sh, &n); in->h = (int)sh[3]; in->w = (int)sh[4];
     in->noised = rd(ref, "in_noised", &nd, sh, &n);
-    in->clean = rd(ref, "in_clean", &nd, sh, &n);
+    { char pc[1200]; snprintf(pc, sizeof pc, "%s/in_clean.npy", ref); in->clean = access(pc, R_OK) == 0 ? rd(ref, "in_clean", &nd, sh, &n) : NULL; }   /* K'=1 (depth 0): no clean chunk */
     in->t = rd(ref, "in_t_trunk", &nd, sh, &n); in->K = (int)sh[1];
     in->proprio = rd(ref, "in_proprio", &nd, sh, &n);
     in->noised_a = rd(ref, "in_noised_a", &nd, sh, &n);

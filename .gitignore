@@ -412,3 +412,4 @@ ref/minimax_h3_native/*
 # praxis / cosmos3 built binaries
 cuda/praxis/praxis_e2e
 cuda/cosmos3/cosmos3_policy
+cuda/praxis/praxis_server

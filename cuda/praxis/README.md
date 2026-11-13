@@ -375,3 +375,98 @@ runner; the antialiased tile resize is not bit-compared to torch (the ref's `can
 - **`--session FILE|-`**: one prompt per line (blank and `#` lines skipped). Policy weights, VAE weights and the prompt caches stay resident across calls; each call re-tiles the frames, VAE-encodes,
   samples and writes `<out>/call_NNN/`. Per-call breakdown and cold/warm summary are printed (`[call N]`, `== session`). Caveat for the memory target: with the VAE weights and the policy both resident, the
   VAE-encode scratch (2.5 GB) overlaps the policy (6.9 GB), so a session call peaks above the 8 GB of the single-shot (sequenced) mode; single-shot mode is unchanged (VAE freed before the policy loads).
+
+## Closed-loop sim: praxis' own MuJoCo DROID sim driven by our CUDA runner (server + client)
+Pieces (all new): `praxis_server.c` (persistent policy process, binary protocol on stdin/stdout, `make -C cuda/praxis praxis_server`), `praxis_client.py` (drop-in stand-in for `PraxisPipeline`/`Session`),
+`run_sim_cuda.py` (= `scripts/run_sim.py` of praxis-1-oss with `policy.type: model` replaced by our client), `check_client_replay.py` (reference replay), `praxis_trim` in the runner.
+Install once (sim code is the target model's own repo): `VIRTUAL_ENV=~/.venv uv pip install "mujoco>=3.16,<3.17" gymnasium pyyaml imageio imageio-ffmpeg /mnt/disk1/praxis/praxis-1-oss/packages/praxis-sim`
+(the Menagerie robot assets are downloaded + SHA-256-checked by the sim into `~/.cache/praxis/sim` on first use, 40 MB). Headless rendering works with `MUJOCO_GL=egl` (renders on the NVIDIA GPU, no black frames
+although the CUDA server is on the same card).
+
+### M1 - correctness of the real session flow
+**(a) K'=1 (first call, depth 0) on the real checkpoint.** Runner bug found and fixed: in the action expert's cross-attention `pr_copyrows` was launched for the clean tap rows with `Nc == 0` (grid of 0 blocks ->
+`launch failed ... (1)`); now guarded (`cuda_praxis_runner.h`, `praxis_expert`). `test_cuda_praxis` accepts a ref dir without `in_clean.npy` (K'=1). The real K'=1 oracle did not exist for fp32, so
+`ref/praxis/gen_real_ref.py --fp32 --tag _fp32 --calls 1` was run (250 s) -> `tmp/praxis_ref/real_fp32/call1` (torch fp32; torch bf16 call1 is `tmp/praxis_ref/real/call1`).
+`make -C cuda/praxis test_praxis_real_k1` (mixed) or by hand; rel-L2 against the torch fp32 call-1 oracle (pass 0 + 2-step sampler, seed 0, same noise):
+| tensor | torch bf16 | ours bf16 experts | ours mixed | ours NVFP4 W4A4 |
+|---|---|---|---|---|
+| dec_vel | 2.99e-2 | **1.22e-2** | 3.14e-2 | 1.08e-1 |
+| ae_out | 8.7e-3 | 4.1e-3 | 1.27e-2 | 2.06e-2 |
+| sampled video (cfg 4) | 0.347 | 0.218 | 0.246 | 0.73 |
+| sampled actions | 0.344 | **0.062** | 0.043 | 0.505 |
+The K'=1 path is correct (bf16-expert error 1.2e-2 is the same class as K'=2's 2.0e-2); the call-1 numbers are noise-floor dominated exactly like call 2. (Mixed: 9.5 s for the whole K'=1 pass+sample test incl. load.)
+**(b) Context of each call = what praxis `SingleArmServeSession.prepare` builds** (read from `praxis/single_arm.py` + `robot_io.ContiguousStreamContext`, and now executed by that very code in the client, see below). With
+`max_context_chunks 1`, `exec_horizon 24`, the sim's history stack of the last 25 observations (executed frames + current):
+- call 1 (stack of 1): depth 0, K'=1. Anchor = VAE latent of the current frame (a 1-frame clip -> 1 latent), no cleans, proprio_all = current pose only. Noised chunk = 6 latents; actions: token 0 gives 1 row, the 21 rows (1 + 5x4).
+- call 2 (the stack holds the 21 executed rows + current = 22): the stream is empty -> `need` = 21 -> clip = stack rows [-22:-1] = the 21 frames from the call-1 observation up to the one before the current frame, tiled and VAE-encoded
+  in one pass (6 latents) = the clean chunk; anchor = its first latent (`dedup`); the current frame is NOT encoded (only its pose is used: proprio_all = [pose at the clean chunk start, current pose]). K'=2, 24 rows.
+- calls n >= 3: the stream appends the 24 executed frames (rows [-25:-1]) and keeps the newest 21 (`max_raws = 21` for 1 context chunk): the window slides, its anchor is the first retained frame, the retained 21 are encoded again
+  (6 latents), the boundary pose is that of the first retained frame. Seed of chunk k of an episode with scene seed s: `session.seed + 1000*s + k` (`seeded_normal`, torch CPU generator, salts 0/1 for video/action noise).
+**(c) Client-frame pose conversion** is praxis's own code (`single_arm.pose8_to_model` / `rel10_to_wire` / `pose_to_rig`, quat <-> matrix, rot6d <-> matrix, relative-to-current -> absolute `robot_command.cartesian_pos`
+with `R_flat9`, `target_grip`, `timestamp = t/15`, `droid_impedance` mode payload; client frame by the observation `descriptor`: `praxis.sim` = turned flange (sim), "" = FR3 hand as in the reference dumps) executed
+in the Python bridge, which is exact by construction and checked: feeding the reference's own `pred_action` tokens of call 1 and call 2 through the session code reproduces `commands_pose.npy`/`commands_grip.npy` with
+max|diff| **0.0** (21 and 24 rows, timestamps 0, 1/15, ...). The un-normalisation (q99 / clip) also matches `action_rel.npy` of the reference.
+**Reference replay** (`check_client_replay.py`, the reference observation of `gen_real_ref.py`, call 1 = 1 frame, call 2 = 22 frames, mixed experts, prompt "pick up the red cup and place it on the plate"):
+canvas of the encoded window **pixel-identical** to `canvas_call2.npy` (tiles from praxis's CPU `tile_clip`); VAE latents (our CUDA Wan2.2 VAE, uint8 tiles) vs the torch `encode_eager` latents: anchor 1.96e-3, clean0 1.70e-3 rel-L2;
+proprio_all 0 diff; sampled action tokens vs torch fp32 oracle: call 2 6.7e-2 (un-normalised action rows 2.9e-2; commands: xyz max 12.5 mm, R 0.034, grip 0.09), call 1 0.26 (action rows 0.14; xyz max 5.4 mm; grip 0.25) - against the
+torch bf16 reference 0.46 / 0.16, i.e. within the 0.34-0.5 noise floor of torch-bf16-vs-fp32 itself (call 1's number is bigger than the 4.3e-2 of the harness above because here the text conditioning and the VAE latents are our own too).
+
+### Server protocol / memory sequencing (`praxis_server.c`)
+`cuda/praxis/praxis_server --policy DIR [--vae DIR --qwen DIR --stream 2 --text-cache DIR --vae-mode keep|reload --trim 0|1|2]` (from the repo root; expert format by env exactly like `praxis_e2e`:
+`PRAXIS_EXPERT_FMT=mixed|nvfp4|nvfp4a16`, `PRAXIS_PACK_CACHE=<file>`; the mixed pack is `/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache.p3c86754d5e664762`, 19.5 GB, written by the first mixed run, 160-400 s cold).
+Framed binary requests (`PRXQ`, op, length) on stdin, responses on a private dup of stdout (everything printf'd by the shared `praxis_e2e` helpers goes to stderr = the server log); every response carries ms / aux ms /
+device GB peak over the idle context (cuMemGetInfo polled every 4 ms) / GB after. Ops: ENCODE (uint8 tile clip -> policy latent), SAMPLE (prompt + uncond prompt + K' + anchor/cleans/proprio/noise -> video + action tokens; the policy
+is loaded lazily on the first SAMPLE and stays resident), TEXT (warms the Qwen3.5-2B conditioning cache; the Qwen weights are loaded and freed per cache miss), DECODE (latent -> uint8 frames), INFO, QUIT. Weights, pack, ring, text cache
+stay resident across calls and across episodes/tasks.
+Memory (the <8 GB target for a LONG-LIVED session): the policy alone peaks at 7.5 GB over the context during SAMPLE (own accounting 7.24 GB; ring 2 x 1.02 GB, weights 2.9 GB, workspace 1.4 GB), and the VAE encode needs 2.6 GB more, Qwen 2.7 GB. Measured
+with the VAE kept resident: SAMPLE peak 8.89 GB, ENCODE 7.98 GB, both over the idle context = **above 8 GB**. What fixes it (`--vae-mode reload --trim 2`, the defaults of the client except vae-mode): before ENCODE/DECODE/TEXT the server
+releases the policy's device workspace (`praxis_trim`, regrows on demand) and its expert ring (`praxis_release_stream`, `praxis_set_stream` re-creates it before the next SAMPLE), and the VAE is loaded per use from its fp16 cache and freed (~165-215 ms
+per load). Measured in the closed loop (mixed, K'=2, device GB over the 0.13 GB idle ctx): ENCODE peak **6.26-6.63**, SAMPLE peak **7.54-7.69**, Qwen warm 2.86 (cold prompt), resident after a call 3.3-3.7 between calls -> **max instant 7.83 GB incl. context < 8 GB**.
+Cost of the sequencing per call: ~0.2 s VAE reload + ~0.8 s encode (21 frames of 224x832) + ~0.9 s CPU tiling (praxis' torch resize) around 7.4 s (mixed) / 5.5 s (NVFP4) / 3.0 s (mixed, cfg video 1 + skip-last-video) of sampling.
+**Python client**: `PraxisClient(checkpoint, sampler=SamplerSettings(...), env=..., vae_mode=..., trim=...)` has `.policy.config`, `.embodiment`, `.session(prompt, seed, max_context_chunks, control_mode, exec_horizon)` returning a session with
+`.step(obs) -> StepResult(commands, action_rows_norm, action_rel, pred_video_latent, pred_action_norm, depth, seed, ...)` and `.decode_video(result)`: the observation->commands interface of `PraxisPipeline`/`Session`, so `praxis.sim.loop.ModelPolicy`
+runs on it unchanged. The state machine/tiling/pose code is praxis's, the three heavy calls go to the server; torch here is CPU only.
+
+### M3 - closed loop results (praxis sim, configs/sim_droid.yaml: droid_impedance, exec_horizon 24, 15 Hz, 2 Euler steps, t_shift 12.5, cfg video 4 / action 1, max_context_chunks 1, time limit 20.6 s = 309 ticks, stop 1 s after success)
+Commands (from the repo root; outputs under `/mnt/disk01/tmp/praxis_sim/<name>/`: `episode_NNN.{mp4,json,npz}`, `summary.json`, `calls.json` (per-call timing/peaks), `server.log`):
+```
+MUJOCO_GL=egl ~/.venv/bin/python -I cuda/praxis/run_sim_cuda.py --config /mnt/disk1/praxis/praxis-1-oss/configs/sim_droid.yaml --vae-mode reload --expert-fmt mixed \
+   --set task.name=cube_on_plate --set task.prompt=null --set "episodes.seeds=[0,1,2,3,4,5]" --set output.dir=/mnt/disk01/tmp/praxis_sim/cube_on_plate_mixed
+# --expert-fmt nvfp4 | mixed | bf16(parity only);  --cfg-video 1.0 --skip-last-video (fast, no predicted-video panel);  --no-decode;  --policy scripted|hold (the sim's own, smoke tests)
+```
+Smoke tests with the sim's own scripted policy (lift_cube, cube_on_plate, move_block): all succeed (86 / 141-142 / 131-135 ticks), frames render on the NVIDIA GPU (EGL), no bad-view ticks.
+Results (praxis' own sim, our CUDA policy; success = the sim's success check; per-call = full `Session.step` wall time on this RTX 5060 Ti incl. CPU tiling 0.9 s + VAE reload/encode 1.0 s; calls: depth 0 then depth 1):
+| run | experts / sampler | episodes (seeds) | success | mean / p50 call |
+|---|---|---|---|---|
+| lift_cube | mixed, cfg video 4 | 3 (0-2) | **3/3** | 8.9 / 8.2 s |
+| cube_on_plate | mixed, cfg video 4 | 6 (0-5) | **6/6** | 8.5 / 8.2 s |
+| cube_on_plate | NVFP4 W4A4 | 6 | 5/6 (seed 0 fails) | 6.7 / 6.4 s |
+| cube_on_plate | mixed, cfg video 1 + skip-last-video ("fast") | 6 | 6/6 | 4.4 / 3.9 s |
+| move_block | mixed | 6 | 5/6 (seed 2) | 8.4 / 8.2 s |
+| move_block | NVFP4 | 6 | 4/6 (seeds 2, 4) | 6.4 / 6.4 s |
+| move_block | mixed fast | 6 | 5/6 (seed 4) | 4.6 / 4.0 s |
+| block_in_bowl | mixed | 3 | 2/3 (seed 1) | 8.8 / 8.3 s |
+Per call (K'=2, median, mixed): tiling+prepare 0.85 s, VAE encode 0.75 s (+0.2 s load), sampler 7.36 s (NVFP4 5.47 s, mixed fast 2.99 s); first call (K'=1) 4.4 s NVFP4. Predicted-video decode (VAE decode + reload) was on for the mixed runs and is excluded from the call time.
+Videos: `/mnt/disk01/tmp/praxis_sim/<run>/episode_NNN.mp4` (overview | exterior | wrist on top, the model's predicted video decoded from our latents below), e.g. `lift_cube_mixed`, `cube_on_plate_mixed`, `move_block_mixed`.
+Context only (not comparable: other sampler config/ckpt settings, 16 scenes x 2 samplers there): praxis EVAL.md lists the *earlier* checkpoint at 30/32 lift_cube, 31/32 cube_on_plate, 30/32 move_block, 32/32 block_in_bowl; the README's ~50% is the hard suite, not run here.
+Our small samples (3-6 episodes per row, one sampler seed each) cannot separate mixed from NVFP4 (NVFP4 lost 1 episode on each of cube_on_plate/move_block versus mixed, within noise). Failures are behavioural (hesitation/regrasp, block not carried far enough); diagnosis below.
+Honest limits: no episode was run through the torch pipeline closed loop (only single-call replays, see M4); the failing move_block seed 2 was NOT re-run with bf16 experts (that run was started and cancelled in favour of M4); the 16-scene suites / hard suite were not run; the server is one process per sim run (a 3-6 episode run reloads
+the policy once, ~20 s from the pack cache, first-call text 1.1 s).
+
+### M4 - the chunk-boundary jump: model behaviour, not a bridge bug
+Observation: at every chunk boundary the commanded xyz jumps by ~25-31 mm (mean over runs: mixed 26-31, NVFP4 24-26, fast 26-28) versus a median per-tick step of ~6 mm; within-chunk step CV 0.43-0.48 (the torch reference commands of the real dumps: 0.39-0.50).
+`/mnt/disk01/tmp/praxis_sim/jitter.py <run dirs>` computes both from the episode npz.
+1. **praxis's own path does nothing between chunks in chunked mode.** The sim loop (`loop.run_episode`) executes all rows of `Session.step` one per tick with no blending, no row skipping, no interpolation; our run uses that very loop and `SingleArmServeSession` unchanged.
+   Smoothing/junction logic exists only in the serve path and is opt-in: `smoothing: savgol` (Savitzky-Golay over each chunk's relative xyz/grip, smooths inside the chunk, does not touch the junction) and real-time chunking `schedule=rtc` (`praxis/serve/rtc.py`: the answer repeats the plan prefix and a rebase offset decays over `rebase_decay` rows - exactly a junction fix). `configs/sim_droid.yaml` uses neither.
+2. **Inputs are identical to praxis's.** `check_sim_replay.py` records the sim's real observation stack of call 2 (`run_sim_cuda.py --dump-obs`, cube_on_plate seed 1), runs praxis's own preprocessing + the PyTorch reference model (`ref/praxis/gen_real_ref.py --obs-npz ... --descriptor praxis.sim --calls 2`, bf16 AND fp32, offload) and our client:
+   anchor rel-L2 1.9e-3, clean latent 2.0e-3 (our CUDA VAE vs torch), proprio_all 0.0, boundary poses and pose_now equal, noise seed identical (call 2 -> seed 1). The relative rows are applied to the current pose (`pose8_now`), the context is the 21 executed frames before the current one, as praxis builds it (section M1 b).
+3. **The torch fp32 oracle on the same observation has the same jump**: first relative row |row0| = 34.7 mm, row1 35.2, row2 33.3 (fp32); ours mixed 33.0 / 33.2 / 31.2, ours NVFP4 27.7 / 26.7 / 24.4, while the median step is 10 mm. (The torch *bf16* run gives 6.3 mm for row0 - it is the outlier; torch-bf16 vs fp32 sampled-action error 9.8e-2 / xyz 28 mm rms, ours-mixed vs fp32 4.3e-2 / 13.5 mm rms, NVFP4 6.2e-2 / 13.6 mm.)
+   At depth 0 the first row is ~3-4 mm from the current pose (it is the anchor frame), at depth >= 1 the model puts row 0 about 3-4 ticks of motion ahead of the measured pose. The arm tracks the commands (command-vs-measured lag 0.2-18 mm), so the jump really is a lunge. So it is what the checkpoint predicts in the chunked schedule (probably built for the real-time schedule where row k is due at observation time + k/fps and the plan prefix is rebased).
+4. **Mitigation measured, now the DEFAULT of `run_sim_cuda.py` (`--rebase 8`; pass `--rebase 0` for praxis's own unmodified chunk behaviour)** (not praxis behaviour; `run_sim_cuda.py --rebase R`: shift the new chunk's xyz so row 0 continues the previous command (last + last step), decaying linearly to 0 over R=8 rows; rotation/grip unchanged; cfg video 1 + skip-last-video config, mixed):
+| run | success | boundary jump mean | within-chunk step CV |
+|---|---|---|---|
+| cube_on_plate fast (baseline) | 6/6 | 25.7 mm | 0.45 |
+| cube_on_plate fast + rebase 8 | 5/6 (seed 0 timed out) | **6.3 mm** (= one step) | 0.47 |
+| move_block fast (baseline) | 5/6 | 28.3 mm | 0.46 |
+| move_block fast + rebase 8 | 5/6 (same seed 4 fails) | **5.9 mm** | 0.46 |
+Rebase removes the lunge at no measurable success cost on these 12+12 episodes (it does not change the within-chunk jitter, CV 0.45-0.48, which is model sampling noise; praxis' savgol option would be the knob for that). Not tried: more Euler steps, action CFG, savgol in the sim loop (each is a few-line change in `CudaModelPolicy`, untested).

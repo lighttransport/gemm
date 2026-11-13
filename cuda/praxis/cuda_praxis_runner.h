@@ -62,6 +62,10 @@ void praxis_select_state(praxis_runner *r, int i);   /* 0: cond (default), 1: un
 void praxis_prof_report(praxis_runner *r, FILE *f);
 void praxis_prof_reset(praxis_runner *r);
 void praxis_free(praxis_runner *r);
+/* Release the workspace slots (they regrow on demand): lets a resident policy share the device with a transient stage (VAE, Qwen) between calls. Returns bytes freed. */
+size_t praxis_trim(praxis_runner *r);
+/* Release the expert ring (streamed mode); praxis_set_stream(r, n) re-creates it. */
+void praxis_release_stream(praxis_runner *r);
 /* ring_slots == 0: routed banks resident on device; >= 1: streamed through that many slots. */
 int praxis_set_stream(praxis_runner *r, int ring_slots);
 void praxis_set_dump_dir(praxis_runner *r, const char *dir);  /* per-block taps as .npy */
@@ -1478,6 +1482,15 @@ void praxis_stats_get(const praxis_runner *r, praxis_stats *s) {
     s->free_min_bytes_used = r->base_free > r->min_free ? r->base_free - r->min_free : 0;
     s->host_rss_peak_load_kb = r->rss_peak_load; s->pack_cache_hits = r->pack_cache_hits; s->pack_cache_written = r->pack_cache_written; s->n_shards = r->n_shards; s->n_moe_layers_total = r->n_moe_total;
 }
+void praxis_release_stream(praxis_runner *r) { if (!r) return; cuCtxSetCurrent(r->ctx); cuCtxSynchronize(); pr_release_banks(r); r->seq = 0; }
+size_t praxis_trim(praxis_runner *r) {
+    if (!r) return 0;
+    cuCtxSetCurrent(r->ctx); cuCtxSynchronize();
+    size_t freed = 0;
+    for (int i = 0; i < WS_N; i++) { cu_buf_slot *s = &r->ws[i]; if (s->ptr) { cuMemFree(s->ptr); r->cur_bytes -= s->cap; r->ws_bytes -= s->cap; freed += s->cap; s->ptr = 0; s->cap = 0; } }
+    pr_track(r);
+    return freed;
+}
 void praxis_free(praxis_runner *r) {
     if (!r) return;
     cuCtxSetCurrent(r->ctx);
@@ -2449,7 +2462,7 @@ int praxis_expert(praxis_runner *r, const float *noised_a, const float *t, const
         if (cross) {
             /* kv source = [text_kv | tap_proj(rms_norm(tap) * tap_norm_scale)] (clean frames first, then noised) */
             CUdeviceptr tap = es->taps[ci++];
-            if (pr_copyrows(r, FO(tap, (size_t)(es->Ng + es->Nn) * C), C, fraw, C, es->Nc, C)) return -1;
+            if (es->Nc > 0 && pr_copyrows(r, FO(tap, (size_t)(es->Ng + es->Nn) * C), C, fraw, C, es->Nc, C)) return -1;   /* K'=1: no clean rows */
             if (pr_copyrows(r, FO(tap, (size_t)es->Ng * C), C, FO(fraw, (size_t)es->Nc * C), C, es->Nn, C)) return -1;
             if (pr_rms(r, fraw, C, fnorm, C, c->tap_norm ? ae->tap_scale : 0, 0, 1e-4f, 1.0f, C, Nf, 1)) return -1;
             PRC(cuMemcpyDtoD(kvs, tkv, F4((size_t)G * A)));

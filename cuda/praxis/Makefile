@@ -162,9 +162,21 @@ praxis_e2e: praxis_e2e.c praxis_qwen.c praxis_qwen.h $(PRAXIS_HDRS) cuda_wan22_v
 	$(CC) $(QCFLAGS) -c ../llm/cuda_llm_runner.c -o $(QOBJ)/cuda_llm_runner.o
 	$(CC) $(CFLAGS) -o $@ praxis_e2e.c $(QOBJ)/praxis_qwen.o $(QOBJ)/cuda_llm_runner.o ../cuew.c ../cublasew.c $(LDFLAGS)
 
+praxis_server: praxis_server.c praxis_e2e.c praxis_qwen.c praxis_qwen.h $(PRAXIS_HDRS) cuda_wan22_vae.h ../cuew.c ../llm/cuda_llm_runner.c ../llm/cuda_llm_runner.h
+	mkdir -p $(QOBJ)
+	$(CC) $(QCFLAGS) -c praxis_qwen.c -o $(QOBJ)/praxis_qwen.o
+	$(CC) $(QCFLAGS) -c ../llm/cuda_llm_runner.c -o $(QOBJ)/cuda_llm_runner.o
+	$(CC) $(CFLAGS) -o $@ praxis_server.c $(QOBJ)/praxis_qwen.o $(QOBJ)/cuda_llm_runner.o ../cuew.c ../cublasew.c $(LDFLAGS)
+
 test_praxis_e2e: praxis_e2e
 	cd $(REPO) && cuda/praxis/praxis_e2e --policy /mnt/disk1/praxis/mid2048 --ids $(E2E_REF)/ids.npy --ids-uncond $(E2E_REF)/ids_u.npy \
 	  --ext $(E2E_REF)/ext.npy --wrist $(E2E_REF)/wrist.npy --proprio $(E2E_REF)/proprio.npy --noise-v $(E2E_REF)/smp_noise.salt0.0.npy \
 	  --noise-a $(E2E_REF)/smp_noise.salt1.0.npy --tile-h 64 --tile-w 128 --K 2 --steps 2 --cfg-video 4 --cfg-action 1.5 --decode \
 	  --text-cache $(OUT)/e2e_textcache --out $(OUT)/e2e
 	$(PY) -I $(REPO)/ref/praxis/compare_e2e.py --ref $(E2E_REF) --ours $(OUT)/e2e
+
+# --- real praxis-1-droid, K'=1 (first call, depth 0) parity vs the torch fp32 oracle of call 1 (needs the 54 GB checkpoint + tmp/praxis_ref/real_fp32/call1; not part of `make test`) ---
+# bf16 experts (parity only, ring 2 x 2.9 GB): dec_vel 1.2e-2, ae_out 4.1e-3, actions 6.2e-2;  mixed: 3.1e-2 / 1.3e-2 / 4.3e-2  (torch bf16 itself: 3.0e-2 / 8.7e-3 / 0.34)
+test_praxis_real_k1: test_cuda_praxis
+	cd $(REPO) && PRAXIS_EXPERT_FMT=mixed PRAXIS_PACK_CACHE=/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache cuda/praxis/test_cuda_praxis --model /mnt/disk1/praxis/praxis-1-droid \
+	  --ref tmp/praxis_ref/real_fp32/call1 --out $(OUT)/real_k1_mixed --stream 2 --tol 0.5

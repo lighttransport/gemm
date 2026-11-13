@@ -53,6 +53,8 @@ ap.add_argument("--detail-passes", default="0", help="passes (step*2+branch) wit
 ap.add_argument("--no-prefetch", action="store_true")
 ap.add_argument("--selftest", default=None, help="checkpoint dir of a small model (tiny/mid): compare offloaded run to a resident run, bit-exact")
 ap.add_argument("--tag", default="", help="suffix appended to --out (e.g. _fp32)")
+ap.add_argument("--obs-npz", default=None, help="observation stack (22 rows) of a sim call (exterior, wrist, ee_pose, grip) instead of the synthetic one")
+ap.add_argument("--descriptor", default=None, help="observation descriptor (e.g. praxis.sim)")
 ap.add_argument("--stages", default="obs,text,inputs,sample")
 a = ap.parse_args()
 sys.path.insert(0, a.praxis_src)
@@ -298,7 +300,10 @@ def make_observation(T=22, H=234, W=416, seed=2024):
     return view(seed + 1), view(seed + 2), pose, grip
 
 def stage_obs():
-    ext, wr, pose, grip = make_observation()
+    if a.obs_npz:
+        z = np.load(a.obs_npz); ext, wr, pose, grip = z["exterior"], z["wrist"], z["ee_pose"], z["grip"]
+    else:
+        ext, wr, pose, grip = make_observation()
     np.save(f"{a.out}/obs_exterior.npy", ext); np.save(f"{a.out}/obs_wrist.npy", wr)
     np.save(f"{a.out}/obs_ee_pose.npy", pose); np.save(f"{a.out}/obs_grip.npy", grip)
     from PIL import Image
@@ -346,7 +351,7 @@ def stage_inputs():
     o = load_obs()
     def obs(rows):   # a stack whose last row is the current frame
         return {"ee_pose": o["pose"][:rows], "grip": o["grip"][:rows], "exterior_image": o["exterior"][:rows], "wrist_image": o["wrist"][:rows],
-                "task": a.prompt}
+                "task": a.prompt, **({"descriptor": a.descriptor} if a.descriptor else {})}
     for call, rows in ((1, 1), (2, 22)):
         inp = st.prepare(obs(rows))
         d = f"{a.out}/inputs_call{call}"; os.makedirs(d, exist_ok=True)
