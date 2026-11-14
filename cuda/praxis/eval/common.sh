@@ -11,7 +11,7 @@ run() {
   rm -rf $OUT/$name
   if [ $fmt = nvfp4 ]; then export PRAXIS_NVFP4=1; else unset PRAXIS_NVFP4; fi
   ~/.venv/bin/python -I cuda/praxis/run_sim_cuda.py --config $CFG --vae-mode reload --expert-fmt $fmt "$@" \
-     --set task.name=$task --set task.prompt=null --set "$SEEDS" --set output.dir=$OUT/$name > $OUT/$name.log 2>&1
+     --set task.name=$task --set "task.prompt=${PROMPT:-null}" --set "$SEEDS" --set output.dir=$OUT/$name > $OUT/$name.log 2>&1
   rc=$?
   echo "$name rc=$rc $(grep -h '^success' $OUT/$name.log)"
   ~/.venv/bin/python -I cuda/praxis/eval/prune_videos.py $OUT/$name
