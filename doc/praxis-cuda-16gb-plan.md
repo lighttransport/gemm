@@ -1,16 +1,19 @@
 # praxis-1-droid on one 16GB CUDA GPU (<8GB target) — design plan
 
-Status: design + tiny-model implementation (see `Status update` below). The checkpoints (`runwayml/praxis-1-droid`, `-nvfp4`, `-base`) are gated on
-Hugging Face; the `lte-ai` account has no access, so `config.json` and the safetensors index are
-unread. Dims below are inferred from `praxis-1-oss` constructor defaults + README (54.40 GB computed vs
-54.4 stated; routed 51.34 vs 51.3). Verify against config.json once access is granted.
+Status: **implemented and validated on the real `runwayml/praxis-1-droid` checkpoint** on CUDA (RTX 5060 Ti, peak < 8 GB)
+and on ROCm (RX 9070 XT, `rdna4/praxis`); see the `Status update` sections below for what was built and measured.
+The sections down to "Risks" are the **initial design, kept for reference**. The checkpoints (`runwayml/praxis-1-droid`,
+`-nvfp4`, `-base`) were initially gated on Hugging Face (the `lte-ai` account had no access), so that design was based on
+dims inferred from `praxis-1-oss` constructor defaults + README (54.40 GB computed vs 54.4 stated). Access was granted
+before the real-weights work (Status update 4); the real `config.json` and the 567-tensor index **confirmed every inferred
+dimension** below, and the runner now reads all dims from `config.json`.
 
 ## Done (phase 1)
 - Qwen3.5-2B text encoder: `cuda/llm/test_qwen35_st` (cond = layer-22 pre-norm, rel-L2 1.2e-4).
 - Wan2.2 VAE: `cuda/praxis/` (encode/decode, policy latent 192ch, 18/18 parity checks, 3.2GB peak @21x256x256).
-- PyTorch refs: `ref/praxis/` (text, VAE). Weights: `/mnt/disk1/praxis`.
+- PyTorch refs: `ref/praxis/` (text, VAE). Weights: under `$PRAXIS_ROOT` (e.g. `/path/to/praxis`).
 
-## Model (inferred)
+## Model (initial inference, confirmed by the real config.json)
 - Encoder tower 14 blocks (0,1 dense SwiGLU 11520; 2..13 MoE), decoder tower 6 blocks (0 dense, 1..5 MoE; adaLN
   modulators from encoder cond). dim 3072, 24 Q / 8 KV heads, head_dim 128, gated attn (sigmoid per head), q/k RMSNorm,
   partial RoPE (64 of 128), base 2.6e7, 1-D positions (ROW_STRIDE 360, FRAME_STRIDE 129600).
@@ -29,8 +32,8 @@ NVFP4 14.4 GB (0.85 GB/layer), bf16 51.3 GB. Hence "<8GB" = streaming experts fr
 (c) pin a hot-expert set resident in leftover VRAM (route-frequency profile from real episodes).
 
 ## Design
-1. **Weights**: offline convert (new `cuda/praxis/convert_praxis.py`, torch only for reading bf16) to a repack file:
-   non-routed tensors -> F16/FP8 resident blob; routed experts -> NVFP4 (E2M1 + e4m3 block scale/16 + fp32 global/matrix,
+1. **Weights** (as built: no separate converter script; `praxis_load` reads the safetensors shards directly, packs routed
+   experts layer by layer at load time and caches the packed result with `PRAXIS_PACK_CACHE`): non-routed tensors -> F16/FP8 resident blob; routed experts -> NVFP4 (E2M1 + e4m3 block scale/16 + fp32 global/matrix,
    exactly praxis `quantization/nvfp4.py` recipe; reuse `cuda/fp4` sm_120a block-scale mma kernels) laid out per layer,
    per expert contiguous (≈6.6 MB) for large H2D copies. A bf16 (fallback, 3.0 GB/layer) variant for accuracy bring-up.
 2. **Runner `cuda/praxis/cuda_praxis_runner.h`** (NVRTC, qimg-style): reuse `cuda_llm_runner` attention/RMSNorm/SwiGLU/
@@ -47,6 +50,7 @@ NVFP4 14.4 GB (0.85 GB/layer), bf16 51.3 GB. Hence "<8GB" = streaming experts fr
    across Euler steps) as in praxis, disabled for NVFP4 in reference — validate separately.
 
 ## Milestones / validation (each vs PyTorch dumps from praxis-1-oss, rel-L2/cos like ref/praxis/compare.py)
+(M0-M5 below were all reached; see the status updates for the measured results.)
 M0 get access + config.json; hash-check shards; dump reference tensors (needs an 80GB GPU or CPU offload run of
   praxis `PraxisPipeline`; per-block encoder/decoder/taps/actions with a fixed seed) -> `ref/praxis/gen_backbone_ref.py`.
 M1 weight converter + loader (bf16 resident-all-in-host), single dense block parity.
@@ -56,7 +60,7 @@ M4 NVFP4 experts (sm_120a) parity vs praxis NVFP4 path; measure VRAM (target <8G
 M5 e2e policy call with VAE+Qwen from CUDA; compare actions to reference (task-level sanity, not bitwise).
 
 ## Risks
-- Config unknown until access; dims may differ from inference above.
+- (Resolved) Config was unknown until access; the real `config.json` matched the inferred dims.
 - PCIe bandwidth dominates latency (seconds/call, not the H100's 0.35-0.5 s).
 - NVFP4 loses accuracy on hard tasks in the README's evaluation; prefer FP8/bf16 streaming where bandwidth allows.
 - Reference dumps need >=54GB memory (CPU RAM offload feasible but slow).
@@ -96,7 +100,7 @@ Everything below is validated on tiny/mid/mid128/mid2048 or the synthetic full-s
 
 
 ## Status update 4 (REAL praxis-1-droid checkpoint)
-The checkpoint is now available (`/mnt/disk1/praxis/praxis-1-droid`). Details and tables: `cuda/praxis/README.md` ("REAL checkpoint").
+The checkpoint is now available (`$PRAXIS_ROOT/praxis-1-droid`). Details and tables: `cuda/praxis/README.md` ("REAL checkpoint").
 - Loader: all 567 index keys used (none missing/unused); config semantics validated at load; NVFP4 pack from the 17 shards 259 s cold (disk-bound) -> 14.44 GB pack cache -> 22-40 s load; host RSS 14.5-17.4 GB.
 - End to end on real weights (Qwen -> tiles with the config's antialias fit rule -> VAE -> NVFP4 policy -> un-normalised rows): K'=2, cfg video 4: 5.3 s (ring 2) / 6.0 s (ring 1); skip-last-video 3.5 s;
   paired+skip 2.8 s (timing only); peak 6.1-7.3 GB own accounting (+0.13 GB ctx) with the VAE and Qwen sequenced out: <8 GB met. Matches the synthetic numbers.
@@ -106,7 +110,7 @@ The checkpoint is now available (`/mnt/disk1/praxis/praxis-1-droid`). Details an
 
 ## Status update 5 (NVFP4 accuracy on the real weights: diagnosis, W4A16, FP8 banks, expert-group streaming)
 Details, tables and commands: `cuda/praxis/README.md` ("NVFP4 accuracy on the real weights"). Oracles: torch fp32 of the same weights (`tmp/praxis_ref/real_fp32`, and `real_qat_fp32` for the QAT checkpoint
-`runwayml/praxis-1-droid-nvfp4`, now accessible: different weights, same config, 54.4 GB, downloaded + SHA256-verified to `/mnt/disk01/praxis/praxis-1-droid-nvfp4`).
+`runwayml/praxis-1-droid-nvfp4`, now accessible: different weights, same config, 54.4 GB, downloaded + SHA256-verified to `$PRAXIS_ROOT/praxis-1-droid-nvfp4`).
 - **Diagnosis** (per-MoE-layer attribution on real activations, `cuda/praxis/moe_attr.py`): the NVFP4 loss is weight quantisation (FP4 weights alone ~0.10 routed-output rel-L2 per layer, +dynamic FP4 activations -> ~0.14); the
   down bank is uniformly ~0.08 (FP4 round trip 9.4% on Gaussian-like weights = Lloyd-Max limit, FP8 per channel: 0.02), the gate_up bank is layer dependent with enc13 (0.22), enc10 (0.12), enc3 (0.09) far above the
   rest (0.01-0.06). Router stays fp32 on the unquantised residual; route flips are induced upstream (same top-8 set vs fp32: bf16 64%, mixed 48%, W4A4 31%). Per-expert activation scale, the calibrated FC1 scales (praxis applies them
@@ -132,11 +136,11 @@ Details and commands: `rdna4/praxis/README.md` ("Full server ... closed-loop sim
 - `hip_praxis_server_full` is a drop-in of `praxis_server`: policy runner (WMMA W4A16/FP8 "mixed"), in-process HIP Qwen3.5-2B (cond rel-L2 3.8e-4) + HIP Wan2.2 VAE (18/18) with text cache, `--vae-mode reload`, `--trim` semantics. Peak device memory per op (over the 0.10 GB ctx): Qwen 3.0, ENCODE 2.0 / 5.8-6.6, SAMPLE 6.6 / 7.5, DECODE 7.5, max instant 7.64 GB < 8 GB, same as CUDA.
 - `cuda/praxis/praxis_client.py` is unchanged by default; `PRAXIS_SERVER_CMD` / `run_sim_cuda.py --server-cmd` launches the server through ssh (frames/latents over the pipe: +27 ms per SAMPLE, +80 ms per call for ENCODE).
 - Replay numerics vs the torch fp32 oracle are the same class as CUDA mixed (sampled actions 5.7e-2 / 1.1e-1 call 1/2, sim observation 5.8e-2 vs CUDA 4.3e-2); HIP vs CUDA server on the same observation: pred_action 2.9e-2..4.7e-2, xyz max diff 10-14 mm.
-- Closed loop (MuJoCo+EGL on the local NVIDIA GPU, policy on tr16), seeds 100-105, fast variant: lift_cube 4/6 (CUDA 6/6), cube_on_plate 5/6 (CUDA 5/6); 3.5 s per call end to end (CUDA 4.2 s); boundary jump 6 mm / step CV 0.45 same as CUDA.
+- Closed loop (MuJoCo+EGL on the local NVIDIA GPU, policy on the AMD host), seeds 100-105, fast variant: lift_cube 4/6 (CUDA 6/6), cube_on_plate 5/6 (CUDA 5/6); 3.5 s per call end to end (CUDA 4.2 s); boundary jump 6 mm / step CV 0.45 same as CUDA.
 - Not done: HIP lift_cube failures (seeds 101/102) not diagnosed, only 6 seeds on two tasks, no 'full' (decoded video) / NVFP4 / bf16 closed loop, the old `hip_praxis_server` make rule no longer links (use `hip_praxis_server_full`).
 
 ## Status update 8 (N=12 evaluation E1 + knob sweep E2)
-Details/tables/commands: `cuda/praxis/README.md` ("Evaluation (N=12)"), compact tables `cuda/praxis/eval/RESULTS.md`, scripts `cuda/praxis/eval/{common.sh,e1.sh,e2.sh,summarize.py,prune_videos.py}`; runs in `/mnt/disk01/tmp/praxis_sim2/` (seeds 100-111).
+Details/tables/commands: `cuda/praxis/README.md` ("Evaluation (N=12)"), compact tables `cuda/praxis/eval/RESULTS.md`, scripts `cuda/praxis/eval/{common.sh,e1.sh,e2.sh,summarize.py,prune_videos.py}`; runs in `$PRAXIS_OUT/praxis_sim2/` (seeds 100-111).
 - E1 (A mixed fast rebase 8, B NVFP4, C full cfg video 4 + decoded video, D rebase 0): A lift_cube 11/12, cube_on_plate 10/12, move_block 11/12, block_in_bowl 10/12, stack_block 10/12, press_button 9/12, block_out_of_bowl 3/12 (repeat 3/12). B/C/D within +-2 episodes of A, all paired McNemar p >= 0.5: nothing significant at N=12 except the rebase on the chunk-boundary jump (5-6 mm vs 25-29 mm). B 3.2 s/call, A 4.0 s, C 8.2 s. Server's own peak 7.24 GB (mixed) / 6.88 GB (NVFP4); the 10.7 GB "peak" of one run is a cuMemGetInfo artefact (other processes on the device).
 - E2 knob sweep on block_out_of_bowl (A 3/12): 4 Euler steps 5/12 (6.6 s sampler, p=0.63), action CFG 1.5 / 2.0 6/12 / 6/12 (sampler 2.99 -> 5.89 s, p=0.45 / 0.25), Savitzky-Golay 5 / 9 / 13: 4 / 2 / 7 of 12 (no trend, boundary jump 5.5 -> 4.0 mm but step CV unchanged 0.45), 4 steps + CFG 1.5 4/12, two prompt paraphrases 5/12 each. cube_on_plate (A 10/12) with 4 steps 9/12, CFG 1.5 / 2.0 10/12 / 10/12 (no harm). Nothing significant; the identical baseline repeat shows 1 flip each way. Defaults unchanged.
 - block_out_of_bowl failures: reach/grasp fine; the 20.6 s limit is hit in the carry/release phase (still holding, dithering over the bowl, or dropped back); not a prompt or tracking problem.

@@ -3,16 +3,17 @@
 (original Wan2.2_VAE.pth key names, fp32, see ref/praxis/convert_vae.py), then verifies the weights against the Wan2.2 VAE already on disk.
 
   ~/.venv/bin/python -I ref/cosmos3/convert_vae.py [--src .../cosmos3-edge-droid/vae/diffusion_pytorch_model.safetensors]
-        [--out /mnt/disk1/praxis/cosmos3-vae-wan] [--orig /mnt/disk1/praxis/wan2.2-vae/model.safetensors]
+        [--out $PRAXIS_ROOT/cosmos3-vae-wan] [--orig $PRAXIS_ROOT/wan2.2-vae/model.safetensors]
 Verification: every converted tensor must equal bf16_round(orig_fp32) bit for bit (the checkpoint stores the VAE in bf16)."""
 import argparse, os, re, torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--src", default="/mnt/disk1/praxis/cosmos3-edge-droid/vae/diffusion_pytorch_model.safetensors")
-ap.add_argument("--out", default="/mnt/disk1/praxis/cosmos3-vae-wan")
-ap.add_argument("--orig", default="/mnt/disk1/praxis/wan2.2-vae/model.safetensors")
+ap.add_argument("--src", default=PRAXIS_ROOT + "/cosmos3-edge-droid/vae/diffusion_pytorch_model.safetensors")
+ap.add_argument("--out", default=PRAXIS_ROOT + "/cosmos3-vae-wan")
+ap.add_argument("--orig", default=PRAXIS_ROOT + "/wan2.2-vae/model.safetensors")
 a = ap.parse_args()
 
 RES = [("norm1.gamma", "residual.0.gamma"), ("conv1", "residual.2"), ("norm2.gamma", "residual.3.gamma"), ("conv2", "residual.6"), ("conv_shortcut", "shortcut")]

@@ -1,7 +1,7 @@
 /*
  * test_hip_wan22_vae.c - driver for the standalone RDNA4/HIP Wan2.2 VAE runner.
  *
- *   ./test_hip_wan22_vae --weights /mnt/nvme01/models/praxis/wan2.2-vae \
+ *   ./test_hip_wan22_vae --weights $PRAXIS_ROOT/wan2.2-vae \
  *        --ref tmp/praxis_ref/vae --out tmp/praxis_out/vae [--taps] [--repeat N]
  *
  * Reads <ref>/video.npy ([1,3,T,H,W] f32) and encodes it -> <out>/latent.npy;
@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <math.h>
+#include "../../common/praxis_paths.h"
 
 static float *npy_read(const char *path, int *nd, long long shape[8]) {
     FILE *f = fopen(path, "rb");
@@ -201,7 +202,7 @@ static int synth_main(hip_wan22_vae *r, int T, int H, int W, int tile, int tov, 
 }
 
 int main(int argc, char **argv) {
-    const char *wdir = "/mnt/nvme01/models/praxis/wan2.2-vae", *ref = "tmp/praxis_ref/vae", *out = "tmp/praxis_out/vae";
+    const char *wdir = px_root("wan2.2-vae"), *ref = "tmp/praxis_ref/vae", *out = "tmp/praxis_out/vae";
     int taps = 0, repeat = 1, selfdec = 0, verbose = 1, do_enc = 1, do_dec = 1;
     int synT = 0, synH = 0, synW = 0, tile = -2, tov = -1, cmp_untiled = 0, use_u8 = 0;
     for (int i = 1; i < argc; i++) {

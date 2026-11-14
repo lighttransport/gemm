@@ -7,8 +7,8 @@ loop, rel-L2 of the weight conversion itself 3.5e-8); norms +1, `A_log -> -exp`.
 
 ## Usage (run from the repo root)
     make -C cuda/llm test_qwen35_st
-    ./cuda/llm/test_qwen35_st /mnt/disk1/praxis/qwen3.5-2b -i ids.npy -o out_dir -p 32 --cond-only   # praxis_e2e usage
-    ./cuda/llm/test_qwen35_st /mnt/disk1/praxis/qwen3.5-2b -i ids.npy -o out_dir                    # layer_00..24 + cond
+    ./cuda/llm/test_qwen35_st $PRAXIS_ROOT/qwen3.5-2b -i ids.npy -o out_dir -p 32 --cond-only   # praxis_e2e usage
+    ./cuda/llm/test_qwen35_st $PRAXIS_ROOT/qwen3.5-2b -i ids.npy -o out_dir                    # layer_00..24 + cond
     ./cuda/llm/test_qwen35_st --help
 
 Outputs: `layer_NN.npy` = HF `hidden_states[NN]` (NN 0..23 pre-final-norm, **layer_24 post-final-norm**),

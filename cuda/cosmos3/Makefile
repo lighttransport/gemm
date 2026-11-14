@@ -2,11 +2,12 @@
 #   make -C cuda/cosmos3 refs        # regenerate the oracle dumps (needs ~/.venv torch + diffusers)
 #   make -C cuda/cosmos3 test        # parity: teacher-forced per layer/step + free running
 REPO   := $(abspath ../..)
+PRAXIS_ROOT ?= $(HOME)/praxis
 PY     ?= $(HOME)/.venv/bin/python
 CC     ?= gcc
 CFLAGS  = -O2 -mavx2 -mfma -mf16c -fopenmp -Wall -Wno-unused-function -Wno-unknown-pragmas -I../../common -I.. -D_GNU_SOURCE
 LDFLAGS = -lm -ldl -lpthread -fopenmp
-MODEL  ?= /mnt/disk1/praxis/cosmos3-edge-droid
+MODEL  ?= $(PRAXIS_ROOT)/cosmos3-edge-droid
 REF    ?= $(REPO)/tmp/cosmos3_ref
 OUT    ?= $(REPO)/tmp/cosmos3_out
 CMP     = $(PY) -I $(REPO)/ref/cosmos3/compare.py
@@ -36,6 +37,6 @@ cosmos3_policy: cosmos3_policy.c $(HDRS) ../praxis/cuda_wan22_vae.h ../praxis/pr
 vae_weights:
 	cd $(REPO) && $(PY) -I ref/cosmos3/convert_vae.py
 e2e: cosmos3_policy
-	cd $(REPO) && cuda/cosmos3/cosmos3_policy --model $(MODEL) --vae /mnt/disk1/praxis/cosmos3-vae-wan --ref $(REF) --out $(OUT)_e2e
+	cd $(REPO) && cuda/cosmos3/cosmos3_policy --model $(MODEL) --vae $(PRAXIS_ROOT)/cosmos3-vae-wan --ref $(REF) --out $(OUT)_e2e
 	$(CMP) --ref $(REF)/final_action.npy --ours $(OUT)_e2e/final_action.npy
 	$(CMP) --ref $(REF)/x0_latent_frame0.npy --ours $(OUT)_e2e/x0_latent_frame0.npy

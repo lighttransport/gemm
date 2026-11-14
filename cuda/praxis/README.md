@@ -2,6 +2,13 @@
 
 Standalone CUDA (NVRTC, no nvcc) code for praxis-1.
 
+## Paths and environment
+No machine-specific paths are hardcoded; defaults come from two environment variables:
+- `PRAXIS_ROOT` (default `$HOME/praxis`): models, weights and reference code, one sub-directory each: `praxis-1-droid`, `praxis-1-oss` (the model's own repo), `qwen3.5-2b`, `wan2.2-vae`, `wan2.2-ti2v`, `cosmos3-edge-droid`, `cosmos3-vae-wan`, the generated test models `tiny`, `mid`, `mid128`, `mid128_sh`, `mid2048`, `mid_sh`, and the pack caches `praxis-1-droid.nvfp4.packcache*`. Symlink `~/praxis` to wherever the data lives, or export `PRAXIS_ROOT`.
+- `PRAXIS_OUT` (default `<repo>/tmp`): scratch, dumps and sim outputs (`praxis_sim*/`, `praxis_server_tmp`, ...). `tmp` is typically a symlink to a large disk.
+
+Makefiles take the same names (`PRAXIS_ROOT ?= $(HOME)/praxis`), the Python tools use them as `--flag` defaults, C programs read them through `common/praxis_paths.h`, and the `eval/*.sh` scripts derive the repo root from their own location. The `--model/--policy/--vae/--qwen/--ckpt/--config` flags always override the defaults.
+
 ## Wan2.2 VAE
 `cuda_wan22_vae.h`, `test_cuda_wan22_vae.c`; `make -C cuda/praxis test` (18/18 PASS), `bench`, `test_tiled`, `bench_big`.
 
@@ -39,7 +46,7 @@ padding semantics only self-checked (no torch oracle for padded inputs); tiled p
 - `cuda_praxis_runner.h` (host, config/weights/streaming/sampler) + `praxis_kernels.h` (NVRTC kernels).
 - `test_cuda_praxis.c` driver; `make -C cuda/praxis test_praxis`.
 - Reference: `ref/praxis/gen_backbone_ref.py` (praxis' tiny random policy, fp32 compute on CUDA, bf16-exact weights;
-  writes `/mnt/disk1/praxis/tiny/{model.safetensors,config.json}` and `tmp/praxis_ref/backbone/*.npy`).
+  writes `$PRAXIS_ROOT/tiny/{model.safetensors,config.json}` and `tmp/praxis_ref/backbone/*.npy`).
 
 Everything is config driven (`config.json` in the praxis checkpoint layout): dim, heads, depths, dense prefix,
 tap blocks, expert counts/top-k/scaling, rope, unpatch factor, action expert dims, chunking. The real 3072-dim
@@ -108,7 +115,7 @@ grouped block-scale mma GEMM `pr4_gemm_grouped` (BM64 x BN128 x BK128, 2-stage c
 cuBLAS bf16 ~25 here). Synthetic NVFP4 banks are random valid packed bytes.
 
 ### Synthetic full-size model (`make bench_praxis_synth`; config `gen_synth_config.py`)
-`bench_praxis_synth --synthetic /mnt/disk1/praxis/synth [--stream R] [--pair] [--skip-last-video] [--cfg-video 4 --cfg-action 1] [--profile] [--no-h2d]`.
+`bench_praxis_synth --synthetic $PRAXIS_ROOT/synth [--stream R] [--pair] [--skip-last-video] [--cfg-video 4 --cfg-action 1] [--profile] [--no-h2d]`.
 Inferred real dims (dim 3072, 24/8 heads, hd 128, 128 experts top-8, hidden 1280, enc 14 / dec 6, action expert 16 x 1024), window K'=2, 6 frames/chunk, 13x16 latent
 (208 tokens/frame), text 64: encoder 4020 tokens, decoder 9988. Weights random (resident bf16 device buffers; routed banks random pinned host memory). bf16 banks reuse
 4 distinct 2.8 GB pinned banks cyclically (51 GB pinned would not fit comfortably in 63 GB RAM); every layer still streams a full-size bank, so bandwidth numbers are real.
@@ -201,7 +208,7 @@ with their own text lengths; pair / skip-last-video / ctx-cache / NVFP4 / pack c
 - Constants not in config: `row_stride`/`frame_stride` default to 360 / 129600 (optional config keys under `backbone`).
 
 ## REAL checkpoint (runwayml/praxis-1-droid, 17 bf16 shards, 54.4 GB) - first real-weight results
-Checkpoint dir `/mnt/disk1/praxis/praxis-1-droid`; reference dumps `tmp/praxis_ref/real` (torch bf16, layer-offloaded; README there) and `tmp/praxis_ref/real_fp32` (torch fp32 = the truth; same
+Checkpoint dir `$PRAXIS_ROOT/praxis-1-droid`; reference dumps `tmp/praxis_ref/real` (torch bf16, layer-offloaded; README there) and `tmp/praxis_ref/real_fp32` (torch fp32 = the truth; same
 script with `--fp32 --tag _fp32 --calls 2`, 350 s). All commands from the repo root.
 
 ### Loading / config / keys
@@ -223,7 +230,7 @@ script with `--fp32 --tag _fp32 --calls 2`, 350 s). All commands from the repo r
 `cuda/praxis/gen_real_inputs.py` makes deterministic synthetic inputs (ids via the Qwen tokenizer, two 720x1280 DROID-like views, pose8). Example:
 ```
 ~/.venv/bin/python -I cuda/praxis/gen_real_inputs.py --out tmp/praxis_real/in
-PRAXIS_NVFP4=1 PRAXIS_PACK_CACHE=/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache cuda/praxis/praxis_e2e --policy /mnt/disk1/praxis/praxis-1-droid \
+PRAXIS_NVFP4=1 PRAXIS_PACK_CACHE=$PRAXIS_ROOT/praxis-1-droid.nvfp4.packcache cuda/praxis/praxis_e2e --policy $PRAXIS_ROOT/praxis-1-droid \
   --ids tmp/praxis_real/in/ids.npy --ids-uncond tmp/praxis_real/in/ids_u.npy --ext tmp/praxis_real/in/ext.npy --wrist tmp/praxis_real/in/wrist.npy \
   --pose8 tmp/praxis_real/in/pose8.npy --K 2 --steps 2 --cfg-video 4 --cfg-action 1 --stream 2 --repeat 5 --text-cache tmp/praxis_real/textcache --out tmp/praxis_real/out
 ```
@@ -270,7 +277,7 @@ level; task-level quality (praxis reports NVFP4 loses on `hard` tasks) is not me
 ### NVFP4 accuracy on the real weights: diagnosis and the mixed-precision expert preset (`PRAXIS_EXPERT_FMT`)
 Problem: on the real checkpoint the NVFP4 routed experts (W4A4) cost ~4x the velocity error of the bf16 experts (dec_vel 7.8e-2 vs 2.0e-2 against the torch fp32 oracle). Everything below uses
 `test_cuda_praxis --ref <torch fp32 oracle>` (pass 0 + 2-step sampler, K'=2), driven by `cuda/praxis/run_expert_variant.sh`, `action_metrics.py` (errors incl. un-normalised actions),
-`moe_attr.py` (per-MoE-layer attribution on real activations), `router_flips.py`, `check_pack.py`. Scratch: `tmp/praxis_attr`, `tmp/praxis_out/variant_*` (tmp -> /mnt/disk01/tmp).
+`moe_attr.py` (per-MoE-layer attribution on real activations), `router_flips.py`, `check_pack.py`. Scratch: `tmp/praxis_attr`, `tmp/praxis_out/variant_*` (tmp is a symlink to a large disk).
 
 **Diagnosis (base weights `praxis-1-droid`, per MoE layer, routed-expert output rel-L2 vs the bf16 expert path on the real activations of the bf16 pipeline; `moe_attr.py`)**
 | layer | gate_up FP4 only | down FP4 only | W4A16 | W4A4 | acts FP4 only | down FP8 only | W8A16 |
@@ -295,7 +302,7 @@ Router: logits are computed in fp32 from the fp32 residual stream (never quantis
 identical top-8 set vs the fp32 oracle, mean over the 17 layers: bf16 experts 64%, mixed preset 48%, W4A4 31% (`router_flips.py`; individual-expert overlap 94% / 91% / 86%).
 
 **The QAT checkpoint** `runwayml/praxis-1-droid-nvfp4` is now accessible (config.json is identical to the base, the 17 shards have different bytes: bf16 master weights after 5000 QAT steps, 54.4 GB, downloaded and
-SHA256-verified to `/mnt/disk01/praxis/praxis-1-droid-nvfp4`; the packing happens at load time, same recipe). It is the right weight set for any NVFP4 path; results are given for both weight sets,
+SHA256-verified to `$PRAXIS_ROOT/praxis-1-droid-nvfp4`; the packing happens at load time, same recipe). It is the right weight set for any NVFP4 path; results are given for both weight sets,
 each against the torch fp32 oracle of its own weights (`tmp/praxis_ref/real_fp32`, `tmp/praxis_ref/real_qat_fp32`; the two fp32 oracles differ from each other by 0.51 rel-L2 in sampled actions, i.e. the
 sampled video/action metrics have a noise floor of that order and **dec_vel is the only stable fidelity number**).
 
@@ -348,7 +355,7 @@ Reading the numbers (single seed, K'=2; **dec_vel is the stable metric**, ae_out
   error against their own bf16 forward** (`moe_attr.py` on QAT activations, enc3/7/10/13/dec2: W4A4 0.15/0.11/0.21/0.27/0.12, same three sensitive gate_up banks 0.083/0.123/0.164, W4A16 mean 0.127): QAT trains the model to *work*
   with FP4 weights+activations, it does not make the FP4 forward numerically closer to a bf16 forward. Task-level quality of any variant (praxis reports NVFP4-QAT ties bf16 overall, loses on `hard`) is NOT measured here;
   QAT was trained for W4A4, so for the QAT weights `nvfp4` is the configuration the authors validated and `mixed` the one closest to the unquantised forward.
-- Usage: `PRAXIS_EXPERT_FMT=mixed [PRAXIS_PACK_CACHE=<file>] cuda/praxis/praxis_e2e ... --policy /mnt/disk1/praxis/praxis-1-droid[-nvfp4]` (no `PRAXIS_NVFP4=1` needed; the old env keeps meaning W4A4). The mixed plan packs into its own cache file
+- Usage: `PRAXIS_EXPERT_FMT=mixed [PRAXIS_PACK_CACHE=<file>] cuda/praxis/praxis_e2e ... --policy $PRAXIS_ROOT/praxis-1-droid[-nvfp4]` (no `PRAXIS_NVFP4=1` needed; the old env keeps meaning W4A4). The mixed plan packs into its own cache file
   `<cache>.p3c86754d5e664762` (19.5 GB, written once; the plain-NVFP4 cache is untouched). Cold pack 160-380 s (disk), 25-40 s from cache. Reproduce: `LAT=3 cuda/praxis/run_expert_variant.sh <label> <model> <oracle> PRAXIS_EXPERT_FMT=mixed`.
 
 
@@ -379,7 +386,7 @@ runner; the antialiased tile resize is not bit-compared to torch (the ref's `can
 ## Closed-loop sim: praxis' own MuJoCo DROID sim driven by our CUDA runner (server + client)
 Pieces (all new): `praxis_server.c` (persistent policy process, binary protocol on stdin/stdout, `make -C cuda/praxis praxis_server`), `praxis_client.py` (drop-in stand-in for `PraxisPipeline`/`Session`),
 `run_sim_cuda.py` (= `scripts/run_sim.py` of praxis-1-oss with `policy.type: model` replaced by our client), `check_client_replay.py` (reference replay), `praxis_trim` in the runner.
-Install once (sim code is the target model's own repo): `VIRTUAL_ENV=~/.venv uv pip install "mujoco>=3.16,<3.17" gymnasium pyyaml imageio imageio-ffmpeg /mnt/disk1/praxis/praxis-1-oss/packages/praxis-sim`
+Install once (sim code is the target model's own repo): `VIRTUAL_ENV=~/.venv uv pip install "mujoco>=3.16,<3.17" gymnasium pyyaml imageio imageio-ffmpeg $PRAXIS_ROOT/praxis-1-oss/packages/praxis-sim`
 (the Menagerie robot assets are downloaded + SHA-256-checked by the sim into `~/.cache/praxis/sim` on first use, 40 MB). Headless rendering works with `MUJOCO_GL=egl` (renders on the NVIDIA GPU, no black frames
 although the CUDA server is on the same card).
 
@@ -413,7 +420,7 @@ torch bf16 reference 0.46 / 0.16, i.e. within the 0.34-0.5 noise floor of torch-
 
 ### Server protocol / memory sequencing (`praxis_server.c`)
 `cuda/praxis/praxis_server --policy DIR [--vae DIR --qwen DIR --stream 2 --text-cache DIR --vae-mode keep|reload --trim 0|1|2]` (from the repo root; expert format by env exactly like `praxis_e2e`:
-`PRAXIS_EXPERT_FMT=mixed|nvfp4|nvfp4a16`, `PRAXIS_PACK_CACHE=<file>`; the mixed pack is `/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache.p3c86754d5e664762`, 19.5 GB, written by the first mixed run, 160-400 s cold).
+`PRAXIS_EXPERT_FMT=mixed|nvfp4|nvfp4a16`, `PRAXIS_PACK_CACHE=<file>`; the mixed pack is `$PRAXIS_ROOT/praxis-1-droid.nvfp4.packcache.p3c86754d5e664762`, 19.5 GB, written by the first mixed run, 160-400 s cold).
 Framed binary requests (`PRXQ`, op, length) on stdin, responses on a private dup of stdout (everything printf'd by the shared `praxis_e2e` helpers goes to stderr = the server log); every response carries ms / aux ms /
 device GB peak over the idle context (cuMemGetInfo polled every 4 ms) / GB after. Ops: ENCODE (uint8 tile clip -> policy latent), SAMPLE (prompt + uncond prompt + K' + anchor/cleans/proprio/noise -> video + action tokens; the policy
 is loaded lazily on the first SAMPLE and stays resident), TEXT (warms the Qwen3.5-2B conditioning cache; the Qwen weights are loaded and freed per cache miss), DECODE (latent -> uint8 frames), INFO, QUIT. Weights, pack, ring, text cache
@@ -428,10 +435,10 @@ Cost of the sequencing per call: ~0.2 s VAE reload + ~0.8 s encode (21 frames of
 runs on it unchanged. The state machine/tiling/pose code is praxis's, the three heavy calls go to the server; torch here is CPU only.
 
 ### M3 - closed loop results (praxis sim, configs/sim_droid.yaml: droid_impedance, exec_horizon 24, 15 Hz, 2 Euler steps, t_shift 12.5, cfg video 4 / action 1, max_context_chunks 1, time limit 20.6 s = 309 ticks, stop 1 s after success)
-Commands (from the repo root; outputs under `/mnt/disk01/tmp/praxis_sim/<name>/`: `episode_NNN.{mp4,json,npz}`, `summary.json`, `calls.json` (per-call timing/peaks), `server.log`):
+Commands (from the repo root; outputs under `$PRAXIS_OUT/praxis_sim/<name>/`: `episode_NNN.{mp4,json,npz}`, `summary.json`, `calls.json` (per-call timing/peaks), `server.log`):
 ```
-MUJOCO_GL=egl ~/.venv/bin/python -I cuda/praxis/run_sim_cuda.py --config /mnt/disk1/praxis/praxis-1-oss/configs/sim_droid.yaml --vae-mode reload --expert-fmt mixed \
-   --set task.name=cube_on_plate --set task.prompt=null --set "episodes.seeds=[0,1,2,3,4,5]" --set output.dir=/mnt/disk01/tmp/praxis_sim/cube_on_plate_mixed
+MUJOCO_GL=egl ~/.venv/bin/python -I cuda/praxis/run_sim_cuda.py --config $PRAXIS_ROOT/praxis-1-oss/configs/sim_droid.yaml --vae-mode reload --expert-fmt mixed \
+   --set task.name=cube_on_plate --set task.prompt=null --set "episodes.seeds=[0,1,2,3,4,5]" --set output.dir=$PRAXIS_OUT/praxis_sim/cube_on_plate_mixed
 # --expert-fmt nvfp4 | mixed | bf16(parity only);  --cfg-video 1.0 --skip-last-video (fast, no predicted-video panel);  --no-decode;  --policy scripted|hold (the sim's own, smoke tests)
 ```
 Smoke tests with the sim's own scripted policy (lift_cube, cube_on_plate, move_block): all succeed (86 / 141-142 / 131-135 ticks), frames render on the NVIDIA GPU (EGL), no bad-view ticks.
@@ -447,7 +454,7 @@ Results (praxis' own sim, our CUDA policy; success = the sim's success check; pe
 | move_block | mixed fast | 6 | 5/6 (seed 4) | 4.6 / 4.0 s |
 | block_in_bowl | mixed | 3 | 2/3 (seed 1) | 8.8 / 8.3 s |
 Per call (K'=2, median, mixed): tiling+prepare 0.85 s, VAE encode 0.75 s (+0.2 s load), sampler 7.36 s (NVFP4 5.47 s, mixed fast 2.99 s); first call (K'=1) 4.4 s NVFP4. Predicted-video decode (VAE decode + reload) was on for the mixed runs and is excluded from the call time.
-Videos: `/mnt/disk01/tmp/praxis_sim/<run>/episode_NNN.mp4` (overview | exterior | wrist on top, the model's predicted video decoded from our latents below), e.g. `lift_cube_mixed`, `cube_on_plate_mixed`, `move_block_mixed`.
+Videos: `$PRAXIS_OUT/praxis_sim/<run>/episode_NNN.mp4` (overview | exterior | wrist on top, the model's predicted video decoded from our latents below), e.g. `lift_cube_mixed`, `cube_on_plate_mixed`, `move_block_mixed`.
 Context only (not comparable: other sampler config/ckpt settings, 16 scenes x 2 samplers there): praxis EVAL.md lists the *earlier* checkpoint at 30/32 lift_cube, 31/32 cube_on_plate, 30/32 move_block, 32/32 block_in_bowl; the README's ~50% is the hard suite, not run here.
 Our small samples (3-6 episodes per row, one sampler seed each) cannot separate mixed from NVFP4 (NVFP4 lost 1 episode on each of cube_on_plate/move_block versus mixed, within noise). Failures are behavioural (hesitation/regrasp, block not carried far enough); diagnosis below.
 Honest limits: no episode was run through the torch pipeline closed loop (only single-call replays, see M4); the failing move_block seed 2 was NOT re-run with bf16 experts (that run was started and cancelled in favour of M4); the 16-scene suites / hard suite were not run; the server is one process per sim run (a 3-6 episode run reloads
@@ -455,7 +462,7 @@ the policy once, ~20 s from the pack cache, first-call text 1.1 s).
 
 ### M4 - the chunk-boundary jump: model behaviour, not a bridge bug
 Observation: at every chunk boundary the commanded xyz jumps by ~25-31 mm (mean over runs: mixed 26-31, NVFP4 24-26, fast 26-28) versus a median per-tick step of ~6 mm; within-chunk step CV 0.43-0.48 (the torch reference commands of the real dumps: 0.39-0.50).
-`/mnt/disk01/tmp/praxis_sim/jitter.py <run dirs>` computes both from the episode npz.
+`$PRAXIS_OUT/praxis_sim/jitter.py <run dirs>` computes both from the episode npz.
 1. **praxis's own path does nothing between chunks in chunked mode.** The sim loop (`loop.run_episode`) executes all rows of `Session.step` one per tick with no blending, no row skipping, no interpolation; our run uses that very loop and `SingleArmServeSession` unchanged.
    Smoothing/junction logic exists only in the serve path and is opt-in: `smoothing: savgol` (Savitzky-Golay over each chunk's relative xyz/grip, smooths inside the chunk, does not touch the junction) and real-time chunking `schedule=rtc` (`praxis/serve/rtc.py`: the answer repeats the plan prefix and a rebase offset decays over `rebase_decay` rows - exactly a junction fix). `configs/sim_droid.yaml` uses neither.
 2. **Inputs are identical to praxis's.** `check_sim_replay.py` records the sim's real observation stack of call 2 (`run_sim_cuda.py --dump-obs`, cube_on_plate seed 1), runs praxis's own preprocessing + the PyTorch reference model (`ref/praxis/gen_real_ref.py --obs-npz ... --descriptor praxis.sim --calls 2`, bf16 AND fp32, offload) and our client:
@@ -477,11 +484,11 @@ Paired closed-loop evaluation of the CUDA runner in praxis' own MuJoCo DROID sim
 **(a) Setup.** Seeds 100-111 for every run (the same 12 initial states in every variant; the earlier 3-6 episode runs used seeds 0-5). Variants (all `--expert-fmt mixed` unless noted, `--vae-mode reload`, praxis-1-droid checkpoint, one server process at a time on the RTX 5060 Ti):
 - **A** (baseline, "fast"): mixed experts, `--cfg-video 1.0 --skip-last-video`, `--rebase 8` (the `run_sim_cuda.py` default), 2 Euler steps, t_shift 12.5, action CFG 1.0.
 - **B**: A with NVFP4 W4A4 experts. **C**: "full" = cfg video 4 + decoded predicted video (rebase 8). **D**: A with `--rebase 0` (praxis' own chunk behaviour).
-Rerun (skips runs that already have a `summary.json`; outputs `/mnt/disk01/tmp/praxis_sim2/<name>/`, videos pruned to failures + first success by `eval/prune_videos.py`):
+Rerun (skips runs that already have a `summary.json`; outputs `$PRAXIS_OUT/praxis_sim2/<name>/`, videos pruned to failures + first success by `eval/prune_videos.py`):
 ```
 bash cuda/praxis/eval/e1.sh            # A/B/C/D + extra tasks (lift_cube cube_on_plate move_block block_in_bowl block_out_of_bowl stack_block press_button)
 bash cuda/praxis/eval/e2.sh 1          # knob sweep on block_out_of_bowl;  e2.sh 2 = combo + cube_on_plate validation + prompt variants;  e2.sh 3 = baseline repeat
-~/.venv/bin/python -I cuda/praxis/eval/summarize.py /mnt/disk01/tmp/praxis_sim2/A_*                      # Wilson CI, ticks, latency, boundary jump, step CV, peak GB
+~/.venv/bin/python -I cuda/praxis/eval/summarize.py $PRAXIS_OUT/praxis_sim2/A_*                      # Wilson CI, ticks, latency, boundary jump, step CV, peak GB
 ~/.venv/bin/python -I cuda/praxis/eval/summarize.py --pair <dirA> <dirB>                                   # paired exact McNemar (same seeds)
 ```
 (a single run by hand: `MUJOCO_GL=egl ~/.venv/bin/python -I cuda/praxis/run_sim_cuda.py --config .../sim_droid.yaml --vae-mode reload --expert-fmt mixed --cfg-video 1.0 --skip-last-video --set task.name=<task> --set task.prompt=null --set "episodes.seeds=[100,...,111]" --set output.dir=<dir>`; extra flags `--num-steps N --cfg-scale S --savgol W --sg-order 3 --rebase R`.)

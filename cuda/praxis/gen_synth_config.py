@@ -5,8 +5,9 @@ Real dims are inferred from praxis-1-oss constructor defaults + README (checkpoi
 dim 3072, 24 Q / 8 KV heads, head_dim 128, dense 11520, 128 experts top-8 (hidden 1280), encoder 14 blocks (0,1 dense),
 decoder 6 blocks (0 dense), action expert 16 blocks dim 1024."""
 import argparse, json, os
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 ap = argparse.ArgumentParser()
-ap.add_argument("--out", default="/mnt/disk1/praxis/synth")
+ap.add_argument("--out", default=PRAXIS_ROOT + "/synth")
 ap.add_argument("--dim", type=int, default=3072)
 ap.add_argument("--head-dim", type=int, default=128)
 ap.add_argument("--kv-heads", type=int, default=8)

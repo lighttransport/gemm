@@ -4,7 +4,7 @@
  *   conditioning canvas frame -> Wan2.2 VAE encode (cuda/praxis/cuda_wan22_vae.h, weights converted by ref/cosmos3/convert_vae.py)
  *   -> clean latent frame 0 + seeded noise -> und tower (once) -> UniPC denoise (cond + uncond generation passes) -> action chunk [32][10]
  *
- *   cuda/cosmos3/cosmos3_policy --model /mnt/disk1/praxis/cosmos3-edge-droid --vae /mnt/disk1/praxis/cosmos3-vae-wan --ref tmp/cosmos3_ref
+ *   cuda/cosmos3/cosmos3_policy --model $PRAXIS_ROOT/cosmos3-edge-droid --vae $PRAXIS_ROOT/cosmos3-vae-wan --ref tmp/cosmos3_ref
  *        [--out tmp/cosmos3_e2e] [--steps 4] [--guidance 3] [--keep-vae] [--oracle-latent] [--repeat N]
  *
  * Python-side helper inputs (exported by ref/cosmos3/gen_ref.py, no C tokenizer / image resampler needed): token ids (input_ids_{cond,uncond}.npy),
@@ -20,6 +20,7 @@
 #define CUDA_COSMOS3_IMPLEMENTATION
 #include "../praxis/cuda_wan22_vae.h"
 #include "cuda_cosmos3_runner.h"
+#include "../../common/praxis_paths.h"
 
 static double nowms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec * 1e-6; }
 static double used_mb(void) { size_t fr = 0, tot = 0; cuMemGetInfo(&fr, &tot); return (tot - fr) / 1048576.0; }
@@ -34,7 +35,7 @@ static long long *read_i8(const char *path, int *n) {
 static float *rd(const char *ref, const char *name, long long *n) { char p[1400]; snprintf(p, sizeof p, "%s/%s.npy", ref, name); float *d = cosmos3_npy_read(p, n); if (!d) fprintf(stderr, "cannot read %s\n", p); return d; }
 
 int main(int argc, char **argv) {
-    const char *model = "/mnt/disk1/praxis/cosmos3-edge-droid", *vae_dir = "/mnt/disk1/praxis/cosmos3-vae-wan", *ref = "tmp/cosmos3_ref", *out = "tmp/cosmos3_e2e";
+    const char *model = px_root("cosmos3-edge-droid"), *vae_dir = px_root("cosmos3-vae-wan"), *ref = "tmp/cosmos3_ref", *out = "tmp/cosmos3_e2e";
     int steps = 4, keep_vae = 0, cache_und = 0, oracle_lat = 0, repeat = 1, T = 9, LH = 11, LW = 20, CH = 192, CW = 320, chunk = 32, domain = 8, raw = 10;
     float guidance = 3.0f, fps = 15.0f;
     for (int i = 1; i < argc; i++) {

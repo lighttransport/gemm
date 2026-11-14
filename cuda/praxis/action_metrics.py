@@ -2,10 +2,11 @@
 actions and the un-normalised action-row errors (rms over the 24 rows: xyz in mm, rot6d, grip), config normalisation of the checkpoint.
   ~/.venv/bin/python -I cuda/praxis/action_metrics.py --ours tmp/praxis_out/x --ref tmp/praxis_ref/real_fp32 [--label name] [--json out.json]
 """
-import argparse, json
+import argparse, json, os
 import numpy as np
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 
-CFG = "/mnt/disk1/praxis/praxis-1-droid/config.json"
+CFG = PRAXIS_ROOT + "/praxis-1-droid/config.json"
 
 
 def rel(a, b):

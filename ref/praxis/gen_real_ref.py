@@ -37,12 +37,13 @@ Run (repo root):  ~/.venv/bin/python -I ref/praxis/gen_real_ref.py            (-
 import argparse, json, os, sys, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np, torch
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--praxis-src", default="/mnt/disk1/praxis/praxis-1-oss")
-ap.add_argument("--ckpt", default="/mnt/disk1/praxis/praxis-1-droid")
-ap.add_argument("--qwen", default="/mnt/disk1/praxis/qwen3.5-2b")
-ap.add_argument("--vae", default="/mnt/disk1/praxis/wan2.2-ti2v/Wan2.2_VAE.pth")
+ap.add_argument("--praxis-src", default=PRAXIS_ROOT + "/praxis-1-oss")
+ap.add_argument("--ckpt", default=PRAXIS_ROOT + "/praxis-1-droid")
+ap.add_argument("--qwen", default=PRAXIS_ROOT + "/qwen3.5-2b")
+ap.add_argument("--vae", default=PRAXIS_ROOT + "/wan2.2-ti2v/Wan2.2_VAE.pth")
 ap.add_argument("--out", default="tmp/praxis_ref/real")
 ap.add_argument("--prompt", default="pick up the red cup and place it on the plate")
 ap.add_argument("--device", default="cuda")

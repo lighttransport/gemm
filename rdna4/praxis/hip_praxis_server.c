@@ -2,7 +2,7 @@
  * hip_praxis_server.c - persistent praxis-1 policy server for RDNA4 / ROCm, same binary protocol as cuda/praxis/praxis_server.c (so
  * cuda/praxis/praxis_client.py works against it: PraxisClient(..., binary="rdna4/praxis/hip_praxis_server")).
  *
- *   rdna4/praxis/hip_praxis_server --policy /mnt/nvme01/models/praxis/praxis-1-droid [--stream 2] [--text-cache DIR]
+ *   rdna4/praxis/hip_praxis_server --policy $PRAXIS_ROOT/praxis-1-droid [--stream 2] [--text-cache DIR]
  *        [--text FILE.npy --text-u FILE.npy] [--trim 0|1|2]
  *   env: PRAXIS_EXPERT_FMT=mixed|nvfp4a16|nvfp4 (W4A16 on RDNA4), PRAXIS_FP8_BANKS=..., PRAXIS_PACK_CACHE=<file>, PRAXIS_SLOT_MB=...
  *
@@ -36,6 +36,7 @@
 #include "../../cuda/praxis/praxis_qwen.h"   /* tokenizer (praxis_tok.c) */
 #include <pthread.h>
 #include <unistd.h>
+#include "../../common/praxis_paths.h"
 
 static int g_out_fd = 1;
 static int rd_full(void *b, size_t n) { size_t o = 0; while (o < n) { ssize_t k = read(0, (char *)b + o, n - o); if (k <= 0) return -1; o += (size_t)k; } return 0; }
@@ -153,7 +154,7 @@ static void pre_qwen(void *a) {   /* a resident policy gives its workspace back 
 }
 
 int main(int argc, char **argv) {
-    const char *policy = NULL, *cache = NULL, *fixed = NULL, *fixed_u = NULL, *vae_dir = "/mnt/nvme01/models/praxis/wan2.2-vae", *qwen = "/mnt/nvme01/models/praxis/qwen3.5-2b", *vae_mode = "keep";
+    const char *policy = NULL, *cache = NULL, *fixed = NULL, *fixed_u = NULL, *vae_dir = px_root("wan2.2-vae"), *qwen = px_root("qwen3.5-2b"), *vae_mode = "keep";
     int ring = 2, trim = 2, ring_released = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--policy") && i + 1 < argc) policy = argv[++i];

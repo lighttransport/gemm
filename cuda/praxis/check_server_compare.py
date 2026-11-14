@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Run the SAME recorded sim observation (run_sim_cuda.py --dump-obs) through two servers (call 1 = 1 frame, call 2 = 22 frames, session seed 0, identical noise)
-and diff their outputs: the local CUDA server and a remote one given by PRAXIS_SERVER_CMD (e.g. the HIP server on tr16).  Sequential, one server at a time.
-  PRAXIS_SERVER_CMD='ssh tr16 "..."' ~/.venv/bin/python -I cuda/praxis/check_server_compare.py --obs .../m4_obs/obs_call1.npz [--oracle .../m4_ref_fp32]"""
+and diff their outputs: the local CUDA server and a remote one given by PRAXIS_SERVER_CMD (e.g. the HIP server on the AMD host).  Sequential, one server at a time.
+  PRAXIS_SERVER_CMD='ssh <amd-host> "..."' ~/.venv/bin/python -I cuda/praxis/check_server_compare.py --obs .../m4_obs/obs_call1.npz [--oracle .../m4_ref_fp32]"""
 import argparse, os, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import praxis_client as pc
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
+PRAXIS_OUT = os.environ.get("PRAXIS_OUT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp"))
 ap = argparse.ArgumentParser()
 ap.add_argument("--obs", required=True); ap.add_argument("--oracle", default=None)
 ap.add_argument("--prompt", default="Put the red cube on the blue plate."); ap.add_argument("--expert-fmt", default="mixed")
-ap.add_argument("--ckpt", default="/mnt/disk1/praxis/praxis-1-droid")
+ap.add_argument("--ckpt", default=PRAXIS_ROOT + "/praxis-1-droid")
 a = ap.parse_args()
 rel = lambda x, y: float(np.linalg.norm(np.asarray(x, np.float64) - np.asarray(y, np.float64)) / (np.linalg.norm(np.asarray(y, np.float64)) + 1e-30))
 z = np.load(a.obs)
@@ -21,8 +23,8 @@ res = {}; dec = {}
 for tag, cmd in (("cuda", None), ("remote", remote)):
     if cmd: os.environ["PRAXIS_SERVER_CMD"] = cmd
     else: os.environ.pop("PRAXIS_SERVER_CMD", None)
-    env = {"PRAXIS_EXPERT_FMT": a.expert_fmt, "PRAXIS_PACK_CACHE": "/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache"}
-    pipe = pc.PraxisClient(a.ckpt, env=env, vae_mode="reload", log_path=f"/mnt/disk01/tmp/praxis_sim_hip/server_cmp_{tag}.log")
+    env = {"PRAXIS_EXPERT_FMT": a.expert_fmt, "PRAXIS_PACK_CACHE": PRAXIS_ROOT + "/praxis-1-droid.nvfp4.packcache"}
+    pipe = pc.PraxisClient(a.ckpt, env=env, vae_mode="reload", log_path=f"{PRAXIS_OUT}/praxis_sim_hip/server_cmp_{tag}.log")
     sess = pipe.session(prompt=a.prompt, seed=0, max_context_chunks=1, control_mode="droid_impedance", exec_horizon=24)
     pipe.warm_text([a.prompt])
     r1 = sess.step(obs(1)); r2 = sess.step(obs(22))

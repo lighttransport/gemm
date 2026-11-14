@@ -1,7 +1,7 @@
 /*
  * praxis_server.c - persistent praxis-1 policy server (binary protocol over stdin/stdout), for closed-loop use from cuda/praxis/praxis_client.py.
  *
- *   cuda/praxis/praxis_server --policy /mnt/disk1/praxis/praxis-1-droid [--vae DIR] [--qwen DIR] [--stream 2] [--text-cache DIR]
+ *   cuda/praxis/praxis_server --policy $PRAXIS_ROOT/praxis-1-droid [--vae DIR] [--qwen DIR] [--stream 2] [--text-cache DIR]
  *        [--vae-mode keep|reload] [--trim 0|1|2]
  *   env: PRAXIS_NVFP4=1 | PRAXIS_EXPERT_FMT=mixed|nvfp4|nvfp4a16, PRAXIS_PACK_CACHE=<file> (as praxis_e2e)
  *
@@ -30,6 +30,7 @@
 #undef main
 #include <pthread.h>
 #include <stdint.h>
+#include "../../common/praxis_paths.h"
 
 static int g_out_fd = 1;
 static int rd_full(void *b, size_t n) { size_t o = 0; while (o < n) { ssize_t k = read(0, (char *)b + o, n - o); if (k <= 0) return -1; o += (size_t)k; } return 0; }
@@ -43,7 +44,7 @@ typedef struct { unsigned char *p; size_t n, cap; } buf_t;
 static void *bufw(buf_t *b, const void *d, size_t n) { if (b->n + n > b->cap) { b->cap = (b->n + n) * 2; b->p = (unsigned char *)realloc(b->p, b->cap); } memcpy(b->p + b->n, d, n); b->n += n; return b->p + b->n - n; }
 
 int main(int argc, char **argv) {
-    const char *policy = NULL, *vae_dir = "/mnt/disk1/praxis/wan2.2-vae", *qwen = "/mnt/disk1/praxis/qwen3.5-2b", *cache = NULL, *vae_mode = "keep";
+    const char *policy = NULL, *vae_dir = px_root("wan2.2-vae"), *qwen = px_root("qwen3.5-2b"), *cache = NULL, *vae_mode = "keep";
     int ring = 2, trim = 2, ring_released = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--policy") && i + 1 < argc) policy = argv[++i];
@@ -64,7 +65,7 @@ int main(int argc, char **argv) {
     real_cfg rc; if (read_real_cfg(policy, &rc) || !rc.ok) { fprintf(stderr, "cannot read normalisation from %s/config.json\n", policy); return 1; }
     pthread_t th; pthread_create(&th, NULL, poller, NULL);
     char tok_path[1300], tmp[1300]; snprintf(tok_path, sizeof tok_path, "%s/tokenizer.json", qwen);
-    snprintf(tmp, sizeof tmp, "/mnt/disk01/tmp/praxis_server_tmp"); mkdirs(tmp);
+    snprintf(tmp, sizeof tmp, "%s", px_out("praxis_server_tmp")); mkdirs(tmp);
     txt_cfg tcfg = { qwen, "cuda/llm/test_qwen35_st", cache, tmp, tok_path, 0 };
     cuda_wan22_vae *vae = NULL; praxis_runner *r = NULL; int C = 192, F = 6, A = 0;
     fprintf(stderr, "[server] ready: policy %s, vae-mode %s, trim %d, ring %d, idle ctx %.2f GB\n", policy, vae_mode, trim, ring, gb(idle));

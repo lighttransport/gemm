@@ -1,8 +1,10 @@
-# sourced by the eval batch scripts. Outputs: /mnt/disk01/tmp/praxis_sim2/<name>/ ; seeds 100..111 (the earlier sims used 0-5).
-cd /home/syoyo/work/gemm/praxis
+# sourced by the eval batch scripts. Outputs: $PRAXIS_OUT/praxis_sim2/<name>/ (PRAXIS_OUT defaults to <repo>/tmp) ; seeds 100..111 (the earlier sims used 0-5).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$REPO"
 export MUJOCO_GL=egl
-CFG=/mnt/disk1/praxis/praxis-1-oss/configs/sim_droid.yaml
-OUT=${OUT:-/mnt/disk01/tmp/praxis_sim2}
+PRAXIS_ROOT=${PRAXIS_ROOT:-$HOME/praxis}
+CFG=$PRAXIS_ROOT/praxis-1-oss/configs/sim_droid.yaml
+OUT=${OUT:-${PRAXIS_OUT:-$REPO/tmp}/praxis_sim2}
 SEEDS="episodes.seeds=[100,101,102,103,104,105,106,107,108,109,110,111]"
 # run <name> <task> <expert-fmt> [run_sim_cuda.py flags...]; the default 'fast' flags are added by fast()/full()
 run() {

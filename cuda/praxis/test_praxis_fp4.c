@@ -4,11 +4,12 @@
  *   2. device grouped W4A4 block-scale GEMMs (quantize -> gate_up -> SwiGLU -> quantize -> down) vs a CPU fp32 reference
  *      that uses the DEQUANTIZED weights and the dequantized quantized activations  (kernel exactness, rel-L2 ~ bf16 output rounding),
  *   3. the same pipeline vs the unquantized fp32 reference (original bf16 weights, bf16-exact activations): the NVFP4 error.
- *   cuda/praxis/test_praxis_fp4 --model /mnt/disk1/praxis/mid [--tokens 300] [--layer 1]
+ *   cuda/praxis/test_praxis_fp4 --model $PRAXIS_ROOT/mid [--tokens 300] [--layer 1]
  */
 #define SAFETENSORS_IMPLEMENTATION
 #define CUDA_PRAXIS_IMPLEMENTATION
 #include "cuda_praxis_runner.h"
+#include "../../common/praxis_paths.h"
 
 static unsigned long long rs = 88172645463325252ULL;
 static float rnd(void) { float a = 0; for (int i = 0; i < 4; i++) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; a += (float)(rs >> 40) / 16777216.0f; } return (a - 2.0f) * 1.732f; }
@@ -64,7 +65,7 @@ static int pack_bench(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--pack-bench")) return pack_bench();
-    const char *model = "/mnt/disk1/praxis/mid"; int T = 300, layer = 1;
+    const char *model = px_root("mid"); int T = 300, layer = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) T = atoi(argv[++i]);

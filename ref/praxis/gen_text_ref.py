@@ -7,9 +7,10 @@ cond.npy (= hidden_states[-3], the praxis conditioning).
 """
 import argparse, os, numpy as np, torch
 from transformers import AutoModel, AutoProcessor
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="/mnt/disk1/praxis/qwen3.5-2b")
+ap.add_argument("--model", default=PRAXIS_ROOT + "/qwen3.5-2b")
 ap.add_argument("--prompt", default="pick up the red cup and place it on the plate")
 ap.add_argument("--prompt-file", help="read the prompt text from this file (overrides --prompt)")
 ap.add_argument("--ids", help="use token ids from this .npy (int32/int64) instead of tokenizing")

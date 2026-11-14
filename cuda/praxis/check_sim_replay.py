@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """M4: replay a recorded SIM observation (run_sim_cuda.py --dump-obs) through PraxisClient (session seed 0, so call 2 uses seed 1 like gen_real_ref.py)
 and diff everything against the torch reference of the SAME observation (gen_real_ref.py --obs-npz ... --descriptor praxis.sim --calls 2).
-  ~/.venv/bin/python -I cuda/praxis/check_sim_replay.py --obs /mnt/disk01/tmp/praxis_sim/m4_obs/obs_call1.npz --ref /mnt/disk01/tmp/praxis_sim/m4_ref [--oracle DIR]"""
+  ~/.venv/bin/python -I cuda/praxis/check_sim_replay.py --obs $PRAXIS_OUT/praxis_sim/m4_obs/obs_call1.npz --ref $PRAXIS_OUT/praxis_sim/m4_ref [--oracle DIR]"""
 import argparse, os, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import praxis_client as pc
 from praxis import single_arm as SA
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
+PRAXIS_OUT = os.environ.get("PRAXIS_OUT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp"))
 ap = argparse.ArgumentParser()
 ap.add_argument("--obs", required=True); ap.add_argument("--ref", required=True)
 ap.add_argument("--oracle", default=None); ap.add_argument("--prompt", default="Put the red cube on the blue plate."); ap.add_argument("--expert-fmt", default="mixed")
@@ -14,8 +16,8 @@ a = ap.parse_args()
 L = lambda p: np.load(p).astype(np.float32)
 rel = lambda x, y: float(np.linalg.norm(np.asarray(x, np.float64) - y) / (np.linalg.norm(y) + 1e-30))
 z = np.load(a.obs)
-env = {"PRAXIS_EXPERT_FMT": a.expert_fmt, "PRAXIS_PACK_CACHE": "/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache"}
-pipe = pc.PraxisClient("/mnt/disk1/praxis/praxis-1-droid", env=env, vae_mode="reload", log_path="/mnt/disk01/tmp/praxis_sim/server_m4.log")
+env = {"PRAXIS_EXPERT_FMT": a.expert_fmt, "PRAXIS_PACK_CACHE": PRAXIS_ROOT + "/praxis-1-droid.nvfp4.packcache"}
+pipe = pc.PraxisClient(PRAXIS_ROOT + "/praxis-1-droid", env=env, vae_mode="reload", log_path=PRAXIS_OUT + "/praxis_sim/server_m4.log")
 sess = pipe.session(prompt=a.prompt, seed=0, max_context_chunks=1, control_mode="droid_impedance", exec_horizon=24)
 pipe.warm_text([a.prompt])
 obs = lambda n: {"ee_pose": z["ee_pose"][:n], "exterior_image": z["exterior"][:n], "wrist_image": z["wrist"][:n], "grip": z["grip"][:n], "task": a.prompt, "descriptor": "praxis.sim"}

@@ -6,6 +6,7 @@
 #define SAFETENSORS_IMPLEMENTATION
 #define CUDA_PRAXIS_IMPLEMENTATION
 #include "cuda_praxis_runner.h"
+#include "../../common/praxis_paths.h"
 
 static unsigned long long rs = 88172645463325252ULL;
 static float rnd(void) { float a = 0; for (int i = 0; i < 4; i++) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; a += (float)(rs >> 40) / 16777216.0f; } return (a - 2.0f) * 1.732f; }
@@ -113,7 +114,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--K") && i + 1 < argc) K = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--S") && i + 1 < argc) S = atoi(argv[++i]);
     }
-    praxis_runner *r = praxis_load_synthetic("/mnt/disk1/praxis/mid", 0, 0, 1);   /* only the compiled kernels are used */
+    praxis_runner *r = praxis_load_synthetic(px_root("mid"), 0, 0, 1);   /* only the compiled kernels are used */
     if (!r) return 1;
     int bad = 0;
     {   /* encoder: [registers, anchor, text (code 0)] [noised frames (2c+2)] [clean frames (2c+1)] */

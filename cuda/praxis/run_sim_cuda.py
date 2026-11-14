@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Closed-loop praxis MuJoCo sim (scripts/run_sim.py of praxis-1-oss) with OUR CUDA policy server instead of the PyTorch pipeline.
 
-  MUJOCO_GL=egl PRAXIS_EXPERT_FMT=mixed PRAXIS_PACK_CACHE=/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache \
-    ~/.venv/bin/python -I cuda/praxis/run_sim_cuda.py --config /mnt/disk1/praxis/praxis-1-oss/configs/sim_droid.yaml \
-      --set task.name=lift_cube --set task.prompt=null --set "episodes.seeds=[0,1,2]" --set output.dir=/mnt/disk01/tmp/praxis_sim/lift_cube_mixed
+  MUJOCO_GL=egl PRAXIS_EXPERT_FMT=mixed PRAXIS_PACK_CACHE=$PRAXIS_ROOT/praxis-1-droid.nvfp4.packcache \
+    ~/.venv/bin/python -I cuda/praxis/run_sim_cuda.py --config $PRAXIS_ROOT/praxis-1-oss/configs/sim_droid.yaml \
+      --set task.name=lift_cube --set task.prompt=null --set "episodes.seeds=[0,1,2]" --set output.dir=$PRAXIS_OUT/praxis_sim/lift_cube_mixed
 
 Everything of the sim is praxis's own (scene, tasks, env, loop.run_episode, control mode droid_impedance, exec_horizon 24, History stack, MP4 writer); only
 `policy.type=model` is replaced: ModelPolicy is built on a PraxisClient (cuda/praxis/praxis_client.py) instead of PraxisPipeline. Options (before --set):
@@ -25,12 +25,13 @@ import praxis_client as pc  # noqa: E402  (puts the praxis source tree on sys.pa
 import praxis.sim  # noqa: E402,F401
 from praxis.sim import loop  # noqa: E402
 from praxis.sim.config import load_config  # noqa: E402
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--config", required=True)
 ap.add_argument("--set", action="append", default=[])
 ap.add_argument("--policy", default="model")
-ap.add_argument("--checkpoint", default="/mnt/disk1/praxis/praxis-1-droid")
+ap.add_argument("--checkpoint", default=PRAXIS_ROOT + "/praxis-1-droid")
 ap.add_argument("--expert-fmt", default="mixed")
 ap.add_argument("--vae-mode", default="keep")
 ap.add_argument("--no-decode", action="store_true")
@@ -41,14 +42,14 @@ ap.add_argument("--cfg-scale", type=float, default=None, help="text guidance of 
 ap.add_argument("--savgol", type=int, default=0, help="opt-in Savitzky-Golay window (praxis serve smoothing, window 9 order 3 are its defaults) over each chunk's relative xyz + grip; 0 = off")
 ap.add_argument("--sg-order", type=int, default=3)
 ap.add_argument("--stream", type=int, default=2)
-ap.add_argument("--server-cmd", default=None, help="opt-in remote policy server: complete shell command (stdin/stdout = binary protocol), e.g. ssh tr16 '...hip_praxis_server_full ...'; sets PRAXIS_SERVER_CMD (CUDA default unchanged)")
+ap.add_argument("--server-cmd", default=None, help="opt-in remote policy server: complete shell command (stdin/stdout = binary protocol), e.g. ssh <amd-host> '...hip_praxis_server_full ...'; sets PRAXIS_SERVER_CMD (CUDA default unchanged)")
 ap.add_argument("--rebase", type=int, default=8, help="boundary mitigation, DEFAULT 8 (NOT praxis chunked behaviour; --rebase 0 = praxis behaviour): shift the new chunk's xyz so its first row continues the previous command (last + last step), decaying linearly to 0 over this many rows")
 ap.add_argument("--dump-obs", default=None, help="dir: save the observation stack of every call (obs_call<N>.npz) for reference replays")
 a = ap.parse_args()
 if a.server_cmd:
     os.environ["PRAXIS_SERVER_CMD"] = a.server_cmd
 
-paths = [f"model.checkpoint={a.checkpoint}", "model.vae_weights=/mnt/disk1/praxis/wan2.2-ti2v/Wan2.2_VAE.pth", "model.text_encoder=/mnt/disk1/praxis/qwen3.5-2b",
+paths = [f"model.checkpoint={a.checkpoint}", f"model.vae_weights={PRAXIS_ROOT}/wan2.2-ti2v/Wan2.2_VAE.pth", f"model.text_encoder={PRAXIS_ROOT}/qwen3.5-2b",
          "viewer.enabled=false", f"policy.type={a.policy}"]
 if a.no_decode or a.skip_last_video:
     paths.append("policy.decode_video=false")
@@ -108,7 +109,7 @@ if a.policy == "model":
                                                  cfg_video_scale=a.cfg_video if a.cfg_video is not None else s.cfg_video_scale,
                                                  skip_last_video=a.skip_last_video),
         env=({"PRAXIS_BF16_MMAP": "1"} if a.expert_fmt == "bf16" else
-             {"PRAXIS_EXPERT_FMT": a.expert_fmt, "PRAXIS_PACK_CACHE": os.environ.get("PRAXIS_PACK_CACHE", "/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache")}),
+             {"PRAXIS_EXPERT_FMT": a.expert_fmt, "PRAXIS_PACK_CACHE": os.environ.get("PRAXIS_PACK_CACHE", PRAXIS_ROOT + "/praxis-1-droid.nvfp4.packcache")}),
         vae_mode=a.vae_mode, stream=a.stream, log_path=str(out_dir / "server.log"))
     policy = CudaModelPolicy(pipe, cfg.session, cfg.policy.decode_video)
 try:

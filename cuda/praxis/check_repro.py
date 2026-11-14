@@ -8,10 +8,12 @@ import argparse, itertools, os, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import praxis_client as pc
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
+PRAXIS_OUT = os.environ.get("PRAXIS_OUT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp"))
 ap = argparse.ArgumentParser()
 ap.add_argument("--obs", nargs="+", required=True); ap.add_argument("--run", action="append", default=[])
 ap.add_argument("--prompt", default="Pick up the red cube."); ap.add_argument("--oracle", default=None)
-ap.add_argument("--ckpt", default="/mnt/disk1/praxis/praxis-1-droid"); ap.add_argument("--outdir", required=True, help="one <tag>.pkl per finished run (resumable: finished tags are skipped); the report covers every pkl in the dir")
+ap.add_argument("--ckpt", default=PRAXIS_ROOT + "/praxis-1-droid"); ap.add_argument("--outdir", required=True, help="one <tag>.pkl per finished run (resumable: finished tags are skipped); the report covers every pkl in the dir")
 a = ap.parse_args()
 rel = lambda x, y: float(np.linalg.norm(np.asarray(x, np.float64) - np.asarray(y, np.float64)) / (np.linalg.norm(np.asarray(y, np.float64)) + 1e-30))
 import pickle
@@ -21,8 +23,8 @@ for spec in a.run:
     if os.path.exists(f"{a.outdir}/{tag}.pkl"): print("skip", tag); continue
     if cmd == "local": os.environ.pop("PRAXIS_SERVER_CMD", None)
     else: os.environ["PRAXIS_SERVER_CMD"] = cmd
-    env = {"PRAXIS_EXPERT_FMT": "mixed", "PRAXIS_PACK_CACHE": "/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache"}
-    pipe = pc.PraxisClient(a.ckpt, env=env, vae_mode="reload", log_path=f"/mnt/disk01/tmp/praxis_sim_hip/server_repro_{tag}.log")
+    env = {"PRAXIS_EXPERT_FMT": "mixed", "PRAXIS_PACK_CACHE": PRAXIS_ROOT + "/praxis-1-droid.nvfp4.packcache"}
+    pipe = pc.PraxisClient(a.ckpt, env=env, vae_mode="reload", log_path=f"{PRAXIS_OUT}/praxis_sim_hip/server_repro_{tag}.log")
     out = []
     for of in a.obs:
         z = np.load(of)

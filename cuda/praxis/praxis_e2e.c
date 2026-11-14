@@ -5,8 +5,8 @@
  *
  *   cuda/praxis/praxis_e2e --policy DIR | --synthetic DIR  --ids ids.npy [--ids-uncond ids_u.npy]
  *        --ext ext.npy --wrist wrist.npy  [--proprio p.npy] [--K 2] [--steps 2] [--cfg-video 4 --cfg-action 1]
- *        [--qwen /mnt/disk1/praxis/qwen3.5-2b] [--qwen-bin cuda/llm/test_qwen35_st] [--text-cache DIR]
- *        [--vae /mnt/disk1/praxis/wan2.2-vae] [--tile-h 256 --tile-w 416] [--noise-v f.npy --noise-a f.npy] [--seed N]
+ *        [--qwen $PRAXIS_ROOT/qwen3.5-2b] [--qwen-bin cuda/llm/test_qwen35_st] [--text-cache DIR]
+ *        [--vae $PRAXIS_ROOT/wan2.2-vae] [--tile-h 256 --tile-w 416] [--noise-v f.npy --noise-a f.npy] [--seed N]
  *        [--stream R] [--pair] [--skip-last-video] [--ctx-cache] [--decode] [--keep-vae] [--out DIR]
  *
  * Run from the repo root (the Qwen runner loads cubins relative to it). Stage sequence, VRAM freed between stages:
@@ -26,6 +26,7 @@
 #include "praxis_qwen.h"
 #include <sys/wait.h>
 #include <sys/time.h>
+#include "../../common/praxis_paths.h"
 
 /* ---------------- npy ---------------- */
 typedef struct { void *data; char dt[8]; int nd; long long shape[8]; size_t n; } npy_t;
@@ -342,7 +343,7 @@ typedef struct { double text, tiles, vae, pol_load, samp, post, total; } call_t;
 int main(int argc, char **argv) {
     const char *policy = NULL, *synth = NULL, *ids_p = NULL, *ids_u_p = NULL, *ext_p = NULL, *wr_p = NULL, *prop_p = NULL, *noise_v_p = NULL, *noise_a_p = NULL, *pose8_p = NULL;
     const char *tok_test = NULL, *prompt = NULL, *prompt_u = " ", *tokjson = NULL, *session = NULL;
-    const char *qwen = "/mnt/disk1/praxis/qwen3.5-2b", *qbin = "cuda/llm/test_qwen35_st", *cache = NULL, *vae_dir = "/mnt/disk1/praxis/wan2.2-vae", *out = "tmp/praxis_out/e2e";
+    const char *qwen = px_root("qwen3.5-2b"), *qbin = "cuda/llm/test_qwen35_st", *cache = NULL, *vae_dir = px_root("wan2.2-vae"), *out = "tmp/praxis_out/e2e";
     int repeat = 1, load_only = 0, aa_force = -1, cfg_tile = 1,  K = 2, steps = 2, th = 256, tw = 416, ring = 2, pair = 0, skipv = 0, ctx = 0, decode = 0, keep_vae = 0, qspawn = 0; unsigned long long seed = 1;
     double cfg_v = 4.0, cfg_a = 1.0, t_shift = 12.5;
     for (int i = 1; i < argc; i++) {

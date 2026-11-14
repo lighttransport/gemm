@@ -1,7 +1,9 @@
 # rdna4/praxis Makefile.
-# Run from anywhere; tests chdir to the repo root. Weights/refs default to the tr16 layout.
+# Run from anywhere; tests chdir to the repo root. Weights default to $(PRAXIS_ROOT) (default ~/praxis), scratch to $(PRAXIS_OUT) (default <repo>/tmp).
 # No hipcc needed: all kernels are compiled at run time through HIPRTC (rocew).
 REPO   := $(abspath ../..)
+PRAXIS_ROOT ?= $(HOME)/praxis
+PRAXIS_OUT  ?= $(REPO)/tmp
 CC     ?= gcc
 ROCEW   = ../rocew.c
 COMMON_HDRS = ../rocew.h ../hip_runner_common.h ../../common/safetensors.h
@@ -11,7 +13,7 @@ COMMON_HDRS = ../rocew.h ../hip_runner_common.h ../../common/safetensors.h
 #   make -C rdna4/praxis vae-test      # 5x64x64 oracle check, 18 checks (rel-L2 <= 0.02, cos >= 0.999)
 #   make -C rdna4/praxis vae-bench     # 9x128x128 and 21x256x256 timing + checks
 #   make -C rdna4/praxis vae-test-tiled / vae-bench-big
-VAE_WEIGHTS ?= /mnt/nvme01/models/praxis/wan2.2-vae
+VAE_WEIGHTS ?= $(PRAXIS_ROOT)/wan2.2-vae
 VAE_REF     ?= $(REPO)/tmp/praxis_ref
 VAE_OUT     ?= $(REPO)/tmp/praxis_out_hip
 PY          ?= python3
@@ -53,10 +55,10 @@ vae-clean:
 # ======================= BEGIN praxis-runner (hip_praxis_runner.h) =======================
 #   make -C rdna4/praxis test_hip_praxis hip_praxis_server
 #   make -C rdna4/praxis test_hip_praxis_all     # tiny/mid/mid128 parity: exact fp32 path (0.02) + WMMA bf16 fast path (0.06) + streaming/sampler/ctx-cache selftests
-PX_TMP    ?= /mnt/nvme01/praxis_tmp
+PX_TMP    ?= $(PRAXIS_OUT)
 PX_REF    ?= $(PX_TMP)/praxis_ref
 PX_OUT    ?= $(PX_TMP)/praxis_out_hip
-PX_MODELS ?= /mnt/nvme01/models/praxis
+PX_MODELS ?= $(PRAXIS_ROOT)
 PX_CFLAGS  = -O2 -mavx2 -mfma -mf16c -fopenmp -Wall -Wno-unused-function -Wno-unknown-pragmas -I.. -I../../common -D_GNU_SOURCE
 PX_LDFLAGS = -lm -ldl -lpthread -fopenmp
 PX_CMP     = python3 $(REPO)/ref/praxis/compare.py --tol 0.02 --cos 0.999 --skip-missing

@@ -15,9 +15,10 @@ Invocation:  ~/.venv/bin/python -I ref/cosmos3/gen_ref.py [--out tmp/cosmos3_ref
 import argparse, copy, json, os, sys, time
 import numpy as np, torch
 from PIL import Image
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="/mnt/disk1/praxis/cosmos3-edge-droid")
+ap.add_argument("--model", default=PRAXIS_ROOT + "/cosmos3-edge-droid")
 ap.add_argument("--out", default="tmp/cosmos3_ref")
 ap.add_argument("--prompt", default="pick up the red cup and place it on the plate")
 ap.add_argument("--steps", type=int, default=4)

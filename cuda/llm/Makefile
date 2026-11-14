@@ -65,7 +65,8 @@ test_qwen35_st: test_qwen35_st.c $(RUNNER_SRC) $(CUEW_SRC) $(CUBLASEW_SRC) $(MOE
 # Parity check of the Qwen3.5-2B safetensors text tower against the HF fp32 dump
 # (tmp/praxis_ref/text, from ref/praxis/gen_text_ref.py): all 25 hidden states + cond must pass
 # compare.py (rel-L2 <= 0.005, cos >= 0.9999). Override QWEN35_DIR / QWEN35_REF as needed.
-QWEN35_DIR ?= /mnt/disk1/praxis/qwen3.5-2b
+PRAXIS_ROOT ?= $(HOME)/praxis
+QWEN35_DIR ?= $(PRAXIS_ROOT)/qwen3.5-2b
 QWEN35_REF ?= tmp/praxis_ref/text
 QWEN35_OUT ?= tmp/praxis_out/text_check
 .PHONY: test_qwen35_st_check

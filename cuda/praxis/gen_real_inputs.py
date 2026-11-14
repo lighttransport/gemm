@@ -3,9 +3,10 @@
 Writes ids.npy / ids_u.npy (Qwen3.5 tokenizer, no chat template, blank caption " " for the unguided branch), ext.npy / wrist.npy
 (uint8 [T][720][1280][3]) and pose8.npy (float32 [K'][8] xyz, quat wxyz, grip)."""
 import argparse, os, numpy as np
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", required=True); ap.add_argument("--prompt", default="pick up the red cup and put it in the sink")
-ap.add_argument("--frames", type=int, default=25); ap.add_argument("--qwen", default="/mnt/disk1/praxis/qwen3.5-2b"); ap.add_argument("--K", type=int, default=2)
+ap.add_argument("--frames", type=int, default=25); ap.add_argument("--qwen", default=PRAXIS_ROOT + "/qwen3.5-2b"); ap.add_argument("--K", type=int, default=2)
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 from transformers import AutoTokenizer

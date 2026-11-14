@@ -2,7 +2,7 @@
  * test_cuda_praxis.c - driver of the praxis-1 CUDA runner, validated against the
  * PyTorch reference dumps of ref/praxis/gen_backbone_ref.py (praxis' tiny policy).
  *
- *   cuda/praxis/test_cuda_praxis --model /mnt/disk1/praxis/tiny --ref tmp/praxis_ref/backbone \
+ *   cuda/praxis/test_cuda_praxis --model $PRAXIS_ROOT/tiny --ref tmp/praxis_ref/backbone \
  *        --out tmp/praxis_out/backbone [--stream N] [--selftest-stream]
  *
  * Writes enc_, dec_, ae_ and smp_ .npy files under --out (same names as the reference) and
@@ -16,6 +16,7 @@
 #include "cuda_praxis_runner.h"
 #include <errno.h>
 #include <time.h>
+#include "../../common/praxis_paths.h"
 
 static float *npy_read(const char *path, int *nd, long long shape[8], size_t *count) {
     FILE *f = fopen(path, "rb");
@@ -172,7 +173,7 @@ static void print_stats(praxis_runner *r, const char *tag) {
 }
 
 int main(int argc, char **argv) {
-    const char *model = "/mnt/disk1/praxis/tiny", *ref = "tmp/praxis_ref/backbone", *out = "tmp/praxis_out/backbone";
+    const char *model = px_root("tiny"), *ref = "tmp/praxis_ref/backbone", *out = "tmp/praxis_out/backbone";
     int stream = 0, selftest = 0, verbose = 0, no_sample = 0, selftest_smp = 0, repeat = 0;
     double tol = 0.02;
     for (int i = 1; i < argc; i++) {

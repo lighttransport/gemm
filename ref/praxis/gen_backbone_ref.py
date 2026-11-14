@@ -16,10 +16,11 @@ Needs praxis-1-oss importable (PYTHONPATH or --praxis-src); runs on CUDA (flex a
 """
 import argparse, json, os, sys
 import numpy as np, torch
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--praxis-src", default="/mnt/disk1/praxis/praxis-1-oss")
-ap.add_argument("--model-out", default="/mnt/disk1/praxis/tiny")
+ap.add_argument("--praxis-src", default=PRAXIS_ROOT + "/praxis-1-oss")
+ap.add_argument("--model-out", default=PRAXIS_ROOT + "/tiny")
 ap.add_argument("--out", default="tmp/praxis_ref/backbone")
 ap.add_argument("--device", default="cuda")
 ap.add_argument("--seed", type=int, default=0)

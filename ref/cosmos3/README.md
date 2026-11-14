@@ -43,5 +43,5 @@ layer inputs, norms, `s*_pred_vision/pred_action` (transformer output, all steps
   the bf16 oracle and the CUDA runner are from the fp32 truth (the honest tolerance for bf16-vs-bf16 comparisons).
 * `tokenize_prompt.py` : standalone token ids (chat template + JSON action caption + eos + `<|vision_start|>`), `--check` verifies against the exported ids.
 * `convert_vae.py` : checkpoint `vae/` (diffusers AutoencoderKLWan, bf16) -> Wan2.2_VAE.pth key layout (fp32) for `cuda/praxis/cuda_wan22_vae.h`, and verifies all 196 tensors
-  against `/mnt/disk1/praxis/wan2.2-vae` bit for bit after bf16 rounding of the original (0 differences).
+  against `$PRAXIS_ROOT/wan2.2-vae` bit for bit after bf16 rounding of the original (0 differences).
 * `cond_canvas.npy` : frame 0 of the padded canvas video the VAE sees (bf16 rounded, [-1,1], [3,192,320]) - the CUDA pipeline feeds it to its VAE.

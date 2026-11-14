@@ -14,9 +14,10 @@ shape [1,3,T',H,W]) and, with --inter, intermediate tensors (channel-first
          encode_eager / decode_unit. Use with WAN_VAE_RAW_WEIGHTS=1 in the C runner.
 """
 import argparse, os, sys, numpy as np, torch
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 ap = argparse.ArgumentParser()
-ap.add_argument("--praxis-src", default="/mnt/disk1/praxis/praxis-1-oss")
-ap.add_argument("--weights", default="/mnt/disk1/praxis/wan2.2-ti2v/Wan2.2_VAE.pth")
+ap.add_argument("--praxis-src", default=PRAXIS_ROOT + "/praxis-1-oss")
+ap.add_argument("--weights", default=PRAXIS_ROOT + "/wan2.2-ti2v/Wan2.2_VAE.pth")
 ap.add_argument("--out", default="tmp/praxis_ref/vae")
 ap.add_argument("--frames", type=int, default=5)
 ap.add_argument("--size", type=int, default=64)

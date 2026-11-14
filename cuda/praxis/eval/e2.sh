@@ -1,6 +1,6 @@
 #!/bin/bash
 # E2: knob sweep on block_out_of_bowl (A baseline 3/12), seeds 100-111, one knob at a time vs the E1 A_* baselines.  bash cuda/praxis/eval/e2.sh [stage]
-source /home/syoyo/work/gemm/praxis/cuda/praxis/eval/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 T=block_out_of_bowl
 stage=${1:-1}
 if [ $stage = 1 ]; then

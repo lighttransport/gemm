@@ -10,7 +10,7 @@ The observation -> commands logic is praxis's own, imported unchanged from the p
     server consumes bit-identical noise.
 The torch used here is CPU-only (tensors stay on the CPU, the GPU belongs to the server).
 
-    pipe = PraxisClient(checkpoint="/mnt/disk1/praxis/praxis-1-droid")            # spawns cuda/praxis/praxis_server
+    pipe = PraxisClient(checkpoint="$PRAXIS_ROOT/praxis-1-droid")            # spawns cuda/praxis/praxis_server
     sess = pipe.session(prompt="Pick up the red cube.", seed=0, max_context_chunks=1, control_mode="droid_impedance", exec_horizon=24)
     res = sess.step(obs)          # obs as praxis.single_arm expects (stacks of frames, ee_pose, grip, descriptor); res.commands = robot_command rows
     frames = sess.decode_video(res)
@@ -28,7 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
-PRAXIS_SRC = os.environ.get("PRAXIS_SRC", "/mnt/disk1/praxis/praxis-1-oss")
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
+PRAXIS_OUT = os.environ.get("PRAXIS_OUT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp"))
+PRAXIS_SRC = os.environ.get("PRAXIS_SRC", PRAXIS_ROOT + "/praxis-1-oss")
 if PRAXIS_SRC not in sys.path:
     sys.path.insert(0, PRAXIS_SRC)
 
@@ -88,7 +90,7 @@ class PraxisServer:
             cmd += ["--text-cache", str(text_cache)]
         e = dict(os.environ)
         e.update(env or {})
-        self.log = open(log_path or "/mnt/disk01/tmp/praxis_sim/server.log", "ab")
+        self.log = open(log_path or PRAXIS_OUT + "/praxis_sim/server.log", "ab")
         # opt-in remote server: PRAXIS_SERVER_CMD is the COMPLETE shell command that starts a server speaking this protocol on its stdin/stdout (e.g. through
         # ssh to the AMD host); the local `cmd`/`env` above are then ignored (give the policy path, --stream, --vae-mode, PRAXIS_EXPERT_FMT=... in the command).
         remote = os.environ.get("PRAXIS_SERVER_CMD")

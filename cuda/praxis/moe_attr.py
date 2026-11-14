@@ -5,8 +5,8 @@ and a checkpoint dir (bf16 shards). For every MoE layer the routed-expert output
 bf16 operands / fp32 accumulate (= the runner's bf16 path) for variants of the quantisation (weights, activations, scale search), and the
 rel-L2 against the bf16 variant is reported. Quantiser = praxis nvfp4.py recipe (global amax/2688, e4m3 block scale clamp [2^-6,448],
 reciprocal multiplies, E2M1 RNE); also the runner's chunked global (4096 rows) vs praxis per-expert activation global.
-Run:  ~/.venv/bin/python -I cuda/praxis/moe_attr.py --dump tmp/praxis_attr/bf16 --ckpt /mnt/disk1/praxis/praxis-1-droid [--layers enc2,dec1]
-Scratch/outputs live under /mnt/disk01 only (tmp -> /mnt/disk01/tmp).
+Run:  ~/.venv/bin/python -I cuda/praxis/moe_attr.py --dump tmp/praxis_attr/bf16 --ckpt $PRAXIS_ROOT/praxis-1-droid [--layers enc2,dec1]
+Scratch/outputs live under tmp/ (a symlink to a large disk) only.
 """
 import argparse, json, os, sys
 import numpy as np

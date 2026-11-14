@@ -16,6 +16,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import praxis_client as pc  # noqa: E402
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
+PRAXIS_OUT = os.environ.get("PRAXIS_OUT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--ref", default="tmp/praxis_ref/real")
@@ -23,7 +25,7 @@ ap.add_argument("--oracle", default="tmp/praxis_ref/real_fp32")
 ap.add_argument("--expert-fmt", default="mixed")
 ap.add_argument("--calls", default="1,2")
 ap.add_argument("--vae-mode", default="keep")
-ap.add_argument("--ckpt", default="/mnt/disk1/praxis/praxis-1-droid")
+ap.add_argument("--ckpt", default=PRAXIS_ROOT + "/praxis-1-droid")
 a = ap.parse_args()
 prompt = "pick up the red cup and place it on the plate"
 
@@ -38,12 +40,12 @@ def L(p):
     return np.load(p).astype(np.float32)
 
 
-env = {"PRAXIS_PACK_CACHE": "/mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache"}
+env = {"PRAXIS_PACK_CACHE": PRAXIS_ROOT + "/praxis-1-droid.nvfp4.packcache"}
 if a.expert_fmt == "bf16":
     env["PRAXIS_BF16_MMAP"] = "1"
 else:
     env["PRAXIS_EXPERT_FMT"] = a.expert_fmt
-pipe = pc.PraxisClient(a.ckpt, server=None, env=env, vae_mode=a.vae_mode, log_path="/mnt/disk01/tmp/praxis_sim/server_replay.log")
+pipe = pc.PraxisClient(a.ckpt, server=None, env=env, vae_mode=a.vae_mode, log_path=PRAXIS_OUT + "/praxis_sim/server_replay.log")
 ext, wr, pose, grip = (np.load(f"{a.ref}/obs_{n}.npy") for n in ("exterior", "wrist", "ee_pose", "grip"))
 sess = pipe.session(prompt=prompt, seed=0, max_context_chunks=1, control_mode="droid_impedance", exec_horizon=24)
 pipe.warm_text([prompt])

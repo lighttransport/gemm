@@ -5,8 +5,9 @@ Writes input_ids_cond.npy / input_ids_uncond.npy (int64) = ids the C driver read
 import argparse, json, os, sys, numpy as np
 from transformers import AutoTokenizer
 from diffusers.pipelines.cosmos.pipeline_cosmos3_omni import Cosmos3OmniPipeline
+PRAXIS_ROOT = os.environ.get("PRAXIS_ROOT", os.path.expanduser("~/praxis"))
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="/mnt/disk1/praxis/cosmos3-edge-droid"); ap.add_argument("--out", default="tmp/cosmos3_ref")
+ap.add_argument("--model", default=PRAXIS_ROOT + "/cosmos3-edge-droid"); ap.add_argument("--out", default="tmp/cosmos3_ref")
 ap.add_argument("--prompt", default="pick up the red cup and place it on the plate")
 ap.add_argument("--canvas-h", type=int, default=192); ap.add_argument("--canvas-w", type=int, default=320)
 ap.add_argument("--chunk", type=int, default=32); ap.add_argument("--fps", type=float, default=15.0)

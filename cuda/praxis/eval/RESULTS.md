@@ -1,6 +1,6 @@
 # Evaluation results (N=12, seeds 100-111) - generated
 
-Generated from `/mnt/disk01/tmp/praxis_sim2/` with `summarize.py` (see cuda/praxis/README.md 'Evaluation (N=12)'). Success = the sim's check, Wilson 95% CI. Latency = per Session.step call; part of the E2 runs shared the GPU with another job's EGL rendering (server_sample_ms is unaffected: see README). 'peak GB' = cuMemGetInfo-based, includes other processes; the server's own peak is 7.24 GB (A, mixed) / 6.88 GB (NVFP4).
+Generated from `$PRAXIS_OUT/praxis_sim2/` with `summarize.py` (see cuda/praxis/README.md 'Evaluation (N=12)'). Success = the sim's check, Wilson 95% CI. Latency = per Session.step call; part of the E2 runs shared the GPU with another job's EGL rendering (server_sample_ms is unaffected: see README). 'peak GB' = cuMemGetInfo-based, includes other processes; the server's own peak is 7.24 GB (A, mixed) / 6.88 GB (NVFP4).
 
 ## E1: variants (A mixed fast rebase 8, B NVFP4, C full cfg video 4 + decoded video, D rebase 0)
 

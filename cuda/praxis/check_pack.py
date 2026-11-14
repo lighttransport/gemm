@@ -1,5 +1,5 @@
 """Cross-check of the C packer (PRAXIS_PACK_CACHE blob) against the praxis nvfp4.py recipe re-implemented in torch (CPU), on one real expert.
-  ~/.venv/bin/python -I cuda/praxis/check_pack.py --cache /mnt/disk1/praxis/praxis-1-droid.nvfp4.packcache --ckpt /mnt/disk1/praxis/praxis-1-droid --block 2 --expert 3
+  ~/.venv/bin/python -I cuda/praxis/check_pack.py --cache $PRAXIS_ROOT/praxis-1-droid.nvfp4.packcache --ckpt $PRAXIS_ROOT/praxis-1-droid --block 2 --expert 3
 Also confirms the e4m3 scale clamp [2^-6,448], global = amax/2688 and reports the fraction of identical codes / scale bytes."""
 import argparse, sys, os
 import numpy as np, torch

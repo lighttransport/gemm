@@ -3,13 +3,14 @@
  * (config from gen_synth_config.py), routed expert banks as random pinned-host memory streamed through a device ring,
  * everything else random bf16 device buffers. Measures VRAM, per-pass / per-call latency, H2D bandwidth, time split.
  *
- *   cuda/praxis/bench_praxis_synth --synthetic /mnt/disk1/praxis/synth [--stream 2] [--K 2] [--S 64] [--h 13 --w 16]
+ *   cuda/praxis/bench_praxis_synth --synthetic $PRAXIS_ROOT/synth [--stream 2] [--K 2] [--S 64] [--h 13 --w 16]
  *        [--cfg-video 4.0] [--cfg-action 1.0] [--steps 2] [--synth-banks 4] [--repeat 2] [--no-call] [--no-h2d] [--profile]
  */
 #define SAFETENSORS_IMPLEMENTATION
 #define CUDA_PRAXIS_IMPLEMENTATION
 #include "cuda_praxis_runner.h"
 #include <time.h>
+#include "../../common/praxis_paths.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static unsigned long long rs = 88172645463325252ULL;
@@ -32,7 +33,7 @@ static void stats(praxis_runner *r, const char *tag) {
 }
 
 int main(int argc, char **argv) {
-    const char *dir = "/mnt/disk1/praxis/synth";
+    const char *dir = px_root("synth");
     int ctx = 0, ring = 2, K = 2, S = 64, h = 13, w = 16, steps = 2, nbanks = 4, repeat = 2, do_call = 1, prof = 0, skip_h2d = 0, exact = 0, pair = 0, skipv = 0;
     double cfg_v = 4.0, cfg_a = 1.0;
     for (int i = 1; i < argc; i++) {

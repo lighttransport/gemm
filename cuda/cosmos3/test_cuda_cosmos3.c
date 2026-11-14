@@ -1,7 +1,7 @@
 /*
  * test_cuda_cosmos3.c - driver of the Cosmos3-Edge-Policy CUDA transformer runner, validated against ref/cosmos3/gen_ref.py dumps.
  *
- *   cuda/cosmos3/test_cuda_cosmos3 --model /mnt/disk1/praxis/cosmos3-edge-droid --ref tmp/cosmos3_ref --out tmp/cosmos3_out [--teacher-force] [--steps 4] [--guidance 3]
+ *   cuda/cosmos3/test_cuda_cosmos3 --model $PRAXIS_ROOT/cosmos3-edge-droid --ref tmp/cosmos3_ref --out tmp/cosmos3_out [--teacher-force] [--steps 4] [--guidance 3]
  *
  * Reads token ids, noise latents (`latents_init`, `action_init`) from --ref, runs the und tower once, then either
  *   --teacher-force : every step's transformer input is the ORACLE's (isolates per-step transformer error), or
@@ -11,6 +11,7 @@
 #define SAFETENSORS_IMPLEMENTATION
 #define CUDA_COSMOS3_IMPLEMENTATION
 #include "cuda_cosmos3_runner.h"
+#include "../../common/praxis_paths.h"
 
 static long long *read_i8(const char *path, int *n) {
     FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "cannot open %s\n", path); return NULL; }
@@ -23,7 +24,7 @@ static long long *read_i8(const char *path, int *n) {
 static double nowms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec * 1e-6; }
 
 int main(int argc, char **argv) {
-    const char *model = "/mnt/disk1/praxis/cosmos3-edge-droid", *ref = "tmp/cosmos3_ref", *out = "tmp/cosmos3_out";
+    const char *model = px_root("cosmos3-edge-droid"), *ref = "tmp/cosmos3_ref", *out = "tmp/cosmos3_out";
     int steps = 4, tf = 0, T = 9, H = 11, W = 20, chunk = 32, domain = 8, raw = 10, verbose = 1, repeat = 1, dump_steps = 1, nocfg = 0;
     float guidance = 3.0f, fps = 15.0f;
     for (int i = 1; i < argc; i++) {
