@@ -50,6 +50,8 @@ class SamplerSettings:
     t_shift: float = 12.5
     cfg_scale: float = 1.0  # action guidance
     cfg_video_scale: float = 4.0
+    sg_window: int = 0  # opt-in: Savitzky-Golay smoothing (praxis serve smoothing=savgol, defaults 9/3) of each chunk's relative xyz + grip; 0 = off (praxis' chunked sim behaviour)
+    sg_order: int = 3
     skip_last_video: bool = False  # server skips the last video step (no predicted video); only when the video is not decoded
 
 
@@ -87,7 +89,13 @@ class PraxisServer:
         e = dict(os.environ)
         e.update(env or {})
         self.log = open(log_path or "/mnt/disk01/tmp/praxis_sim/server.log", "ab")
-        self.proc = subprocess.Popen(cmd, cwd=str(REPO), env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, bufsize=0)
+        # opt-in remote server: PRAXIS_SERVER_CMD is the COMPLETE shell command that starts a server speaking this protocol on its stdin/stdout (e.g. through
+        # ssh to the AMD host); the local `cmd`/`env` above are then ignored (give the policy path, --stream, --vae-mode, PRAXIS_EXPERT_FMT=... in the command).
+        remote = os.environ.get("PRAXIS_SERVER_CMD")
+        if remote:
+            self.proc = subprocess.Popen(remote, shell=True, cwd=str(REPO), env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, bufsize=0)
+        else:
+            self.proc = subprocess.Popen(cmd, cwd=str(REPO), env=e, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, bufsize=0)
         self.last = {}
 
     def _rd(self, n):
@@ -198,6 +206,7 @@ class Session:
         v = cfg["video"]
         self.uncond = cfg["text_encoder"]["blank_caption"]
         self.enc_ms = 0.0
+        self.enc_rtt_ms = 0.0
         self.state = single_arm.SingleArmServeSession(
             encode=self._encode, stats=pipe.stats, device="cpu", prompt=prompt, max_context_chunks=max_context_chunks,
             fps=float(cfg["chunking"].get("grid_hz", single_arm.FPS)), dims=single_arm.q99_dims(cfg),
@@ -209,6 +218,7 @@ class Session:
         u8 = clip[0].round().clamp(0, 255).to(torch.uint8).contiguous().numpy()
         lat = self.pipe.server.encode(u8)
         self.enc_ms += self.pipe.server.last["ms"]
+        self.enc_rtt_ms += self.pipe.server.last["rtt_ms"]
         self.last_encode = dict(self.pipe.server.last)
         return torch.from_numpy(lat)[None]
 
@@ -216,6 +226,7 @@ class Session:
     def step(self, obs, executed_rows=None):
         t0 = time.monotonic()
         self.enc_ms = 0.0
+        self.enc_rtt_ms = 0.0
         self.last_encode = {}
         inputs = self.state.prepare(obs, executed_rows)
         t_prep = time.monotonic() - t0
@@ -239,7 +250,17 @@ class Session:
         video = None if s.skip_last_video else torch.from_numpy(vid)[None]
         commands = self.state.finish(inputs, actions)
         rows, rel = self.state.decode_actions(inputs, actions)
-        timing = dict(prepare_s=t_prep, encode_ms=self.enc_ms, sample_s=t_samp, server_sample_ms=samp["ms"], server_aux_ms=samp["aux_ms"],
+        if s.sg_window and len(rel) >= s.sg_window > s.sg_order:  # same as praxis.serve.policy._smoothed (xyz + grip, rotation untouched, grip clipped)
+            from scipy.signal import savgol_filter
+            from praxis import robot_io
+            sm = robot_io.denormalize_rows(rows, self.state.stats, self.state.dims)
+            for dim in single_arm.Q99_DIMS:
+                sm[:, dim] = savgol_filter(sm[:, dim], s.sg_window, s.sg_order)
+            rel = robot_io.clip_grip(sm, single_arm.GRIP_DIMS)
+            commands = self.state.rel_to_wire(rel, inputs.pose8_now)
+            if self.state.exec_horizon is not None:
+                commands = commands[: self.state.exec_horizon]
+        timing = dict(prepare_s=t_prep, encode_ms=self.enc_ms, encode_rtt_ms=self.enc_rtt_ms, sample_rtt_ms=samp["rtt_ms"], sample_s=t_samp, server_sample_ms=samp["ms"], server_aux_ms=samp["aux_ms"],
                       peak_gb_sample=samp["peak_gb"], peak_gb_encode=self.last_encode.get("peak_gb"), total_s=time.monotonic() - t0, depth=inputs.depth)
         self.pipe.timings.append(timing)
         return StepResult(commands=commands, action_rows_norm=rows, action_rel=rel, pred_video_latent=video, pred_action_norm=actions,

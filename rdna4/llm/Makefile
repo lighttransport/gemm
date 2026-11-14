@@ -266,6 +266,19 @@ test_glm5next_contract: test_glm5next_contract.c ../../common/glm5next.h ../../c
 bench_cpu_qwen_expert: bench_cpu_qwen_expert.c
 	$(CC) -O3 -Wall -Wextra -march=native -fopenmp -o $@ $< -ldl -lm
 
+# ---- praxis: Qwen3.5-2B text encoder direct from HF safetensors (standalone, no monolith) ----
+.PHONY: qwen35-st qwen35-st-check
+qwen35-st: test_hip_qwen35_st
+test_hip_qwen35_st: test_hip_qwen35_st.c hip_qwen35_st.c hip_qwen35_st.h $(ROCEW_SRC) ../rocew.h ../hip_runner_common.h ../../common/safetensors.h
+	$(CC) -O3 -Wall -D_GNU_SOURCE -I.. -march=native -o $@ test_hip_qwen35_st.c hip_qwen35_st.c $(ROCEW_SRC) -ldl -lm -lpthread
+# run from the repo root:  make -C rdna4/llm qwen35-st-check QWEN35_DIR=<qwen3.5-2b dir>
+QWEN35_DIR ?= /mnt/nvme01/models/praxis/qwen3.5-2b
+qwen35-st-check: test_hip_qwen35_st
+	cd ../.. && rm -rf tmp/praxis_out/text_hip_check && ./rdna4/llm/test_hip_qwen35_st $(QWEN35_DIR) -i tmp/praxis_ref/text/ids.npy -o tmp/praxis_out/text_hip_check -p 32
+	cd ../.. && python3 ref/praxis/compare.py --ref-dir tmp/praxis_ref/text --ours-dir tmp/praxis_out/text_hip_check --skip-missing --tol 0.005 | tee tmp/praxis_out/text_hip_check/compare.log
+	@test "`grep -c '^PASS' ../../tmp/praxis_out/text_hip_check/compare.log`" = 26 || { echo "qwen35-st-check: FAILED (expected 26 PASS)"; exit 1; }
+	@echo "qwen35-st-check: OK"
+
 clean:
 	rm -f $(TARGET) test_fattn_vec_half2 bench_cpu_qwen_expert test_glm5next_contract test_glm5next_ref test_glm5next_cpu_kda test_glm5next_cpu_full test_glm5next_cpu_runtime test_glm5next_nextn mm_blaslt_bridge.o reference_sampler.o cuda_moe_bridge.o qwen35_attention_q8.inc qwen35_dflash2.inc qwen35_matvec_q2k.inc qwen35_matvec_iq.inc
 
