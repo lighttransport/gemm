@@ -530,3 +530,22 @@ Notes: (1) 4 Euler steps are valid with `window_joint` (euler only; num_steps is
 **(d) HIP/AMD results (see `rdna4/praxis/README.md`).** The same server protocol runs on the RX 9070 XT (W4A16/FP8 "mixed", 7.65 GB, ~7.25 s plain call, ~3.5 s per call end to end in the fast variant). 12-seed lift_cube (seeds 100-111): HIP 10/12 vs CUDA 11/12, paired McNemar p=1.0; seeds 101/102 on repeat: HIP 6/11 vs CUDA 6/6 (chosen because they failed; a possible mild grasp-timing disadvantage of W4A16 is unproven). Both servers are bit-deterministic for identical inputs; the HIP-vs-CUDA gap on the same observation (pred_action 1.3e-2..7.3e-2, command xyz rms 2-25 mm) is the size of either backend's distance to the torch fp32 oracle; no bug found.
 
 **(e) Limitations.** N=12 per cell: a Wilson CI is about +-20 points, a paired McNemar test needs roughly >= 5 discordant pairs in one direction to reach p < 0.05, so only large effects are detectable. The sim is synthetic (MuJoCo, rendered scenes), not the real robot; the sim itself is not exactly repeatable (initial state depends on episode order; the A repeat flips one seed each way). The EVAL.md numbers (30/32 etc., earlier checkpoint, 16 scenes x 2 samplers) are not comparable to ours (different checkpoint/sampler settings and scene count). Quantisation variants (NVFP4 W4A4, mixed, HIP W4A16) are indistinguishable at task level here but not proven equal. The sweep is one knob at a time on one weak task with one sampler seed per episode; knob effects below ~30 points are not resolvable. Latency of part of the runs was measured with a concurrent EGL job on the same GPU (use `server_sample_ms`, unaffected, for the GPU time).
+
+## Co-existence with a GPU/CPU miner
+
+A CPU miner (about 29 cores) and a GPU miner were running on the same machine as the CUDA closed-loop evaluation
+(RTX 5060 Ti 16 GB) for about 40 minutes of sampled runs (fresh-seed CUDA batch, 468 samples every 5 s):
+
+| metric | observed |
+|---|---|
+| GPU memory used, max | 11.8 GB of 16.3 GB (policy 7.8 GB + miner 3.75 GB at the worst sample; the miner mostly held 0.4 GB) |
+| policy server VRAM, max | 7.9 GB (same as without the miner) |
+| out-of-memory errors | none in the run logs; no swap use; host memory available min 36 GB |
+| GPU utilisation / temperature / power / SM clock | >= 96% / <= 55 C / <= 76 W of 180 W / >= 2062 MHz (no throttling) |
+| host load (1 min), max | 60 on this machine (miner on most cores) |
+| policy per-call time, `lift_cube` fast | 4.07 s mean, 3.95 s median with the miner vs 4.17 s / 3.96 s before |
+
+No slowdown was visible in per-call time; success rates are unaffected (the sim is not real time). A larger miner
+memory table (several GB) would still fit next to the policy; one above about 8 GB would not. The kernel log shows no GPU
+errors during the miner period; the only NVIDIA Xid events in the log were from early development runs of
+`test_cuda_praxis` (before the miner existed).

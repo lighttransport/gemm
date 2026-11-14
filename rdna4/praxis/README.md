@@ -98,3 +98,9 @@ repeat/other seeds were run, and the failing HIP episodes were not analysed (can
 - **Qwen cond HIP vs CUDA** (same token ids, same cache hashes) for 'Pick up the red cube.' 4.2e-4, blank caption 9.1e-4 rel-L2 (cos 1.000000); two more prompts 3.9e-4, 4.3e-4. VAE encode is covered by the anchor column above.
 - Router top-k per MoE layer HIP vs CUDA: NOT done (the runners do not expose it cheaply); no fp32 torch oracle for these observations (~3 min/call, not run).
 - Conclusion: no bug found. lift_cube 10/12 vs 11/12 on seeds 100-111 (McNemar p = 1.0); repeated 101/102 HIP 6/11 vs CUDA 6/6 (p ~ 0.04 but on seeds picked for failing) leaves a possible mild grasp-timing disadvantage of W4A16 unproven; more seeds (e.g. 112-135, both backends) would be needed to settle it.
+
+## HIP vs CUDA closed-loop validation
+
+Paired closed-loop comparison on the same seeds and settings (6 tasks x 12 seeds plus 3 tasks x 24 fresh seeds, and a full-variant
+check): pooled success CUDA 88% vs HIP 84% (difference -3.5 points, 95% CI [-10.2, +3.2], McNemar p = 0.41); not significant,
+equivalence not proven. Details, per-task tables and the reproduction commands: `RESULTS_HIP_VS_CUDA.md`.
