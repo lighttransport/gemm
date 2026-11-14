@@ -413,3 +413,6 @@ ref/minimax_h3_native/*
 cuda/praxis/praxis_e2e
 cuda/cosmos3/cosmos3_policy
 cuda/praxis/praxis_server
+
+# session resume/hand-off notes (existing tracked resume*.md files stay tracked)
+resume*.md
